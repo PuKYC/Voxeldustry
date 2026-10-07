@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://n2wwv7h51fv5"]
+
+[ext_resource type="Script" uid="uid://chff1ig5jtl1l" path="res://bevy_client/bevy_client.gd" id="1"]
+
+[node name="BevyClient" type="Node" unique_id=2043540208]
+script = ExtResource("1")

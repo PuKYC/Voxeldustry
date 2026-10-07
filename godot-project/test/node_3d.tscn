@@ -1,0 +1,8 @@
+[gd_scene format=3 uid="uid://dbe23peov0udv"]
+
+[ext_resource type="Script" uid="uid://cg3euqs5a2a3y" path="res://test/node_3d.gd" id="1_nd1li"]
+
+[node name="Node3D" type="Node3D" unique_id=402495988]
+script = ExtResource("1_nd1li")
+
+[node name="BevyAppManager" type="BevyAppManager" parent="." unique_id=816110605]

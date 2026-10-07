@@ -1,0 +1,19 @@
+[package]
+name = "godot-client-ext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[dependencies]
+godot = { version = "0.5.5", features = ["api-4-2"] }
+# 注意：这里**不依赖 bevy**。
+# godot-client-ext 是唯一同时认识 Godot 与 game-core 的 crate，
+# 但它只做 `Variant ↔ game_core 类型` 的机械搬运，不需要 Bevy 本身。
+game-core = { path = "../game-core" }
+crossbeam-channel = { workspace = true }

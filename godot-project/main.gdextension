@@ -1,0 +1,28 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.2
+
+[libraries]
+; --- Linux ---
+linux.debug.x86_64 =     "res://../target/debug/libgodot_client_ext_linux_x86_64.so"
+linux.release.x86_64 =   "res://../target/release/libgodot_client_ext_linux_x86_64.so"
+linux.debug.arm64 =      "res://../target/debug/libgodot_client_ext_linux_arm64.so"
+linux.release.arm64 =    "res://../target/release/libgodot_client_ext_linux_arm64.so"
+
+; --- Windows ---
+windows.debug.x86_64 =   "res://../target/debug/godot_client_ext_windows_x86_64.dll"
+windows.release.x86_64 = "res://../target/release/godot_client_ext_windows_x86_64.dll"
+
+; --- Android ---
+android.debug.arm64 =    "res://../target/debug/libgodot_client_ext_android_arm64.so"
+android.release.arm64 =  "res://../target/release/libgodot_client_ext_android_arm64.so"
+android.debug.arm32 =    "res://../target/debug/libgodot_client_ext_android_arm32.so"
+android.release.arm32 =  "res://../target/release/libgodot_client_ext_android_arm32.so"
+android.debug.x86_64 =   "res://../target/debug/libgodot_client_ext_android_x86_64.so"
+android.release.x86_64 = "res://../target/release/libgodot_client_ext_android_x86_64.so"
+
+; --- macOS (保留以备不时之需) ---
+macos.debug =            "res://../target/debug/libgodot_client_ext_macos_x86_64.dylib"
+macos.release =          "res://../target/release/libgodot_client_ext_macos_x86_64.dylib"
+macos.debug.arm64 =      "res://../target/debug/libgodot_client_ext_macos_arm64.dylib"
+macos.release.arm64 =    "res://../target/release/libgodot_client_ext_macos_arm64.dylib"

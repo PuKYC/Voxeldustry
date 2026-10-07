@@ -1,0 +1,27 @@
+[package]
+name = "voxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Deterministic SVO-DAG voxel storage, meshing and integer rect extraction (derived from voxelis v25.4.0)."
+
+[dependencies]
+glam = { workspace = true }
+rustc-hash = { workspace = true }
+
+[features]
+default = []
+# 内存统计（estimated_total_bytes / stats）。
+memory_stats = []
+# 上游 cfg 名称保留（默认关闭）：供移植代码的 #[cfg(feature = ...)] 门控使用。
+# 注意：上游的 tracy feature 依赖未移植的 tracy-client，故不声明；相关 cfg 块永不编译。
+debug_trace_ref_counts = []
+trace_greedy_timings = []
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "mesh_rebuild"
+harness = false

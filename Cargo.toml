@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/voxel", "game-engine", "game-core", "godot-client-ext"]
+# default-members = ["game-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# 最小化 Bevy：默认特性关掉，各 crate 按需开启 features。
+bevy = { version = "0.19", default-features = false }
+fixed = { version = "1.31", features = ["serde"] }
+rand_pcg = "0.10"
+rand_core = "0.10"
+serde = { version = "1", features = ["derive"] }
+
+bevy_replicon = { version = "0.43" }
+bevy_replicon_renet = "0.19"
+
+rstar = "0.13.0"
+
+crossbeam-channel = { version = "0.5" }
+
+# 体素世界层（crates/voxel）：整数体素坐标，无 Bevy 依赖。
+glam = "0.32"
+rustc-hash = "1"
+
+# 基准。
+criterion = "0.5"
+
+

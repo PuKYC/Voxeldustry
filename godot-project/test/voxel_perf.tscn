@@ -1,0 +1,35 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://test/voxel_perf.gd" id="1_perf"]
+[ext_resource type="PackedScene" path="res://bevy_client/bevy_client.tscn" id="2_client"]
+
+[node name="VoxelPerf" type="Node3D"]
+script = ExtResource("1_perf")
+radius_blocks = 2
+max_lod = 0
+warmup_frames = 60
+measure_frames = 600
+
+[node name="BevyAppManager" type="BevyAppManager" parent="."]
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.957826, -0.287348, 0, 0.287348, 0.957826, 0, 48, 64)
+fov = 60.0
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866025, 0, 0.5, 0.383022, 0.642788, -0.663414, -0.321394, 0.766044, 0.55667, 0, 0, 0)
+shadow_enabled = true
+
+[node name="BevyClient" parent="." instance=ExtResource("2_client")]
+manager_path = NodePath("../BevyAppManager")
+entity_parent = NodePath("..")
+mode = 2
+channel = 2
+autostart = true
+fixed_hz = 60.0
+runner_hz = 60.0
+enable_demo = false
+source_id = 1
+enable_input = true
+voxel_radius_blocks = 2
+voxel_max_lod = 0

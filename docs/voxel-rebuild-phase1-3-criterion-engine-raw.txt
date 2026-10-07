@@ -1,0 +1,340 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/dptui/ecs_game/godot-client-ext/Cargo.toml
+workspace: /home/dptui/ecs_game/Cargo.toml
+warning: unused import: `glam::Vec3`
+  --> crates/voxel/src/mesh/greedy.rs:23:5
+   |
+23 | use glam::Vec3;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unexpected `cfg` condition value: `tracy`
+  --> crates/voxel/src/store/batch.rs:94:15
+   |
+94 |         #[cfg(feature = "tracy")]
+   |               ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+   = help: consider adding `tracy` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:104:15
+    |
+104 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:114:15
+    |
+114 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:123:15
+    |
+123 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:135:15
+    |
+135 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:157:15
+    |
+157 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:186:15
+    |
+186 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/batch.rs:195:15
+    |
+195 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+  --> crates/voxel/src/store/voxtree.rs:70:15
+   |
+70 |         #[cfg(feature = "tracy")]
+   |               ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+   = help: consider adding `tracy` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+  --> crates/voxel/src/store/voxtree.rs:82:15
+   |
+82 |         #[cfg(feature = "tracy")]
+   |               ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+   = help: consider adding `tracy` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+  --> crates/voxel/src/store/voxtree.rs:89:15
+   |
+89 |         #[cfg(feature = "tracy")]
+   |               ^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+   = help: consider adding `tracy` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:116:15
+    |
+116 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:134:15
+    |
+134 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:231:15
+    |
+231 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:246:15
+    |
+246 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:263:15
+    |
+263 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:270:15
+    |
+270 |         #[cfg(feature = "tracy")]
+    |               ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:348:11
+    |
+348 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:371:11
+    |
+371 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:538:11
+    |
+538 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:560:11
+    |
+560 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:640:11
+    |
+640 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:683:11
+    |
+683 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `tracy`
+   --> crates/voxel/src/store/voxtree.rs:703:11
+    |
+703 |     #[cfg(feature = "tracy")]
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `debug_trace_ref_counts`, `default`, `memory_stats`, and `trace_greedy_timings`
+    = help: consider adding `tracy` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `ByteConversion`
+ --> crates/voxel/src/io/export.rs:9:14
+  |
+9 |     BlockId, ByteConversion, ChunkKey, Lod, VoxInterner, VoxOpsConfig, VoxTree, VoxelTrait,
+  |              ^^^^^^^^^^^^^^
+
+warning: unused import: `ByteConversion`
+  --> crates/voxel/src/io/import.rs:10:14
+   |
+10 |     BlockId, ByteConversion, ChunkKey, MaxDepth, VoxInterner, VoxTree, VoxelTrait, EMPTY_CHILD,
+   |              ^^^^^^^^^^^^^^
+
+warning: associated items `empty` and `node_count` are never used
+   --> crates/voxel/src/mesh/occupancy.rs:407:19
+    |
+404 | impl LocalTree {
+    | -------------- associated items in this implementation
+...
+407 |     pub(crate) fn empty() -> Self {
+    |                   ^^^^^
+...
+422 |     pub(crate) fn node_count(&self) -> usize {
+    |                   ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel` (lib) generated 28 warnings (run `cargo fix --lib -p voxel` to apply 1 suggestion)
+warning: private item shadows public glob re-export
+  --> game-engine/src/voxel/mod.rs:25:1
+   |
+25 | mod interner;
+   | ^^^^^^^^^^^^^
+   |
+note: the name `interner` in the type namespace is supposed to be publicly re-exported here
+  --> game-engine/src/voxel/mod.rs:19:9
+   |
+19 | pub use ::voxel::store::*;
+   |         ^^^^^^^^^^^^^^^^^
+note: but the private item here shadows it
+  --> game-engine/src/voxel/mod.rs:25:1
+   |
+25 | mod interner;
+   | ^^^^^^^^^^^^^
+   = note: `#[warn(hidden_glob_reexports)]` on by default
+
+warning: `game-engine` (lib) generated 1 warning
+    Finished `bench` profile [optimized] target(s) in 1.34s
+     Running benches/voxel_rebuild.rs (target/release/deps/voxel_rebuild-90d3c9265eb5a931)
+Gnuplot not found, using plotters backend
+Benchmarking single_edit/new_wrapped_e2e
+Benchmarking single_edit/new_wrapped_e2e: Warming up for 3.0000 s
+Benchmarking single_edit/new_wrapped_e2e: Collecting 50 samples in estimated 10.465 s (5100 iterations)
+Benchmarking single_edit/new_wrapped_e2e: Analyzing
+single_edit/new_wrapped_e2e
+                        time:   [1.4991 ms 1.5013 ms 1.5038 ms]
+                        change: [-27.941% -25.296% -22.184%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking single_edit/old_local_e2e
+Benchmarking single_edit/old_local_e2e: Warming up for 3.0000 s
+Benchmarking single_edit/old_local_e2e: Collecting 50 samples in estimated 9.9614 s (6375 iterations)
+Benchmarking single_edit/old_local_e2e: Analyzing
+single_edit/old_local_e2e
+                        time:   [1.5182 ms 1.5214 ms 1.5251 ms]
+                        change: [+0.6541% +0.9133% +1.1629%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+
+Benchmarking boundary_scenario/scenario_a_e2e
+Benchmarking boundary_scenario/scenario_a_e2e: Warming up for 3.0000 s
+Benchmarking boundary_scenario/scenario_a_e2e: Collecting 50 samples in estimated 9.9049 s (6375 iterations)
+Benchmarking boundary_scenario/scenario_a_e2e: Analyzing
+boundary_scenario/scenario_a_e2e
+                        time:   [1.5215 ms 1.5277 ms 1.5334 ms]
+                        change: [+0.9211% +1.1786% +1.4484%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 3 outliers among 50 measurements (6.00%)
+  1 (2.00%) low mild
+  2 (4.00%) high mild
+Benchmarking boundary_scenario/scenario_b_e2e
+Benchmarking boundary_scenario/scenario_b_e2e: Warming up for 3.0000 s
+Benchmarking boundary_scenario/scenario_b_e2e: Collecting 50 samples in estimated 11.990 s (3825 iterations)
+Benchmarking boundary_scenario/scenario_b_e2e: Analyzing
+boundary_scenario/scenario_b_e2e
+                        time:   [3.0529 ms 3.0647 ms 3.0770 ms]
+                        change: [+2.1589% +2.4158% +2.6611%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 50 measurements (4.00%)
+  2 (4.00%) high mild
+

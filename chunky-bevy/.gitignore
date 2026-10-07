@@ -1,0 +1,4 @@
+/target
+/saves
+flake.nix
+flake.lock

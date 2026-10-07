@@ -1,0 +1,32 @@
+[package]
+name = "game-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bevy = { workspace = true, features = ["std", "multi_threaded", "bevy_log"] }
+fixed = { workspace = true }
+rand_pcg = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+rstar = { workspace = true }
+crossbeam-channel = { workspace = true }
+bevy_replicon = { workspace = true, optional = true }
+voxel = { path = "../crates/voxel", optional = true }
+
+[features]
+default = []
+# 网络适配（replicon）：默认关闭，保持 engine 依赖树干净。
+net = ["dep:bevy_replicon"]
+# 体素世界层；把 crates/voxel re-export 给 core。
+voxel = ["dep:voxel"]
+
+[dev-dependencies]
+serde_json = "1"
+criterion = { workspace = true }
+
+[[bench]]
+name = "voxel_rebuild"
+harness = false
+required-features = ["voxel"]
