@@ -461,7 +461,7 @@ fn bench_chunk_shapes(c: &mut Criterion) {
     group.finish();
 }
 
-/// T6 / Phase 5: same 32^3 terrain occupancy, full `extract_rects` vs
+/// same 32^3 terrain occupancy, full `extract_rects` vs
 /// `IncrementalMesh::rebuild` from the previous version, for a 1^3 / 4^3 /
 /// 16^3 material edit anchored at the +X / south-west corner (so the edit
 /// always crosses the exposed surface).

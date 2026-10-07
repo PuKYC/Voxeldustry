@@ -5,13 +5,11 @@
 //! game_core::world::{WorldGenerator, generate_island, DEFAULT_VOXEL_SIZE} and
 //! game_engine::voxel::{VoxVolume, VoxelInterner, extract_block, pack_rect_stream, ...}.
 //!
-//! Determinism (L3): the island seed, chunk enumeration and voxel size are fixed,
+//! Determinism: the island seed, chunk enumeration and voxel size are fixed,
 //! so every printed number is reproducible.
 //!
 //! Note on the memory ratio: VoxelInterner::estimated_total_bytes() is dominated
-//! by the *preallocated* node pool, so the design's per-node figure (58-68 B,
-//! design section 7.1/7.2) is naturally read as bytes per node-pool slot
-//! (estimated_total_bytes() / capacity(), exactly the design's "v1 58 B" row).
+//! by the *preallocated* node pool, so the design's per-node figure (58-68 B) is naturally read as bytes per node-pool slot
 //! The unique reachable node count is smaller whenever the budget is generous, so
 //! it is printed separately as bytes/reachable for tracking but is not the
 //! denominator of the hard assertion (that would conflate over-provisioning with

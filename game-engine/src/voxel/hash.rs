@@ -10,6 +10,7 @@ use super::volume::VoxVolume;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// TODO 可能独立出来
 /// 自研 FNV-1a 64：跨平台 / 跨版本可复现（std DefaultHasher 不作确定性承诺）。
 struct Fnv(u64);
 

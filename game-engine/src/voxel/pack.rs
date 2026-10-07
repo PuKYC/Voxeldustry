@@ -1,4 +1,4 @@
-//! 矩形实例打包（路径 B）。
+//! 矩形实例打包。
 //!
 //! ## 8 B/矩形 位布局（小端 u64）
 //!
@@ -23,7 +23,6 @@
 //! orientation 只把 plane({0,1,2}) 与 dir({0,1}) 折成 3 bit；矩形是位置无关的
 //! 整数描述符，不含 body/island 变换，也不含 voxel_size。顺序由
 //! pack_rect_stream 固定为 (ChunkKey, plane, dir, material, slice, row, col)
-//! （确定性）。
 
 use voxel::mesh::{AoRectBatch, RectBatch, RectInstance};
 

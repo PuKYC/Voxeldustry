@@ -286,7 +286,7 @@ fn warm_external<'a>(
     external
 }
 
-/// T6 / Phase 5 internal path: end-to-end mesh_block_incremental vs the full
+/// end-to-end mesh_block_incremental vs the full
 /// mesh_block_wrapped recompute, for 1^3 / 4^3 / 16^3 edits of chunk (0,0,0).
 ///
 /// Both sides invalidate the wrapped cache every iteration (so occupancy is
@@ -374,7 +374,7 @@ fn bench_incremental_internal(c: &mut Criterion) {
     group.finish();
 }
 
-/// T6 / Phase 5 external-only path.  World B differs from A only by the
+/// World B differs from A only by the
 /// neighbour chunk (0,0,0); neighbour block (1,0,0) has an unchanged occupancy
 /// bitmap, so plan.internal == false rebuilds only the affected YZNeg slices.
 ///

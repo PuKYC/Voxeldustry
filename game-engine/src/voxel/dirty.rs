@@ -4,7 +4,7 @@
 //! `VoxelBox`（块内整数体素范围）+ `MeshBlockDirty`（块级 internal/faces）
 //! + `rebuild_plan`（band 相对**全局块边界**过滤）。
 //!
-//! 确定性 L3：所有会决定顺序的容器都是 BTreeMap / 排序 Vec。
+//! 确定性：所有会决定顺序的容器都是 BTreeMap / 排序 Vec。
 
 use std::collections::BTreeMap;
 

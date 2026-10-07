@@ -1,14 +1,14 @@
-//! Engine-side incremental mesh cache and entry point (spec 5 T6 / test 10).
+//! Engine-side incremental mesh cache and entry point.
 //!
 //! IncrementalMeshCache maps (block origin, lod) to a
 //! voxel::mesh::IncrementalMesh (the slice-level incremental greedy cache) and
 //! does a byte-budgeted LRU on top (default 32 MiB).
 //!
-//! Invalidation boundary (spec 5 T6, critical):
+//! Invalidation boundary:
 //! * WrappedBlockCache::invalidate_covered only drops wrapped trees and MUST
 //!   NOT remove IncrementalMeshCache entries.  After an edit the block is
 //!   re-wrapped to a fresh occupancy, then rebuilt incrementally; removing the
-//!   entry here would make every step a cold start and erase the T6 gain.
+//!   entry here would make every step a cold start.
 //! * Only whole-body unload / clear / release_body / LOD eviction (a block no
 //!   longer covered by any CoverPolicy) call remove / remove_covered / clear.
 //!
@@ -16,7 +16,7 @@
 //! BlockId and no interner reference, so it may safely outlive the wrapped
 //! trees it was built from and eviction only drops values (iron law 2.3/2.4).
 //!
-//! Determinism (L3): meshes is a BTreeMap; LRU eviction picks the smallest
+//! Determinism : meshes is a BTreeMap; LRU eviction picks the smallest
 //! (stamp, key) pair, so equal stamps break ties by ascending key.  No HashMap
 //! iteration decides anything.
 
@@ -153,7 +153,7 @@ impl IncrementalMeshCache {
     /// Removes the incremental mesh of every LOD block covering key.
     ///
     /// Call this on unload / release_body / LOD eviction.  Never call it from
-    /// the per-edit wrapped invalidation path (spec 5 T6).
+    /// the per-edit wrapped invalidation path.
     pub fn remove_covered(&mut self, key: ChunkKey) {
         for lod in 0..=voxel::mesh::MAX_LOD {
             let lod = Lod::new(lod);
@@ -267,7 +267,7 @@ fn empty_batch(block: MeshBlock) -> AoRectBatch {
     }
 }
 
-/// Meshes one block incrementally (spec 5 T6).
+/// Meshes one block incrementally.
 ///
 /// * plan.internal == true: wrap the block (hash-consed) and build its
 ///   occupancy with the same build_tree_occupancy the full path uses, then

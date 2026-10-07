@@ -1,4 +1,4 @@
-//! Slice-level incremental greedy meshing (spec Phase 5 / T6).
+//! Slice-level incremental greedy meshing.
 //!
 //! Reuses the full extractor's merge code: every slice is produced by the same
 //! greedy_slice the full path calls, so bit-for-bit equivalence is a

@@ -51,7 +51,7 @@ mod tests {
 
     /// 确定性金标：固定初始状态跑 1000 个 fixed tick，两遍结果逐位一致。
     ///
-    /// 只关心确定性边界（L3）：同样的输入 + 同样的顺序 -> 同样的世界状态。
+    /// 只关心确定性边界：同样的输入 + 同样的顺序 -> 同样的世界状态。
     #[test]
     fn fixed_tick_simulation_is_bitwise_deterministic() {
         use game_engine::identity::StableEntityId;

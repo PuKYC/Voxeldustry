@@ -62,7 +62,7 @@ fn death_system(
     }
 }
 
-/// 造成伤害（瞬时消息）。来源只管写 Health，不判定死亡（L2）。
+/// 造成伤害（瞬时消息）。来源只管写 Health，不判定死亡
 #[derive(Message)]
 pub struct DamageEvent {
     pub entity: Entity,

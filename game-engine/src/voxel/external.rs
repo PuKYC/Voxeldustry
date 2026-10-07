@@ -10,11 +10,10 @@
 //! **不持有 interner 引用**：值只有纯位数据（Box<[u64]>），没有 VoxTree，
 //! 所以永远不需要 dec_ref_recursive，不存在 的引用泄漏问题。
 //!
-//! **确定性（L3）**：masks 用 BTreeMap；遍历顺序确定。
+//! **确定性**：masks 用 BTreeMap；遍历顺序确定。
 //!
-//! **容量上限（v1 不做 LRU）**：条目数达到 EXTERNAL_MASK_CACHE_CAPACITY 时，
+//! **容量上限**：条目数达到 EXTERNAL_MASK_CACHE_CAPACITY 时，
 //! 在插入新条目之前直接 clear() 整个缓存。4096 条 × 256 B ≈ 1 MiB。
-//! 第一版不做 LRU。
 
 use std::collections::BTreeMap;
 
@@ -24,7 +23,7 @@ use voxel::store::{MaxDepth, VoxTree};
 
 use super::interner::VoxelInterner;
 
-/// external 掩码缓存条目上限（v1 不做 LRU，满了整体 clear()）。
+/// external 掩码缓存条目上限
 pub const EXTERNAL_MASK_CACHE_CAPACITY: usize = 4096;
 
 /// external 面掩码缓存。key = (邻居 wrapped root BlockId, ExternalPlane, max_depth)。
@@ -78,7 +77,7 @@ impl ExternalMaskCache {
     }
 
     /// Like get_or_generate but takes the raw store interner, for engine entry
-    /// points that already hold a &VoxInterner<u8> (the T6 incremental mesher).
+    /// points that already hold a &VoxInterner<u8> .
     /// Same key, same value.
     pub fn get_or_generate_raw(
         &mut self,
@@ -96,7 +95,7 @@ impl ExternalMaskCache {
         let depth = max_depth.max();
         let key = (u64::from(root), plane as u8, depth);
 
-        // v1 无 LRU：满了先把整个缓存清掉，再插入新条目。命中时不清理。
+        // 满了先把整个缓存清掉，再插入新条目。命中时不清理。
         if self.masks.len() >= EXTERNAL_MASK_CACHE_CAPACITY && !self.masks.contains_key(&key) {
             self.masks.clear();
         }

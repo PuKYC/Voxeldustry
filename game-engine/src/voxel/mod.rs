@@ -1,4 +1,4 @@
-//! game-engine 体素世界层（WP3 填充）：VoxVolume / VoxelInterner / 打包 / 脏标记。
+//! game-engine 体素世界层：VoxVolume / VoxelInterner / 打包 / 脏标记。
 //!
 //! 本模块只做机制与 Bevy 适配：不产出几何、不含游戏语义、不定义游戏数值。
 //!
@@ -12,7 +12,7 @@
 //!
 //! 边界铁律：crates/voxel 只用整数体素坐标，不知道 voxel_size；
 //! 世界换算只在 volume 的 body_voxel / world_meters 里发生，且仅在表现出口把
-//! FixedPoint 转 f32。确定性（L3）：所有会产字节或决定顺序的容器一律
+//! FixedPoint 转 f32。确定性：所有会产字节或决定顺序的容器一律
 //! BTreeMap / 排序 Vec，绝不用 HashMap 迭代序。
 
 pub use ::voxel::mesh::{extract_block, MeshBlock, RectBatch, RectInstance};

@@ -306,7 +306,7 @@ fn build_local_occupancy(
 /// Builds the occupancy grid of an already-wrapped tree.
 ///
 /// Shared by extract_block_tree_with_ao and the engine incremental mesher
-/// (spec 5 T6): the latter needs the same occupancy construction to diff
+/// sthe latter needs the same occupancy construction to diff
 /// against its cached copy, so this is deliberately public rather than
 /// duplicated.  tree has depth BASE_DEPTH + lod, so it is sampled at
 /// tree.max_depth(lod) (always 32^3).

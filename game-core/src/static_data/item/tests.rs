@@ -37,7 +37,7 @@ fn item_tags_are_sorted_ascending() {
     }
 }
 
-/// T6：核心标签表 id / 名字唯一、id <= 999、分区为 core。
+/// 核心标签表 id / 名字唯一、id <= 999、分区为 core。
 #[test]
 fn item_tag_ids_and_names_are_unique() {
     assert!(detect_id_collisions(ITEM_TAG_TABLE).is_empty());
