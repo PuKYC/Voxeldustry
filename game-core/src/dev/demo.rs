@@ -41,7 +41,7 @@ pub struct DemoDrifter {
 
 /// 演示插件（纯实体演示）。
 ///
-/// 地形不在演示插件里：它属于世界层，由装配方在 `WorldPlugin` 之前
+/// 地形不在演示插件里：它属于体素层，由装配方在 `GameVoxelPlugin` 之前
 /// `insert_resource(TerrainConfig)` 启用（见 `BevyBackendConfig::terrain`）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DemoPlugin;

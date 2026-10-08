@@ -10,15 +10,16 @@
 use std::collections::BTreeMap;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use game_engine::presentation::voxel::{mesh_block_wrapped, pack_rect_batch, WrappedBlockCache};
 use game_engine::voxel::{
-    chunk_key, lod_block_origin, mesh_block_wrapped, pack_rect_batch, ChunkKey, Lod, MeshBlock,
-    RectBatch, VoxInterner, VoxTree, WrappedBlockCache,
+    chunk_key, lod_block_origin, ChunkKey, Lod, MeshBlock, RectBatch, VoxInterner, VoxTree,
 };
 
 use game_core::static_data::voxel::DEFAULT_BIOME;
-use game_core::world::generation::{WorldGenerator, WorldSeed};
-use game_core::world::terrain::blocks::lod_blocks;
-use game_core::world::terrain::neighbor_origins;
+use game_core::voxel::terrain::blocks::lod_blocks;
+use game_core::voxel::terrain::generation::WorldGenerator;
+use game_core::voxel::terrain::neighbor_origins;
+use game_core::world::WorldSeed;
 
 /// 生成子块的范围（覆盖 lod3 的块 + 一圈 margin）。
 ///

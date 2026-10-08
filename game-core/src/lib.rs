@@ -18,7 +18,9 @@
 //! | [`privacy`] | 隐私组件与 `CorePrivacyScope` |
 //! | `prediction` | 预测 / 回滚绑定（单人路径） |
 //! | [`presentation`] | 表现通道（payload / synced_components / sync / semantics / event） |
-//! | [`static_data`] | 静态数据（prototype / item） |
+//! | [`static_data`] | 静态数据（prototype / item / voxel 数值 + WorldTables） |
+//! | `voxel` | 体素世界层（Body / 停靠 / LOD / 地形；GameVoxelPlugin + TerrainPlugin） |
+//! | `world` | 世界确定性状态（Island / WorldSeed / WorldRng） |
 //! | `net`（`feature = "net"`） | replicon 可见性适配 |
 //! | `dev` | 仅开发 / 演示场景（生产可整体删除） |
 
@@ -35,7 +37,9 @@ pub mod presentation;
 pub mod privacy;
 pub mod spec;
 pub mod static_data;
-/// 游戏世界语义与数值：BodyKind / 生成 / LOD 策略 / 停靠类型。
+/// 体素世界层（游戏内容）：Body / 停靠 / LOD / 地形；装配 GameVoxelPlugin + TerrainPlugin。
+pub mod voxel;
+/// 游戏世界语义：Island / WorldSeed / WorldRng（极简确定性状态）。
 pub mod world;
 
 /// 网络适配（replicon VisibilityFilter / AOI 桥）；仅 feature = "net" 编译。

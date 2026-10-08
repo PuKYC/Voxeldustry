@@ -21,7 +21,7 @@ use crate::static_data::prototype::Prototype;
 use game_engine::identity::StableIdWorldExt;
 use game_engine::spatial::Size;
 
-use crate::world::terrain::{TerrainConfig, TerrainStats};
+use crate::voxel::terrain::{TerrainConfig, TerrainStats, VoxelLodObserver};
 
 /// 性能测试用的输入源 ID。
 pub const PERF_SOURCE: InputSourceId = InputSourceId(1);
@@ -123,7 +123,7 @@ pub const VOXEL_PERF_SOURCE: InputSourceId = InputSourceId(2);
 ///
 /// 地形在 Startup 网格化一次（静态）；移动观察者会让 mesh 块实体不停进出
 /// 可见集，从而把「空间索引 -> AOI -> 可见性 -> 收集 -> 发布」整条链路的
-/// 成本压出来（含 RECTLIST 的大载荷进出）。
+/// 成本压出来（含 RAWVOXELS 的大载荷进出）。
 #[derive(Clone, Copy, Debug)]
 pub struct VoxelPerfPlugin {
     pub terrain: TerrainConfig,
@@ -150,11 +150,14 @@ struct VoxelPerfConfig {
 impl Plugin for VoxelPerfPlugin {
     fn build(&self, app: &mut App) {
         let radius = observer_radius_meters(self.terrain.radius_blocks);
-        // 地形参数必须在 WorldPlugin 之前插入才会被注册（见 WorldPlugin::build）；
-        // CoreGame 路径已挂过 WorldPlugin，这里不重复挂。
+        // 地形参数必须在 GameVoxelPlugin 之前插入才会被注册（见 TerrainPlugin::build）；
+        // CoreGame 路径已挂过 GameVoxelPlugin / TerrainPlugin，这里不重复挂。
         app.insert_resource(self.terrain);
-        if !app.is_plugin_added::<crate::world::WorldPlugin>() {
-            app.add_plugins(crate::world::WorldPlugin);
+        if !app.is_plugin_added::<crate::voxel::GameVoxelPlugin>() {
+            app.add_plugins(crate::voxel::GameVoxelPlugin);
+        }
+        if !app.is_plugin_added::<crate::voxel::terrain::TerrainPlugin>() {
+            app.add_plugins(crate::voxel::terrain::TerrainPlugin);
         }
         app.insert_resource(VoxelPerfConfig {
             speed: self.speed,
@@ -186,15 +189,24 @@ fn spawn_voxel_perf_world(world: &mut World) {
 }
 
 /// 观察者位置只由 tick 决定（确定性），在 ±span 内来回。
+///
+/// 同时把位置写进 [VoxelLodObserver]，驱动 terrain 的运行期 LOD 重划分
+/// （世界层只看该资源，不引入 terrain -> input 依赖）。
 fn move_voxel_observer(
     tick: Res<SimulationTick>,
     config: Res<VoxelPerfConfig>,
     mut query: Query<&mut Transform, With<LocalPlayer>>,
+    mut lod_observer: ResMut<VoxelLodObserver>,
 ) {
     let span = config.observer_radius.max(1.0) * 0.25;
     let x = wrap_delta(tick.0 as f32 * config.speed, span);
+    let mut position = None;
     for mut transform in &mut query {
         transform.translation.x = x;
+        position = Some(transform.translation.to_array());
+    }
+    if let Some(position) = position {
+        lod_observer.position = position;
     }
 }
 
@@ -205,8 +217,8 @@ fn report_terrain_once(stats: Res<TerrainStats>, mut reported: Local<bool>) {
     }
     *reported = true;
     println!(
-        "[voxel_perf] chunks={} blocks={} lod={:?} rects={}",
-        stats.chunks, stats.blocks, stats.lod_blocks, stats.rects
+        "[voxel_perf] chunks={} blocks={} lod={:?}",
+        stats.chunks, stats.blocks, stats.lod_blocks
     );
 }
 
@@ -288,15 +300,17 @@ mod tests {
         let startup_ms = started.elapsed().as_secs_f64() * 1e3;
 
         let stats = *app.world().resource::<TerrainStats>();
-        assert!(stats.chunks > 0 && stats.blocks > 0 && stats.rects > 0);
+        assert!(stats.chunks > 0 && stats.blocks > 0);
         assert_eq!(
             stats.blocks,
-            app.world().resource::<crate::world::TerrainBlocks>().len()
+            app.world()
+                .resource::<crate::voxel::terrain::TerrainBlocks>()
+                .len()
         );
 
         let mut frames = 0usize;
         let mut commands = 0usize;
-        let mut rect_commands = 0usize;
+        let mut raw_commands = 0usize;
         let started = Instant::now();
         for _ in 0..FRAMES {
             app.update();
@@ -305,13 +319,17 @@ mod tests {
                 commands += entry.frame.commands.len();
                 for command in entry.frame.commands.iter() {
                     if let crate::presentation::PresentationCommand::Add {
-                        payload: crate::presentation::SyncPayload::RectList(payload),
+                        payload: crate::presentation::SyncPayload::RawVoxels(payload),
                         ..
                     } = command
                     {
-                        assert!(!payload.is_empty(), "RECTLIST 载荷必须带矩形");
+                        assert!(!payload.is_empty(), "RAWVOXELS 载荷必须带原始体素");
                         assert_eq!(payload.lod, 0);
-                        rect_commands += 1;
+                        assert_eq!(
+                            payload.blocks.len(),
+                            game_engine::presentation::voxel::RAW_VOXELS
+                        );
+                        raw_commands += 1;
                     }
                 }
                 assert!(!entry.streams.kinds.is_empty(), "发布时必须带 SoA 流");
@@ -319,19 +337,18 @@ mod tests {
         }
         let per_frame = started.elapsed().as_secs_f64() * 1e3 / FRAMES as f64;
         println!(
-            "voxel scene [{}]: startup {:.1} ms | chunks={} blocks={} rects={} | {:.3} ms/frame x {} | {} frames | {} commands",
+            "voxel scene [{}]: startup {:.1} ms | chunks={} blocks={} | {:.3} ms/frame x {} | {} frames | {} commands",
             profile_label(),
             startup_ms,
             stats.chunks,
             stats.blocks,
-            stats.rects,
             per_frame,
             FRAMES,
             frames,
             commands
         );
         assert!(frames > 0, "移动观察者必须产生可见性变化并发布帧");
-        assert!(rect_commands > 0, "体素场景必须至少下发一次 RECTLIST 载荷");
+        assert!(raw_commands > 0, "体素场景必须至少下发一次 RAWVOXELS 载荷");
     }
 
     /// 多 LOD 体素场景（release 手动跑；debug 生成很慢）。
@@ -349,13 +366,12 @@ mod tests {
         let startup_ms = started.elapsed().as_secs_f64() * 1e3;
         let stats = *app.world().resource::<TerrainStats>();
         println!(
-            "voxel LOD scene [{}]: startup {:.1} ms | chunks={} blocks={} lod={:?} rects={}",
+            "voxel LOD scene [{}]: startup {:.1} ms | chunks={} blocks={} lod={:?}",
             profile_label(),
             startup_ms,
             stats.chunks,
             stats.blocks,
-            stats.lod_blocks,
-            stats.rects
+            stats.lod_blocks
         );
         assert!(
             stats.lod_blocks[1] > 0 || stats.lod_blocks[2] > 0 || stats.lod_blocks[3] > 0,

@@ -3,6 +3,8 @@
 //! runner / 通道 / 生命周期在 game-engine::backend；这里只提供本游戏的
 //! 配置、demo / perf / 体素地形组合与 FFI 入口。
 
+use std::sync::{Arc, Mutex};
+
 use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
@@ -11,7 +13,7 @@ use game_engine::backend::{self, EngineConfig, GameModule};
 use crate::app::CoreGame;
 use crate::dev::demo::DemoPlugin;
 use crate::spec::{ClientBridge, CoreSpec};
-use crate::world::terrain::TerrainConfig;
+use crate::voxel::terrain::{TerrainConfig, VoxelLodHandle, VoxelLodRuntime};
 
 // 消息类型由引擎定义，重导出保持 godot 侧路径不变。
 pub use game_engine::backend::{BevyControlMsg, BevyLifecycleMsg, FromBevy};
@@ -25,11 +27,14 @@ pub struct BevyBackendConfig {
     pub enable_demo: bool,
     /// 挂载性能测试场景并生成该数量的实体（Some 时取代 demo）。
     pub perf_entity_count: Option<usize>,
-    /// 体素地形参数（Some 时启用；Godot 体素 demo / perf 用）。地形不是插件：
-    /// 配置在 `WorldPlugin` 之前插入，体素数据只以组件存在（`VoxVolume` 等）。
+    /// 体素地形参数（Some 时启用；Godot 体素 demo / perf 用）。地形由 TerrainPlugin 装配：
+    /// 配置在 `GameVoxelPlugin` / `TerrainPlugin` 之前插入，体素数据只以组件存在（`VoxVolume` 等）。
     pub terrain: Option<TerrainConfig>,
     /// 体素性能场景：true 时额外挂 VoxelPerfPlugin（移动观察者压表现链路）。
     pub terrain_perf: bool,
+    /// Godot -> Bevy 的 LOD 运行期句柄（observer / thresholds / max_lod）。
+    /// Some 时插入 [VoxelLodHandle]，运行期流式系统读它。
+    pub voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
 }
 
 impl Default for BevyBackendConfig {
@@ -41,6 +46,7 @@ impl Default for BevyBackendConfig {
             perf_entity_count: None,
             terrain: None,
             terrain_perf: false,
+            voxel_lod: None,
         }
     }
 }
@@ -51,11 +57,12 @@ struct CoreGameModule {
     perf_entity_count: Option<usize>,
     terrain: Option<TerrainConfig>,
     terrain_perf: bool,
+    voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
 }
 
 impl GameModule<CoreSpec> for CoreGameModule {
     fn build(&self, app: &mut App) {
-        // 地形参数必须在 CoreGame（进而 WorldPlugin）之前插入才会被注册。
+        // 地形参数必须在 CoreGame（进而 GameVoxelPlugin / TerrainPlugin）之前插入才会被注册。
         let terrain = match (self.terrain, self.terrain_perf) {
             (Some(config), _) => Some(config),
             (None, true) => Some(TerrainConfig::default()),
@@ -65,6 +72,10 @@ impl GameModule<CoreSpec> for CoreGameModule {
         };
         if let Some(config) = terrain {
             app.insert_resource(config);
+        }
+        // LOD 句柄必须在 CoreGame.build 之前插入，terrain 运行期系统才会读到它。
+        if let Some(handle) = &self.voxel_lod {
+            app.insert_resource(VoxelLodHandle(handle.clone()));
         }
         CoreGame.build(app);
         if self.terrain_perf {
@@ -99,6 +110,7 @@ pub fn run_bevy_backend(
             perf_entity_count: config.perf_entity_count,
             terrain: config.terrain,
             terrain_perf: config.terrain_perf,
+            voxel_lod: config.voxel_lod,
         },
         bridge,
         ctrl_rx,

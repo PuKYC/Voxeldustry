@@ -18,9 +18,9 @@ use crate::privacy::ExactHealth;
 
 use super::payload::{
     InteractionHint, PayloadKind, PresentationState, PresentedHealth, PresentedPrototype,
-    RectListPayload, SyncPayload, ToPresentation,
+    RawVoxelPayload, SyncPayload, ToPresentation,
 };
-use super::voxel_mesh::VoxelMeshBlock;
+use super::voxel_mesh::VoxChunkRaw;
 use super::PresentationAppExt;
 use super::PresentedTransform;
 use super::RenderTransformSample;
@@ -92,10 +92,11 @@ synced_components! {
     // 原型：普通整数组件，走 PROTOTYPE 载荷（不再由 Attach 携带）。
     Prototype => crate::static_data::prototype::Prototype,
         |c: &crate::static_data::prototype::Prototype| PresentedPrototype(c.0 .0);
-    // 体素 mesh 块：一个 32³ 块的 39 bit 矩形流，走 RECTLIST 载荷（路径 B）。
-    // 块原点由同一实体上的 Transform 载荷（PresentedTransform）携带。
-    RectList => VoxelMeshBlock,
-        |c: &VoxelMeshBlock| RectListPayload::from_stream(c.lod, &c.words);
+    // 体素表现的唯一通道：一个 32³ 块 + halo 层（34³）的方块 id，走 RAWVOXELS
+    // 载荷，由 Godot 侧自行贪婪 meshing。块原点由同一实体上的 Transform 载荷
+    //（PresentedTransform）携带。
+    RawVoxels => VoxChunkRaw,
+        |c: &VoxChunkRaw| RawVoxelPayload::from_halo(c.lod, c.blocks.clone());
 }
 
 // 逻辑侧 `Transform` **不直出**：真正注册的是表现侧 `PresentedTransform`

@@ -37,8 +37,8 @@ fn all_payload_kinds_have_round_trippable_labels() {
                 SyncPayload::Extension(crate::presentation::payload::ExtensionPayload::default())
             }
             PayloadKind::Prototype => SyncPayload::Prototype(PresentedPrototype::default()),
-            PayloadKind::RectList => SyncPayload::RectList(
-                crate::presentation::payload::RectListPayload::from_stream(2, &[1, 2, 3]),
+            PayloadKind::RawVoxels => SyncPayload::RawVoxels(
+                crate::presentation::payload::RawVoxelPayload::from_halo(1, vec![1, 2, 3, 4]),
             ),
         };
         assert_eq!(payload.kind(), kind);

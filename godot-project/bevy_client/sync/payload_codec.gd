@@ -117,12 +117,22 @@ func _decode_wire(e: EntityData, c: CommandCursor, schema: Dictionary) -> Varian
 				i32i += 1
 				value[name] = _read_tags(c.i32_pool, c.i32_off + i32i, n)
 				i32i += n
-			BevyEnums.Wire.WORDS:
-				# 与 TAGS 同形状，但保留完整 64 位（39 bit 矩形 + 保留位）。
-				var word_count := int(c.i32_pool[c.i32_off + i32i])
-				i32i += 1
-				value[name] = _read_words(c.i32_pool, c.i32_off + i32i, word_count)
-				i32i += word_count
+			BevyEnums.Wire.BYTES:
+				# 原始体素 halo：i32 池 = [byte_len, chunk_count, chunk...]，每个 chunk
+				# 是 8 字节小端打包的 u64（Rust 侧 as i64 推入，最高位可能为负）。
+				# 逐字节取 chunk 的第 (j & 7) 个小端字节；chunk 下标 = j >> 3。
+				var byte_len := int(c.i32_pool[c.i32_off + i32i])
+				var chunk_count := int(c.i32_pool[c.i32_off + i32i + 1])
+				if byte_len < 0 or chunk_count < 0:
+					return null
+				i32i += 2
+				var blocks := PackedByteArray()
+				blocks.resize(byte_len)
+				for j in byte_len:
+					var chunk := int(c.i32_pool[c.i32_off + i32i + (j >> 3)])
+					blocks[j] = (chunk >> ((j & 7) * 8)) & 0xFF
+				i32i += chunk_count
+				value[name] = blocks
 			BevyEnums.Wire.EXT_BAG:
 				var bag: Variant = _decode_ext(e, c, c.i32_off + i32i)
 				if bag == null:
@@ -178,13 +188,6 @@ static func _read_tags(src: PackedInt64Array, start: int, n: int) -> PackedInt32
 	for j in n:
 		tags[j] = int(src[start + j])
 	return tags
-
-
-## 64 位整数字段（RECTLIST 的矩形流）；slice 是原生实现，不逐元素循环。
-static func _read_words(src: PackedInt64Array, start: int, n: int) -> PackedInt64Array:
-	if n <= 0:
-		return PackedInt64Array()
-	return src.slice(start, start + n)
 
 
 # ───────────────────────── 插值载荷 ─────────────────────────

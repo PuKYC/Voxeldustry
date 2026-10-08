@@ -7,7 +7,7 @@ use rand_pcg::Pcg32;
 use crate::math::FixedPoint;
 
 /// 确定性 PRNG 状态（ECS Resource）。
-#[derive(Resource)]
+#[derive(Resource, Clone, Debug)]
 pub struct RngState(pub Pcg32);
 
 impl RngState {

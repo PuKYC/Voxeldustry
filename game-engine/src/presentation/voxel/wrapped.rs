@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use voxel::mesh::{extract_block_tree_with_ao, wrap_block, AoRectBatch, MeshBlock};
 use voxel::store::{ChunkKey, Lod, VoxInterner, VoxTree};
 
-use super::key::lod_block_origin;
+use crate::voxel::lod_block_origin;
 
 /// LOD 包装树缓存。key = (块原点, lod)。
 ///
@@ -118,4 +118,19 @@ pub fn mesh_block_wrapped(
         .get(block.origin, block.lod)
         .expect("get_or_wrap must have inserted the requested block");
     extract_block_tree_with_ao(tree, interner, block, external)
+}
+
+/// 先清空包装缓存再释放 body。
+///
+/// 原在世界层 `hash.rs`，因为参数涉及 [WrappedBlockCache]（表现层机制）
+/// 而搬到本模块。保持 `release_body` 的公开签名不变，生产调用链若持有
+/// WrappedBlockCache 应改用本函数，否则包装缓存里的 root 引用会把 body
+/// 节点钉住。
+pub fn release_body_with_cache(
+    interner: &mut VoxInterner<u8>,
+    volume: &mut crate::voxel::VoxVolume,
+    cache: &mut WrappedBlockCache,
+) -> usize {
+    cache.clear(interner);
+    crate::voxel::release_body(interner, volume)
 }

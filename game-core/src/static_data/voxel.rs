@@ -1,11 +1,12 @@
 //! 体素世界静态数据。
 //!
 //! **游戏数值不是引擎常量**：体素边长、方块调色板、材质表、生物群系表、
-//! LOD 距离阈值全部落在本模块，由 crate::world 消费。
+//! LOD 距离阈值全部落在本模块，由 crate::voxel / crate::world 消费。
 //!
 //! 依赖方向：本模块只依赖 game_engine；**不依赖 presentation / godot**。
 //! Game 数值一律以 FixedPoint（I40F24）或整数表达，避免 f32 进入逻辑层。
 
+use bevy::prelude::*;
 use game_engine::math::FixedPoint;
 
 // ── 方块 id（u8 调色板，0 = 空气 = VoxTree 的 T::default()）─────────────────
@@ -265,9 +266,58 @@ pub const LOD_DISTANCE_THRESHOLDS: [FixedPoint; 3] = [
     FixedPoint::from_bits(128 << 24),
 ];
 
+// ── 世界静态表资源句柄 ────────────────────────────────────────────────────
+
+/// 世界静态表资源句柄：只读访问本模块中的游戏数值。
+///
+/// 把静态表做成 Resource 是为了让系统通过注入拿到一致入口，
+/// 也方便将来在测试 / mod 中替换数值（v1 仍读 const 表）。
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct WorldTables;
+
+impl WorldTables {
+    pub fn block(&self, id: u8) -> Option<&'static BlockDef> {
+        block_def(id)
+    }
+
+    pub fn material(&self, id: MaterialId) -> Option<&'static MaterialDef> {
+        material_def(id)
+    }
+
+    pub fn biome(&self, id: BiomeId) -> Option<&'static BiomeDef> {
+        biome_def(id)
+    }
+
+    pub fn block_is_solid(&self, id: u8) -> bool {
+        is_solid_block(id)
+    }
+
+    /// 默认体素边长（写进 VoxVolume.voxel_size）。
+    pub fn voxel_size(&self) -> FixedPoint {
+        DEFAULT_VOXEL_SIZE
+    }
+
+    /// LOD 距离阈值（米，定点）。
+    pub fn lod_thresholds(&self) -> &'static [FixedPoint; 3] {
+        &LOD_DISTANCE_THRESHOLDS
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_tables_delegate_to_static_tables() {
+        let tables = WorldTables;
+        assert!(tables.block(STONE_BLOCK).is_some());
+        assert!(tables.material(MaterialId(0)).is_some());
+        assert!(tables.biome(DEFAULT_BIOME).is_some());
+        assert!(tables.block_is_solid(STONE_BLOCK));
+        assert!(!tables.block_is_solid(AIR_BLOCK));
+        assert_eq!(tables.voxel_size(), DEFAULT_VOXEL_SIZE);
+        assert_eq!(tables.lod_thresholds().len(), 3);
+    }
 
     #[test]
     fn block_ids_unique_and_materials_exist() {

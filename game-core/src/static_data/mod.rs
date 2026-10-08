@@ -21,6 +21,7 @@ pub struct StaticDataPlugin;
 impl Plugin for StaticDataPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ItemTagIndex>()
+            .init_resource::<voxel::WorldTables>()
             .add_systems(Startup, build_item_tag_index);
     }
 }

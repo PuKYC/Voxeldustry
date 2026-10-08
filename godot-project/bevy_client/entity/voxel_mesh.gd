@@ -1,14 +1,15 @@
 class_name VoxelMeshNode
 extends BevyEntityNode
-## 路径 B 体素绘制节点：每块一个 MultiMeshInstance3D，逐顶点在 GPU 上把
+## 体素绘制节点：每块一个 MultiMeshInstance3D，逐顶点在 GPU 上把
 ## 39 bit 贪心矩形展开成四边形（见 shaders/voxel_rect.gdshader）。
 ##
 ## 8 B/矩形只有一份：R32G32_UINT 纹理，由 RenderingDevice 创建 / 更新
 ## （Texture2DRD 绑定给 usampler2D）。GDScript 每块只做一次
 ## texture_update + instance_count 赋值，**绝不逐矩形循环**。
 ##
-## 数据来源：同一实体上的 Transform 载荷给出块原点（米），RectList 载荷给出
-## lod + 39 bit 矩形流。几何数学的真相源是 game-core::presentation::voxel_mesh。
+## 数据来源：同一实体上的 Transform 载荷给出块原点（米），RAWVOXELS 载荷给出
+## lod + 34³ 原始体素；gdext mesher（mesh_fn）现算矩形流后上传。
+## 几何数学的真相源是 game-core::presentation::voxel_mesh。
 
 const SHADER_PATH := "res://bevy_client/shaders/voxel_rect.gdshader"
 const WORD_BYTES := 8
@@ -19,6 +20,9 @@ const TEX_WIDTH := 1024
 ## BevyClient 启动时从 get_voxel_table() 拉一次并写入。
 static var palette_texture: Texture2D = null
 static var voxel_size: float = 0.45
+## RAWVOXELS：由 BevyClient 装配的 gdext mesher 桥（manager.mesh_voxel_halo）。
+## 无效时 set_raw_voxel_view 只告警，不做网格化。
+static var mesh_fn: Callable = Callable()
 ## 调试：为 true 时读回第一块纹理自检（会触发 GPU 同步，仅调试用）。
 static var debug_self_check: bool = false
 
@@ -76,7 +80,8 @@ static func _shared_quad() -> QuadMesh:
 
 # ───────────────────────── ViewLayer 钩子 ─────────────────────────
 
-## 呈现 RectList：lod + 39 bit 矩形流（u64 原样，绝不截断成 32 位）。
+## 内部矩形上传 helper：lod + 39 bit 矩形流（u64 原样，绝不截断成 32 位）。
+## 唯一调用方是同节点的 set_raw_voxel_view；ViewLayer 不直接调用。
 func set_mesh_view(lod: int, words: PackedInt64Array) -> void:
 	var count := words.size()
 	if count <= 0:
@@ -99,11 +104,26 @@ func set_mesh_view(lod: int, words: PackedInt64Array) -> void:
 	_has_mesh = true
 
 
-## 清除矩形（组件被移除时恢复默认呈现）。
+## 清除矩形（内部 helper；组件被移除时恢复默认呈现）。
 func reset_mesh_view() -> void:
 	if _mm != null:
 		_mm.visible_instance_count = 0
 	_has_mesh = false
+
+
+## 呈现原始体素 halo：调用 gdext 暴露的 Rust mesher 现算 39 bit 矩形流，
+## 再复用 set_mesh_view 上传。lod/blocks 由 ViewLayer 从 RAWVOXELS 组件解出。
+func set_raw_voxel_view(lod: int, blocks: PackedByteArray) -> void:
+	if not mesh_fn.is_valid():
+		push_warning("[VoxelMeshNode] mesh_fn 未设置，无法网格化 RAWVOXELS halo")
+		return
+	var words: PackedInt64Array = mesh_fn.call(lod, blocks)
+	set_mesh_view(lod, words)
+
+
+## 清除原始体素呈现（组件被移除时恢复默认）。
+func reset_raw_voxel_view() -> void:
+	reset_mesh_view()
 
 
 func _process(_delta: float) -> void:
@@ -128,8 +148,8 @@ func _upload(words: PackedInt64Array, count: int) -> void:
 	if _rd == null:
 		_rd = RenderingServer.get_rendering_device()
 	if _rd == null:
-		# Compatibility 渲染器没有 RD；路径 B 需要 Forward+ / Mobile。
-		push_warning("[VoxelMeshNode] RenderingDevice 不可用，路径 B 需要 Forward+ / Mobile 渲染器")
+		# Compatibility 渲染器没有 RD；GPU 矩形展开需要 Forward+ / Mobile。
+		push_warning("[VoxelMeshNode] RenderingDevice 不可用，需要 Forward+ / Mobile 渲染器")
 		return
 
 	var width := mini(count, TEX_WIDTH)

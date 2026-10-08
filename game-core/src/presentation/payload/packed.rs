@@ -3,14 +3,14 @@
 //! 字节布局知识在引擎的 packed 模块提供原语；这里只把「字段 -> 字节」接上。
 
 use game_engine::presentation::packed::{
-    put_bool, put_f32, put_u32, put_u64, put_u8, PackedError, PackedPayload, Reader, MAX_TAGS,
+    put_bool, put_f32, put_u32, put_u8, PackedError, PackedPayload, Reader, MAX_TAGS,
 };
 
 use crate::input::actions::ActionId;
 
 use super::{
     ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedHealth,
-    PresentedPrototype, PresentedVisibility, RectListPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
+    PresentedPrototype, PresentedVisibility, RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
 };
 
 impl PackedPayload for PresentationState {
@@ -172,35 +172,34 @@ impl PackedPayload for InteractionHint {
     }
 }
 
-// ── 矩形实例载荷：count u32 LE + lod u8 + count × u64 LE（版本化、确定性）──
+// ── 原始体素载荷：byte_len u32 LE + lod u8 + byte_len 字节（版本化、确定性）──
 //
 // 载荷体（不含 kind 码）字节布局：
-//   [0,4)          count  u32 LE   矩形数
-//   [4]            lod    u8       mesh 块 LOD
-//   [5,5+8*count)  count × u64 LE  39 bit 矩形描述符（位布局见 RectListPayload）
+//   [0,4)            byte_len  u32 LE
+//   [4]              lod       u8
+//   [5,5+byte_len)   byte_len 个原始体素字节
 //
-// 逐字小端、无填充、无平台相关布局；同一输入 -> 逐字节一致。
-// SoA 池布局（write_pools 与 read_body 必须一致）：i32 池依次 [lod, count, word...]。
-// 这是**追加**的载荷体，GPF1 头部与 0..6 号既有载荷的布局一概不动。
-impl PackedPayload for RectListPayload {
+// SoA 池布局（write_pools 与 read_body 必须逐槽一致）：
+//   i32 池依次 [lod, byte_len, chunk_count, chunk...]，
+//   其中 chunk_count = ceil(byte_len / 8)，每 chunk 是 8 字节小端打包的 u64
+//   （尾部补零）再 as i64。绝不 1 byte 占 1 个 i64。
+impl PackedPayload for RawVoxelPayload {
     fn put_body(&self, out: &mut Vec<u8>) {
-        let count = self.rect_count();
-        put_u32(out, count as u32);
+        put_u32(out, self.blocks.len() as u32);
         put_u8(out, self.lod);
-        for chunk in self.rects.chunks_exact(RectListPayload::WORD_BYTES) {
-            let mut bytes = [0u8; RectListPayload::WORD_BYTES];
-            bytes.copy_from_slice(chunk);
-            put_u64(out, u64::from_le_bytes(bytes));
-        }
+        out.extend_from_slice(&self.blocks);
     }
 
     fn write_pools(&self, _f: &mut Vec<f32>, i: &mut Vec<i64>) {
+        let byte_len = self.blocks.len();
+        let chunk_count = byte_len.div_ceil(8);
         i.push(i64::from(self.lod));
-        i.push(self.rect_count() as i64);
-        for chunk in self.rects.chunks_exact(RectListPayload::WORD_BYTES) {
-            let mut bytes = [0u8; RectListPayload::WORD_BYTES];
-            bytes.copy_from_slice(chunk);
-            i.push(u64::from_le_bytes(bytes) as i64);
+        i.push(byte_len as i64);
+        i.push(chunk_count as i64);
+        for chunk in self.blocks.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            i.push(u64::from_le_bytes(word) as i64);
         }
     }
 
@@ -209,37 +208,62 @@ impl PackedPayload for RectListPayload {
         _f: &mut Vec<f32>,
         i: &mut Vec<i64>,
     ) -> Result<(), PackedError> {
-        let count = r.u32()? as usize;
+        let byte_len = r.u32()? as usize;
         let lod = r.u8()?;
+        let chunk_count = byte_len.div_ceil(8);
         i.push(i64::from(lod));
-        i.push(count as i64);
-        for _ in 0..count {
+        i.push(byte_len as i64);
+        i.push(chunk_count as i64);
+        let mut remaining = byte_len;
+        while remaining >= 8 {
             i.push(r.u64()? as i64);
+            remaining -= 8;
+        }
+        if remaining > 0 {
+            let mut word = [0u8; 8];
+            for byte in word.iter_mut().take(remaining) {
+                *byte = r.u8()?;
+            }
+            i.push(u64::from_le_bytes(word) as i64);
         }
         Ok(())
     }
 
     fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
         // 脏池 / 越界 offset 一律退化为空载荷，绝不 panic。
-        let Some(header_end) = io.checked_add(2) else {
+        let (Some(io1), Some(io2), Some(io3)) =
+            (io.checked_add(1), io.checked_add(2), io.checked_add(3))
+        else {
             return Self::default();
         };
-        let Some(header) = i.get(io..header_end) else {
+        let (Some(lod_raw), Some(byte_len_raw), Some(chunk_count_raw)) =
+            (i.get(io).copied(), i.get(io1).copied(), i.get(io2).copied())
+        else {
             return Self::default();
         };
-        let lod = header[0] as u8;
-        let count = header[1] as usize;
-        let Some(words_end) = header_end.checked_add(count) else {
+        let (Ok(lod), Ok(byte_len), Ok(chunk_count)) = (
+            u8::try_from(lod_raw),
+            usize::try_from(byte_len_raw),
+            usize::try_from(chunk_count_raw),
+        ) else {
             return Self::default();
         };
-        let Some(words) = i.get(header_end..words_end) else {
+        if chunk_count != byte_len.div_ceil(8) {
             return Self::default();
-        };
-        let mut rects = Vec::with_capacity(count * RectListPayload::WORD_BYTES);
-        for word in words {
-            rects.extend_from_slice(&(*word as u64).to_le_bytes());
         }
-        Self { lod, rects }
+        let Some(chunks_end) = io3.checked_add(chunk_count) else {
+            return Self::default();
+        };
+        let Some(chunks) = i.get(io3..chunks_end) else {
+            return Self::default();
+        };
+        let mut blocks = Vec::with_capacity(byte_len);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let word = (*chunk as u64).to_le_bytes();
+            let take = byte_len.saturating_sub(index.saturating_mul(8)).min(8);
+            blocks.extend_from_slice(&word[..take]);
+        }
+        Self { lod, blocks }
     }
 }
 
@@ -413,134 +437,98 @@ impl PackedPayload for ExtensionPayload {
 
 #[cfg(test)]
 mod tests {
-    use crate::presentation::payload::{PayloadKind, RectListPayload, SyncPayload};
+    use crate::presentation::payload::RawVoxelPayload;
     use game_engine::presentation::packed::{PackedPayload, Reader};
-    use game_engine::voxel::{chunk_key, pack_rect_stream, Lod, RectBatch, RectInstance};
+    use game_engine::presentation::voxel::RAW_VOXELS;
 
-    fn rect(
-        plane: u8,
-        dir: u8,
-        slice: u8,
-        row: u8,
-        col: u8,
-        w: u8,
-        h: u8,
-        material: u8,
-    ) -> RectInstance {
-        RectInstance {
-            plane,
-            dir,
-            slice,
-            row,
-            col,
-            w,
-            h,
-            material,
-        }
-    }
-
-    /// 用引擎打包器产出一段真实的 39 bit 矩形流。
-    fn sample_words() -> Vec<u64> {
-        let batch = RectBatch {
-            origin: chunk_key(1, -2, 3),
-            lod: Lod::new(0),
-            rects: vec![
-                rect(0, 0, 0, 0, 0, 4, 3, 7),
-                rect(2, 1, 32, 31, 31, 32, 5, 255),
-            ],
-        };
-        pack_rect_stream(&[batch])
-    }
-
-    fn body_bytes(payload: &RectListPayload) -> Vec<u8> {
+    fn raw_body_bytes(payload: &RawVoxelPayload) -> Vec<u8> {
         let mut out = Vec::new();
         payload.put_body(&mut out);
         out
     }
 
-    fn decode_body(bytes: &[u8]) -> RectListPayload {
+    /// read_body 推进的池必须与 write_pools 逐槽一致，并能 from_pools 还原。
+    fn decode_raw_body(bytes: &[u8]) -> RawVoxelPayload {
         let mut r = Reader::new(bytes);
         let mut f = Vec::new();
         let mut i = Vec::new();
-        RectListPayload::read_body(&mut r, &mut f, &mut i).expect("载荷体必须能解码");
+        RawVoxelPayload::read_body(&mut r, &mut f, &mut i).expect("raw 载荷体必须能解码");
         assert!(r.u8().is_err(), "载荷体必须正好消费完，不能有尾部字节");
-        RectListPayload::from_pools(&f, &i, 0, 0)
+        let decoded = RawVoxelPayload::from_pools(&f, &i, 0, 0);
+        let mut f2 = Vec::new();
+        let mut i2 = Vec::new();
+        decoded.write_pools(&mut f2, &mut i2);
+        assert_eq!(f2, f, "read_body 与 write_pools 的 f32 池必须一致");
+        assert_eq!(i2, i, "read_body 与 write_pools 的 i32 池必须逐槽一致");
+        decoded
     }
 
-    /// 非空矩形流经 GPF1 字节 / SoA 池往返后无损。
+    /// 非空 / 空 / 非 8 倍数长度的往返必须无损。
     #[test]
-    fn rect_list_roundtrips_losslessly() {
-        let words = sample_words();
-        assert_eq!(words.len(), 2, "样例应有两个矩形");
-        let payload = RectListPayload::from_stream(2, &words);
-        assert_eq!(payload.rect_count(), 2);
-        assert!(!payload.is_empty());
+    fn raw_voxel_payload_roundtrips_losslessly() {
+        for lod in [0u8, 3] {
+            for len in [0usize, 1, 7, 8, 9, 17, RAW_VOXELS] {
+                let blocks: Vec<u8> = (0..len).map(|i| ((i * 7 + 1) % 256) as u8).collect();
+                let payload = RawVoxelPayload::from_halo(lod, blocks.clone());
+                let out = raw_body_bytes(&payload);
 
-        let out = body_bytes(&payload);
+                // 版本化布局自检：byte_len u32 LE + lod u8 + byte_len 字节。
+                assert_eq!(out.len(), 4 + 1 + len);
+                assert_eq!(
+                    u32::from_le_bytes(out[0..4].try_into().unwrap()),
+                    len as u32
+                );
+                assert_eq!(out[4], lod);
+                assert_eq!(&out[5..], &blocks[..]);
 
-        // 版本化布局自检：count u32 LE + lod u8 + count × u64 LE。
-        assert_eq!(out.len(), 4 + 1 + words.len() * 8);
-        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 2);
-        assert_eq!(out[4], 2);
-        assert_eq!(u64::from_le_bytes(out[5..13].try_into().unwrap()), words[0]);
-
-        let decoded = decode_body(&out);
-        assert_eq!(decoded, payload);
-        assert_eq!(decoded.lod, 2);
-        assert_eq!(decoded.to_words(), words);
+                let decoded = decode_raw_body(&out);
+                assert_eq!(decoded, payload);
+                assert_eq!(decoded.blocks, blocks);
+            }
+        }
     }
 
-    /// 空列表也必须有稳定布局：count = 0、lod 保留。
+    /// 池布局必须是 [lod, byte_len, chunk_count, chunk...]，chunk 数 = ceil(len/8)。
     #[test]
-    fn empty_rect_list_roundtrips() {
-        let payload = RectListPayload::from_stream(0, &[]);
-        assert!(payload.is_empty());
-        assert_eq!(payload.rect_count(), 0);
-
-        let out = body_bytes(&payload);
-        assert_eq!(out, vec![0, 0, 0, 0, 0], "空列表 = count 0 + lod 0");
-
-        let decoded = decode_body(&out);
-        assert_eq!(decoded, payload);
-        assert_eq!(decoded.to_words(), Vec::<u64>::new());
-    }
-
-    /// 同一输入两次编码 -> 逐字节一致；解码后再编码也一致。
-    #[test]
-    fn rect_list_bytes_are_deterministic() {
-        let words = sample_words();
-        let a = RectListPayload::from_stream(3, &words);
-        let b = RectListPayload::from_stream(3, &words);
-        let bytes_a = body_bytes(&a);
-        let bytes_b = body_bytes(&b);
-        assert_eq!(bytes_a, bytes_b, "同一输入必须产出逐字节一致的载荷");
-
-        let mut again = Vec::new();
-        decode_body(&bytes_a).put_body(&mut again);
-        assert_eq!(bytes_a, again, "解码 -> 再编码必须逐字节一致");
-    }
-
-    /// 宏生成的 SyncPayload 分发也要能往返（kind 码 + 载荷体）。
-    #[test]
-    fn rect_list_sync_payload_roundtrips() {
-        let words = sample_words();
-        let payload = SyncPayload::RectList(RectListPayload::from_stream(1, &words));
-
-        let mut out = Vec::new();
-        payload.put(&mut out);
-        assert_eq!(
-            out[0],
-            PayloadKind::RectList.code(),
-            "载荷体前必须是 kind 码 7"
-        );
-        assert_eq!(out[0], 7);
-
-        let mut r = Reader::new(&out);
+    fn raw_voxel_pool_layout_is_chunked() {
+        let payload = RawVoxelPayload::from_halo(2, vec![1, 2, 3, 4, 5]);
         let mut f = Vec::new();
         let mut i = Vec::new();
-        let kind = SyncPayload::read_into(&mut r, &mut f, &mut i).expect("必须能解码");
-        assert_eq!(kind, PayloadKind::RectList);
-        let decoded = SyncPayload::from_pools(kind, &f, &i, 0, 0);
-        assert_eq!(decoded, payload);
+        payload.write_pools(&mut f, &mut i);
+        assert!(f.is_empty(), "raw 载荷不写 f32 池");
+        assert_eq!(i.len(), 3 + 1, "5 字节 = 1 个补齐 chunk");
+        assert_eq!(i[0], 2);
+        assert_eq!(i[1], 5);
+        assert_eq!(i[2], 1);
+        let expected = u64::from_le_bytes([1, 2, 3, 4, 5, 0, 0, 0]) as i64;
+        assert_eq!(i[3], expected);
+
+        let mut f = Vec::new();
+        let mut i = Vec::new();
+        RawVoxelPayload::from_halo(0, vec![9; RAW_VOXELS]).write_pools(&mut f, &mut i);
+        assert_eq!(i[2], RAW_VOXELS.div_ceil(8) as i64);
+    }
+
+    /// 脏池 / 越界 offset 必须退化为 default，绝不 panic。
+    #[test]
+    fn raw_voxel_from_pools_degrades_on_dirty_pool() {
+        assert_eq!(
+            RawVoxelPayload::from_pools(&[], &[], 0, 0),
+            RawVoxelPayload::default()
+        );
+        assert_eq!(
+            RawVoxelPayload::from_pools(&[], &[1], 0, 0),
+            RawVoxelPayload::default()
+        );
+        // chunk_count 与 byte_len 不一致 -> default。
+        assert_eq!(
+            RawVoxelPayload::from_pools(&[], &[0, 5, 99, 1], 0, 0),
+            RawVoxelPayload::default()
+        );
+        // 越界 io -> default。
+        assert_eq!(
+            RawVoxelPayload::from_pools(&[], &[0, 0, 0], 0, 99),
+            RawVoxelPayload::default()
+        );
     }
 }

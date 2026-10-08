@@ -27,6 +27,8 @@ enum Mode {
 @export_range(0, 16, 1) var voxel_radius_blocks: int = 2
 ## voxel_perf：最高 LOD（0..=3），传给 start_bevy_voxel_perf。
 @export_range(0, 3, 1) var voxel_max_lod: int = 0
+## voxel_perf：LOD 距离阈值（米，x/y/z = 三档），运行期可调。
+@export var voxel_lod_thresholds: Vector3 = Vector3(32.0, 64.0, 128.0)
 
 @export_group("Runtime")
 @export var autostart: bool = true
@@ -134,6 +136,7 @@ func _start_backend() -> void:
 				_start_entity_backend()
 		Mode.VOXEL_PERF:
 			if _mgr.has_method("start_bevy_voxel_perf"):
+				set_voxel_lod_config(voxel_max_lod, voxel_lod_thresholds)
 				_mgr.start_bevy_voxel_perf(fixed_hz, runner_hz, voxel_radius_blocks, voxel_max_lod)
 			else:
 				push_warning("[BevyClient] 扩展缺少 start_bevy_voxel_perf()，回退到实体演示")
@@ -157,12 +160,35 @@ func _apply_voxel_table() -> void:
 	if not (table is Dictionary) or (table as Dictionary).is_empty():
 		return
 	VoxelMeshNode.voxel_size = float(table.get("voxel_size", VoxelMeshNode.voxel_size))
+	# RAWVOXELS 载荷的 mesher 来自 gdext 扩展：交给 VoxelMeshNode 现算矩形流。
+	# 扩展没有该方法时保持 mesh_fn 无效，set_raw_voxel_view 会告警后跳过。
+	if _mgr.has_method("mesh_voxel_halo"):
+		VoxelMeshNode.mesh_fn = Callable(_mgr, "mesh_voxel_halo")
 	var bytes: PackedByteArray = table.get("palette", PackedByteArray())
 	if bytes.size() != 256 * 4:
 		push_warning("[BevyClient] 体素调色板字节数异常：%d" % bytes.size())
 		return
 	var image := Image.create_from_data(256, 1, false, Image.FORMAT_RGBA8, bytes)
 	VoxelMeshNode.palette_texture = ImageTexture.create_from_image(image)
+
+
+## 运行期 LOD：覆写观察者位置（米）。后端未启动 / 扩展缺方法时静默跳过。
+func set_voxel_observer(position: Vector3) -> void:
+	if _mgr != null and _mgr.has_method("set_voxel_observer"):
+		_mgr.set_voxel_observer(position)
+
+
+## 运行期 LOD：覆写 max_lod 与三档阈值（米）。需在 start_bevy_voxel_perf 之前调用。
+func set_voxel_lod_config(max_lod: int, thresholds: Vector3) -> void:
+	if _mgr != null and _mgr.has_method("set_voxel_lod_config"):
+		_mgr.set_voxel_lod_config(max_lod, thresholds.x, thresholds.y, thresholds.z)
+
+
+## 距离（米）-> LOD：用后端当前配置；扩展缺方法时回退 0。
+func voxel_lod_for_distance(distance: float) -> int:
+	if _mgr != null and _mgr.has_method("voxel_lod_for_distance"):
+		return int(_mgr.voxel_lod_for_distance(distance))
+	return 0
 
 
 ## 业务扩展：按 key 订阅 EXT 字段（转发给 PayloadCodec）。

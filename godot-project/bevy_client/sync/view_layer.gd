@@ -157,12 +157,12 @@ func _present_view(data: EntityData, node: BevyEntityNode, kind: int, view: int)
 			var value = data.get_component(kind)
 			if value is Dictionary:
 				node.visible = bool(value.get(_visible_field(kind), true))
-		BevyEnums.View.MESH:
-			var rect_value = data.get_component(kind)
-			if rect_value is Dictionary:
-				node.set_mesh_view(
-					int(rect_value.get("lod", 0)),
-					rect_value.get("rects", PackedInt64Array())
+		BevyEnums.View.RAWVOXEL:
+			var raw_value = data.get_component(kind)
+			if raw_value is Dictionary:
+				node.set_raw_voxel_view(
+					int(raw_value.get("lod", 0)),
+					raw_value.get("blocks", PackedByteArray())
 				)
 
 
@@ -179,7 +179,7 @@ func _reset_view(node: BevyEntityNode, view: int) -> void:
 	match view:
 		BevyEnums.View.VISIBLE:
 			node.visible = true
-		BevyEnums.View.MESH:
-			node.reset_mesh_view()
+		BevyEnums.View.RAWVOXEL:
+			node.reset_raw_voxel_view()
 		_:
 			pass

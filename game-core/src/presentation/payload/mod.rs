@@ -32,9 +32,11 @@ game_engine::define_payloads! {
     Extension    = 5, "ext",          payload: ExtensionPayload;
     // 原型：曾经的 attach 附加负载，现在是与其它载荷地位平等的普通 i32 载荷。
     Prototype    = 6, "prototype",    payload: PresentedPrototype;
-    // 体素网格：一个 body / mesh block 的贪心矩形实例流（设计 9.2 / 9.5）。
-    // code 只追加，禁止重排 / 复用。
-    RectList     = 7, "rectlist",     payload: RectListPayload;
+    // code 7 是已删除的 RectList（服务端贪婪矩形流）遗位：**有意留空，禁止复用**
+    // （复用会破坏线格式与 Godot ABI）。
+    // 体素表现的唯一通道：一个 32³ 块内部 + halo 层（34³）的方块 id 缓冲，
+    // 由 Godot 侧自行贪婪 meshing。code 只追加。
+    RawVoxels    = 8, "rawvoxels",    payload: RawVoxelPayload;
 }
 
 /// L5：精简表现状态。
@@ -76,75 +78,37 @@ pub struct PresentedVisibility {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PresentedPrototype(pub u32);
 
-/// 一个 body / mesh block 的贪心矩形实例流（设计 9.2 / 9.5）。
+/// 一个 mesh 块的原始体素缓冲（内部 32³ + halo 层，共 34³）。
 ///
-/// 承载 `game_engine::voxel::pack_rect_stream` 产出的 8 B/矩形 u64 流，转成
-/// **确定的小端字节缓冲**（`rects`，每 8 字节一个 u64）。`lod` 是该 mesh 块
-/// 的 LOD 级别（0..=3）。
+/// 承载 `game_engine::presentation::voxel::extract_raw_halo` 产出的方块 id 字节缓冲
+/// （`blocks.len() == RAW_VOXELS == 39304`，值 = 方块 id，0 = 空气）。
 ///
-/// ## 39 bit 矩形位布局（小端 u64）
+/// ## 布局（冻结，A / B 两侧逐字节一致）
 ///
-/// ```text
-/// bit  [0,3)   orientation = plane * 2 + dir   (3 bit, 0..5)
-/// bit  [3,9)   slice                           (6 bit, 0..32)
-/// bit  [9,14)  row                             (5 bit, 0..31)
-/// bit [14,19)  col                             (5 bit, 0..31)
-/// bit [19,25)  w                               (6 bit, 1..32)
-/// bit [25,31)  h                               (6 bit, 1..32)
-/// bit [31,39)  material                        (8 bit)
-/// bit [39,47)  ao                              (4 角 × 2 bit, 3=全亮)
-/// bit [47,64)  0（保留）
-/// ```
+/// - 内部 32³：块局部体素 `(x, y, z) ∈ [0, 32)³` 落在 halo 坐标
+///   `(x+1, y+1, z+1)`；
+/// - 扁平下标 `i = hx + 34 * (hy + 34 * hz)`，`hx, hy, hz ∈ [0, 34)`；
+/// - halo 是 6 个同 LOD 邻块的一层边界，仅用于剔除块边界面；缺失邻块 = 空气；
+/// - `lod` 是该 mesh 块的 LOD 级别（0..=3），体素缩放由渲染侧按 lod 处理。
 ///
-/// AO（bit [39,47)）：每角 2 bit、0..=3，角序 i = cx | (cy << 1)，与
-/// `voxel_mesh::rect_corner` 及着色器 UV 同序。39 bit 描述符本身不变；旧生产端
-/// 写 0、旧消费端只读 [0,39)，因此是向后兼容的纯扩展。
-///
-/// 矩形是**位置无关**的整数描述符：body / island 的变换**不在**载荷里，由
-/// Godot 绘制节点（A = `MultiMeshInstance3D.Transform3D`；B = per-draw model
-/// matrix / push constant）携带，`voxel_size` 同样不进载荷。
+/// 这是体素表现的**唯一**通道：同一个 mesh 块只下发本载荷（组件 [crate::presentation::voxel_mesh::VoxChunkRaw]）。
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct RectListPayload {
+pub struct RawVoxelPayload {
     /// mesh 块的 LOD 级别（0..=3）。
     pub lod: u8,
-    /// `pack_rect_stream` 的 u64 流按小端展开的字节缓冲；长度恒为 8 的倍数。
-    pub rects: Vec<u8>,
+    /// `extract_raw_halo` 的 34³ 方块 id 缓冲；长度应为 `RAW_VOXELS`。
+    pub blocks: Vec<u8>,
 }
 
-impl RectListPayload {
-    /// 一个矩形描述符的字节数（u64，路径 B）。
-    pub const WORD_BYTES: usize = 8;
-
-    /// 从 `game_engine::voxel::pack_rect_stream` 的 `Vec<u64>` 构造，
-    /// 逐字按小端展开成确定性字节缓冲。
-    pub fn from_stream(lod: u8, words: &[u64]) -> Self {
-        let mut rects = Vec::with_capacity(words.len() * Self::WORD_BYTES);
-        for word in words {
-            rects.extend_from_slice(&word.to_le_bytes());
-        }
-        Self { lod, rects }
+impl RawVoxelPayload {
+    /// 从 `extract_raw_halo` 的缓冲构造。
+    pub fn from_halo(lod: u8, blocks: Vec<u8>) -> Self {
+        Self { lod, blocks }
     }
 
-    /// 矩形数量（字节缓冲长度 / 8）。
-    pub fn rect_count(&self) -> usize {
-        self.rects.len() / Self::WORD_BYTES
-    }
-
-    /// 是否为空矩形列表。
+    /// 是否为空缓冲。
     pub fn is_empty(&self) -> bool {
-        self.rects.is_empty()
-    }
-
-    /// 还原成 u64 流；长度不是 8 的倍数的尾部残字节被忽略。
-    pub fn to_words(&self) -> Vec<u64> {
-        self.rects
-            .chunks_exact(Self::WORD_BYTES)
-            .map(|chunk| {
-                let mut word = [0u8; Self::WORD_BYTES];
-                word.copy_from_slice(chunk);
-                u64::from_le_bytes(word)
-            })
-            .collect()
+        self.blocks.is_empty()
     }
 }
 
@@ -224,25 +188,26 @@ mod tests {
         assert_eq!(rendered.position[2], 0.0);
     }
 
-    /// 新载荷 code / 名字必须出现在注册表里，且 0..6 保持原样（只追加）。
+    /// raw voxel 载荷 code / 名字只追加，语义为「内部 32³ + halo」。
     #[test]
-    fn rect_list_kind_is_registered_append_only() {
+    fn raw_voxels_kind_is_registered_append_only() {
+        assert_eq!(PayloadKind::RawVoxels.code(), 8);
+        assert_eq!(PayloadKind::RawVoxels.as_str(), "rawvoxels");
+        assert_eq!(PayloadKind::from_code(8), Some(PayloadKind::RawVoxels));
+        assert!(!PayloadKind::RawVoxels.is_perception_gated());
+        let payload = RawVoxelPayload::from_halo(1, vec![1, 2, 3]);
+        assert_eq!(payload.lod, 1);
+        assert!(!payload.is_empty());
+        assert!(RawVoxelPayload::default().is_empty());
+    }
+
+    /// 0..6 与 8 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
+    #[test]
+    fn payload_codes_are_append_only_and_code_seven_stays_vacant() {
         assert_eq!(
-            PayloadKind::RectList.code(),
-            7,
-            "rectlist code 必须固定为 7"
-        );
-        assert_eq!(PayloadKind::RectList.as_str(), "rectlist");
-        assert_eq!(PayloadKind::from_code(7), Some(PayloadKind::RectList));
-        assert!(!PayloadKind::RectList.is_perception_gated());
-        assert_eq!(
-            PayloadKind::ALL
-                .iter()
-                .copied()
-                .filter(|kind| *kind == PayloadKind::RectList)
-                .count(),
-            1,
-            "rectlist 必须恰好出现一次"
+            PayloadKind::from_code(7),
+            None,
+            "code 7（旧 RectList）必须留空，禁止复用"
         );
         for (code, name) in [
             (0u8, "transform"),
@@ -252,6 +217,7 @@ mod tests {
             (4, "interaction"),
             (5, "ext"),
             (6, "prototype"),
+            (8, "rawvoxels"),
         ] {
             assert_eq!(
                 PayloadKind::from_code(code).map(|kind| kind.as_str()),

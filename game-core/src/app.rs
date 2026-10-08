@@ -12,6 +12,8 @@ use crate::prediction::PredictionPlugin;
 use crate::presentation::{register_synced_components, PresentationPlugin};
 use crate::spec::CoreSpec;
 use crate::static_data::StaticDataPlugin;
+use crate::voxel::terrain::TerrainPlugin;
+use crate::voxel::GameVoxelPlugin;
 use crate::world::WorldPlugin;
 use game_engine::aoi::AoIPlugin;
 use game_engine::identity::StableIdPlugin;
@@ -36,6 +38,8 @@ impl GameModule<CoreSpec> for CoreGame {
         app.add_plugins((GameplayPlugin, MovementPlugin, DeathPlugin));
         // 体素世界层：游戏语义 / 数值 / 生成。v1 无执行。
         app.add_plugins(WorldPlugin);
+        app.add_plugins(GameVoxelPlugin);
+        app.add_plugins(TerrainPlugin);
         // 预测 / 回滚绑定（单人：全部 Predicted、delay 0、无重演）。
         app.add_plugins(PredictionPlugin);
         register_synced_components(app);

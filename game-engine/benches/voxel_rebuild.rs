@@ -14,11 +14,14 @@ use bevy::math::IVec3;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use game_engine::math::FixedPoint;
+use game_engine::presentation::voxel::{
+    floor_to_lod_policy, mesh_block_incremental, mesh_block_wrapped, pack_rect_stream,
+    rebuild_plan, ExternalMaskCache, FaceMask, IncrementalMeshCache, MeshBlockDirty,
+    WrappedBlockCache,
+};
 use game_engine::voxel::{
-    chunk_key, floor_to_lod_policy, mesh_block_incremental, mesh_block_wrapped, pack_rect_stream,
-    ChunkKey, ExternalMaskCache, FaceMask, IncrementalMeshCache, Lod, MaxDepth, MeshBlock,
-    MeshBlockDirty, VoxInterner, VoxOpsBulkWrite, VoxOpsWrite, VoxTree, VoxVolume, VoxelBox,
-    VoxelDirtySet, VoxelInterner, WrappedBlockCache, CHUNK_DEPTH,
+    chunk_key, ChunkKey, Lod, MaxDepth, MeshBlock, VoxInterner, VoxOpsBulkWrite, VoxOpsWrite,
+    VoxTree, VoxVolume, VoxelBox, VoxelDirtySet, VoxelInterner, CHUNK_DEPTH,
 };
 
 /// Base subchunks per island axis (8^3 = 512, exactly one LOD3 mesh block).
@@ -131,7 +134,7 @@ fn bench_boundary_scenarios(c: &mut Criterion) {
     };
     let mut dirty = VoxelDirtySet::new();
     dirty.mark_edited(key, edit_a);
-    let plan_a = dirty.take_rebuild_plan(&policy);
+    let plan_a = rebuild_plan(&dirty.take_edits(), &policy);
     assert!(dirty.is_empty(), "scenario A: dirty set must be drained");
     assert_eq!(plan_a.len(), 1, "scenario A: one planned block");
     assert!(plan_a[0].internal, "scenario A: block must be internal");
@@ -148,7 +151,7 @@ fn bench_boundary_scenarios(c: &mut Criterion) {
         max: [32, 24, 24],
     };
     dirty.mark_edited(key, edit_b);
-    let plan_b = dirty.take_rebuild_plan(&policy);
+    let plan_b = rebuild_plan(&dirty.take_edits(), &policy);
     assert_eq!(plan_b.len(), 2, "scenario B: internal + one neighbour");
     assert_eq!(
         plan_b.iter().filter(|p| p.internal).count(),

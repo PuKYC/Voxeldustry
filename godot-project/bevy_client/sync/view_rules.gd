@@ -12,15 +12,15 @@ extends RefCounted
 
 enum Build {
 	PROTOTYPE_SCENE, ## 用 PROTOTYPE.prototype_id 从 EntityFactory 取 PackedScene
-	VOXEL_MESH,      ## 体素 mesh 块：用 RectList 直接驱动一个 VoxelMeshNode
+	VOXEL_RAW,       ## 原始体素 halo：gdext mesher 现算矩形流后交给 VoxelMeshNode
 }
 
 ## 从上到下取第一条满足的规则；没有返回 {}。
 var RULES: Array = [
 	{
-		"name": "voxel",
-		"require": [BevyEnums.Payload.TRANSFORM, BevyEnums.Payload.RECTLIST],
-		"build": Build.VOXEL_MESH,
+		"name": "voxel_raw",
+		"require": [BevyEnums.Payload.TRANSFORM, BevyEnums.Payload.RAWVOXELS],
+		"build": Build.VOXEL_RAW,
 	},
 	{
 		"name": "spatial",

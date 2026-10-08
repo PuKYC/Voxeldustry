@@ -1,14 +1,17 @@
-//! game-engine 体素世界层：VoxVolume / VoxelInterner / 打包 / 脏标记。
+//! game-engine 体素世界层：纯世界数据（VoxVolume / VoxelInterner / 编辑缓冲）。
 //!
 //! 本模块只做机制与 Bevy 适配：不产出几何、不含游戏语义、不定义游戏数值。
 //!
 //! - VoxVolume / Attachment / 整数 ChunkKey 寻址；
 //! - VoxelInterner（Bevy Resource，包裹 voxel::store::VoxInterner<u8>）；
-//! - 实例缓冲打包 pack_rect_stream（8 B/矩形，路径 B）；
-//! - VoxelDirtySet + rebuild_plan；
+//! - VoxelEdit / VoxelChangeBuffer 编辑缓冲；
+//! - VoxelBox / DirtyChunk / VoxelDirtySet 脏集，及 apply_voxel_changes 应用系统；
 //! - LazyChunks 懒生成缓存（生成函数由 game-core 提供）；
 //! - VoxelAabb、content_hash、release_body；
-//! - VoxelPlugin（由 game-core 注册）。
+//! - VoxelPlugin（由 game-core 注册，装世界层资源、指标与变更系统）。
+//!
+//! 表现层的网格机制（重建计划 / 打包 / raw halo / 各种缓存）在
+//! `crate::presentation::voxel`，世界层不反向依赖它。
 //!
 //! 边界铁律：crates/voxel 只用整数体素坐标，不知道 voxel_size；
 //! 世界换算只在 volume 的 body_voxel / world_meters 里发生，且仅在表现出口把
@@ -19,30 +22,20 @@ pub use ::voxel::mesh::{extract_block, MeshBlock, RectBatch, RectInstance};
 pub use ::voxel::store::*;
 
 mod aabb;
+mod change;
 mod dirty;
-mod external;
 mod hash;
-mod incremental;
 mod interner;
 mod key;
 mod lazy;
-mod pack;
 mod plugin;
 mod volume;
-mod wrapped;
 
 pub use aabb::{chunk_aabb, VoxelAabb};
-pub use dirty::{
-    floor_to_lod_policy, rebuild_plan, CoverPolicy, DirtyChunk, FaceMask, MeshBlockDirty, VoxelBox,
-    VoxelDirtySet,
-};
-pub use external::ExternalMaskCache;
+pub use change::{apply_voxel_changes, VoxelChangeBuffer, VoxelEdit, VoxelSet};
+pub use dirty::{DirtyChunk, VoxelBox, VoxelDirtySet};
 pub use hash::{
     chunk_content_hash, content_hash, count_body_nodes, dec_ref_recursive, release_body,
-    release_body_with_cache,
-};
-pub use incremental::{
-    mesh_block_incremental, IncrementalMeshCache, DEFAULT_INCREMENTAL_CACHE_BYTES,
 };
 pub use interner::{
     update_voxel_memory_metric, VoxelInterner, VoxelMemoryMetric, DEFAULT_INTERNER_BUDGET_BYTES,
@@ -51,15 +44,8 @@ pub use key::{
     chunk_key, chunk_voxels_per_axis, floor_div, lod_block_origin, lod_block_span, neighbors6,
 };
 pub use lazy::{ChunkGenerator, LazyChunks};
-pub use pack::{
-    orientation_of, pack_ao, pack_rect, pack_rect_batch, pack_rect_batch_with_ao, pack_rect_stream,
-    pack_rect_stream_with_ao, pack_rect_with_ao, unpack_ao, unpack_rect, AO_BITS, AO_CORNER_BITS,
-    AO_SHIFT, COL_BITS, H_BITS, MATERIAL_BITS, ORIENTATION_BITS, RECT_BITS, ROW_BITS, SLICE_BITS,
-    WORD_BITS, W_BITS,
-};
 pub use plugin::VoxelPlugin;
 pub use volume::{body_voxel, voxel_scale, world_meters, world_meters_f32, Attachment, VoxVolume};
-pub use wrapped::{mesh_block_wrapped, WrappedBlockCache};
 
 #[cfg(test)]
 mod tests {

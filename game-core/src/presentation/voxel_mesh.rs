@@ -1,11 +1,14 @@
-//! 体素 mesh 块的 GPU 矩形流（路径 B）。
+//! 体素网格的 GPU 几何契约（体素表现唯一通道 = 原始体素 halo）。
 //!
 //! ## 分层
 //!
-//! - game-engine::voxel::pack_rect_stream 产出 8 B/矩形的 39 bit u64 流；
-//!   低 39 bit 是描述符，bit [39,47) 是 4 角 AO（见 [ao_corner_index]）；
-//! - 本模块把「一个 32³ mesh 块的矩形流」定义成可由表现管线承载的组件
-//!   [VoxelMeshBlock]，并给出 rect -> 四边形角点 / 法线的**整数几何契约**；
+//! - 世界层 `game-engine::voxel` 提供 `VoxVolume`；表现层机制
+//!   `game_engine::presentation::voxel::extract_raw_halo` 产出 34³ halo 缓冲，
+//!   Godot 侧再调 gdext mesher（`game_core::presentation::mesh_raw_halo`）现算
+//!   8 B/矩形的 39 bit u64 流（低 39 bit 是描述符，bit [39,47) 是 4 角 AO，
+//!   见 [ao_corner_index]）；
+//! - 本模块把「一个 32³ mesh 块的原始体素缓冲」定义成可由表现管线承载的组件
+//!   [VoxChunkRaw]，并给出 rect -> 四边形角点 / 法线的**整数几何契约**；
 //! - Godot 侧的 voxel_rect.gdshader 用完全相同的位布局与轴映射逐顶点展开，
 //!   本模块的 rect_corner / rect_normal 就是那份着色器数学的 Rust 镜像，
 //!   由单测锁死（没有 Godot 可跑时，这是唯一能自动验证的几何真相源）。
@@ -20,41 +23,24 @@
 //! dir = 0 是 DIR_POS（+轴法线），dir = 1 是 DIR_NEG（-轴法线）。
 //!
 //! 矩形是位置无关的：块原点（米）由节点的 Transform 载荷给出，LOD 缩放
-//! voxel_size * 2^lod 由渲染侧按 RectListPayload.lod 计算。
+//! voxel_size * 2^lod 由渲染侧按 RawVoxelPayload.lod 计算。
 
 use bevy::prelude::*;
-use game_engine::voxel::{unpack_rect, RectInstance};
+use game_engine::voxel::RectInstance;
 
-/// 一个 mesh 块（32³ 基础跨度）的贪心矩形流。
+/// 一个 mesh 块（32³ 基础跨度）的原始体素缓冲（内部 32³ + halo 层，共 34³）。
 ///
-/// material 字段是**方块 id**（static_data::voxel::BLOCK_TABLE 的 id），
-/// 渲染侧用方块 id 查调色板。
-#[derive(Component, Clone, Debug, Default, PartialEq, Eq)]
-pub struct VoxelMeshBlock {
+/// 值 = 方块 id（`static_data::voxel::BLOCK_TABLE` 的 id），0 = 空气。
+/// 布局与 `game_engine::presentation::voxel::extract_raw_halo` 一致。
+///
+/// 这是体素表现的**唯一**通道（RawVoxels 载荷）：Godot 侧调 gdext mesher
+/// 现算矩形流后交给 VoxelMeshNode 渲染。
+#[derive(Component, Clone, Debug, PartialEq, Eq, Default)]
+pub struct VoxChunkRaw {
     /// mesh 块的 LOD 级别（0..=3）。
     pub lod: u8,
-    /// pack_rect_stream / pack_rect_batch_with_ao 产出的 8 B 字（每个 u64 一个
-    /// 矩形）：低 39 bit 是描述符，bit [39,47) 是 4 角 AO（见 [ao_corner_index]）。
-    pub words: Vec<u64>,
-}
-
-impl VoxelMeshBlock {
-    pub fn new(lod: u8, words: Vec<u64>) -> Self {
-        Self { lod, words }
-    }
-
-    pub fn rect_count(&self) -> usize {
-        self.words.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.words.is_empty()
-    }
-
-    /// 解码成 RectInstance（39 bit 布局的唯一真相源在引擎）。
-    pub fn rects(&self) -> impl Iterator<Item = RectInstance> + '_ {
-        self.words.iter().copied().map(unpack_rect)
-    }
+    /// `extract_raw_halo` 产出的 34³ 方块 id 缓冲。
+    pub blocks: Vec<u8>,
 }
 
 /// 一个矩形在块局部体素坐标下的 4 个角点。
@@ -103,7 +89,7 @@ pub fn rect_scale_meters(voxel_size_m: f32, lod: u8) -> f32 {
 mod tests {
     use super::*;
     use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
-    use game_engine::voxel::{pack_rect, pack_rect_with_ao, unpack_ao};
+    use game_engine::presentation::voxel::{pack_rect, pack_rect_with_ao, unpack_ao, unpack_rect};
 
     fn rect(
         plane: u8,
@@ -137,10 +123,6 @@ mod tests {
         for r in cases {
             assert_eq!(unpack_rect(pack_rect(&r)), r);
         }
-        let block = VoxelMeshBlock::new(2, cases.iter().map(pack_rect).collect());
-        assert_eq!(block.rect_count(), 3);
-        assert!(!block.is_empty());
-        assert_eq!(block.rects().collect::<Vec<_>>(), cases.to_vec());
     }
 
     #[test]

@@ -104,9 +104,9 @@ pub fn dec_ref_recursive(interner: &mut VoxInterner<u8>, root: &BlockId) {
 /// 释放一个体素体：遍历所有 chunk 根做 dec_ref_recursive 并清空容器。
 /// 返回释放的根数量。
 ///
-/// 注意：若调用点持有 [`super::wrapped::WrappedBlockCache`]，必须先用
-/// [`release_body_with_cache`]，否则包装缓存里的 root 引用会把 body 节点钉住
-/// （见）。本函数保持原签名不变，供无缓存的调用点使用。
+/// 注意：若调用点持有表现层的 WrappedBlockCache，必须先用
+/// `crate::presentation::voxel::release_body_with_cache`，否则包装缓存里的
+/// root 引用会把 body 节点钉住。本函数保持原签名不变，供无缓存的调用点使用。
 pub fn release_body(interner: &mut VoxInterner<u8>, volume: &mut VoxVolume) -> usize {
     let mut released = 0;
     for tree in volume.chunks.values() {
@@ -118,17 +118,4 @@ pub fn release_body(interner: &mut VoxInterner<u8>, volume: &mut VoxVolume) -> u
     }
     volume.chunks.clear();
     released
-}
-
-/// 先清空包装缓存再释放 body。
-///
-/// 保持 `release_body` 的公开签名不变，生产调用链若持有 WrappedBlockCache
-/// 应改用本函数。
-pub fn release_body_with_cache(
-    interner: &mut VoxInterner<u8>,
-    volume: &mut VoxVolume,
-    cache: &mut super::wrapped::WrappedBlockCache,
-) -> usize {
-    cache.clear(interner);
-    release_body(interner, volume)
 }

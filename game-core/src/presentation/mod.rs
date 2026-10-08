@@ -13,7 +13,7 @@ pub use synced_components::register_synced_components;
 pub mod payload;
 pub mod semantics;
 pub mod sync;
-// 体素 mesh 块的矩形流组件 + rect -> 四边形几何契约（路径 B）。
+// 体素 mesh 的原始体素组件 + rect -> 四边形几何契约（唯一通道 = RawVoxels）。
 #[cfg(test)]
 mod tests;
 pub mod voxel_mesh;
@@ -25,6 +25,15 @@ pub mod voxel_mesh;
 // （`interp` 目前没有调用方走模块路径访问，具体类型走下面的顶层重导出即可，
 // 不再额外重导出 `interp` 模块本身。）
 pub use game_engine::presentation::packed;
+
+// 原始体素 halo 通道（RawVoxels 载荷）：给 Godot 侧自行做贪婪 meshing 用。
+// 机制已随网格搬迁到 game_engine::presentation::voxel，但 godot-client-ext 只
+// 依赖 game-core，需要经 game_core::presentation::* 取用；这是**面向 FFI 的有意
+// 重导出**，路径必须保持稳定，请勿当作冗余 import 清理。
+pub use game_engine::presentation::voxel::{
+    extract_raw_halo, mesh_raw_halo, raw_halo_has_solid_interior, raw_halo_index, RAW_DIM,
+    RAW_HALO, RAW_VOXELS,
+};
 
 use bevy::prelude::*;
 use game_engine::presentation::{
@@ -52,8 +61,8 @@ pub use game_engine::presentation::pipeline::{PresentationRuntime, PresentationV
 pub use payload::{
     project, ExtError, ExtField, ExtValue, ExtensionBag, ExtensionFieldSchema, ExtensionPayload,
     ExtensionSchema, FieldVisibility, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, SetOutcome, SyncPayload,
-    ToPresentation,
+    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelPayload, SetOutcome,
+    SyncPayload, ToPresentation,
 };
 pub use semantics::{
     action_state_name, anim_name, domain_table, is_core_domain, locomotion_name, mod_hash_id,
@@ -62,7 +71,7 @@ pub use semantics::{
     OVERLAY_TAG_TABLE, SEMANTIC_DOMAINS, SOUND_TABLE, VFX_TABLE,
 };
 pub use sync::{CorePendingPresentation, CoreSyncBaseline};
-pub use voxel_mesh::{rect_corner, rect_normal, rect_scale_meters, VoxelMeshBlock};
+pub use voxel_mesh::{rect_corner, rect_normal, rect_scale_meters, VoxChunkRaw};
 
 /// 表现管线插件（引擎机制 + game-core 的收集/发布胶水）。
 pub struct PresentationPlugin;

@@ -41,12 +41,21 @@ func on_removed(_reason: int) -> void:
 	pass
 
 
-## 体素矩形呈现（路径 B）：默认无操作，VoxelMeshNode 覆写。
+## 内部矩形上传 helper（VoxelMeshNode 覆写）；ViewLayer 不直接调用。
 func set_mesh_view(_lod: int, _words: PackedInt64Array) -> void:
 	pass
 
 
 func reset_mesh_view() -> void:
+	pass
+
+
+## 原始体素 halo 呈现（RAWVOXELS）：默认无操作，VoxelMeshNode 覆写。
+func set_raw_voxel_view(_lod: int, _blocks: PackedByteArray) -> void:
+	pass
+
+
+func reset_raw_voxel_view() -> void:
 	pass
 
 

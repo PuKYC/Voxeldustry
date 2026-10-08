@@ -9,6 +9,9 @@ pub mod interp;
 pub mod packed;
 pub mod payload;
 pub mod pipeline;
+/// 体素网格机制（表现层）；依赖世界层 `crate::voxel`，仅 feature = "voxel" 编译。
+#[cfg(feature = "voxel")]
+pub mod voxel;
 
 use std::marker::PhantomData;
 

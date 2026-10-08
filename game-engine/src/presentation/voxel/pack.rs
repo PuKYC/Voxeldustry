@@ -190,7 +190,7 @@ pub fn pack_rect_stream_with_ao(batches: &[AoRectBatch]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voxel::key::chunk_key;
+    use crate::voxel::chunk_key;
     use voxel::store::Lod;
 
     fn rect(

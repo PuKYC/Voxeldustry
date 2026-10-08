@@ -20,7 +20,7 @@ func register_prototype(id: int, scene: PackedScene, poolable: bool = true) -> v
 	_poolable[id] = poolable
 
 func acquire(proto_id: int, build: int = ViewRules.Build.PROTOTYPE_SCENE) -> BevyEntityNode:
-	if build == ViewRules.Build.VOXEL_MESH:
+	if build == ViewRules.Build.VOXEL_RAW:
 		return _acquire_voxel()
 	var bucket: Array = _pool.get(proto_id, [])
 	var e: BevyEntityNode

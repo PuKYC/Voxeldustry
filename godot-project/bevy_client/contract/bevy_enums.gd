@@ -41,7 +41,8 @@ enum Payload {
 	INTERACTION = 4,
 	EXT = 5,
 	PROTOTYPE = 6,
-	RECTLIST = 7, ## 体素矩形实例流（只追加，禁止重排/复用）
+	## 7 是已删除的 RECTLIST 遗位：有意留空，禁止复用。
+	RAWVOXELS = 8, ## 原始体素 halo：Godot 调 gdext mesher 现算 39 bit 矩形流
 }
 
 ## attach / detach / despawn 命令的 payload_kinds 哨兵（packed::PAYLOAD_NONE）。
@@ -67,8 +68,8 @@ enum Wire {
 	I32,     ## i32 池：1 个 int
 	BOOL,    ## i32 池：1 个 int，!= 0 即 true
 	TAGS,    ## i32 池：n + n 个 int -> PackedInt32Array
-	WORDS,   ## i32 池：n + n 个 int -> PackedInt64Array（保留 64 位；RECTLIST 用）
 	EXT_BAG, ## i32 池：变长扩展袋（吃掉本条命令剩余槽位）
+	BYTES,   ## i32 池：[byte_len, chunk_count, chunk...] -> PackedByteArray（RAWVOXELS 用）
 }
 
 ## 视图呈现方式：PayloadCodec 只产数据，ViewLayer 按它决定怎么演。
@@ -76,7 +77,7 @@ enum View {
 	NONE,      ## 纯数据载荷，不接触节点
 	TRANSFORM, ## 位姿：codec.sample_position / sample_yaw
 	VISIBLE,   ## 可见性：node.visible
-	MESH,      ## 体素矩形：node.set_mesh_view(lod, words)
+	RAWVOXEL,  ## 原始体素 halo：gdext mesher 现算后 node.set_raw_voxel_view(lod, blocks)
 }
 
 ## 载荷 schema。新增核心载荷 = 这里加一行（+ Rust 侧）。
@@ -124,12 +125,12 @@ const PAYLOAD_SCHEMA := {
 		"wire": [Wire.I32],
 		"view": View.NONE,
 	},
-	## 体素矩形实例流：i32 池 = [lod, count, word...]（39 bit 矩形 × count）。
-	## WORDS 保留完整 64 位（绝不用 TAGS 截断成 32 位）；view=MESH 交给
-	## VoxelMeshNode 用 RenderingDevice 在 GPU 上展开（路径 B）。
-	Payload.RECTLIST: {
-		"fields": ["lod", "rects"],
-		"wire": [Wire.I32, Wire.WORDS],
-		"view": View.MESH,
+	## 原始体素 halo：i32 池 = [lod, byte_len, chunk_count, chunk...]；BYTES 解成
+	## PackedByteArray，view=RAWVOXEL 交给 VoxelMeshNode 调 gdext mesher 现算
+	## 39 bit 矩形流后，再用 RenderingDevice 在 GPU 上展开。
+	Payload.RAWVOXELS: {
+		"fields": ["lod", "blocks"],
+		"wire": [Wire.I32, Wire.BYTES],
+		"view": View.RAWVOXEL,
 	},
 }

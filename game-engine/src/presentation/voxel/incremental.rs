@@ -29,10 +29,10 @@ use voxel::mesh::{
 };
 use voxel::store::{ChunkKey, Lod, MaxDepth, VoxInterner, VoxTree};
 
-use super::dirty::MeshBlockDirty;
 use super::external::ExternalMaskCache;
-use super::key::lod_block_origin;
+use super::plan::MeshBlockDirty;
 use super::wrapped::WrappedBlockCache;
+use crate::voxel::lod_block_origin;
 
 /// Default incremental cache byte budget (32 MiB).
 pub const DEFAULT_INCREMENTAL_CACHE_BYTES: usize = 32 * 1024 * 1024;

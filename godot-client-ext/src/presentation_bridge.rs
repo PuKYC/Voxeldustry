@@ -297,8 +297,9 @@ fn payload_to_dictionary(payload: &SyncPayload) -> VarDictionary {
             out.set("value", i64::from(value.0));
         }
 
-        SyncPayload::RectList(_) => {
-            // 体素矩形列表只走 GPF1 紧凑通道；Dictionary 兼容通道不支持。
+        SyncPayload::RawVoxels(_) => {
+            // 原始体素 halo 只走 GPF1 紧凑通道（Godot 侧调 gdext mesher 现算）；
+            // Dictionary 兼容通道不支持。
         }
 
         SyncPayload::Transform(sample) => {

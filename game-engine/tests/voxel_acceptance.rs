@@ -11,14 +11,17 @@ use std::collections::BTreeMap;
 
 use bevy::math::IVec3;
 use game_engine::math::FixedPoint;
+use game_engine::presentation::voxel::{
+    floor_to_lod_policy, mesh_block_incremental, mesh_block_wrapped, pack_rect_stream,
+    rebuild_plan, release_body_with_cache, ExternalMaskCache, FaceMask, IncrementalMeshCache,
+    MeshBlockDirty, WrappedBlockCache,
+};
 use game_engine::rng::RngState;
 use game_engine::voxel::{
-    chunk_key, chunk_voxels_per_axis, count_body_nodes, extract_block, floor_to_lod_policy,
-    lod_block_origin, mesh_block_incremental, mesh_block_wrapped, neighbors6, pack_rect_stream,
-    rebuild_plan, release_body, release_body_with_cache, ChunkKey, DirtyChunk, ExternalMaskCache,
-    FaceMask, IncrementalMeshCache, Lod, MaxDepth, MeshBlock, MeshBlockDirty, VoxOpsBulkWrite,
+    chunk_key, chunk_voxels_per_axis, count_body_nodes, extract_block, lod_block_origin,
+    neighbors6, release_body, ChunkKey, DirtyChunk, Lod, MaxDepth, MeshBlock, VoxOpsBulkWrite,
     VoxOpsState, VoxOpsWrite, VoxTree, VoxVolume, VoxelAabb, VoxelBox, VoxelDirtySet,
-    VoxelInterner, WrappedBlockCache, CHUNK_DEPTH,
+    VoxelInterner, CHUNK_DEPTH,
 };
 use voxel::mesh::{extract_block_tree_with_ao, extract_block_with_ao, AoRectBatch};
 use voxel::store::VoxInterner;
@@ -605,7 +608,7 @@ fn plan_mesh_pack_is_byte_deterministic() {
      -> (Vec<u64>, Vec<MeshBlock>) {
         let mut dirty = VoxelDirtySet::new();
         dirty.mark_edited(ekey, eb);
-        let plan = dirty.take_rebuild_plan(&policy);
+        let plan = rebuild_plan(&dirty.take_edits(), &policy);
         let mut batches = Vec::new();
         for p in plan.iter() {
             let batch = mesh_block_wrapped(

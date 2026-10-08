@@ -4,15 +4,14 @@
 //! - 每个 mesh 块是 32³ 基础跨度（= 一个 base 子块 × 2^lod）；
 //! - 块原点必须对齐到 2^lod 个基础子块（引擎的 wrap_block / MeshBlock 要求）；
 //! - 块原点（米）= origin * 32 * voxel_size，**不乘 2^lod**（LOD 缩放由渲染侧
-//!   按 RectListPayload.lod 与 rect_scale_meters 处理）。
+//!   按 RawVoxelPayload.lod 与 rect_scale_meters 处理）。
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use game_engine::math::FixedPoint;
 use game_engine::voxel::{chunk_key, ChunkKey};
 
-use crate::world::generation::CHUNK_SIZE;
-use crate::world::lod::{lod_for_distance, MAX_LOD};
+use crate::voxel::lod::{VoxelLodConfig, MAX_LOD};
+use crate::voxel::terrain::generation::CHUNK_SIZE;
 
 /// 生成区域在 x/z 上比 mesh 区域多出的子块数。
 ///
@@ -54,19 +53,43 @@ pub fn chunk_keys_to_generate(radius_blocks: i32, max_lod: u8) -> Vec<ChunkKey> 
     out
 }
 
-/// XZ 上按到世界原点的距离做 LOD 合并，再按 y 层展开成块列表（确定性升序）。
+/// 静态观察者（世界原点）的 LOD 划分。
+///
+/// 等价于 [lod_blocks_for_observer] 传观察者 [0.0, 0.0] 与
+/// [VoxelLodConfig::default]。保留旧签名，Startup 生成与既有测试不改。
+#[must_use]
+pub fn lod_blocks(radius_blocks: i32, max_lod: u8, voxel_size_m: f64) -> Vec<TerrainBlock> {
+    lod_blocks_for_observer(
+        [0.0, 0.0],
+        radius_blocks,
+        max_lod,
+        voxel_size_m,
+        &VoxelLodConfig::default(),
+    )
+}
+
+/// XZ 上按到**观察者**的距离做 LOD 合并，再按 y 层展开成块列表（确定性升序）。
 ///
 /// 合并规则（自下而上）：
-/// 1. level 0 单元 = 区域内每个基础子块 (x, z) ∈ [-radius, radius]²；
+/// 1. level 0 单元 = 区域内每个基础子块 (x, z) ∈ [-radius, radius]²（与观察者无关）；
 /// 2. 若某父块（边长 2^(level+1) 个子块，原点是 2^(level+1) 的倍数）的 4 个
-///    level 子块都存在，且父块 XZ AABB 到原点的**最近切比雪夫距离**已经落在
-///    `lod_for_distance` 允许的 level+1 档（dist 越大 LOD 越粗），则合并；
+///    level 子块都存在，且父块 XZ AABB 到观察者的**最近切比雪夫距离**已经落在
+///    [VoxelLodConfig::lod_for_distance_m] 允许的 level+1 档，则合并；
 /// 3. 每个叶子的 y 层 = 从 0 起每 2^lod 层一个块，铺满 band。
+///
+/// max_lod 同时决定 y band 层数（必须与 Startup 生成时的 max_lod 一致）；
+/// 观察者只改变 XZ 合并，不改变覆盖范围。
 ///
 /// 不变量（tests 里断言）：区域里每个 (x, z) 基础子块恰好被一个叶子覆盖，
 /// 且每个叶子的 y 层恰好覆盖 band 一次。
 #[must_use]
-pub fn lod_blocks(radius_blocks: i32, max_lod: u8, voxel_size_m: f64) -> Vec<TerrainBlock> {
+pub fn lod_blocks_for_observer(
+    observer_xz_m: [f64; 2],
+    radius_blocks: i32,
+    max_lod: u8,
+    voxel_size_m: f64,
+    config: &VoxelLodConfig,
+) -> Vec<TerrainBlock> {
     let radius = radius_blocks.max(0);
     let max_lod = max_lod.min(MAX_LOD);
 
@@ -105,7 +128,15 @@ pub fn lod_blocks(radius_blocks: i32, max_lod: u8, voxel_size_m: f64) -> Vec<Ter
             {
                 continue;
             }
-            if !may_coarsen(px, pz, parent_size, voxel_size_m, level + 1) {
+            if !may_coarsen_for_observer(
+                observer_xz_m,
+                px,
+                pz,
+                parent_size,
+                voxel_size_m,
+                level + 1,
+                config,
+            ) {
                 continue;
             }
             merges.push((px, pz));
@@ -174,22 +205,52 @@ pub fn block_span(lod: u8) -> i32 {
     1i32 << lod
 }
 
-/// 父块 XZ AABB 到原点的最近距离（米，切比雪夫 = 两轴取大）是否已经允许
-/// 粗到 `level`。
-fn may_coarsen(px: i32, pz: i32, size: i32, voxel_size_m: f64, level: u8) -> bool {
-    let dist_m = nearest_axis_m(px, size, voxel_size_m).max(nearest_axis_m(pz, size, voxel_size_m));
-    lod_for_distance(FixedPoint::from_num(dist_m)).lod() >= level
+/// 父块 XZ AABB 到观察者的最近距离（米，切比雪夫 = 两轴取大）是否已经允许
+/// 粗到 level。
+fn may_coarsen_for_observer(
+    observer_xz_m: [f64; 2],
+    px: i32,
+    pz: i32,
+    size: i32,
+    voxel_size_m: f64,
+    level: u8,
+    config: &VoxelLodConfig,
+) -> bool {
+    let chunk_m = f64::from(CHUNK_SIZE) * voxel_size_m;
+    let dx = nearest_axis_distance_m(px, size, chunk_m, observer_xz_m[0]);
+    let dz = nearest_axis_distance_m(pz, size, chunk_m, observer_xz_m[1]);
+    config.lod_for_distance_m(dx.max(dz)) >= level
 }
 
-/// 一维 AABB [origin*chunk, (origin+size)*chunk] 到 0 的最近距离（米）。
-fn nearest_axis_m(origin: i32, size: i32, voxel_size_m: f64) -> f64 {
-    let chunk_m = f64::from(CHUNK_SIZE) * voxel_size_m;
+/// 一维闭区间 [origin*chunk_m, (origin+size)*chunk_m] 到观察者坐标的最近距离（米）。
+#[must_use]
+pub fn nearest_axis_distance_m(origin: i32, size: i32, chunk_m: f64, observer_axis_m: f64) -> f64 {
     let lo = f64::from(origin) * chunk_m;
-    let hi = lo + f64::from(size) * chunk_m;
-    if lo > 0.0 {
-        lo
-    } else if hi < 0.0 {
-        -hi
+    axis_interval_distance(lo, lo + f64::from(size) * chunk_m, observer_axis_m)
+}
+
+/// 块（米原点 + 边长）到观察者（米）的最近距离，只取 X / Z 两轴的切比雪夫最大值。
+///
+/// Y 被刻意忽略：地形 LOD 是水平距离策略。这是 FFI voxel_lod_for_block 的
+/// 唯一真相源，与 [lod_blocks_for_observer] 的合并距离同源。
+#[must_use]
+pub fn nearest_block_distance_m(
+    observer_m: [f64; 3],
+    block_origin_m: [f64; 3],
+    span_m: f64,
+) -> f64 {
+    let span = span_m.max(0.0);
+    let dx = axis_interval_distance(block_origin_m[0], block_origin_m[0] + span, observer_m[0]);
+    let dz = axis_interval_distance(block_origin_m[2], block_origin_m[2] + span, observer_m[2]);
+    dx.max(dz)
+}
+
+/// 一维闭区间 [lo, hi] 到 point 的最近距离（点在区间内为 0）。
+fn axis_interval_distance(lo: f64, hi: f64, point: f64) -> f64 {
+    if point < lo {
+        lo - point
+    } else if point > hi {
+        point - hi
     } else {
         0.0
     }
@@ -201,8 +262,7 @@ mod tests {
     use crate::static_data::voxel::VOXEL_SIZE_METERS;
 
     /// 区域里每个 (x, y, z) 基础子块被叶子恰好覆盖一次（3D 划分不重叠、无空洞）。
-    fn assert_partition(radius_blocks: i32, max_lod: u8) {
-        let blocks = lod_blocks(radius_blocks, max_lod, VOXEL_SIZE_METERS);
+    fn assert_partition_of(blocks: &[TerrainBlock], radius_blocks: i32, max_lod: u8) {
         assert!(!blocks.is_empty());
         let layers = y_band_layers(max_lod);
 
@@ -246,6 +306,15 @@ mod tests {
         for cell in expected {
             assert_eq!(covered.get(&cell), Some(&1), "({cell:?}) 覆盖数不为 1");
         }
+    }
+
+    /// 旧签名包装：静态观察者（世界原点）的划分。
+    fn assert_partition(radius_blocks: i32, max_lod: u8) {
+        assert_partition_of(
+            &lod_blocks(radius_blocks, max_lod, VOXEL_SIZE_METERS),
+            radius_blocks,
+            max_lod,
+        );
     }
 
     #[test]
@@ -346,5 +415,93 @@ mod tests {
             assert!(layers >= 4);
             assert!(layers.rem_euclid(1i32 << max_lod) == 0);
         }
+    }
+
+    #[test]
+    fn observer_partition_matches_static_partition_at_origin() {
+        for (radius, max_lod) in [(2, 1), (8, 3), (24, 3)] {
+            assert_eq!(
+                lod_blocks(radius, max_lod, VOXEL_SIZE_METERS),
+                lod_blocks_for_observer(
+                    [0.0, 0.0],
+                    radius,
+                    max_lod,
+                    VOXEL_SIZE_METERS,
+                    &VoxelLodConfig::default(),
+                ),
+                "观察者在原点 + 默认配置必须逐块等于旧 lod_blocks（radius {radius}）"
+            );
+        }
+    }
+
+    #[test]
+    fn far_observer_coarsens_far_side_and_keeps_near_lod0() {
+        // 观察者置于区域 +X 侧（x=100 m 落在第 8 个子块 AABB 内）。
+        let observer = [100.0f64, 0.0];
+        let blocks = lod_blocks_for_observer(
+            observer,
+            8,
+            3,
+            VOXEL_SIZE_METERS,
+            &VoxelLodConfig::default(),
+        );
+        assert_partition_of(&blocks, 8, 3);
+
+        // 观察者附近（x = +8 边缘子块）必须保持 LOD0。
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.origin.x == 8 && block.lod == 0),
+            "观察者附近必须保持 LOD0"
+        );
+        // 远离观察者（x <= -4）必须出现粗于 LOD0 的块。
+        let far_max = blocks
+            .iter()
+            .filter(|block| block.origin.x <= -4)
+            .map(|block| block.lod)
+            .max()
+            .expect("远端必须有块");
+        assert!(far_max >= 1, "远端必须变粗，实测最粗 {far_max}");
+    }
+
+    #[test]
+    fn observer_partition_is_deterministic() {
+        let first = lod_blocks_for_observer(
+            [37.5, -12.25],
+            8,
+            3,
+            VOXEL_SIZE_METERS,
+            &VoxelLodConfig::default(),
+        );
+        let second = lod_blocks_for_observer(
+            [37.5, -12.25],
+            8,
+            3,
+            VOXEL_SIZE_METERS,
+            &VoxelLodConfig::default(),
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn nearest_axis_distance_matches_closed_interval() {
+        assert_eq!(nearest_axis_distance_m(0, 2, 10.0, 5.0), 0.0);
+        assert_eq!(nearest_axis_distance_m(0, 2, 10.0, -3.0), 3.0);
+        assert_eq!(nearest_axis_distance_m(0, 2, 10.0, 25.0), 5.0);
+    }
+
+    #[test]
+    fn nearest_block_distance_ignores_y() {
+        // Y 极远也必须被忽略：块 [0,10]³，观察者在 +Z 外 5 m。
+        let distance = nearest_block_distance_m([5.0, 1000.0, 15.0], [0.0, 0.0, 0.0], 10.0);
+        assert!((distance - 5.0).abs() < 1e-9);
+        // 观察者在块内 -> 0。
+        assert_eq!(
+            nearest_block_distance_m([5.0, 5.0, 5.0], [0.0, 0.0, 0.0], 10.0),
+            0.0
+        );
+        // X 更远时取两轴最大值。
+        let distance = nearest_block_distance_m([-30.0, 0.0, 12.0], [0.0, 0.0, 0.0], 10.0);
+        assert!((distance - 30.0).abs() < 1e-9);
     }
 }

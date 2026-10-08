@@ -22,6 +22,7 @@ use game_engine::voxel::{
 use crate::static_data::voxel::{
     biome_def, BiomeId, AIR_BLOCK, DEFAULT_BIOME, DIRT_BLOCK, GRASS_BLOCK, STONE_BLOCK,
 };
+use crate::world::WorldSeed;
 
 /// 子块每轴体素数（CHUNK_DEPTH = 5 -> 32）。
 pub const CHUNK_SIZE: i32 = 1 << (CHUNK_DEPTH as u32);
@@ -35,16 +36,6 @@ pub const DEFAULT_INTERNER_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// 建一个缺省预算的共享 interner。
 pub fn new_interner() -> VoxInterner<u8> {
     VoxInterner::<u8>::with_memory_budget(DEFAULT_INTERNER_BUDGET_BYTES)
-}
-
-/// 世界生成种子（Bevy Resource）。
-#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WorldSeed(pub u64);
-
-impl WorldSeed {
-    pub const fn new(seed: u64) -> Self {
-        Self(seed)
-    }
 }
 
 /// 单岛屿的确定性生成器：种子 + 生物群系。

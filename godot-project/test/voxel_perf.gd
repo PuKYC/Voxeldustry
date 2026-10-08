@@ -20,6 +20,10 @@ extends Node3D
 @export_range(0, 16, 1) var radius_blocks: int = 2
 ## 传给 start_bevy_voxel_perf 的最高 LOD（0..=3）。
 @export_range(0, 3, 1) var max_lod: int = 0
+## LOD 距离阈值（米，x/y/z = 三档），运行期可调。
+@export var lod_thresholds: Vector3 = Vector3(32.0, 64.0, 128.0)
+## 为 true 时每帧把 Camera3D 位置推给后端作 LOD 观察者。
+@export var drive_observer_from_camera: bool = false
 @export var fixed_hz: float = 60.0
 @export var runner_hz: float = 60.0
 
@@ -37,6 +41,7 @@ extends Node3D
 @export var print_every_frame: bool = false
 
 var _client: Node = null
+var _camera: Camera3D = null
 var _frames: int = 0
 var _measured: int = 0
 var _total_frame_usec: int = 0
@@ -54,20 +59,20 @@ func _enter_tree() -> void:
 	_client.set("manager_path", ^"../BevyAppManager")
 	_client.set("entity_parent", ^"..")
 	_client.set("mode", 2)  # BevyClient.Mode.VOXEL_PERF
-	_client.set("channel", 2)  # PACKED_STREAMS（RECTLIST 只走快通道）
+	_client.set("channel", 2)  # PACKED_STREAMS（体素 RAWVOXELS 只走快通道）
 	_client.set("autostart", true)
 	_client.set("fixed_hz", fixed_hz)
 	_client.set("runner_hz", runner_hz)
 	_client.set("enable_demo", false)
 	_client.set("voxel_radius_blocks", radius_blocks)
 	_client.set("voxel_max_lod", max_lod)
+	_client.set("voxel_lod_thresholds", lod_thresholds)
 
 
 func _ready() -> void:
-	if aim_camera_on_ready:
-		var camera := get_node_or_null(^"Camera3D") as Camera3D
-		if camera != null:
-			camera.look_at(focus_point, Vector3.UP)
+	_camera = get_node_or_null(^"Camera3D") as Camera3D
+	if aim_camera_on_ready and _camera != null:
+		_camera.look_at(focus_point, Vector3.UP)
 
 	if _client == null:
 		_client = get_node_or_null(^"BevyClient")
@@ -85,11 +90,18 @@ func _ready() -> void:
 	if actual_radius != radius_blocks or actual_lod != max_lod:
 		push_warning("[voxel_perf] 配置未生效：client radius=%d max_lod=%d，期望 %d/%d" % [actual_radius, actual_lod, radius_blocks, max_lod])
 	print("[voxel_perf] 启动：radius_blocks=%d max_lod=%d fixed_hz=%.1f runner_hz=%.1f warmup=%d measure=%d" % [radius_blocks, max_lod, fixed_hz, runner_hz, warmup_frames, measure_frames])
+	# 冒烟：LOD 计算可以从 Godot 侧调用（阈值 / max_lod 已下发）。
+	var smoke := 0
+	if _client.has_method("voxel_lod_for_distance"):
+		smoke = int(_client.call("voxel_lod_for_distance", 40.0))
+	print("[voxel_perf] voxel_lod_for_distance(40.0)=%d thresholds=(%.0f,%.0f,%.0f) drive_observer_from_camera=%s" % [smoke, lod_thresholds.x, lod_thresholds.y, lod_thresholds.z, drive_observer_from_camera])
 
 
 func _process(delta: float) -> void:
 	if _client == null or _finished:
 		return
+	if drive_observer_from_camera and _camera != null:
+		_client.call("set_voxel_observer", _camera.global_position)
 
 	var begin := Time.get_ticks_usec()
 	_frames += 1

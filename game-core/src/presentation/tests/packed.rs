@@ -9,7 +9,7 @@ use game_engine::presentation::packed::{
 
 use super::payload::{
     ExtField, ExtValue, ExtensionPayload, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, SyncPayload,
+    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelPayload, SyncPayload,
 };
 use super::RenderTransformSample;
 use super::{PresentationCommand, PresentationFrame, PresentationSlot};
@@ -516,8 +516,8 @@ fn wire_shape(tokens: &[String]) -> (usize, usize, bool, bool) {
             "F32" | "ANGLE" => f32_count += 1,
             "VEC3" => f32_count += 3,
             "I32" | "BOOL" => i32_count += 1,
-            // TAGS / WORDS 都是「count + n 个 i32 池槽」的变长列表。
-            "TAGS" | "WORDS" => has_varlen = true,
+            // TAGS / BYTES 都是「count + n 个 i32 池槽」的变长列表。
+            "TAGS" | "BYTES" => has_varlen = true,
             "EXT_BAG" => has_ext = true,
             _ => {}
         }
@@ -556,9 +556,10 @@ fn sample_payload(kind: PayloadKind) -> SyncPayload {
             .expect("测试样本身份合法"),
         ),
         PayloadKind::Prototype => SyncPayload::Prototype(PresentedPrototype(9)),
-        PayloadKind::RectList => SyncPayload::RectList(
-            crate::presentation::payload::RectListPayload::from_stream(1, &[1, 2]),
-        ),
+        PayloadKind::RawVoxels => SyncPayload::RawVoxels(RawVoxelPayload::from_halo(
+            1,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        )),
     }
 }
 

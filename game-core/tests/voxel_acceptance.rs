@@ -2,8 +2,10 @@
 //! instance-buffer determinism on generated islands (design section 10).
 //!
 //! These are integration tests over the public API only:
-//! game_core::world::{WorldGenerator, generate_island, DEFAULT_VOXEL_SIZE} and
-//! game_engine::voxel::{VoxVolume, VoxelInterner, extract_block, pack_rect_stream, ...}.
+//! game_core::voxel::terrain::generation::{WorldGenerator, generate_island} +
+//! game_core::static_data::voxel::DEFAULT_VOXEL_SIZE and
+//! game_engine::voxel::{VoxVolume, VoxelInterner, extract_block, ...} plus
+//! game_engine::presentation::voxel::pack_rect_stream.
 //!
 //! Determinism: the island seed, chunk enumeration and voxel size are fixed,
 //! so every printed number is reproducible.
@@ -19,10 +21,11 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use game_core::static_data::voxel::DEFAULT_VOXEL_SIZE;
-use game_core::world::generate_island;
+use game_core::voxel::terrain::generation::generate_island;
+use game_engine::presentation::voxel::pack_rect_stream;
 use game_engine::voxel::{
-    chunk_key, count_body_nodes, extract_block, neighbors6, pack_rect_stream, ChunkKey, Lod,
-    MeshBlock, RectBatch, VoxOpsState, VoxTree, VoxVolume, VoxelInterner,
+    chunk_key, count_body_nodes, extract_block, neighbors6, ChunkKey, Lod, MeshBlock, RectBatch,
+    VoxOpsState, VoxTree, VoxVolume, VoxelInterner,
 };
 
 /// World seed used by every generated-island acceptance test (fixed -> reproducible).

@@ -21,7 +21,7 @@ use bevy::prelude::*;
 use voxel::mesh::{ExternalPlaneKind, OccupancyDataBuilder};
 use voxel::store::{MaxDepth, VoxTree};
 
-use super::interner::VoxelInterner;
+use crate::voxel::VoxelInterner;
 
 /// external 掩码缓存条目上限
 pub const EXTERNAL_MASK_CACHE_CAPACITY: usize = 4096;

@@ -12,14 +12,18 @@
 //! 只能在 Godot 主线程调用；后台 Bevy 线程只碰 [`ClientBridge`] 里的纯数据通道。
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use godot::builtin::{Array, PackedByteArray, PackedStringArray, VarDictionary};
+use godot::builtin::{
+    Array, PackedByteArray, PackedFloat32Array, PackedInt64Array, PackedStringArray, VarDictionary,
+};
 use godot::prelude::*;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use game_core::bevy_backend::*;
 use game_core::presentation::semantics::SemanticRegistry;
 use game_core::spec::ClientBridge;
-use game_core::world::TerrainConfig;
+use game_core::voxel::terrain::{nearest_block_distance_m, TerrainConfig, VoxelLodRuntime};
+use game_core::voxel::VoxelLodConfig;
 
 use crate::presentation_bridge;
 
@@ -54,6 +58,9 @@ pub struct BevyAppManager {
     /// 最近一帧的插值时刻 T_t / 步长（`render_alpha` 用）。
     last_tick_clock_ms: u64,
     last_timestep_ms: f32,
+
+    /// 体素 LOD 运行期句柄：Godot 主线程写，后台 Bevy 线程经 VoxelLodHandle 读。
+    voxel_lod: Arc<Mutex<VoxelLodRuntime>>,
 }
 
 #[godot_api]
@@ -70,6 +77,7 @@ impl INode for BevyAppManager {
             input_seq: 0,
             last_tick_clock_ms: 0,
             last_timestep_ms: 0.0,
+            voxel_lod: Arc::new(Mutex::new(VoxelLodRuntime::default())),
         }
     }
 
@@ -155,8 +163,8 @@ impl BevyAppManager {
 
     /// 启动体素地形 demo：挂 `TerrainConfig::default()`（radius 2 / max_lod 1）。
     ///
-    /// 地形在 Startup 生成并网格化一次，产出带 `VoxelMeshBlock` 的 mesh 块实体；
-    /// Godot 侧路径 B 的 VoxelMeshNode 负责渲染。
+    /// 地形在 Startup 生成一次，产出带 `VoxChunkRaw` 的 mesh 块实体；
+    /// 贪婪 meshing 在 Godot 侧调 gdext `mesh_voxel_halo` 现算，再由 VoxelMeshNode 渲染。
     ///
     /// 默认 radius 2 / max_lod 1（196 子块）：release ≈ 2–4 s，**debug ≈ 30 s**
     /// （生成是 debug 下的瓶颈）。只想快速看一眼可以用
@@ -378,6 +386,72 @@ impl BevyAppManager {
         presentation_bridge::voxel_table_to_variant()
     }
 
+    /// 原始体素 halo → 39 bit 矩形流（调用 game-core mesher 现算）。
+    ///
+    /// lod 越界会被夹到 0..=3；blocks 是 RAWVOXELS 载荷解出的原始体素字节。
+    /// mesher 输出 Vec<u64>，而 u64 没有 ToGodot，这里逐元素按位转 i64
+    /// 交给 PackedInt64Array（每个 u64 一个矩形，保留完整 64 位，绝不截断成 32 位）。
+    #[func]
+    fn mesh_voxel_halo(&self, lod: i64, blocks: PackedByteArray) -> PackedInt64Array {
+        let bytes = blocks.to_vec();
+        let words = game_core::presentation::mesh_raw_halo(lod.clamp(0, 3) as u8, &bytes);
+        let signed: Vec<i64> = words.iter().map(|w| *w as i64).collect();
+        PackedInt64Array::from(&signed[..])
+    }
+
+    /// 距离（米）-> LOD，用运行期配置（未设置则默认 32/64/128 m）。
+    #[func]
+    fn voxel_lod_for_distance(&self, distance_m: f64) -> i64 {
+        i64::from(self.voxel_lod_config().lod_for_distance_m(distance_m))
+    }
+
+    /// 块（米原点 + 边长）-> LOD。距离公式的唯一真相源在 game-core。
+    #[func]
+    fn voxel_lod_for_block(&self, observer: Vector3, block_origin: Vector3, span_m: f64) -> i64 {
+        let distance_m = nearest_block_distance_m(
+            [observer.x as f64, observer.y as f64, observer.z as f64],
+            [
+                block_origin.x as f64,
+                block_origin.y as f64,
+                block_origin.z as f64,
+            ],
+            span_m,
+        );
+        i64::from(self.voxel_lod_config().lod_for_distance_m(distance_m))
+    }
+
+    /// 运行时覆写观察者位置（米）；运行期流式系统优先用它。
+    #[func]
+    fn set_voxel_observer(&mut self, position: Vector3) {
+        if let Ok(mut runtime) = self.voxel_lod.lock() {
+            runtime.observer = Some([position.x as f32, position.y as f32, position.z as f32]);
+        }
+    }
+
+    /// 运行时覆写 LOD 配置：max_lod（0..=3）+ 三档阈值（米）。
+    #[func]
+    fn set_voxel_lod_config(&mut self, max_lod: i64, t0: f64, t1: f64, t2: f64) {
+        if let Ok(mut runtime) = self.voxel_lod.lock() {
+            runtime.config = Some(VoxelLodConfig {
+                max_lod: u8::try_from(max_lod).unwrap_or(3).min(3),
+                thresholds_m: [t0 as f32, t1 as f32, t2 as f32],
+            });
+        }
+    }
+
+    /// 当前生效的 LOD 配置（已 sanitized）：max_lod + thresholds(PackedFloat32Array)。
+    #[func]
+    fn get_voxel_lod_config(&self) -> VarDictionary {
+        let config = self.voxel_lod_config();
+        let mut out = VarDictionary::new();
+        out.set("max_lod", i64::from(config.max_lod));
+        out.set(
+            "thresholds",
+            &PackedFloat32Array::from(&config.thresholds_m[..]),
+        );
+        out
+    }
+
     /// 原型表：`Array[{ prototype_id, name, version }]`。
     ///
     /// Godot 用它把 `prototype_id` 映射到自己的 `PackedScene`。
@@ -520,6 +594,7 @@ impl BevyAppManager {
             perf_entity_count,
             terrain,
             terrain_perf,
+            voxel_lod: Some(self.voxel_lod.clone()),
         };
 
         // 跨边界句柄：Godot 主线程留一份，后台线程拿一份克隆（内部是 Arc 共享）。
@@ -531,6 +606,16 @@ impl BevyAppManager {
         self.worker = Some(thread::spawn(move || {
             run_bevy_backend(ctrl_rx, life_tx, session, config, thread_bridge);
         }));
+    }
+
+    /// 读取当前生效的 LOD 配置（未设置则默认 32/64/128），已 sanitized。
+    fn voxel_lod_config(&self) -> VoxelLodConfig {
+        self.voxel_lod
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.config)
+            .unwrap_or_default()
+            .sanitized()
     }
 
     fn send_control(&self, msg: BevyControlMsg) {
