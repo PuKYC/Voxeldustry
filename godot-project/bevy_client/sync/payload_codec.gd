@@ -18,7 +18,11 @@ var _interp: Dictionary = {}
 
 ## 解析一条 ADD / UPDATE 的 payload。
 func apply(e: EntityData, kind: int, c: CommandCursor) -> void:
-	if kind < 0 or kind >= BevyEnums.PAYLOAD_COUNT:
+	# 载荷 code 不是连续上界：code 7（已删除的 RectList）留空，RAWVOXELS = 8，
+	# 而 PAYLOAD_COUNT 是「条目数」(8)。用 `kind >= PAYLOAD_COUNT` 判界会把
+	# RAWVOXELS(8) 整条丢弃 -> 实体只剩 TRANSFORM，ViewRules 匹配不到 -> nodes=0。
+	# 未知 code 交给下面的 schema 查询兜底。
+	if kind < 0 or kind >= BevyEnums.PAYLOAD_NONE:
 		return
 	var schema: Dictionary = BevyEnums.PAYLOAD_SCHEMA.get(kind, {})
 	if schema.is_empty():

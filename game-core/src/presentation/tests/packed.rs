@@ -652,6 +652,83 @@ fn godot_payload_schema_matches_rust_pool_layout() {
     }
 }
 
+// ───────── P3.5：GDScript 解码端 kind 判界不能丢合法载荷 ─────────
+
+/// 抽取 payload_codec.gd 里 `kind >= BevyEnums.<CONST>` 的上界常量名。
+///
+/// 返回 `None` 表示解码端没有按 code 判界（例如改用 schema 存在性判断），
+/// 此时不存在「合法载荷被上界误杀」的风险。
+fn decoder_kind_upper_bound(codec: &str) -> Option<String> {
+    let needle = "kind >= BevyEnums.";
+    let start = codec.find(needle)?;
+    let after = &codec[start + needle.len()..];
+    Some(
+        after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect(),
+    )
+}
+
+/// 读取 GDScript `const NAME := <literal>` 的整数常量（支持十进制与 0x 十六进制）。
+fn gdscript_int_const(source: &str, name: &str) -> Option<i64> {
+    let marker = format!("const {name}");
+    let start = source.find(&marker)?;
+    let after = &source[start + marker.len()..];
+    let assign = after
+        .find(":=")
+        .map(|index| index + 2)
+        .or_else(|| after.find('=').map(|index| index + 1))?;
+    let token: String = after[assign..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let token = token.replace('_', "");
+    if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else {
+        token.parse().ok()
+    }
+}
+
+/// 回归：`PayloadCodec.apply` 的 kind 上界必须接纳每一个合法载荷 code。
+///
+/// code 7 是已删除 RectList 的遗位，`RAWVOXELS = 8` 使「枚举条目数」不再等于
+/// 「最大 code + 1」。曾用 `kind >= PAYLOAD_COUNT(8)` 判界，RAWVOXELS(8) 被整条
+/// 丢弃，实体只剩 TRANSFORM，ViewRules 匹配不到 -> nodes=0。
+#[test]
+fn godot_payload_codec_kind_guard_accepts_every_payload_code() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let enums_path = root.join("../godot-project/bevy_client/contract/bevy_enums.gd");
+    let codec_path = root.join("../godot-project/bevy_client/sync/payload_codec.gd");
+    let enums = std::fs::read_to_string(&enums_path)
+        .unwrap_or_else(|error| panic!("读不到 {}: {error}", enums_path.display()));
+    let codec = std::fs::read_to_string(&codec_path)
+        .unwrap_or_else(|error| panic!("读不到 {}: {error}", codec_path.display()));
+
+    let Some(bound_name) = decoder_kind_upper_bound(&codec) else {
+        // 解码端不按 code 判界：没有可被上界误杀的载荷。
+        return;
+    };
+    let bound = gdscript_int_const(&enums, &bound_name).unwrap_or_else(|| {
+        panic!(
+            "{} 里找不到 const {bound_name} 的整数常量（payload_codec.gd 引用了它）",
+            enums_path.display()
+        )
+    });
+
+    for &kind in PayloadKind::ALL {
+        assert!(
+            i64::from(kind.code()) < bound,
+            "PayloadCodec.apply 的 kind 上界 {bound_name}={bound} 会丢弃载荷 {} (code={})；\
+             code 7 留空后不能用「条目数」当 code 上界，请改用 PAYLOAD_NONE 或 schema 存在性判断。",
+            kind.as_str(),
+            kind.code(),
+        );
+    }
+}
+
 /// 性能冒烟：把「1000 实体 × 5 命令」的帧编码 / 解析 N 次，打印吞吐。
 ///
 /// 用 cargo test -p game-core presentation::tests::packed::bench -- --nocapture 查看输出。
