@@ -17,6 +17,10 @@ serde = { version = "1", features = ["derive"] }
 bevy_replicon = { version = "0.43" }
 bevy_replicon_renet = "0.19"
 
+# 物理（avian3d）：默认关闭，只在 game-engine 的 physics feature 下进入依赖树。
+# 只取 3d + f32 parry + 确定性开关，避免引入渲染 / 调试插件依赖。
+avian3d = { version = "0.7", default-features = false, features = ["3d", "parry-f32", "enhanced-determinism"] }
+
 rstar = "0.13.0"
 
 crossbeam-channel = { version = "0.5" }

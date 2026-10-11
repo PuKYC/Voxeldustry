@@ -370,6 +370,11 @@ fn build_terrain(
 
     // 地形根实体：体素容器以组件形式挂载
     //（「一岛 / 一船 / 一结构 = 一个 VoxVolume 组件」）；生成完成后一次性 attach。
+    // physics：同时挂 VoxelCollider，让地形派生 avian 碰撞体（Transform 由
+    // #[require(Transform)] 补为原点，正好等于 body 局部原点）。
+    #[cfg(feature = "physics")]
+    commands.spawn((volume, game_engine::voxel::VoxelCollider));
+    #[cfg(not(feature = "physics"))]
     commands.spawn(volume);
 
     info!(
@@ -521,6 +526,8 @@ mod tests {
         });
         app.add_plugins(crate::voxel::GameVoxelPlugin);
         app.add_plugins(TerrainPlugin);
+        // 只用 app.update() 的测试必须显式 finish，Avian 在 Plugin::finish 注册诊断资源。
+        app.finish();
         app
     }
 
@@ -703,6 +710,8 @@ mod tests {
             ..TerrainConfig::default()
         });
         app.add_systems(Update, stream_terrain_lod);
+        // 只用 app.update() 的测试必须显式 finish，Avian 在 Plugin::finish 注册诊断资源。
+        app.finish();
 
         let world = app.world_mut();
         let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);

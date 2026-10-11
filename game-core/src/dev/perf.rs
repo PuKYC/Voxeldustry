@@ -278,6 +278,8 @@ mod tests {
         app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
             Duration::from_millis(16),
         ));
+        // 只用 app.update() 的测试必须显式 finish，Avian 在 Plugin::finish 注册诊断资源。
+        app.finish();
         app
     }
 
@@ -335,9 +337,23 @@ mod tests {
                 assert!(!entry.streams.kinds.is_empty(), "发布时必须带 SoA 流");
             }
         }
+        // 碰撞派生：地形根实体在 physics 下带 VoxelCollider，FixedUpdate 的
+        // VoxelSet::Collision 阶段按 chunk 派生 avian Collider（纳入本场景计时）。
+        #[cfg(feature = "physics")]
+        let (collider_count, chunk_count) = {
+            let mut colliders = app.world_mut().query::<&game_engine::voxel::Collider>();
+            let collider_count = colliders.iter(app.world()).count();
+            let mut chunk_colliders =
+                app.world_mut().query::<&game_engine::voxel::VoxelCollisionChunk>();
+            let chunk_count = chunk_colliders.iter(app.world()).count();
+            (collider_count, chunk_count)
+        };
+        #[cfg(not(feature = "physics"))]
+        let (collider_count, chunk_count) = (0usize, 0usize);
+
         let per_frame = started.elapsed().as_secs_f64() * 1e3 / FRAMES as f64;
         println!(
-            "voxel scene [{}]: startup {:.1} ms | chunks={} blocks={} | {:.3} ms/frame x {} | {} frames | {} commands",
+            "voxel scene [{}]: startup {:.1} ms | chunks={} blocks={} | {:.3} ms/frame x {} | {} frames | {} commands | colliders={} chunk_colliders={}",
             profile_label(),
             startup_ms,
             stats.chunks,
@@ -345,10 +361,19 @@ mod tests {
             per_frame,
             FRAMES,
             frames,
-            commands
+            commands,
+            collider_count,
+            chunk_count
         );
         assert!(frames > 0, "移动观察者必须产生可见性变化并发布帧");
         assert!(raw_commands > 0, "体素场景必须至少下发一次 RAWVOXELS 载荷");
+        #[cfg(feature = "physics")]
+        assert!(collider_count > 0, "体素地形必须派生至少一个 avian Collider");
+        #[cfg(feature = "physics")]
+        assert!(
+            chunk_count > 0,
+            "体素地形必须派生至少一个 per-chunk VoxelCollisionChunk"
+        );
     }
 
     /// 多 LOD 体素场景（release 手动跑；debug 生成很慢）。

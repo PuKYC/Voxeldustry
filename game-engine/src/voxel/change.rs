@@ -65,9 +65,17 @@ impl VoxelChangeBuffer {
 }
 
 /// 体素机制系统阶段（仿 input::InputSet）。
+///
+/// 顺序固定为 Apply -> Collision -> Mesh：
+/// - Apply：把编辑缓冲写进 VoxVolume；
+/// - Collision：按 volume 内容派生 / 撤销物理 Collider；
+/// - Mesh：重建网格。
+///
+/// Collision 变体无论如何都存在，保证阶段顺序在不同 feature 组合下一致。
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VoxelSet {
     Apply,
+    Collision,
     Mesh,
 }
 

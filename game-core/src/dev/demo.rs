@@ -27,6 +27,11 @@ use crate::static_data::prototype::Prototype;
 use game_engine::identity::{StableEntityId, StableIdWorldExt};
 use game_engine::rng::RngState;
 use game_engine::spatial::Size;
+#[cfg(feature = "physics")]
+use game_engine::voxel::{
+    ChunkKey, MaxDepth, RigidBody, VoxOpsWrite, VoxTree, VoxVolume, VoxelCollider, VoxelInterner,
+    CHUNK_DEPTH,
+};
 
 /// 本地输入源 ID。
 pub const LOCAL_SOURCE: InputSourceId = InputSourceId(1);
@@ -127,6 +132,66 @@ fn spawn_demo_world(world: &mut World) {
             _ => {}
         }
     }
+
+    #[cfg(feature = "physics")]
+    spawn_demo_voxel_physics(world);
+}
+
+/// physics 演示：一块静态体素平台 + 一个从空中落下的动态体素方块。
+///
+/// 两者都用 VoxVolume + VoxelCollider 派生 avian Collider；没有 [VoxelInterner]
+/// （例如只挂 `DemoPlugin` 的最小测试）时整体跳过，避免污染纯演示测试。
+/// 约定实体 Transform = body 局部原点，所以平台局部 0..32 覆盖 [0, 32]。
+#[cfg(feature = "physics")]
+fn spawn_demo_voxel_physics(world: &mut World) {
+    use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
+
+    if world.get_resource::<VoxelInterner>().is_none() {
+        return;
+    }
+
+    let (platform, cube) = {
+        let mut interner = world.resource_mut::<VoxelInterner>();
+        (
+            solid_box_volume(&mut interner, DEFAULT_VOXEL_SIZE, [32, 4, 32]),
+            solid_box_volume(&mut interner, DEFAULT_VOXEL_SIZE, [8, 8, 8]),
+        )
+    };
+
+    world.spawn_stable((
+        platform,
+        VoxelCollider,
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        Size(None),
+        RigidBody::Static,
+    ));
+    world.spawn_stable((
+        cube,
+        VoxelCollider,
+        Transform::from_xyz(0.0, 24.0, 0.0),
+        Size(None),
+        RigidBody::Dynamic,
+    ));
+}
+
+/// 构造一个各轴长度为 size 的实心单 chunk VoxVolume（仅演示，每轴 <= 32）。
+#[cfg(feature = "physics")]
+fn solid_box_volume(
+    interner: &mut VoxelInterner,
+    voxel_size: game_engine::math::FixedPoint,
+    size: [i32; 3],
+) -> VoxVolume {
+    let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+    for x in 0..size[0] {
+        for y in 0..size[1] {
+            for z in 0..size[2] {
+                let _ = tree.set(interner.inner_mut(), IVec3::new(x, y, z), 1);
+            }
+        }
+    }
+    let mut volume = VoxVolume::new(voxel_size);
+    volume.insert_chunk(ChunkKey::new(0, 0, 0), tree);
+    volume
 }
 
 /// 玩家：消费 `ResolvedInput`（**已经过能力过滤**），推进。

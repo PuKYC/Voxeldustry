@@ -23,6 +23,8 @@ pub use ::voxel::store::*;
 
 mod aabb;
 mod change;
+#[cfg(feature = "physics")]
+mod collision;
 mod dirty;
 mod hash;
 mod interner;
@@ -33,6 +35,16 @@ mod volume;
 
 pub use aabb::{chunk_aabb, VoxelAabb};
 pub use change::{apply_voxel_changes, VoxelChangeBuffer, VoxelEdit, VoxelSet};
+#[cfg(feature = "physics")]
+pub use collision::{
+    build_chunk_voxels, build_voxel_collider, cleanup_voxel_colliders,
+    collect_chunk_solid_voxels, collect_solid_voxels, collect_surface_voxels,
+    sync_voxel_collision_chunks, voxel_size_meters_f32, VoxelCollider, VoxelCollisionChunk,
+    VoxelCollisionPlugin,
+};
+/// avian 物理类型再导出（physics feature）：game-core 无需直接依赖 avian3d。
+#[cfg(feature = "physics")]
+pub use avian3d::prelude::{Collider, RigidBody};
 pub use dirty::{DirtyChunk, VoxelBox, VoxelDirtySet};
 pub use hash::{
     chunk_content_hash, content_hash, count_body_nodes, dec_ref_recursive, release_body,

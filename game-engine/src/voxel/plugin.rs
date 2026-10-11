@@ -40,6 +40,11 @@ impl Plugin for VoxelPlugin {
             .init_resource::<VoxelMemoryMetric>()
             .add_systems(Update, update_voxel_memory_metric);
         app.add_systems(FixedUpdate, apply_voxel_changes.in_set(VoxelSet::Apply))
-            .configure_sets(FixedUpdate, (VoxelSet::Apply, VoxelSet::Mesh).chain());
+            .configure_sets(
+                FixedUpdate,
+                (VoxelSet::Apply, VoxelSet::Collision, VoxelSet::Mesh).chain(),
+            );
+        // 碰撞派生 / 撤销系统由 VoxelCollisionPlugin（physics feature）注册；
+        // 这里只固定 Apply -> Collision -> Mesh 的阶段顺序。
     }
 }

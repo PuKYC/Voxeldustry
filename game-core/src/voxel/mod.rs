@@ -31,6 +31,9 @@ impl Plugin for GameVoxelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LodPolicy>()
             .add_plugins(game_engine::voxel::VoxelPlugin::default());
+        // 体素物理碰撞：默认关闭；启用 physics 时补齐 avian PhysicsPlugins。
+        #[cfg(feature = "physics")]
+        app.add_plugins(game_engine::voxel::VoxelCollisionPlugin::default());
     }
 }
 
@@ -45,6 +48,8 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.add_plugins(GameVoxelPlugin);
+        // 只用 app.update() 的测试必须显式 finish，Avian 在 Plugin::finish 注册诊断资源。
+        app.finish();
 
         app.world_mut()
             .spawn((Body::island(true, DEFAULT_BIOME), IslandTag));

@@ -16,9 +16,12 @@ rstar = { workspace = true }
 crossbeam-channel = { workspace = true }
 
 [features]
-default = []
+# 默认启用体素物理碰撞（avian3d）；不需要物理的构建可用 --no-default-features。
+default = ["physics"]
 # 网络适配（replicon）——单人构建不需要，默认关闭。
 net = ["dep:bevy_replicon", "game-engine/net"]
+# 体素物理碰撞；透传 game-engine/physics（默认关）。
+physics = ["game-engine/physics"]
 
 [dev-dependencies]
 serde_json = "1"

@@ -14,6 +14,7 @@ rstar = { workspace = true }
 crossbeam-channel = { workspace = true }
 bevy_replicon = { workspace = true, optional = true }
 voxel = { path = "../crates/voxel", optional = true }
+avian3d = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -21,6 +22,8 @@ default = []
 net = ["dep:bevy_replicon"]
 # 体素世界层；把 crates/voxel re-export 给 core。
 voxel = ["dep:voxel"]
+# 体素物理碰撞派生（avian3d）；依赖 voxel。
+physics = ["dep:avian3d", "voxel"]
 
 [dev-dependencies]
 serde_json = "1"
@@ -30,3 +33,9 @@ criterion = { workspace = true }
 name = "voxel_rebuild"
 harness = false
 required-features = ["voxel"]
+
+# 体素碰撞几何构建：全体素 vs 外壳（耗时 + 临时 Vec 内存）。
+[[bench]]
+name = "voxel_collider"
+harness = false
+required-features = ["voxel", "physics"]
