@@ -32,7 +32,7 @@ void vertex() {
 	int inst = INSTANCE_ID;
 	ivec2 tex_size = textureSize(rect_data, 0);
 	int width = max(tex_size.x, 1);
-	uvec2 packed = texelFetch(rect_data, ivec2(inst % width, inst / width), 0);
+	uvec4 packed = texelFetch(rect_data, ivec2(inst % width, inst / width), 0);
 
 	uint lo = packed.x;
 	uint hi = packed.y;

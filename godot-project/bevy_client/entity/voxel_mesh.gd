@@ -3,9 +3,13 @@ extends BevyEntityNode
 ## 体素绘制节点：每块一个 MultiMeshInstance3D，逐顶点在 GPU 上把
 ## 39 bit 贪心矩形展开成四边形（见 shaders/voxel_rect.gdshader）。
 ##
-## 8 B/矩形只有一份：R32G32_UINT 纹理，由 RenderingDevice 创建 / 更新
-## （Texture2DRD 绑定给 usampler2D）。GDScript 每块只做一次
-## texture_update + instance_count 赋值，**绝不逐矩形循环**。
+## 8 B/矩形只有一份：R32G32_SFLOAT 纹理（float 位模式承载原始 u64），由
+## RenderingDevice 创建 / 更新（Texture2DRD 绑定给 sampler2D）。之所以不用
+## R32G32_UINT，是因为 Godot 4.x 的 Texture2DRD 无法把整数格式映射到
+## Image::Format，会在 texture_rd_initialize 时报 "Unsupported image format"。
+## 着色器端用 floatBitsToUint 还原 u64 位模式，无损。
+##
+## GDScript 每块只做一次 texture_update + instance_count 赋值，**绝不逐矩形循环**。
 ##
 ## 数据来源：同一实体上的 Transform 载荷给出块原点（米），RAWVOXELS 载荷给出
 ## lod + 34³ 原始体素；gdext mesher（mesh_fn）现算矩形流后上传。
@@ -89,10 +93,12 @@ func set_mesh_view(lod: int, words: PackedInt64Array) -> void:
 		return
 
 	_lod = lod
-	if _mm.visible_instance_count != count:
-		_mm.visible_instance_count = count
+	# 顺序很重要：instance_count 必须先扩容，再设置 visible_instance_count，
+	# 否则 Godot 会抛 "p_count > instance_count"。
 	if _mm.instance_count != count:
 		_mm.instance_count = count
+	if _mm.visible_instance_count != count:
+		_mm.visible_instance_count = count
 
 	_material.set_shader_parameter("voxel_size", voxel_size)
 	_material.set_shader_parameter("block_lod", lod)
@@ -156,6 +162,8 @@ func _upload(words: PackedInt64Array, count: int) -> void:
 	var height := (count + width - 1) / width
 	var needed := width * height
 
+	# PackedInt64Array 已经是小端序的 8B/word；直接把位模式原样送 GPU，
+	# 着色器端 floatBitsToUint 还原。
 	var bytes := words.to_byte_array()
 	if bytes.size() != needed * WORD_BYTES:
 		# 最后一行可能不满：补零到纹理大小（GPU 只读前 count 个 texel）。
@@ -169,7 +177,8 @@ func _upload(words: PackedInt64Array, count: int) -> void:
 
 	var fmt := RDTextureFormat.new()
 	fmt.texture_type = RenderingDevice.TEXTURE_TYPE_2D
-	fmt.format = RenderingDevice.DATA_FORMAT_R32G32_UINT
+	# 关键：用 SFLOAT 承载 u64 位模式，Texture2DRD 才认得 (Image::FORMAT_RGF)。
+	fmt.format = RenderingDevice.DATA_FORMAT_R32G32_SFLOAT
 	fmt.width = width
 	fmt.height = height
 	fmt.depth = 1
@@ -204,6 +213,7 @@ func _free_texture() -> void:
 
 
 ## 读回纹理第一个 texel，验证 u64 位模式无损（仅调试，触发 GPU 同步）。
+## 注意：R32G32_SFLOAT 下读回的字节是原始位模式，直接当 u64 解码即可。
 func _debug_verify(words: PackedInt64Array) -> void:
 	if words.is_empty():
 		return
