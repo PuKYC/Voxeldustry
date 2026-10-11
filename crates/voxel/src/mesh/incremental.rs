@@ -240,8 +240,13 @@ fn external_changed(old: &OccupancyData, next: &OccupancyData) -> [bool; 6] {
 ///
 /// Any cell change in a plane family marks {k-1, k, k+1} for ALL materials of
 /// that family (conservative: a material change alters the global union and
-/// therefore other materials' face masks and AO).  An external change reruns
-/// every slice of just that (plane, dir).
+/// therefore other materials' face masks and AO).
+///
+/// Any external change conservatively marks every slice of every plane family
+/// and direction for all materials: AO samples the tangent coordinates, so an
+/// external mask on one face can shade the perpendicular face families too.
+/// This trades extra work for cross-block AO correctness instead of tracking
+/// the exact set of slices the change can reach.
 fn build_dirty(
     old: &OccupancyData,
     next: &OccupancyData,
@@ -249,6 +254,7 @@ fn build_dirty(
     ext_changed: [bool; 6],
 ) -> BTreeSet<SliceKey> {
     let n = next.voxels_per_axis as usize;
+    let any_external_change = ext_changed.iter().any(|&changed| changed);
     let ids: BTreeSet<usize> = old
         .materials
         .iter()
@@ -259,9 +265,9 @@ fn build_dirty(
     let mut dirty = BTreeSet::new();
     for plane_data in &PLANES {
         let family = plane_data.plane.plane_index();
-        for (dir, ext) in [(Dir::Pos, plane_data.pos), (Dir::Neg, plane_data.neg)] {
+        for dir in [Dir::Pos, Dir::Neg] {
             let mut bits = expand_layers(layers[family], n);
-            if ext_changed[ext as usize] {
+            if any_external_change {
                 bits = full_mask(n);
             }
             if bits == 0 {
@@ -488,8 +494,9 @@ impl IncrementalMesh {
     }
 
     /// External-only rebuild: replace external[p] on the cached occupancy and
-    /// rerun only the affected (plane, dir) slices.  Does not rebuild
-    /// occupancy.
+    /// conservatively rerun every slice of every plane family, because AO
+    /// samples the tangent coordinates and one face mask can shade the
+    /// perpendicular families.  Does not rebuild occupancy.
     pub fn rebuild_external(
         &mut self,
         changed: &[(ExternalPlane, Box<[u64]>)],
@@ -663,6 +670,7 @@ mod tests {
                 global_active,
                 external,
                 external_exists,
+                halo: None,
                 per_material,
                 materials,
             }
@@ -697,6 +705,7 @@ mod tests {
             global_active: [AxisOccupancy::new(0); 6],
             external: vec![0; 6 * n],
             external_exists: [false; 6],
+            halo: None,
             per_material: vec![vec![0; 3 * n * n]],
             materials: vec![(1, 0)],
         }
@@ -990,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_external_only_reruns_affected_slices() {
+    fn rebuild_external_reruns_every_slice_conservatively() {
         let n = 7usize;
         let mut state = 0xabcd_ef01_2345_6789u64;
         let mut grid = Grid::new(n);
@@ -1014,11 +1023,10 @@ mod tests {
             .collect();
         let report = mesh.rebuild_external(&[(ExternalPlane::YZPos, mask)]);
 
-        for key in &report.dirty {
-            assert_eq!(key.plane, PLANE_YZ);
-            assert_eq!(key.dir, DIR_POS);
-        }
+        // AO reads the tangent coordinate, so one external change conservatively
+        // dirties every cached slice of every plane family.
         assert!(report.dirty_slices > 0);
+        assert_eq!(report.reused_slices, 0);
 
         let mut reference_occ = occ.clone();
         reference_occ.external[0..n].copy_from_slice(&mesh.occupancy().external[0..n]);

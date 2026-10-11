@@ -217,8 +217,8 @@ fn report_terrain_once(stats: Res<TerrainStats>, mut reported: Local<bool>) {
     }
     *reported = true;
     println!(
-        "[voxel_perf] chunks={} blocks={} lod={:?}",
-        stats.chunks, stats.blocks, stats.lod_blocks
+        "[voxel_perf] chunks={} blocks={} groups={} lod={:?}",
+        stats.chunks, stats.blocks, stats.groups, stats.lod_blocks
     );
 }
 
@@ -227,6 +227,7 @@ mod tests {
     use super::*;
     use crate::input::GameInputPlugin;
     use crate::presentation::{register_synced_components, PresentationPlugin, PresentationSlot};
+    use crate::voxel::terrain::TerrainGroups;
     use game_engine::aoi::AoIPlugin;
     use game_engine::identity::StableIdPlugin;
     use game_engine::spatial::SpatialPlugin;
@@ -304,10 +305,8 @@ mod tests {
         let stats = *app.world().resource::<TerrainStats>();
         assert!(stats.chunks > 0 && stats.blocks > 0);
         assert_eq!(
-            stats.blocks,
-            app.world()
-                .resource::<crate::voxel::terrain::TerrainBlocks>()
-                .len()
+            stats.groups,
+            app.world().resource::<TerrainGroups>().len()
         );
 
         let mut frames = 0usize;
@@ -321,16 +320,19 @@ mod tests {
                 commands += entry.frame.commands.len();
                 for command in entry.frame.commands.iter() {
                     if let crate::presentation::PresentationCommand::Add {
-                        payload: crate::presentation::SyncPayload::RawVoxels(payload),
+                        payload: crate::presentation::SyncPayload::RawVoxelGroups(payload),
                         ..
                     } = command
                     {
-                        assert!(!payload.is_empty(), "RAWVOXELS 载荷必须带原始体素");
+                        assert!(!payload.is_empty(), "RAWVOXELGROUPS 载荷必须带原始体素");
                         assert_eq!(payload.lod, 0);
-                        assert_eq!(
-                            payload.blocks.len(),
-                            game_engine::presentation::voxel::RAW_VOXELS
-                        );
+                        for (key, (blocks, _mask)) in &payload.chunks {
+                            assert_eq!(
+                                blocks.len(),
+                                game_engine::presentation::voxel::RAW_VOXELS,
+                                "块 {key:?} 的 halo 长度"
+                            );
+                        }
                         raw_commands += 1;
                     }
                 }
@@ -366,7 +368,10 @@ mod tests {
             chunk_count
         );
         assert!(frames > 0, "移动观察者必须产生可见性变化并发布帧");
-        assert!(raw_commands > 0, "体素场景必须至少下发一次 RAWVOXELS 载荷");
+        assert!(
+            raw_commands > 0,
+            "体素场景必须至少下发一次 RAWVOXELGROUPS 载荷"
+        );
         #[cfg(feature = "physics")]
         assert!(collider_count > 0, "体素地形必须派生至少一个 avian Collider");
         #[cfg(feature = "physics")]

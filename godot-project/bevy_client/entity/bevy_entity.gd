@@ -51,11 +51,22 @@ func reset_mesh_view() -> void:
 
 
 ## 原始体素 halo 呈现（RAWVOXELS）：默认无操作，VoxelMeshNode 覆写。
-func set_raw_voxel_view(_lod: int, _blocks: PackedByteArray) -> void:
+## skirt_mask 是 6 bit 跨 LOD 裙边掩码（0 = 无裙边）。
+func set_raw_voxel_view(_lod: int, _blocks: PackedByteArray, _skirt_mask: int) -> void:
 	pass
 
 
 func reset_raw_voxel_view() -> void:
+	pass
+
+
+## 原始体素分组呈现（RAWVOXELGROUPS）：默认无操作，VoxelGroupNode 覆写。
+## chunks 元素 shape：{ x, y, z, skirt_mask, blocks }（BTreeMap 升序）。
+func set_raw_voxel_group_view(_lod: int, _chunks: Array) -> void:
+	pass
+
+
+func reset_raw_voxel_group_view() -> void:
 	pass
 
 

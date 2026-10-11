@@ -18,9 +18,9 @@ var _interp: Dictionary = {}
 
 ## 解析一条 ADD / UPDATE 的 payload。
 func apply(e: EntityData, kind: int, c: CommandCursor) -> void:
-	# 载荷 code 不是连续上界：code 7（已删除的 RectList）留空，RAWVOXELS = 8，
-	# 而 PAYLOAD_COUNT 是「条目数」(8)。用 `kind >= PAYLOAD_COUNT` 判界会把
-	# RAWVOXELS(8) 整条丢弃 -> 实体只剩 TRANSFORM，ViewRules 匹配不到 -> nodes=0。
+	# 载荷 code 不是连续上界：code 7（已删除的 RectList）留空，RAWVOXELS = 8、
+	# RAWVOXELGROUPS = 9，而 PAYLOAD_COUNT 是「条目数」(9)。用 `kind >= PAYLOAD_COUNT`
+	# 判界会把 RAWVOXELS(8) 整条丢弃 -> 实体只剩 TRANSFORM，ViewRules 匹配不到 -> nodes=0。
 	# 未知 code 交给下面的 schema 查询兜底。
 	if kind < 0 or kind >= BevyEnums.PAYLOAD_NONE:
 		return
@@ -137,6 +137,33 @@ func _decode_wire(e: EntityData, c: CommandCursor, schema: Dictionary) -> Varian
 					blocks[j] = (chunk >> ((j & 7) * 8)) & 0xFF
 				i32i += chunk_count
 				value[name] = blocks
+			BevyEnums.Wire.CHUNK_BLOCKS:
+				# 体素分组：i32 池 = [count, (x, y, z, byte_len, skirt_mask, chunk_count, chunk...)*]，
+				# 每个 chunk 的字节与 BYTES 同构；逐块读出，保持 Rust BTreeMap 的升序。
+				# skirt_mask 是 6 bit 跨 LOD 接缝裙边掩码（0 = 无裙边），必须逐块传给子节点。
+				var group_count := int(c.i32_pool[c.i32_off + i32i])
+				if group_count < 0:
+					return null
+				i32i += 1
+				var chunks := []
+				for _chunk in group_count:
+					var cx := int(c.i32_pool[c.i32_off + i32i])
+					var cy := int(c.i32_pool[c.i32_off + i32i + 1])
+					var cz := int(c.i32_pool[c.i32_off + i32i + 2])
+					var byte_len := int(c.i32_pool[c.i32_off + i32i + 3])
+					var skirt_mask := int(c.i32_pool[c.i32_off + i32i + 4])
+					var chunk_count := int(c.i32_pool[c.i32_off + i32i + 5])
+					if byte_len < 0 or chunk_count < 0:
+						return null
+					i32i += 6
+					var blocks := PackedByteArray()
+					blocks.resize(byte_len)
+					for j in byte_len:
+						var chunk := int(c.i32_pool[c.i32_off + i32i + (j >> 3)])
+						blocks[j] = (chunk >> ((j & 7) * 8)) & 0xFF
+					i32i += chunk_count
+					chunks.append({"x": cx, "y": cy, "z": cz, "skirt_mask": skirt_mask, "blocks": blocks})
+				value[name] = chunks
 			BevyEnums.Wire.EXT_BAG:
 				var bag: Variant = _decode_ext(e, c, c.i32_off + i32i)
 				if bag == null:

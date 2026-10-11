@@ -29,6 +29,14 @@ enum Mode {
 @export_range(0, 3, 1) var voxel_max_lod: int = 0
 ## voxel_perf：LOD 距离阈值（米，x/y/z = 三档），运行期可调。
 @export var voxel_lod_thresholds: Vector3 = Vector3(32.0, 64.0, 128.0)
+## 路径 B：AO 总强度（1.0 = 当前观感、默认开启；0.0 = 完全关闭）。启动时写入 VoxelMeshNode。
+@export_range(0.0, 1.0, 0.01) var voxel_ao_strength: float = 1.0
+## 路径 B：AO 曲线指数（1.0 = 当前观感；>1 加深，<1 减淡）。
+@export_range(0.0, 8.0, 0.1) var voxel_ao_power: float = 1.0
+## 路径 B：LOD 切换交叉淡入时长（秒）。0.0 = 关闭（默认，保持旧观感）。
+@export_range(0.0, 1.0, 0.01) var voxel_lod_fade_duration: float = 0.0
+## 路径 B：跨 LOD 接缝裙边总开关（默认开启）。关闭时按 mask=0 网格化。
+@export var voxel_lod_skirts: bool = true
 
 @export_group("Runtime")
 @export var autostart: bool = true
@@ -92,6 +100,10 @@ func _ready() -> void:
 	tables = StaticTables.new(_mgr)
 	if not semantic_overrides.is_empty():
 		tables.apply_overrides(semantic_overrides)
+	# 路径 B：AO / LOD 淡入 / 裙边配置先于任何 VoxelMeshNode 物化写入静态量。
+	VoxelMeshNode.set_ao(voxel_ao_strength, voxel_ao_power)
+	VoxelMeshNode.set_lod_fade_duration(voxel_lod_fade_duration)
+	VoxelMeshNode.set_lod_skirts_enabled(voxel_lod_skirts)
 	_apply_voxel_table()
 
 	var factory := EntityFactory.new(_container)

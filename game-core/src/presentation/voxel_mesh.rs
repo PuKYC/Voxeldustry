@@ -25,8 +25,10 @@
 //! 矩形是位置无关的：块原点（米）由节点的 Transform 载荷给出，LOD 缩放
 //! voxel_size * 2^lod 由渲染侧按 RawVoxelPayload.lod 计算。
 
+use std::collections::BTreeMap;
+
 use bevy::prelude::*;
-use game_engine::voxel::RectInstance;
+use game_engine::voxel::{ChunkKey, RectInstance};
 
 /// 一个 mesh 块（32³ 基础跨度）的原始体素缓冲（内部 32³ + halo 层，共 34³）。
 ///
@@ -41,6 +43,30 @@ pub struct VoxChunkRaw {
     pub lod: u8,
     /// `extract_raw_halo` 产出的 34³ 方块 id 缓冲。
     pub blocks: Vec<u8>,
+    /// 跨 LOD 接缝裙边掩码（0 = 无裙边）。
+    ///
+    /// bit `face` 对应 ExternalPlane 顺序 `[+x, -x, +y, -y, +z, -z]`，
+    /// 由 `skirt_mask(&face_neighbors(&block, &partition))` 得到：只有面外邻居
+    /// LOD 不同（更粗 / 更细）的面才置位，同 LOD / 缺失为 0。
+    pub skirt_mask: u8,
+}
+/// 一组同一 LOD 的 mesh 块（每块 32³ 基础跨度 + halo，共 34³）。
+///
+/// `chunks` 用 `BTreeMap<ChunkKey, (Vec<u8>, u8)>`：键遍历 = ChunkKey 升序，
+/// 保证组载荷 `put_body` 逐字节确定。元组第一项是 34³ 方块 id 缓冲，布局与
+/// [VoxChunkRaw::blocks] 相同（`blocks.len() == RAW_VOXELS`，值 = 方块 id，
+/// 0 = 空气）；第二项是该块的跨 LOD 接缝裙边掩码（6 bit，ExternalPlane 顺序
+/// `[+x, -x, +y, -y, +z, -z]`，0 = 无裙边）。
+///
+/// 这是 RAWVOXELGROUPS 载荷的源组件：一个实体承载一个 LOD 分组（组内块同 LOD，
+/// 键 = `terrain::GroupKey`），Godot 侧物化一个节点、组内每块一个子
+/// VoxelMeshNode。**必须逐块携带 mask**：否则切到分组通道会静默关闭裙边。
+#[derive(Component, Clone, Debug, PartialEq, Eq, Default)]
+pub struct VoxChunkGroupRaw {
+    /// 组内所有块的 LOD 级别（0..=3）。
+    pub lod: u8,
+    /// 块原点 -> (34³ 方块 id 缓冲, 该块跨 LOD 裙边掩码)。
+    pub chunks: BTreeMap<ChunkKey, (Vec<u8>, u8)>,
 }
 
 /// 一个矩形在块局部体素坐标下的 4 个角点。

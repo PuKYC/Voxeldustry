@@ -8,9 +8,12 @@ use game_engine::presentation::packed::{
 
 use crate::input::actions::ActionId;
 
+use std::collections::BTreeMap;
+
 use super::{
     ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedHealth,
-    PresentedPrototype, PresentedVisibility, RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
+    PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload, MAX_EXT_FIELDS,
+    MAX_EXT_TAGS,
 };
 
 impl PackedPayload for PresentationState {
@@ -172,21 +175,23 @@ impl PackedPayload for InteractionHint {
     }
 }
 
-// ── 原始体素载荷：byte_len u32 LE + lod u8 + byte_len 字节（版本化、确定性）──
+// ── 原始体素载荷：byte_len u32 LE + lod u8 + skirt_mask u8 + byte_len 字节 ──
 //
 // 载荷体（不含 kind 码）字节布局：
-//   [0,4)            byte_len  u32 LE
-//   [4]              lod       u8
-//   [5,5+byte_len)   byte_len 个原始体素字节
+//   [0,4)            byte_len   u32 LE
+//   [4]              lod        u8
+//   [5]              skirt_mask u8（6 bit，ExternalPlane 顺序；0 = 无裙边）
+//   [6,6+byte_len)   byte_len 个原始体素字节
 //
 // SoA 池布局（write_pools 与 read_body 必须逐槽一致）：
-//   i32 池依次 [lod, byte_len, chunk_count, chunk...]，
+//   i32 池依次 [lod, skirt_mask, byte_len, chunk_count, chunk...]，
 //   其中 chunk_count = ceil(byte_len / 8)，每 chunk 是 8 字节小端打包的 u64
 //   （尾部补零）再 as i64。绝不 1 byte 占 1 个 i64。
 impl PackedPayload for RawVoxelPayload {
     fn put_body(&self, out: &mut Vec<u8>) {
         put_u32(out, self.blocks.len() as u32);
         put_u8(out, self.lod);
+        put_u8(out, self.skirt_mask);
         out.extend_from_slice(&self.blocks);
     }
 
@@ -194,6 +199,7 @@ impl PackedPayload for RawVoxelPayload {
         let byte_len = self.blocks.len();
         let chunk_count = byte_len.div_ceil(8);
         i.push(i64::from(self.lod));
+        i.push(i64::from(self.skirt_mask));
         i.push(byte_len as i64);
         i.push(chunk_count as i64);
         for chunk in self.blocks.chunks(8) {
@@ -210,8 +216,10 @@ impl PackedPayload for RawVoxelPayload {
     ) -> Result<(), PackedError> {
         let byte_len = r.u32()? as usize;
         let lod = r.u8()?;
+        let skirt_mask = r.u8()?;
         let chunk_count = byte_len.div_ceil(8);
         i.push(i64::from(lod));
+        i.push(i64::from(skirt_mask));
         i.push(byte_len as i64);
         i.push(chunk_count as i64);
         let mut remaining = byte_len;
@@ -231,18 +239,25 @@ impl PackedPayload for RawVoxelPayload {
 
     fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
         // 脏池 / 越界 offset 一律退化为空载荷，绝不 panic。
-        let (Some(io1), Some(io2), Some(io3)) =
-            (io.checked_add(1), io.checked_add(2), io.checked_add(3))
-        else {
+        let (Some(io1), Some(io2), Some(io3), Some(io4)) = (
+            io.checked_add(1),
+            io.checked_add(2),
+            io.checked_add(3),
+            io.checked_add(4),
+        ) else {
             return Self::default();
         };
-        let (Some(lod_raw), Some(byte_len_raw), Some(chunk_count_raw)) =
-            (i.get(io).copied(), i.get(io1).copied(), i.get(io2).copied())
-        else {
+        let (Some(lod_raw), Some(skirt_raw), Some(byte_len_raw), Some(chunk_count_raw)) = (
+            i.get(io).copied(),
+            i.get(io1).copied(),
+            i.get(io2).copied(),
+            i.get(io3).copied(),
+        ) else {
             return Self::default();
         };
-        let (Ok(lod), Ok(byte_len), Ok(chunk_count)) = (
+        let (Ok(lod), Ok(skirt_mask), Ok(byte_len), Ok(chunk_count)) = (
             u8::try_from(lod_raw),
+            u8::try_from(skirt_raw),
             usize::try_from(byte_len_raw),
             usize::try_from(chunk_count_raw),
         ) else {
@@ -251,10 +266,10 @@ impl PackedPayload for RawVoxelPayload {
         if chunk_count != byte_len.div_ceil(8) {
             return Self::default();
         }
-        let Some(chunks_end) = io3.checked_add(chunk_count) else {
+        let Some(chunks_end) = io4.checked_add(chunk_count) else {
             return Self::default();
         };
-        let Some(chunks) = i.get(io3..chunks_end) else {
+        let Some(chunks) = i.get(io4..chunks_end) else {
             return Self::default();
         };
         let mut blocks = Vec::with_capacity(byte_len);
@@ -263,7 +278,166 @@ impl PackedPayload for RawVoxelPayload {
             let take = byte_len.saturating_sub(index.saturating_mul(8)).min(8);
             blocks.extend_from_slice(&word[..take]);
         }
-        Self { lod, blocks }
+        Self {
+            lod,
+            skirt_mask,
+            blocks,
+        }
+    }
+}
+
+// ── 原始体素分组载荷：lod u8 + count u32 + 每块 (x,y,z,byte_len,skirt_mask,bytes) ──
+//
+// 载荷体（不含 kind 码）字节布局（小端）：
+//   [0]              lod        u8
+//   [1,5)            count      u32 LE
+//   每条记录（按 (x, y, z) 升序）：
+//     x, y, z        u32 LE × 3（i32 的补码位模式）
+//     byte_len       u32 LE
+//     skirt_mask     u8（6 bit，ExternalPlane 顺序；0 = 无裙边）
+//     bytes          byte_len 个原始体素字节
+//
+// SoA 池布局（write_pools 与 read_body 必须逐槽一致）：
+//   i32 池依次 [lod, count, (x, y, z, byte_len, skirt_mask, chunk_count, chunk...)*]，
+//   其中 chunk_count = ceil(byte_len / 8)，每 chunk 是 8 字节小端打包的 u64
+//   （尾部补零）再 as i64。绝不 1 byte 占 1 个 i64。
+//
+// 注意：wire 体与池的字段顺序**不同**——wire 体是 byte_len 后紧跟 skirt_mask，
+// 池是 byte_len, skirt_mask, chunk_count；两边都各自确定，GDScript 按池序解。
+impl PackedPayload for RawVoxelGroupPayload {
+    fn put_body(&self, out: &mut Vec<u8>) {
+        put_u8(out, self.lod);
+        put_u32(out, self.chunks.len() as u32);
+        // BTreeMap 升序遍历：输出逐字节确定。
+        for (key, (bytes, mask)) in &self.chunks {
+            put_u32(out, key.0 as u32);
+            put_u32(out, key.1 as u32);
+            put_u32(out, key.2 as u32);
+            put_u32(out, bytes.len() as u32);
+            put_u8(out, *mask);
+            out.extend_from_slice(bytes);
+        }
+    }
+
+    fn write_pools(&self, _f: &mut Vec<f32>, i: &mut Vec<i64>) {
+        i.push(i64::from(self.lod));
+        i.push(self.chunks.len() as i64);
+        for (key, (bytes, mask)) in &self.chunks {
+            i.push(i64::from(key.0));
+            i.push(i64::from(key.1));
+            i.push(i64::from(key.2));
+            let byte_len = bytes.len();
+            i.push(byte_len as i64);
+            i.push(i64::from(*mask));
+            i.push(byte_len.div_ceil(8) as i64);
+            for chunk in bytes.chunks(8) {
+                let mut word = [0u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                i.push(u64::from_le_bytes(word) as i64);
+            }
+        }
+    }
+
+    fn read_body(
+        r: &mut Reader<'_>,
+        _f: &mut Vec<f32>,
+        i: &mut Vec<i64>,
+    ) -> Result<(), PackedError> {
+        let lod = r.u8()?;
+        let count = r.u32()?;
+        i.push(i64::from(lod));
+        i.push(i64::from(count));
+        for _ in 0..count {
+            let x = r.u32()? as i32;
+            let y = r.u32()? as i32;
+            let z = r.u32()? as i32;
+            let byte_len = r.u32()? as usize;
+            let mask = r.u8()?;
+            let chunk_count = byte_len.div_ceil(8);
+            i.push(i64::from(x));
+            i.push(i64::from(y));
+            i.push(i64::from(z));
+            i.push(byte_len as i64);
+            i.push(i64::from(mask));
+            i.push(chunk_count as i64);
+            let mut remaining = byte_len;
+            while remaining >= 8 {
+                i.push(r.u64()? as i64);
+                remaining -= 8;
+            }
+            if remaining > 0 {
+                let mut word = [0u8; 8];
+                for byte in word.iter_mut().take(remaining) {
+                    *byte = r.u8()?;
+                }
+                i.push(u64::from_le_bytes(word) as i64);
+            }
+        }
+        Ok(())
+    }
+
+    fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
+        // 脏池 / 越界 offset 一律退化为空载荷，绝不 panic。
+        let Some(count_at) = io.checked_add(1) else {
+            return Self::default();
+        };
+        let (Some(lod_raw), Some(count_raw)) = (i.get(io).copied(), i.get(count_at).copied())
+        else {
+            return Self::default();
+        };
+        let (Ok(lod), Ok(count)) = (u8::try_from(lod_raw), usize::try_from(count_raw)) else {
+            return Self::default();
+        };
+        let mut cursor = match count_at.checked_add(1) {
+            Some(cursor) => cursor,
+            None => return Self::default(),
+        };
+        let mut chunks = BTreeMap::new();
+        for _ in 0..count {
+            // 每条记录 6 个头部槽：x, y, z, byte_len, skirt_mask, chunk_count。
+            let base = cursor;
+            let (Some(raw_x), Some(raw_y), Some(raw_z), Some(raw_len), Some(raw_mask), Some(raw_chunks)) = (
+                i.get(base).copied(),
+                i.get(base + 1).copied(),
+                i.get(base + 2).copied(),
+                i.get(base + 3).copied(),
+                i.get(base + 4).copied(),
+                i.get(base + 5).copied(),
+            ) else {
+                return Self::default();
+            };
+            let (Ok(x), Ok(y), Ok(z), Ok(byte_len), Ok(mask), Ok(chunk_count)) = (
+                i32::try_from(raw_x),
+                i32::try_from(raw_y),
+                i32::try_from(raw_z),
+                usize::try_from(raw_len),
+                u8::try_from(raw_mask),
+                usize::try_from(raw_chunks),
+            ) else {
+                return Self::default();
+            };
+            if chunk_count != byte_len.div_ceil(8) {
+                return Self::default();
+            }
+            let Some(data_start) = base.checked_add(6) else {
+                return Self::default();
+            };
+            let Some(data_end) = data_start.checked_add(chunk_count) else {
+                return Self::default();
+            };
+            let Some(words) = i.get(data_start..data_end) else {
+                return Self::default();
+            };
+            let mut blocks = Vec::with_capacity(byte_len);
+            for (index, word) in words.iter().enumerate() {
+                let bytes = (*word as u64).to_le_bytes();
+                let take = byte_len.saturating_sub(index.saturating_mul(8)).min(8);
+                blocks.extend_from_slice(&bytes[..take]);
+            }
+            chunks.insert((x, y, z), (blocks, mask));
+            cursor = data_end;
+        }
+        Self { lod, chunks }
     }
 }
 
@@ -437,9 +611,12 @@ impl PackedPayload for ExtensionPayload {
 
 #[cfg(test)]
 mod tests {
-    use crate::presentation::payload::RawVoxelPayload;
+    use std::collections::BTreeMap;
+
+    use crate::presentation::payload::{RawVoxelGroupPayload, RawVoxelPayload};
     use game_engine::presentation::packed::{PackedPayload, Reader};
     use game_engine::presentation::voxel::RAW_VOXELS;
+    use game_engine::voxel::ChunkKey;
 
     fn raw_body_bytes(payload: &RawVoxelPayload) -> Vec<u8> {
         let mut out = Vec::new();
@@ -463,50 +640,56 @@ mod tests {
         decoded
     }
 
-    /// 非空 / 空 / 非 8 倍数长度的往返必须无损。
+    /// 非空 / 空 / 非 8 倍数长度的往返必须无损，且跨 LOD 裙边掩码逐位保留。
     #[test]
     fn raw_voxel_payload_roundtrips_losslessly() {
-        for lod in [0u8, 3] {
+        // 掩码与 lod 一起覆盖：0（无裙边）与 6 bit 全置位两种。
+        for (lod, skirt_mask) in [(0u8, 0u8), (3, 0b11_1111)] {
             for len in [0usize, 1, 7, 8, 9, 17, RAW_VOXELS] {
                 let blocks: Vec<u8> = (0..len).map(|i| ((i * 7 + 1) % 256) as u8).collect();
-                let payload = RawVoxelPayload::from_halo(lod, blocks.clone());
+                let payload =
+                    RawVoxelPayload::from_halo_with_skirts(lod, blocks.clone(), skirt_mask);
                 let out = raw_body_bytes(&payload);
 
-                // 版本化布局自检：byte_len u32 LE + lod u8 + byte_len 字节。
-                assert_eq!(out.len(), 4 + 1 + len);
+                // 版本化布局自检：byte_len u32 LE + lod u8 + skirt_mask u8 + byte_len 字节。
+                assert_eq!(out.len(), 4 + 1 + 1 + len);
                 assert_eq!(
                     u32::from_le_bytes(out[0..4].try_into().unwrap()),
                     len as u32
                 );
                 assert_eq!(out[4], lod);
-                assert_eq!(&out[5..], &blocks[..]);
+                assert_eq!(out[5], skirt_mask, "掩码必须紧跟 lod 写在线格式里");
+                assert_eq!(&out[6..], &blocks[..]);
 
                 let decoded = decode_raw_body(&out);
                 assert_eq!(decoded, payload);
                 assert_eq!(decoded.blocks, blocks);
+                assert_eq!(decoded.skirt_mask, skirt_mask, "掩码往返必须无损");
             }
         }
     }
 
-    /// 池布局必须是 [lod, byte_len, chunk_count, chunk...]，chunk 数 = ceil(len/8)。
+    /// 池布局必须是 [lod, skirt_mask, byte_len, chunk_count, chunk...]，
+    /// chunk 数 = ceil(len/8)。
     #[test]
     fn raw_voxel_pool_layout_is_chunked() {
-        let payload = RawVoxelPayload::from_halo(2, vec![1, 2, 3, 4, 5]);
+        let payload = RawVoxelPayload::from_halo_with_skirts(2, vec![1, 2, 3, 4, 5], 0b10_1010);
         let mut f = Vec::new();
         let mut i = Vec::new();
         payload.write_pools(&mut f, &mut i);
         assert!(f.is_empty(), "raw 载荷不写 f32 池");
-        assert_eq!(i.len(), 3 + 1, "5 字节 = 1 个补齐 chunk");
-        assert_eq!(i[0], 2);
-        assert_eq!(i[1], 5);
-        assert_eq!(i[2], 1);
+        assert_eq!(i.len(), 4 + 1, "5 字节 = 1 个补齐 chunk");
+        assert_eq!(i[0], 2, "lod");
+        assert_eq!(i[1], 0b10_1010, "skirt_mask 紧跟 lod");
+        assert_eq!(i[2], 5, "byte_len");
+        assert_eq!(i[3], 1, "chunk_count");
         let expected = u64::from_le_bytes([1, 2, 3, 4, 5, 0, 0, 0]) as i64;
-        assert_eq!(i[3], expected);
+        assert_eq!(i[4], expected);
 
         let mut f = Vec::new();
         let mut i = Vec::new();
         RawVoxelPayload::from_halo(0, vec![9; RAW_VOXELS]).write_pools(&mut f, &mut i);
-        assert_eq!(i[2], RAW_VOXELS.div_ceil(8) as i64);
+        assert_eq!(i[3], RAW_VOXELS.div_ceil(8) as i64);
     }
 
     /// 脏池 / 越界 offset 必须退化为 default，绝不 panic。
@@ -529,6 +712,151 @@ mod tests {
         assert_eq!(
             RawVoxelPayload::from_pools(&[], &[0, 0, 0], 0, 99),
             RawVoxelPayload::default()
+        );
+    }
+    fn raw_group_body_bytes(payload: &RawVoxelGroupPayload) -> Vec<u8> {
+        let mut out = Vec::new();
+        payload.put_body(&mut out);
+        out
+    }
+
+    /// read_body 推进的池必须与 write_pools 逐槽一致，并能 from_pools 还原。
+    fn decode_raw_group_body(bytes: &[u8]) -> RawVoxelGroupPayload {
+        let mut r = Reader::new(bytes);
+        let mut f = Vec::new();
+        let mut i = Vec::new();
+        RawVoxelGroupPayload::read_body(&mut r, &mut f, &mut i)
+            .expect("raw group 载荷体必须能解码");
+        assert!(r.u8().is_err(), "载荷体必须正好消费完，不能有尾部字节");
+        let decoded = RawVoxelGroupPayload::from_pools(&f, &i, 0, 0);
+        let mut f2 = Vec::new();
+        let mut i2 = Vec::new();
+        decoded.write_pools(&mut f2, &mut i2);
+        assert_eq!(f2, f, "read_body 与 write_pools 的 f32 池必须一致");
+        assert_eq!(i2, i, "read_body 与 write_pools 的 i32 池必须逐槽一致");
+        decoded
+    }
+
+    /// 空组 / 单块 / 多块 / 完整 34³ 的往返必须无损（含逐块 mask），且字节长度精确。
+    #[test]
+    fn raw_voxel_group_payload_roundtrips_losslessly() {
+        let mut chunks: BTreeMap<ChunkKey, (Vec<u8>, u8)> = BTreeMap::new();
+        chunks.insert(
+            ChunkKey::new(-1, 5, 2),
+            ((0..10).map(|i| ((i * 3 + 1) % 256) as u8).collect(), 0b00_1010),
+        );
+        chunks.insert(ChunkKey::new(0, 0, 0), (Vec::new(), 0));
+        chunks.insert(
+            ChunkKey::new(2, -3, 4),
+            ((0..RAW_VOXELS).map(|i| (i % 251) as u8).collect(), 0b11_1111),
+        );
+        let payload = RawVoxelGroupPayload::from_chunks(1, chunks);
+
+        let out = raw_group_body_bytes(&payload);
+        // 版本化布局自检：lod u8 + count u32 + 每条记录 (12 + 4 + 1 + byte_len)。
+        let expected =
+            1 + 4 + payload.chunks.values().map(|(b, _)| 17 + b.len()).sum::<usize>();
+        assert_eq!(out.len(), expected, "载荷体字节数必须精确");
+        assert_eq!(out[0], 1, "lod 必须在小端 count 之前");
+        assert_eq!(u32::from_le_bytes(out[1..5].try_into().unwrap()), 3);
+
+        let decoded = decode_raw_group_body(&out);
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.chunks.len(), 3);
+        // 逐块 mask 与字节都必须原样回来。
+        assert_eq!(decoded.chunks[&(-1, 5, 2)].1, 0b00_1010);
+        assert_eq!(decoded.chunks[&(0, 0, 0)].1, 0);
+        assert_eq!(decoded.chunks[&(2, -3, 4)].1, 0b11_1111);
+    }
+
+    /// 池布局必须是 [lod, count, (x, y, z, byte_len, skirt_mask, chunk_count, chunk...)*]。
+    #[test]
+    fn raw_voxel_group_pool_layout_is_chunked_per_block() {
+        let mut chunks = BTreeMap::new();
+        chunks.insert(ChunkKey::new(7, -1, 0), (vec![1u8, 2, 3, 4, 5], 0b10_1010));
+        let payload = RawVoxelGroupPayload::from_chunks(2, chunks);
+        let mut f = Vec::new();
+        let mut i = Vec::new();
+        payload.write_pools(&mut f, &mut i);
+        assert!(f.is_empty(), "group 载荷不写 f32 池");
+        assert_eq!(i.len(), 2 + 6 + 1, "每记录 6 个头槽 + 1 个补齐 chunk");
+        assert_eq!(i[0], 2);
+        assert_eq!(i[1], 1);
+        assert_eq!(i[2], 7);
+        assert_eq!(i[3], -1);
+        assert_eq!(i[4], 0);
+        assert_eq!(i[5], 5, "byte_len");
+        assert_eq!(i[6], 0b10_1010, "skirt_mask 紧跟 byte_len");
+        assert_eq!(i[7], 1, "chunk_count");
+        let expected = u64::from_le_bytes([1, 2, 3, 4, 5, 0, 0, 0]) as i64;
+        assert_eq!(i[8], expected);
+    }
+
+    /// 同一组内容无论插入顺序如何，字节必须逐字节相同；记录按 ChunkKey 升序。
+    #[test]
+    fn raw_voxel_group_payload_is_byte_deterministic_and_sorted() {
+        let make = |order: &[(i32, i32, i32)]| -> BTreeMap<ChunkKey, (Vec<u8>, u8)> {
+            let mut chunks = BTreeMap::new();
+            for &(x, y, z) in order {
+                let block = vec![(x + 3) as u8, (y + 4) as u8, (z + 5) as u8];
+                // mask 随插入顺序而变：若遍历不确定，字节就会分叉。
+                let mask = ((x + 1) & 0x3F) as u8;
+                chunks.insert(ChunkKey::new(x, y, z), (block, mask));
+            }
+            chunks
+        };
+        let a = RawVoxelGroupPayload::from_chunks(2, make(&[(0, 0, 1), (-1, 5, 0), (2, -3, 4)]));
+        let b = RawVoxelGroupPayload::from_chunks(2, make(&[(2, -3, 4), (0, 0, 1), (-1, 5, 0)]));
+        assert_eq!(
+            raw_group_body_bytes(&a),
+            raw_group_body_bytes(&b),
+            "插入顺序不得影响字节"
+        );
+
+        // 手工解析记录键序列，断言升序且正好消费完。
+        let bytes = raw_group_body_bytes(&a);
+        let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        let mut cursor = 5usize;
+        let mut keys: Vec<(i32, i32, i32)> = Vec::new();
+        for _ in 0..count {
+            let x = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let y = i32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+            let z = i32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap());
+            let len =
+                u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap()) as usize;
+            // 记录头 = x,y,z(12) + byte_len(4) + skirt_mask(1)。
+            cursor += 17 + len;
+            keys.push((x, y, z));
+        }
+        assert_eq!(cursor, bytes.len(), "记录必须正好消费完载荷体");
+        assert_eq!(keys, vec![(-1, 5, 0), (0, 0, 1), (2, -3, 4)]);
+    }
+
+    /// 脏池 / 越界 offset 必须退化为 default，绝不 panic。
+    #[test]
+    fn raw_voxel_group_from_pools_degrades_on_dirty_pool() {
+        assert_eq!(
+            RawVoxelGroupPayload::from_pools(&[], &[], 0, 0),
+            RawVoxelGroupPayload::default()
+        );
+        assert_eq!(
+            RawVoxelGroupPayload::from_pools(&[], &[1], 0, 0),
+            RawVoxelGroupPayload::default()
+        );
+        // chunk_count 与 byte_len 不一致 -> default（槽：lod,count,x,y,z,len,mask,count）。
+        assert_eq!(
+            RawVoxelGroupPayload::from_pools(&[], &[0, 1, 0, 0, 0, 5, 0, 99], 0, 0),
+            RawVoxelGroupPayload::default()
+        );
+        // mask 超过 u8 -> default。
+        assert_eq!(
+            RawVoxelGroupPayload::from_pools(&[], &[0, 1, 0, 0, 0, 5, 300, 1], 0, 0),
+            RawVoxelGroupPayload::default()
+        );
+        // 越界 io -> default。
+        assert_eq!(
+            RawVoxelGroupPayload::from_pools(&[], &[0, 0, 0], 0, 99),
+            RawVoxelGroupPayload::default()
         );
     }
 }

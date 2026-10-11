@@ -12,10 +12,13 @@ pub use extension::{
     ExtensionSchema, FieldVisibility, SetOutcome, MAX_EXT_FIELDS, MAX_EXT_TAGS,
 };
 
+use std::collections::BTreeMap;
+
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use game_engine::presentation::interp::RenderTransformSample;
+use game_engine::voxel::ChunkKey;
 
 use crate::input::actions::ActionId;
 
@@ -37,6 +40,9 @@ game_engine::define_payloads! {
     // 体素表现的唯一通道：一个 32³ 块内部 + halo 层（34³）的方块 id 缓冲，
     // 由 Godot 侧自行贪婪 meshing。code 只追加。
     RawVoxels    = 8, "rawvoxels",    payload: RawVoxelPayload;
+    // 体素分组：一个组件承载同一 LOD 的多块（每块 34³ halo），按 ChunkKey 升序
+    // 序列化，Godot 侧物化「一个 LOD 分组一个节点」。code 只追加。
+    RawVoxelGroups = 9, "rawvoxelgroups", payload: RawVoxelGroupPayload;
 }
 
 /// L5：精简表现状态。
@@ -89,26 +95,88 @@ pub struct PresentedPrototype(pub u32);
 ///   `(x+1, y+1, z+1)`；
 /// - 扁平下标 `i = hx + 34 * (hy + 34 * hz)`，`hx, hy, hz ∈ [0, 34)`；
 /// - halo 是 6 个同 LOD 邻块的一层边界，仅用于剔除块边界面；缺失邻块 = 空气；
-/// - `lod` 是该 mesh 块的 LOD 级别（0..=3），体素缩放由渲染侧按 lod 处理。
+/// - `lod` 是该 mesh 块的 LOD 级别（0..=3），体素缩放由渲染侧按 lod 处理；
+/// - `skirt_mask` 是跨 LOD 接缝裙边掩码（6 bit，ExternalPlane 顺序
+///   `[+x, -x, +y, -y, +z, -z]`，0 = 无裙边）。
 ///
 /// 这是体素表现的**唯一**通道：同一个 mesh 块只下发本载荷（组件 [crate::presentation::voxel_mesh::VoxChunkRaw]）。
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RawVoxelPayload {
     /// mesh 块的 LOD 级别（0..=3）。
     pub lod: u8,
+    /// 跨 LOD 接缝裙边掩码（6 bit，ExternalPlane 顺序；0 = 无裙边）。
+    pub skirt_mask: u8,
     /// `extract_raw_halo` 的 34³ 方块 id 缓冲；长度应为 `RAW_VOXELS`。
     pub blocks: Vec<u8>,
 }
 
 impl RawVoxelPayload {
-    /// 从 `extract_raw_halo` 的缓冲构造。
+    /// 从 `extract_raw_halo` 的缓冲构造（默认无裙边）。
     pub fn from_halo(lod: u8, blocks: Vec<u8>) -> Self {
-        Self { lod, blocks }
+        Self::from_halo_with_skirts(lod, blocks, 0)
+    }
+
+    /// 从 `extract_raw_halo` 的缓冲 + 跨 LOD 裙边掩码构造。
+    pub fn from_halo_with_skirts(lod: u8, blocks: Vec<u8>, skirt_mask: u8) -> Self {
+        Self {
+            lod,
+            skirt_mask,
+            blocks,
+        }
     }
 
     /// 是否为空缓冲。
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+}
+
+/// 一组同一 LOD 的 mesh 块原始体素缓冲（每块内部 32³ + halo，共 34³）。
+///
+/// 每块的字节布局与 [RawVoxelPayload] 的 `blocks` 一致
+/// （`blocks.len() == RAW_VOXELS`，值 = 方块 id，0 = 空气）；元组第二项是该块的
+/// 跨 LOD 裙边掩码（6 bit，ExternalPlane 顺序；0 = 无裙边）。`chunks` 的键是块的
+/// 原点坐标，用 BTreeMap 保证升序遍历，于是**同一组内容无论插入顺序如何，
+/// [RawVoxelGroupPayload::put_body] 的输出逐字节相同**（确定性铁律）。
+///
+/// `ChunkKey` 在 `crates/voxel` 未派生 serde，载荷侧改用可序列化的 `(x, y, z)`
+/// 三元组键；组件 [crate::presentation::voxel_mesh::VoxChunkGroupRaw] 仍用
+/// `ChunkKey`，两者经 [RawVoxelGroupPayload::from_chunks] 转换。
+///
+/// ## 线格式（小端，载荷体**不含** kind 码）
+///
+/// ```text
+/// [0]              lod        u8
+/// [1,5)            count      u32 LE
+/// 每条记录（count 条，按 (x, y, z) 升序）：
+///   x, y, z        u32 LE × 3（i32 的补码位模式）
+///   byte_len       u32 LE
+///   skirt_mask     u8（6 bit，ExternalPlane 顺序；0 = 无裙边）
+///   bytes          byte_len 个原始体素字节
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RawVoxelGroupPayload {
+    /// 组内所有块的 LOD 级别（0..=3）。
+    pub lod: u8,
+    /// 块原点 `(x, y, z)` -> (34³ 方块 id 缓冲, 该块跨 LOD 裙边掩码)。
+    pub chunks: BTreeMap<(i32, i32, i32), (Vec<u8>, u8)>,
+}
+
+impl RawVoxelGroupPayload {
+    /// 从组件的 `ChunkKey` 表构造；BTreeMap 的升序语义原样保留。
+    pub fn from_chunks(lod: u8, chunks: BTreeMap<ChunkKey, (Vec<u8>, u8)>) -> Self {
+        Self {
+            lod,
+            chunks: chunks
+                .into_iter()
+                .map(|(key, (blocks, mask))| ((key.x, key.y, key.z), (blocks, mask)))
+                .collect(),
+        }
+    }
+
+    /// 是否为空组。
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
     }
 }
 
@@ -201,6 +269,19 @@ mod tests {
         assert!(RawVoxelPayload::default().is_empty());
     }
 
+    /// raw voxel group 载荷 code / 名字只追加，语义为「一组 34³ halo」。
+    #[test]
+    fn raw_voxel_groups_kind_is_registered_append_only() {
+        assert_eq!(PayloadKind::RawVoxelGroups.code(), 9);
+        assert_eq!(PayloadKind::RawVoxelGroups.as_str(), "rawvoxelgroups");
+        assert_eq!(PayloadKind::from_code(9), Some(PayloadKind::RawVoxelGroups));
+        assert!(!PayloadKind::RawVoxelGroups.is_perception_gated());
+        let payload = RawVoxelGroupPayload::from_chunks(1, BTreeMap::new());
+        assert_eq!(payload.lod, 1);
+        assert!(payload.is_empty());
+        assert!(RawVoxelGroupPayload::default().is_empty());
+    }
+
     /// 0..6 与 8 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
     #[test]
     fn payload_codes_are_append_only_and_code_seven_stays_vacant() {
@@ -218,6 +299,7 @@ mod tests {
             (5, "ext"),
             (6, "prototype"),
             (8, "rawvoxels"),
+            (9, "rawvoxelgroups"),
         ] {
             assert_eq!(
                 PayloadKind::from_code(code).map(|kind| kind.as_str()),

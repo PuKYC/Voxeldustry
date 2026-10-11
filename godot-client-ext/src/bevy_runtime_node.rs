@@ -389,12 +389,22 @@ impl BevyAppManager {
     /// 原始体素 halo → 39 bit 矩形流（调用 game-core mesher 现算）。
     ///
     /// lod 越界会被夹到 0..=3；blocks 是 RAWVOXELS 载荷解出的原始体素字节。
+    /// skirt_mask 是 6 bit 跨 LOD 接缝裙边掩码（ExternalPlane 顺序；0 = 无裙边）；
+    /// Godot 侧 VoxelMeshNode.lod_skirts_enabled=false 时固定传 0，行为退回
+    /// 普通 mesh_raw_halo。
     /// mesher 输出 Vec<u64>，而 u64 没有 ToGodot，这里逐元素按位转 i64
     /// 交给 PackedInt64Array（每个 u64 一个矩形，保留完整 64 位，绝不截断成 32 位）。
     #[func]
-    fn mesh_voxel_halo(&self, lod: i64, blocks: PackedByteArray) -> PackedInt64Array {
+    fn mesh_voxel_halo(
+        &self,
+        lod: i64,
+        blocks: PackedByteArray,
+        skirt_mask: i64,
+    ) -> PackedInt64Array {
         let bytes = blocks.to_vec();
-        let words = game_core::presentation::mesh_raw_halo(lod.clamp(0, 3) as u8, &bytes);
+        let mask = (skirt_mask & 0x3F) as u8;
+        let words =
+            game_core::presentation::mesh_raw_halo_with_skirts(lod.clamp(0, 3) as u8, &bytes, mask);
         let signed: Vec<i64> = words.iter().map(|w| *w as i64).collect();
         PackedInt64Array::from(&signed[..])
     }

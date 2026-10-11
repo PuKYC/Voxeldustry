@@ -26,7 +26,8 @@ pub use pack::{
 };
 pub use plan::{floor_to_lod_policy, rebuild_plan, CoverPolicy, FaceMask, MeshBlockDirty};
 pub use raw::{
-    extract_raw_halo, mesh_raw_halo, raw_halo_has_solid_interior, raw_halo_index, RAW_DIM,
-    RAW_HALO, RAW_VOXELS,
+    extract_raw_halo, extract_raw_halo_with_faces, mesh_raw_halo, mesh_raw_halo_with_skirts,
+    raw_halo_has_solid_interior, raw_halo_index, RAW_DIM, RAW_HALO, RAW_VOXELS,
 };
+pub use voxel::mesh::FaceNeighbor;
 pub use wrapped::{mesh_block_wrapped, release_body_with_cache, WrappedBlockCache};

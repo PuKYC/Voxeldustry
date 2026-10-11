@@ -1,5 +1,6 @@
 //! GPF1 打包 roundtrip / 吞吐 / 跨语言一致性测试（载荷集合由 game-core 实例化）。
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use game_engine::presentation::packed::{
@@ -9,13 +10,15 @@ use game_engine::presentation::packed::{
 
 use super::payload::{
     ExtField, ExtValue, ExtensionPayload, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelPayload, SyncPayload,
+    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload,
+    RawVoxelPayload, SyncPayload,
 };
 use super::RenderTransformSample;
 use super::{PresentationCommand, PresentationFrame, PresentationSlot};
 use crate::input::actions::ActionId;
 use game_engine::identity::StableEntityId;
 use game_engine::presentation::interp::RenderTransform;
+use game_engine::voxel::ChunkKey;
 
 fn sample_frame() -> PresentationFrame {
     let a = StableEntityId(1);
@@ -516,8 +519,8 @@ fn wire_shape(tokens: &[String]) -> (usize, usize, bool, bool) {
             "F32" | "ANGLE" => f32_count += 1,
             "VEC3" => f32_count += 3,
             "I32" | "BOOL" => i32_count += 1,
-            // TAGS / BYTES 都是「count + n 个 i32 池槽」的变长列表。
-            "TAGS" | "BYTES" => has_varlen = true,
+            // TAGS / BYTES / CHUNK_BLOCKS 都是「count + n 个 i32 池槽」的变长列表。
+            "TAGS" | "BYTES" | "CHUNK_BLOCKS" => has_varlen = true,
             "EXT_BAG" => has_ext = true,
             _ => {}
         }
@@ -560,6 +563,18 @@ fn sample_payload(kind: PayloadKind) -> SyncPayload {
             1,
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
         )),
+        PayloadKind::RawVoxelGroups => {
+            SyncPayload::RawVoxelGroups(RawVoxelGroupPayload::from_chunks(
+                1,
+                BTreeMap::from([
+                    (
+                        ChunkKey::new(0, 0, 0),
+                        (vec![1, 2, 3, 4, 5, 6, 7, 8, 9], 0b01_0101),
+                    ),
+                    (ChunkKey::new(1, 0, 0), (vec![9, 8, 7], 0)),
+                ]),
+            ))
+        }
     }
 }
 
@@ -685,7 +700,10 @@ fn gdscript_int_const(source: &str, name: &str) -> Option<i64> {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect();
     let token = token.replace('_', "");
-    if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
         i64::from_str_radix(hex, 16).ok()
     } else {
         token.parse().ok()
@@ -802,4 +820,52 @@ fn bench_packed_frame_throughput() {
         per(streams_time),
         per(commands_time),
     );
+}
+
+/// 分组解码端的 `CHUNK_BLOCKS` 分支必须消费 Rust 池里的逐块 skirt_mask 槽。
+///
+/// F2 把 live 路径从 RAWVOXELS 切到 RAWVOXELGROUPS，若 GDScript 漏读 mask，
+/// 就会静默关闭跨 LOD 裙边。这里做静态契约检查（无 Godot 二进制），并在 Rust
+/// 侧断言池布局：每条记录 = x,y,z,byte_len,skirt_mask,chunk_count + chunks。
+#[test]
+fn godot_chunk_blocks_decoder_consumes_per_chunk_skirt_mask() {
+    use game_engine::presentation::packed::PackedPayload;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let codec_path = root.join("../godot-project/bevy_client/sync/payload_codec.gd");
+    let codec = std::fs::read_to_string(&codec_path)
+        .unwrap_or_else(|error| panic!("读不到 {}: {error}", codec_path.display()));
+    let marker = "BevyEnums.Wire.CHUNK_BLOCKS:";
+    let start = codec
+        .find(marker)
+        .expect("payload_codec.gd 必须有 CHUNK_BLOCKS 分支");
+    let branch = &codec[start..];
+    // 截到下一个 wire 分支（EXT_BAG）之前，避免按字节切在多字节字符中间。
+    let end = branch
+        .find("BevyEnums.Wire.EXT_BAG:")
+        .unwrap_or(branch.len());
+    let window = &branch[..end];
+    assert!(
+        window.contains("skirt_mask"),
+        "CHUNK_BLOCKS 分支必须解码逐块 skirt_mask 并放进字典"
+    );
+    assert!(
+        window.contains("i32i + 4") && window.contains("i32i + 5"),
+        "记录头必须按池序含 skirt_mask(+4)/chunk_count(+5) 槽"
+    );
+    assert!(
+        window.contains("i32i += 6"),
+        "记录头必须前进 6 个槽（x,y,z,byte_len,skirt_mask,chunk_count）"
+    );
+
+    // Rust 侧同构自检：17 字节 = 3 个补齐 chunk，记录头 6 槽。
+    let mut chunks = BTreeMap::new();
+    chunks.insert(ChunkKey::new(1, 2, 3), (vec![7u8; 17], 0b11_0000));
+    let payload = RawVoxelGroupPayload::from_chunks(2, chunks);
+    let mut f = Vec::new();
+    let mut i = Vec::new();
+    payload.write_pools(&mut f, &mut i);
+    assert!(f.is_empty());
+    assert_eq!(i.len(), 2 + 6 + 3, "lod/count + 记录头 + ceil(17/8)");
+    assert_eq!(i[6], 0b11_0000, "mask 在 byte_len 之后的第 5 个槽");
 }

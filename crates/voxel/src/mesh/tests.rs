@@ -496,6 +496,82 @@ fn ao_is_constant_across_merged_rects() {
     );
 }
 
+/// Cross-chunk AO must sample the face-neighbour mask of the normal axis.
+#[test]
+fn ao_samples_normal_face_neighbour() {
+    let n = 4usize;
+    let mut b = OccupancyDataBuilder::new(n as u32);
+    b.external[0 * n + 0] = 1; // +X 邻块 (y=0, z=0) 实心
+    b.external_exists[0] = true;
+    let occ = b.build();
+    // +X 面位于 x=n-1，以 (row,col)=(y,z)=(1,1) 为角；负 y/负 z 采样落到外部邻居。
+    assert_eq!(
+        compute_face_ao(&occ, Plane::YZ, Dir::Pos, (n - 1) as u32, 1, 1),
+        [2, 3, 3, 3]
+    );
+}
+
+/// Cross-chunk AO must also sample a perpendicular face-neighbour mask that a
+/// tangent sample falls into.
+#[test]
+fn ao_samples_perpendicular_face_neighbour() {
+    let n = 4usize;
+    let mut b = OccupancyDataBuilder::new(n as u32);
+    b.external[0 * n + 2] = 1 << 1; // +X 邻块 (y=2, z=1) 实心
+    b.external_exists[0] = true;
+    let occ = b.build();
+    // +Y 面位于 y=2，采样时 x 越界落到 +X 邻居（切向）。
+    assert_eq!(
+        compute_face_ao(&occ, Plane::XZ, Dir::Pos, 1, 1, n - 1),
+        [3, 2, 3, 2]
+    );
+}
+
+/// `solid_at` reads face, edge and corner neighbours from the padded halo.
+#[test]
+fn solid_at_reads_padded_halo_face_edge_corner() {
+    use crate::mesh::greedy::solid_at;
+
+    let n = 4usize;
+    let hd = n + 2;
+    let idx =
+        |x: i64, y: i64, z: i64| (x + 1) as usize + hd * ((y + 1) as usize + hd * (z + 1) as usize);
+    let mut halo = vec![0u8; hd * hd * hd];
+    // 面邻居（+X 层，x = n）。
+    halo[idx(n as i64, 1, 1)] = 1;
+    // 棱邻居（+X+Y 棱，x = y = n）。
+    halo[idx(n as i64, n as i64, 2)] = 1;
+    // 角邻居（+X+Y+Z 角）。
+    halo[idx(n as i64, n as i64, n as i64)] = 1;
+
+    let mut b = OccupancyDataBuilder::new(n as u32);
+    b.halo = Some(halo.into_boxed_slice());
+    let occ = b.build();
+
+    assert!(solid_at(&occ, n, n as i64, 1, 1), "halo 面邻居");
+    assert!(solid_at(&occ, n, n as i64, n as i64, 2), "halo 棱邻居");
+    assert!(
+        solid_at(&occ, n, n as i64, n as i64, n as i64),
+        "halo 角邻居"
+    );
+    assert!(!solid_at(&occ, n, n as i64, 1, 2), "halo 空气面");
+    assert!(!solid_at(&occ, n, -2, 0, 0), "padded 范围外读空气");
+    assert!(
+        !solid_at(&occ, n, n as i64 + 1, 0, 0),
+        "padded 范围外读空气"
+    );
+
+    // 无 halo 时回落到 global + 6 面 external 的旧逻辑。
+    let mut b2 = OccupancyDataBuilder::new(n as u32);
+    b2.external[0 * n + 1] = 1 << 1; // +X 邻块 (y=1, z=1) 实心
+    let occ2 = b2.build();
+    assert!(solid_at(&occ2, n, n as i64, 1, 1), "旧逻辑：面掩码");
+    assert!(
+        !solid_at(&occ2, n, n as i64, n as i64, n as i64),
+        "旧逻辑：棱 / 角读空气"
+    );
+}
+
 /// Round-trip of the 39-bit integer packing.
 #[test]
 fn rect_instance_packing_round_trips() {

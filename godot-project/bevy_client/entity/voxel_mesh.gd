@@ -24,6 +24,17 @@ const TEX_WIDTH := 1024
 ## BevyClient 启动时从 get_voxel_table() 拉一次并写入。
 static var palette_texture: Texture2D = null
 static var voxel_size: float = 0.45
+## AO 总强度（静态全局）：1.0 = 当前观感（默认开启），0.0 = 完全关闭。
+static var ao_strength: float = 1.0
+## AO 曲线指数（静态全局）：1.0 = 当前观感（不做 pow）。
+static var ao_power: float = 1.0
+## LOD 切换交叉淡入时长（静态全局，秒）。0.0 = 关闭（默认，保持旧观感）：
+## 关闭时不写 lod_fade，shader 侧的 vec2(0,0) 是严格 no-op。
+static var lod_fade_duration: float = 0.0
+## 跨 LOD 接缝裙边总开关（静态全局，默认开启）：false 时 set_raw_voxel_view
+## 一律向 mesher 传 mask=0，行为退回普通 greedy meshing（镜像 godot_voxel 的
+## per-model lod_skirts_enabled）。
+static var lod_skirts_enabled: bool = true
 ## RAWVOXELS：由 BevyClient 装配的 gdext mesher 桥（manager.mesh_voxel_halo）。
 ## 无效时 set_raw_voxel_view 只告警，不做网格化。
 static var mesh_fn: Callable = Callable()
@@ -42,6 +53,12 @@ var _texture_rid := RID()
 var _tex_capacity := 0
 var _lod := 0
 var _has_mesh := false
+## 已写入材质的 AO 参数缓存；只在变化时写 shader，热路径不重复写。
+var _ao_strength := -1.0
+var _ao_power := -1.0
+## LOD 淡入状态：切换到新 LOD 时从"全 discard"渐变到"全显示"。
+var _fade_active := false
+var _fade_elapsed := 0.0
 
 
 func _init() -> void:
@@ -82,6 +99,28 @@ static func _shared_quad() -> QuadMesh:
 	return _quad
 
 
+## 配置 AO（静态全局，影响之后物化 / 重新上传的体素节点）。
+## strength：1.0 = 当前观感；0.0 = 完全关闭。power：1.0 = 原曲线，>1 加深。
+static func set_ao(strength: float = 1.0, power: float = 1.0) -> void:
+	ao_strength = clampf(strength, 0.0, 1.0)
+	ao_power = clampf(power, 0.0, 8.0)
+
+
+## AO 开关（静态全局）。
+static func set_ao_enabled(enabled: bool) -> void:
+	ao_strength = 1.0 if enabled else 0.0
+
+
+## 配置 LOD 交叉淡入时长（秒，静态全局）。0.0 = 关闭（默认）。
+static func set_lod_fade_duration(seconds: float) -> void:
+	lod_fade_duration = clampf(seconds, 0.0, 1.0)
+
+
+## 跨 LOD 接缝裙边开关（静态全局）。false 时所有块按 mask=0 网格化。
+static func set_lod_skirts_enabled(enabled: bool) -> void:
+	lod_skirts_enabled = enabled
+
+
 # ───────────────────────── ViewLayer 钩子 ─────────────────────────
 
 ## 内部矩形上传 helper：lod + 39 bit 矩形流（u64 原样，绝不截断成 32 位）。
@@ -92,6 +131,10 @@ func set_mesh_view(lod: int, words: PackedInt64Array) -> void:
 		reset_mesh_view()
 		return
 
+	# 同一节点被复用且 LOD 变了：启动一次淡入（首次上传不算切换）。
+	if _has_mesh and lod != _lod and lod_fade_duration > 0.0:
+		_fade_active = true
+		_fade_elapsed = 0.0
 	_lod = lod
 	# 顺序很重要：instance_count 必须先扩容，再设置 visible_instance_count，
 	# 否则 Godot 会抛 "p_count > instance_count"。
@@ -102,9 +145,11 @@ func set_mesh_view(lod: int, words: PackedInt64Array) -> void:
 
 	_material.set_shader_parameter("voxel_size", voxel_size)
 	_material.set_shader_parameter("block_lod", lod)
+	_apply_ao()
 	if palette_texture != null:
 		_material.set_shader_parameter("palette", palette_texture)
 	_material.set_shader_parameter("block_origin", global_position)
+	_apply_lod_fade(0.0)
 
 	_upload(words, count)
 	_has_mesh = true
@@ -115,15 +160,20 @@ func reset_mesh_view() -> void:
 	if _mm != null:
 		_mm.visible_instance_count = 0
 	_has_mesh = false
+	_fade_active = false
+	if _material != null:
+		_material.set_shader_parameter("lod_fade", Vector2(0.0, 0.0))
 
 
 ## 呈现原始体素 halo：调用 gdext 暴露的 Rust mesher 现算 39 bit 矩形流，
-## 再复用 set_mesh_view 上传。lod/blocks 由 ViewLayer 从 RAWVOXELS 组件解出。
-func set_raw_voxel_view(lod: int, blocks: PackedByteArray) -> void:
+## 再复用 set_mesh_view 上传。lod/blocks/skirt_mask 由 ViewLayer 从 RAWVOXELS
+## 组件解出；lod_skirts_enabled=false 时把 mask 归零（行为退回无裙边）。
+func set_raw_voxel_view(lod: int, blocks: PackedByteArray, skirt_mask: int) -> void:
 	if not mesh_fn.is_valid():
 		push_warning("[VoxelMeshNode] mesh_fn 未设置，无法网格化 RAWVOXELS halo")
 		return
-	var words: PackedInt64Array = mesh_fn.call(lod, blocks)
+	var effective_mask := skirt_mask if lod_skirts_enabled else 0
+	var words: PackedInt64Array = mesh_fn.call(lod, blocks, effective_mask)
 	set_mesh_view(lod, words)
 
 
@@ -132,10 +182,41 @@ func reset_raw_voxel_view() -> void:
 	reset_mesh_view()
 
 
-func _process(_delta: float) -> void:
+## 把静态 AO 参数同步到本节点材质（仅在与上次不同时写，避免每帧无谓更新）。
+func _apply_ao() -> void:
+	if _material == null:
+		return
+	if _ao_strength != ao_strength:
+		_material.set_shader_parameter("ao_strength", ao_strength)
+		_ao_strength = ao_strength
+	if _ao_power != ao_power:
+		_material.set_shader_parameter("ao_power", ao_power)
+		_ao_power = ao_power
+
+
+func _process(delta: float) -> void:
 	# 静态块的 Transform 不常变，但 ViewLayer 可能在本帧任何时刻改写位置。
 	if _has_mesh and _material != null:
 		_material.set_shader_parameter("block_origin", global_position)
+		_apply_ao()
+		_apply_lod_fade(delta)
+
+
+## 推进 LOD 交叉淡入。只在 _fade_active 时写 shader，结束后复位成 no-op。
+func _apply_lod_fade(delta: float) -> void:
+	if _material == null or not _fade_active:
+		return
+	if lod_fade_duration <= 0.0:
+		_fade_active = false
+		_material.set_shader_parameter("lod_fade", Vector2(0.0, 0.0))
+		return
+	_fade_elapsed += delta
+	var progress := clampf(_fade_elapsed / lod_fade_duration, 0.0, 1.0)
+	# y = 1.0（淡入）：x 从 1.0 降到 0.0，被 discard 的像素越来越少。
+	_material.set_shader_parameter("lod_fade", Vector2(1.0 - progress, 1.0))
+	if progress >= 1.0:
+		_fade_active = false
+		_material.set_shader_parameter("lod_fade", Vector2(0.0, 0.0))
 
 
 func _exit_tree() -> void:

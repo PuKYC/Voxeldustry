@@ -31,8 +31,8 @@ pub use game_engine::presentation::packed;
 // 依赖 game-core，需要经 game_core::presentation::* 取用；这是**面向 FFI 的有意
 // 重导出**，路径必须保持稳定，请勿当作冗余 import 清理。
 pub use game_engine::presentation::voxel::{
-    extract_raw_halo, mesh_raw_halo, raw_halo_has_solid_interior, raw_halo_index, RAW_DIM,
-    RAW_HALO, RAW_VOXELS,
+    extract_raw_halo, mesh_raw_halo, mesh_raw_halo_with_skirts, raw_halo_has_solid_interior,
+    raw_halo_index, RAW_DIM, RAW_HALO, RAW_VOXELS,
 };
 
 use bevy::prelude::*;
@@ -61,8 +61,8 @@ pub use game_engine::presentation::pipeline::{PresentationRuntime, PresentationV
 pub use payload::{
     project, ExtError, ExtField, ExtValue, ExtensionBag, ExtensionFieldSchema, ExtensionPayload,
     ExtensionSchema, FieldVisibility, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelPayload, SetOutcome,
-    SyncPayload, ToPresentation,
+    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload,
+    RawVoxelPayload, SetOutcome, SyncPayload, ToPresentation,
 };
 pub use semantics::{
     action_state_name, anim_name, domain_table, is_core_domain, locomotion_name, mod_hash_id,
@@ -71,7 +71,7 @@ pub use semantics::{
     OVERLAY_TAG_TABLE, SEMANTIC_DOMAINS, SOUND_TABLE, VFX_TABLE,
 };
 pub use sync::{CorePendingPresentation, CoreSyncBaseline};
-pub use voxel_mesh::{rect_corner, rect_normal, rect_scale_meters, VoxChunkRaw};
+pub use voxel_mesh::{rect_corner, rect_normal, rect_scale_meters, VoxChunkGroupRaw, VoxChunkRaw};
 
 /// 表现管线插件（引擎机制 + game-core 的收集/发布胶水）。
 pub struct PresentationPlugin;

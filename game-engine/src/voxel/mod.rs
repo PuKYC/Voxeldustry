@@ -18,7 +18,10 @@
 //! FixedPoint 转 f32。确定性：所有会产字节或决定顺序的容器一律
 //! BTreeMap / 排序 Vec，绝不用 HashMap 迭代序。
 
-pub use ::voxel::mesh::{extract_block, MeshBlock, RectBatch, RectInstance};
+pub use ::voxel::mesh::{
+    extract_block, tree_voxel_is_solid, MeshBlock, Neighbourhood, RectBatch, RectInstance,
+};
+pub use ::voxel::lod_quadtree::{restricted_quadtree, QuadLeaf};
 pub use ::voxel::store::*;
 
 mod aabb;
@@ -34,17 +37,16 @@ mod plugin;
 mod volume;
 
 pub use aabb::{chunk_aabb, VoxelAabb};
-pub use change::{apply_voxel_changes, VoxelChangeBuffer, VoxelEdit, VoxelSet};
-#[cfg(feature = "physics")]
-pub use collision::{
-    build_chunk_voxels, build_voxel_collider, cleanup_voxel_colliders,
-    collect_chunk_solid_voxels, collect_solid_voxels, collect_surface_voxels,
-    sync_voxel_collision_chunks, voxel_size_meters_f32, VoxelCollider, VoxelCollisionChunk,
-    VoxelCollisionPlugin,
-};
 /// avian 物理类型再导出（physics feature）：game-core 无需直接依赖 avian3d。
 #[cfg(feature = "physics")]
 pub use avian3d::prelude::{Collider, RigidBody};
+pub use change::{apply_voxel_changes, VoxelChangeBuffer, VoxelEdit, VoxelSet};
+#[cfg(feature = "physics")]
+pub use collision::{
+    build_chunk_voxels, build_voxel_collider, cleanup_voxel_colliders, collect_chunk_solid_voxels,
+    collect_solid_voxels, collect_surface_voxels, sync_voxel_collision_chunks,
+    voxel_size_meters_f32, VoxelCollider, VoxelCollisionChunk, VoxelCollisionPlugin,
+};
 pub use dirty::{DirtyChunk, VoxelBox, VoxelDirtySet};
 pub use hash::{
     chunk_content_hash, content_hash, count_body_nodes, dec_ref_recursive, release_body,

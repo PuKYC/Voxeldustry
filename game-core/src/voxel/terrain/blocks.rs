@@ -8,15 +8,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use game_engine::voxel::{chunk_key, ChunkKey};
+use game_engine::voxel::{chunk_key, restricted_quadtree, ChunkKey};
 
 use crate::voxel::lod::{VoxelLodConfig, MAX_LOD};
 use crate::voxel::terrain::generation::CHUNK_SIZE;
 
 /// 生成区域在 x/z 上比 mesh 区域多出的子块数。
 ///
-/// 多生成一圈是为了让边缘 mesh 块的 external 邻块采样有数据（引擎的
-/// external 掩码要求传同 LOD 的已包装邻块；缺子块会被 wrap_block 当成空气）。
+/// 多生成一圈是为了让边缘 mesh 块的 26 邻（6 面 + 12 棱 + 8 角）采样有数据：
+/// `extract_raw_halo` 要求传同 LOD 的已包装邻块；缺子块会被 wrap_block 当成
+/// 空气。LOD 合并只在完整子块组内发生，所以邻块原点最多到 `radius + 1`，
+/// 一圈 margin 足够覆盖 26 邻。
 pub const TERRAIN_MARGIN_CHUNKS: i32 = 1;
 
 /// y 方向层数（从 y=0 起算）。
@@ -70,18 +72,20 @@ pub fn lod_blocks(radius_blocks: i32, max_lod: u8, voxel_size_m: f64) -> Vec<Ter
 
 /// XZ 上按到**观察者**的距离做 LOD 合并，再按 y 层展开成块列表（确定性升序）。
 ///
-/// 合并规则（自下而上）：
+/// 划分规则（XZ 部分委托给 `voxel::restricted_quadtree`）：
 /// 1. level 0 单元 = 区域内每个基础子块 (x, z) ∈ [-radius, radius]²（与观察者无关）；
-/// 2. 若某父块（边长 2^(level+1) 个子块，原点是 2^(level+1) 的倍数）的 4 个
-///    level 子块都存在，且父块 XZ AABB 到观察者的**最近切比雪夫距离**已经落在
+/// 2. 自下而上合并：若某对齐父块（边长 2^(level+1) 个子块）的 4 个 level 子块
+///    都存在，且父块 XZ AABB 到观察者的**最近切比雪夫距离**已经落在
 ///    [VoxelLodConfig::lod_for_distance_m] 允许的 level+1 档，则合并；
-/// 3. 每个叶子的 y 层 = 从 0 起每 2^lod 层一个块，铺满 band。
+/// 3. **2:1 平衡**：把与边相邻叶子 lod 差 ≥ 2 的较粗叶子继续分裂，保证任意
+///    两个边相邻块至多差一档（跨 LOD 邻居采样 / 接缝修复的前提）；
+/// 4. 每个叶子的 y 层 = 从 0 起每 2^lod 层一个块，铺满 band。
 ///
 /// max_lod 同时决定 y band 层数（必须与 Startup 生成时的 max_lod 一致）；
 /// 观察者只改变 XZ 合并，不改变覆盖范围。
 ///
 /// 不变量（tests 里断言）：区域里每个 (x, z) 基础子块恰好被一个叶子覆盖，
-/// 且每个叶子的 y 层恰好覆盖 band 一次。
+/// 每个叶子的 y 层恰好覆盖 band 一次，且任意两个边相邻叶子的 lod 差 ≤ 1。
 #[must_use]
 pub fn lod_blocks_for_observer(
     observer_xz_m: [f64; 2],
@@ -93,77 +97,21 @@ pub fn lod_blocks_for_observer(
     let radius = radius_blocks.max(0);
     let max_lod = max_lod.min(MAX_LOD);
 
-    let mut cells: BTreeMap<(i32, i32), u8> = BTreeMap::new();
-    for x in -radius..=radius {
-        for z in -radius..=radius {
-            cells.insert((x, z), 0);
-        }
-    }
-
-    for level in 0..max_lod {
-        let size = 1i32 << level;
-        let parent_size = size * 2;
-        let mut parents: BTreeSet<(i32, i32)> = BTreeSet::new();
-        for (&(x, z), &cell_level) in cells.iter() {
-            if cell_level != level {
-                continue;
-            }
-            parents.insert((
-                x.div_euclid(parent_size) * parent_size,
-                z.div_euclid(parent_size) * parent_size,
-            ));
-        }
-
-        let mut merges: Vec<(i32, i32)> = Vec::new();
-        for &(px, pz) in parents.iter() {
-            let children = [
-                (px, pz),
-                (px + size, pz),
-                (px, pz + size),
-                (px + size, pz + size),
-            ];
-            if children
-                .iter()
-                .any(|child| cells.get(child) != Some(&level))
-            {
-                continue;
-            }
-            if !may_coarsen_for_observer(
-                observer_xz_m,
-                px,
-                pz,
-                parent_size,
-                voxel_size_m,
-                level + 1,
-                config,
-            ) {
-                continue;
-            }
-            merges.push((px, pz));
-        }
-
-        for (px, pz) in merges {
-            for child in [
-                (px, pz),
-                (px + size, pz),
-                (px, pz + size),
-                (px + size, pz + size),
-            ] {
-                cells.remove(&child);
-            }
-            cells.insert((px, pz), level + 1);
-        }
-    }
+    // XZ 划分委托给 `crates/voxel` 的受限四叉树：先自下而上合并，再做 2:1 平衡。
+    // 闭包语义 = 历史 `may_coarsen_for_observer`（同一对齐父块、同一 level）。
+    let leaves = restricted_quadtree(radius, max_lod, |px, pz, size, level| {
+        may_coarsen_for_observer(observer_xz_m, px, pz, size, voxel_size_m, level, config)
+    });
 
     let layers = y_band_layers(max_lod);
     let mut out = Vec::new();
-    for (&(x, z), &lod) in cells.iter() {
-        let step = 1i32 << lod;
+    for leaf in leaves {
+        let step = leaf.span();
         let mut y = 0;
         while y + step <= layers {
             out.push(TerrainBlock {
-                origin: chunk_key(x, y, z),
-                lod,
+                origin: chunk_key(leaf.x, y, leaf.z),
+                lod: leaf.lod,
             });
             y += step;
         }
@@ -186,6 +134,239 @@ pub fn neighbor_origins(origin: ChunkKey, lod: u8) -> [ChunkKey; 6] {
     ]
 }
 
+/// 单个面方向外侧的邻居报告（纯原点 / LOD，不含包装树）。
+///
+/// 顺序与 [`neighbor_origins`] 一致：`[+x, -x, +y, -y, +z, -z]`。
+/// 2:1 平衡（XZ）保证相邻叶子 LOD 差 ≤ 1，所以同一面的外侧只有三种情况：
+/// - `Same`：同 LOD 的单块；
+/// - `Coarser`：邻居 LOD 大 1。本块面正好落在粗邻居面的一个 16x16 子块内，
+///   `offset` = 子块首格在粗邻居面内的坐标（每个切向轴 0 或 16）；
+/// - `Finer`：邻居 LOD 小 1。本块面被 4 个细邻居按切向 2x2 象限覆盖，
+///   行优先 `[q00, q01, q10, q11]`（行 = 面的 row，列 = 面的 col）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FaceNeighbor {
+    /// 面外无块（按空气处理）。
+    Missing,
+    /// 同 LOD 邻居的原点。
+    Same(ChunkKey),
+    /// 更粗的邻居（LOD 大 1）。
+    Coarser {
+        /// 粗邻居的块原点。
+        origin: ChunkKey,
+        /// 本块面在粗邻居面内的首格（行、列；每轴 0 或 16）。
+        offset: [u8; 2],
+    },
+    /// 更细的邻居（LOD 小 1），切向 2x2 象限行优先。
+    Finer([ChunkKey; 4]),
+}
+
+/// 划分的 XZ 索引 + 块集合，供 [`face_neighbors`] 跨块复用（只建一次）。
+#[derive(Clone, Debug, Default)]
+pub struct TerrainPartition {
+    blocks: BTreeSet<(ChunkKey, u8)>,
+    xz: BTreeMap<(i32, i32), u8>,
+}
+
+impl TerrainPartition {
+    /// 由块列表构建（同一 XZ 基础格的 lod 必须一致）。
+    #[must_use]
+    pub fn new(blocks: &[TerrainBlock]) -> Self {
+        let mut set = BTreeSet::new();
+        let mut xz: BTreeMap<(i32, i32), u8> = BTreeMap::new();
+        for block in blocks {
+            set.insert((block.origin, block.lod));
+            let span = block_span(block.lod);
+            for dx in 0..span {
+                for dz in 0..span {
+                    let cell = (block.origin.x + dx, block.origin.z + dz);
+                    if let Some(previous) = xz.insert(cell, block.lod) {
+                        debug_assert_eq!(previous, block.lod, "({cell:?}) 的 XZ 叶子 lod 冲突");
+                    }
+                }
+            }
+        }
+        Self { blocks: set, xz }
+    }
+
+    /// 块集合中是否存在该 (原点, lod)。
+    #[must_use]
+    pub fn contains(&self, origin: ChunkKey, lod: u8) -> bool {
+        self.blocks.contains(&(origin, lod))
+    }
+
+    /// 某个 XZ 基础格所属叶子的 lod。
+    #[must_use]
+    pub fn xz_lod(&self, x: i32, z: i32) -> Option<u8> {
+        self.xz.get(&(x, z)).copied()
+    }
+
+    /// 某个 XZ 基础格所属叶子的 (x, z, lod)。
+    fn leaf_origin(&self, x: i32, z: i32) -> Option<(i32, i32, u8)> {
+        let lod = self.xz_lod(x, z)?;
+        let span = 1i32 << lod;
+        Some((x.div_euclid(span) * span, z.div_euclid(span) * span, lod))
+    }
+}
+
+/// 给定块与其划分，返回 6 个面的 LOD 感知邻居报告。
+///
+/// 顺序 = [`neighbor_origins`] = `[+x, -x, +y, -y, +z, -z]`。
+/// 竖直（±y）面永远是同一 XZ 叶子的上/下 y 块（同 LOD）；水平（±x / ±z）
+/// 面按 2:1 平衡只会出现 `Same` / `Coarser` / `Finer` 三种之一。
+#[must_use]
+pub fn face_neighbors(block: &TerrainBlock, partition: &TerrainPartition) -> [FaceNeighbor; 6] {
+    let span = block_span(block.lod);
+    [
+        horizontal_neighbor(partition, block.origin, block.lod, span, 1, 0),
+        horizontal_neighbor(partition, block.origin, block.lod, span, -1, 0),
+        vertical_neighbor(partition, block.origin, block.lod, span, 1),
+        vertical_neighbor(partition, block.origin, block.lod, span, -1),
+        horizontal_neighbor(partition, block.origin, block.lod, span, 0, 1),
+        horizontal_neighbor(partition, block.origin, block.lod, span, 0, -1),
+    ]
+}
+
+/// 由面邻居报告得到跨 LOD 面掩码（bit `face` 对应 [`face_neighbors`] 顺序
+/// `[+x, -x, +y, -y, +z, -z]`）。
+///
+/// 只有 `Coarser` / `Finer` 面置位；`Same` / `Missing` 为 0（同 LOD 面不加裙边，
+/// 避免多余几何 / z-fighting）。
+#[must_use]
+pub fn skirt_mask(neighbours: &[FaceNeighbor; 6]) -> u8 {
+    let mut mask = 0u8;
+    for (face, neighbour) in neighbours.iter().enumerate() {
+        if matches!(
+            neighbour,
+            FaceNeighbor::Coarser { .. } | FaceNeighbor::Finer(_)
+        ) {
+            mask |= 1 << face;
+        }
+    }
+    mask
+}
+
+/// 竖直面（±y）：同一 XZ 叶子的相邻 y 块，同 LOD。
+fn vertical_neighbor(
+    partition: &TerrainPartition,
+    origin: ChunkKey,
+    lod: u8,
+    span: i32,
+    sign: i32,
+) -> FaceNeighbor {
+    let neighbour = chunk_key(origin.x, origin.y + sign * span, origin.z);
+    if partition.contains(neighbour, lod) {
+        FaceNeighbor::Same(neighbour)
+    } else {
+        FaceNeighbor::Missing
+    }
+}
+
+/// 水平面（±x / ±z）：面外第一层基础格按切向扫描，收集所属 XZ 叶子。
+fn horizontal_neighbor(
+    partition: &TerrainPartition,
+    origin: ChunkKey,
+    lod: u8,
+    span: i32,
+    dir_x: i32,
+    dir_z: i32,
+) -> FaceNeighbor {
+    let nx = if dir_x > 0 {
+        origin.x + span
+    } else if dir_x < 0 {
+        origin.x - 1
+    } else {
+        origin.x
+    };
+    let nz = if dir_z > 0 {
+        origin.z + span
+    } else if dir_z < 0 {
+        origin.z - 1
+    } else {
+        origin.z
+    };
+    let (tan_start, normal_is_x) = if dir_x != 0 {
+        (origin.z, true)
+    } else {
+        (origin.x, false)
+    };
+
+    // 切向坐标 -> 所属叶子。同一面下最多两个不同叶子（更细时）。
+    let mut leaves: BTreeMap<i32, (i32, i32, u8)> = BTreeMap::new();
+    for t in tan_start..tan_start + span {
+        let (x, z) = if normal_is_x { (nx, t) } else { (t, nz) };
+        if let Some(leaf) = partition.leaf_origin(x, z) {
+            leaves.insert(t, leaf);
+        }
+    }
+    if leaves.is_empty() {
+        return FaceNeighbor::Missing;
+    }
+
+    let lods: BTreeSet<u8> = leaves.values().map(|(_, _, l)| *l).collect();
+    if lods.len() != 1 {
+        // 2:1 对齐下同一面的邻居 LOD 必然一致；不一致只可能是外部传入了
+        // 非划分集合，保守按空气处理。
+        debug_assert!(false, "同一面的邻居 LOD 不一致: {lods:?}");
+        return FaceNeighbor::Missing;
+    }
+    let neighbour_lod = *lods.iter().next().expect("非空");
+    let (&_, &(leaf_x, leaf_z, _)) = leaves.iter().next().expect("非空");
+
+    if neighbour_lod == lod {
+        let neighbour = chunk_key(leaf_x, origin.y, leaf_z);
+        debug_assert!(partition.contains(neighbour, lod));
+        return FaceNeighbor::Same(neighbour);
+    }
+
+    if neighbour_lod == lod + 1 {
+        // 邻居更粗：一个粗叶子覆盖整个切向范围，本块面是其 16x16 子块。
+        let coarse_span = 1i32 << neighbour_lod;
+        let y_origin = origin.y.div_euclid(coarse_span) * coarse_span;
+        let neighbour = chunk_key(leaf_x, y_origin, leaf_z);
+        debug_assert!(partition.contains(neighbour, neighbour_lod));
+        // 32 / 2^(lod+1) = 2^(4-lod)：粗格数 = 细格数 / 2。
+        let shift = 4 - i32::from(lod);
+        let row_offset = ((origin.y - y_origin) << shift) as u8;
+        let col_offset = if normal_is_x {
+            ((origin.z - leaf_z) << shift) as u8
+        } else {
+            ((origin.x - leaf_x) << shift) as u8
+        };
+        return FaceNeighbor::Coarser {
+            origin: neighbour,
+            offset: [row_offset, col_offset],
+        };
+    }
+
+    if neighbour_lod + 1 == lod {
+        // 邻居更细：切向每半区一个细叶子，竖直方向每半区一个 y 块。
+        let fine_span = 1i32 << neighbour_lod;
+        let mut by_half: [Option<(i32, i32)>; 2] = [None; 2];
+        for (_, &(lx, lz, _)) in leaves.iter() {
+            let leaf_tan = if normal_is_x { lz } else { lx };
+            let half = usize::from(leaf_tan >= tan_start + fine_span);
+            by_half[half] = Some((lx, lz));
+        }
+        let mut out = [chunk_key(0, 0, 0); 4];
+        for row_half in 0..2i32 {
+            for col_half in 0..2usize {
+                let Some((lx, lz)) = by_half[col_half] else {
+                    debug_assert!(false, "更细邻居缺少切向半区 {col_half}");
+                    return FaceNeighbor::Missing;
+                };
+                let y = origin.y + row_half * fine_span;
+                let neighbour = chunk_key(lx, y, lz);
+                debug_assert!(partition.contains(neighbour, neighbour_lod));
+                out[(row_half as usize) * 2 + col_half] = neighbour;
+            }
+        }
+        return FaceNeighbor::Finer(out);
+    }
+
+    debug_assert!(false, "LOD 差超过 1: {} -> {}", lod, neighbour_lod);
+    FaceNeighbor::Missing
+}
+
 /// 块原点（米）= origin * CHUNK_SIZE * voxel_size。
 ///
 /// **不乘 2^lod**：块内矩形单位由渲染侧按 voxel_size * 2^lod 缩放。
@@ -203,6 +384,50 @@ pub fn block_origin_meters(origin: ChunkKey, voxel_size_m: f32) -> [f32; 3] {
 #[must_use]
 pub fn block_span(lod: u8) -> i32 {
     1i32 << lod
+}
+
+/// 每个空间区域每轴覆盖的 mesh 块数（可调）。
+///
+/// 混合分组键 = LOD × 空间区域：LOD L 的单个区域边长 = `REGION_BLOCKS * 2^L`
+/// 基础子块，所以**组内所有块同 LOD**，wire 的单 `lod` 字段仍然够用。
+/// 默认 2 -> 每组至多 `2×2×2 = 8` 块，载荷有上界（见 docs §5.1）。
+pub const REGION_BLOCKS: i32 = 2;
+
+/// 混合分组键：LOD + 空间区域网格坐标（每轴 `REGION_BLOCKS` 个块）。
+///
+/// `Ord` 派生保证 `BTreeMap<GroupKey, _>` 的遍历是确定的键升序，stable id 的
+/// 分配顺序因此可复现。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupKey {
+    /// 组内所有块的 LOD 级别（0..=3）。
+    pub lod: u8,
+    /// 空间区域 X 坐标（单位 = `REGION_BLOCKS << lod` 块）。
+    pub rx: i32,
+    /// 空间区域 Y 坐标（单位 = `REGION_BLOCKS << lod` 块）。
+    pub ry: i32,
+    /// 空间区域 Z 坐标（单位 = `REGION_BLOCKS << lod` 块）。
+    pub rz: i32,
+}
+
+/// mesh 块 -> 分组键：`r* = origin.*.div_euclid(REGION_BLOCKS << lod)`。
+///
+/// 必须用欧几里得取整：负坐标下 `/` 会向零截断，导致区域边界错位 / 组重叠。
+#[must_use]
+pub fn group_key(origin: ChunkKey, lod: u8) -> GroupKey {
+    let region = REGION_BLOCKS << lod;
+    GroupKey {
+        lod,
+        rx: origin.x.div_euclid(region),
+        ry: origin.y.div_euclid(region),
+        rz: origin.z.div_euclid(region),
+    }
+}
+
+/// 分组键对应的区域原点（块坐标，对齐到 `REGION_BLOCKS << lod`）。
+#[must_use]
+pub fn group_origin(key: GroupKey) -> ChunkKey {
+    let region = REGION_BLOCKS << key.lod;
+    chunk_key(key.rx * region, key.ry * region, key.rz * region)
 }
 
 /// 父块 XZ AABB 到观察者的最近距离（米，切比雪夫 = 两轴取大）是否已经允许
@@ -306,6 +531,43 @@ mod tests {
         for cell in expected {
             assert_eq!(covered.get(&cell), Some(&1), "({cell:?}) 覆盖数不为 1");
         }
+
+        assert_two_to_one_xz(blocks, radius_blocks);
+    }
+
+    /// 2:1 平衡：任意两个 XZ 边相邻的叶子，lod 差 ≤ 1。
+    ///
+    /// 这是跨 LOD 邻居采样 / 接缝修复的前提，缺失时会出现裂缝与未剔除面。
+    fn assert_two_to_one_xz(blocks: &[TerrainBlock], radius_blocks: i32) {
+        let mut lod_at: BTreeMap<(i32, i32), u8> = BTreeMap::new();
+        for block in blocks {
+            let span = block_span(block.lod);
+            for dx in 0..span {
+                for dz in 0..span {
+                    let cell = (block.origin.x + dx, block.origin.z + dz);
+                    // 同一个 XZ 叶子的多个 y 块会重复命中同一格：lod 必须相同。
+                    if let Some(previous) = lod_at.insert(cell, block.lod) {
+                        assert_eq!(previous, block.lod, "({cell:?}) 的 XZ 叶子 lod 冲突");
+                    }
+                }
+            }
+        }
+
+        for x in -radius_blocks..=radius_blocks {
+            for z in -radius_blocks..=radius_blocks {
+                let a = lod_at[&(x, z)];
+                for (nx, nz) in [(x + 1, z), (x, z + 1)] {
+                    if nx > radius_blocks || nz > radius_blocks {
+                        continue;
+                    }
+                    let b = lod_at[&(nx, nz)];
+                    assert!(
+                        a.abs_diff(b) <= 1,
+                        "({x},{z}) lod {a} 与 ({nx},{nz}) lod {b} 违反 2:1 平衡"
+                    );
+                }
+            }
+        }
     }
 
     /// 旧签名包装：静态观察者（世界原点）的划分。
@@ -391,6 +653,49 @@ mod tests {
         assert!((meters[0] - 2.0 * 32.0 * 0.45).abs() < 1e-4);
         assert!((meters[1] - 1.0 * 32.0 * 0.45).abs() < 1e-4);
         assert!((meters[2] - (-3.0) * 32.0 * 0.45).abs() < 1e-4);
+    }
+
+    /// 分组键必须用欧几里得取整（负坐标），且随 LOD 放大区域步长。
+    #[test]
+    fn group_key_uses_euclidean_regions_and_lod_shift() {
+        // LOD0: 区域边长 = REGION_BLOCKS = 2 块。
+        assert_eq!(
+            group_key(chunk_key(0, 0, 0), 0),
+            GroupKey { lod: 0, rx: 0, ry: 0, rz: 0 }
+        );
+        assert_eq!(
+            group_key(chunk_key(1, 0, 0), 0),
+            GroupKey { lod: 0, rx: 0, ry: 0, rz: 0 }
+        );
+        assert_eq!(
+            group_key(chunk_key(2, 0, 0), 0),
+            GroupKey { lod: 0, rx: 1, ry: 0, rz: 0 }
+        );
+        // 负坐标：-1/-2 -> -1，-3 -> -2（div_euclid 而非向零截断）。
+        assert_eq!(group_key(chunk_key(-1, 0, 0), 0).rx, -1);
+        assert_eq!(group_key(chunk_key(-2, 0, 0), 0).rx, -1);
+        assert_eq!(group_key(chunk_key(-3, 0, 0), 0).rx, -2);
+        // LOD1: 区域边长 = REGION_BLOCKS << 1 = 4 块。
+        assert_eq!(group_key(chunk_key(3, 0, 0), 1).rx, 0);
+        assert_eq!(group_key(chunk_key(4, 0, 0), 1).rx, 1);
+        // group_origin 反推区域左下角（块坐标）。
+        assert_eq!(
+            group_origin(group_key(chunk_key(-3, 5, 7), 0)),
+            chunk_key(-4, 4, 6)
+        );
+        // 同一个组内的块必须映射回同一个键，且 group_origin 落在区域起点。
+        for origin in [
+            chunk_key(0, 0, 0),
+            chunk_key(1, 1, 1),
+            chunk_key(-1, -1, -1),
+        ] {
+            let key = group_key(origin, 0);
+            let start = group_origin(key);
+            assert!(origin.x - start.x >= 0 && origin.x - start.x < REGION_BLOCKS);
+            assert!(origin.y - start.y >= 0 && origin.y - start.y < REGION_BLOCKS);
+            assert!(origin.z - start.z >= 0 && origin.z - start.z < REGION_BLOCKS);
+            assert_eq!(group_key(start, 0), key);
+        }
     }
 
     #[test]
@@ -503,5 +808,173 @@ mod tests {
         // X 更远时取两轴最大值。
         let distance = nearest_block_distance_m([-30.0, 0.0, 12.0], [0.0, 0.0, 0.0], 10.0);
         assert!((distance - 30.0).abs() < 1e-9);
+    }
+
+    // ─────────────────── 跨 LOD 面邻居报告 ───────────────────
+
+    fn block(x: i32, y: i32, z: i32, lod: u8) -> TerrainBlock {
+        TerrainBlock {
+            origin: chunk_key(x, y, z),
+            lod,
+        }
+    }
+
+    /// 粗块面对细邻居：4 个细块按切向 2x2 象限行优先报告。
+    #[test]
+    fn face_neighbors_reports_finer_for_coarse_block() {
+        let coarse = block(2, 0, 0, 1);
+        let fine = [
+            block(1, 0, 0, 0),
+            block(1, 1, 0, 0),
+            block(1, 0, 1, 0),
+            block(1, 1, 1, 0),
+        ];
+        let mut blocks = vec![coarse];
+        blocks.extend_from_slice(&fine);
+        let partition = TerrainPartition::new(&blocks);
+        let neighbours = face_neighbors(&coarse, &partition);
+        // -X 面（face 1）：行 = y、列 = z，行优先。
+        assert_eq!(
+            neighbours[1],
+            FaceNeighbor::Finer([
+                chunk_key(1, 0, 0),
+                chunk_key(1, 0, 1),
+                chunk_key(1, 1, 0),
+                chunk_key(1, 1, 1),
+            ])
+        );
+        assert_eq!(neighbours[0], FaceNeighbor::Missing);
+        assert_eq!(neighbours[4], FaceNeighbor::Missing);
+    }
+
+    /// 细块面对粗邻居：单块 + 2x2 子块偏移（每轴 0 或 16）。
+    #[test]
+    fn face_neighbors_reports_coarser_with_offset() {
+        let coarse = block(2, 0, 0, 1);
+        let fine = [
+            block(1, 0, 0, 0),
+            block(1, 1, 0, 0),
+            block(1, 0, 1, 0),
+            block(1, 1, 1, 0),
+        ];
+        let mut blocks = vec![coarse];
+        blocks.extend_from_slice(&fine);
+        let partition = TerrainPartition::new(&blocks);
+
+        assert_eq!(
+            face_neighbors(&block(1, 0, 0, 0), &partition)[0],
+            FaceNeighbor::Coarser {
+                origin: chunk_key(2, 0, 0),
+                offset: [0, 0],
+            }
+        );
+        assert_eq!(
+            face_neighbors(&block(1, 0, 1, 0), &partition)[0],
+            FaceNeighbor::Coarser {
+                origin: chunk_key(2, 0, 0),
+                offset: [0, 16],
+            }
+        );
+        assert_eq!(
+            face_neighbors(&block(1, 1, 0, 0), &partition)[0],
+            FaceNeighbor::Coarser {
+                origin: chunk_key(2, 0, 0),
+                offset: [16, 0],
+            }
+        );
+        // 同 XZ 叶子的 +Y 邻块是同 LOD。
+        assert_eq!(
+            face_neighbors(&block(1, 0, 0, 0), &partition)[2],
+            FaceNeighbor::Same(chunk_key(1, 1, 0))
+        );
+    }
+
+    /// 真实划分（含多档 LOD）上报告必须自洽，且不触发 LOD 混面断言。
+    #[test]
+    fn face_neighbors_are_consistent_for_real_partition() {
+        let blocks = lod_blocks(8, 3, VOXEL_SIZE_METERS);
+        let partition = TerrainPartition::new(&blocks);
+        for block in &blocks {
+            for neighbour in face_neighbors(block, &partition) {
+                match neighbour {
+                    FaceNeighbor::Missing => {}
+                    FaceNeighbor::Same(origin) => {
+                        assert!(partition.contains(origin, block.lod), "Same 邻块必须存在");
+                    }
+                    FaceNeighbor::Coarser { origin, offset } => {
+                        assert!(
+                            partition.contains(origin, block.lod + 1),
+                            "Coarser 邻块必须以 lod+1 存在"
+                        );
+                        assert!(offset[0] == 0 || offset[0] == 16);
+                        assert!(offset[1] == 0 || offset[1] == 16);
+                    }
+                    FaceNeighbor::Finer(origins) => {
+                        assert!(block.lod >= 1);
+                        for origin in origins {
+                            assert!(
+                                partition.contains(origin, block.lod - 1),
+                                "Finer 邻块必须以 lod-1 存在"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 裙边掩码：只有跨 LOD（Coarser / Finer）面置位。
+    #[test]
+    fn skirt_mask_marks_only_cross_lod_faces() {
+        let coarse = block(2, 0, 0, 1);
+        let fine = [
+            block(1, 0, 0, 0),
+            block(1, 1, 0, 0),
+            block(1, 0, 1, 0),
+            block(1, 1, 1, 0),
+        ];
+        let mut blocks = vec![coarse];
+        blocks.extend_from_slice(&fine);
+        let partition = TerrainPartition::new(&blocks);
+        // 粗块 -X 面是 Finer -> bit 1。
+        assert_eq!(skirt_mask(&face_neighbors(&coarse, &partition)), 1 << 1);
+        // 细块 +X 面是 Coarser -> bit 0；+Z 面是 Same -> 不置位。
+        assert_eq!(
+            skirt_mask(&face_neighbors(&block(1, 0, 0, 0), &partition)),
+            1 << 0
+        );
+    }
+
+    /// ±Z 面的行列轴是 (y, x)：粗邻居的切向 x 偏移必须落在 col。
+    #[test]
+    fn face_neighbors_coarser_uses_face_row_col_axes_for_z() {
+        let coarse = block(0, 0, 2, 1);
+        let fine = [
+            block(0, 0, 1, 0),
+            block(1, 0, 1, 0),
+            block(0, 1, 1, 0),
+            block(1, 1, 1, 0),
+        ];
+        let mut blocks = vec![coarse];
+        blocks.extend_from_slice(&fine);
+        let partition = TerrainPartition::new(&blocks);
+        // 粗块 -Z 面（face 5）：行 = y、列 = x，行优先。
+        assert_eq!(
+            face_neighbors(&coarse, &partition)[5],
+            FaceNeighbor::Finer([
+                chunk_key(0, 0, 1),
+                chunk_key(1, 0, 1),
+                chunk_key(0, 1, 1),
+                chunk_key(1, 1, 1),
+            ])
+        );
+        // 细块 (1,0,1) 的 +Z 面（face 4）：x 偏移 16 应落在 col。
+        assert_eq!(
+            face_neighbors(&block(1, 0, 1, 0), &partition)[4],
+            FaceNeighbor::Coarser {
+                origin: chunk_key(0, 0, 2),
+                offset: [0, 16],
+            }
+        );
     }
 }

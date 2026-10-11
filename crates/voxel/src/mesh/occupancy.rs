@@ -126,6 +126,134 @@ impl ExternalPlane {
     }
 }
 
+/// The 26 neighbours of a meshed block, indexed by signed axis triple.
+///
+/// Slot index is `(dx + 1) + 3 * (dy + 1) + 9 * (dz + 1)` for every
+/// `(dx, dy, dz)` in `{-1, 0, 1}^3`; the centre `(0, 0, 0)` is the meshed
+/// block itself, so slot 13 is always `None`.  A `None` neighbour reads as
+/// air (missing block).
+///
+/// The raw-halo producer (`extract_raw_halo`) walks the halo shell one cell at
+/// a time, maps each cell to the neighbour that owns it and samples that
+/// neighbour directly, so no per-edge / per-corner mask table is needed.
+#[derive(Clone, Copy, Default)]
+pub struct Neighbourhood<'a> {
+    slots: [Option<&'a VoxTree<u8>>; 27],
+}
+
+/// Slot index of a sign triple in [`Neighbourhood`]'s 3x3x3 layout.
+#[must_use]
+#[inline(always)]
+pub const fn neighbour_slot(dx: i8, dy: i8, dz: i8) -> usize {
+    (dx + 1) as usize + 3 * ((dy + 1) as usize) + 9 * ((dz + 1) as usize)
+}
+
+/// Sign triple of the face at `face` in [`ExternalPlane`] order
+/// `[+x, -x, +y, -y, +z, -z]`.
+#[must_use]
+#[inline(always)]
+pub const fn face_sign(face: usize) -> (i8, i8, i8) {
+    match face {
+        0 => (1, 0, 0),
+        1 => (-1, 0, 0),
+        2 => (0, 1, 0),
+        3 => (0, -1, 0),
+        4 => (0, 0, 1),
+        _ => (0, 0, -1),
+    }
+}
+
+impl<'a> Neighbourhood<'a> {
+    /// All 26 neighbours absent (read as air).
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { slots: [None; 27] }
+    }
+
+    /// Builds a neighbourhood from the six face neighbours only.
+    ///
+    /// `faces` is in [`ExternalPlane`] order `[+x, -x, +y, -y, +z, -z]`; the
+    /// twelve edge and eight corner slots stay absent, which reproduces the
+    /// face-only AO of the tree and incremental paths.
+    #[must_use]
+    pub fn from_faces(faces: [Option<&'a VoxTree<u8>>; 6]) -> Self {
+        let mut out = Self::none();
+        for (face, tree) in faces.into_iter().enumerate() {
+            if let Some(tree) = tree {
+                let (dx, dy, dz) = face_sign(face);
+                out.slots[neighbour_slot(dx, dy, dz)] = Some(tree);
+            }
+        }
+        out
+    }
+
+    /// Reads one neighbour by sign triple.
+    #[must_use]
+    #[inline(always)]
+    pub const fn get(&self, dx: i8, dy: i8, dz: i8) -> Option<&'a VoxTree<u8>> {
+        self.slots[neighbour_slot(dx, dy, dz)]
+    }
+
+    /// Stores one neighbour by sign triple.
+    #[inline(always)]
+    pub fn set(&mut self, dx: i8, dy: i8, dz: i8, tree: &'a VoxTree<u8>) {
+        self.slots[neighbour_slot(dx, dy, dz)] = Some(tree);
+    }
+
+    /// The six face neighbours in [`ExternalPlane`] order.
+    #[must_use]
+    pub fn faces(&self) -> [Option<&'a VoxTree<u8>>; 6] {
+        let mut out = [None; 6];
+        for (face, slot) in out.iter_mut().enumerate() {
+            let (dx, dy, dz) = face_sign(face);
+            *slot = self.get(dx, dy, dz);
+        }
+        out
+    }
+}
+
+/// 单个面方向上的邻居，支持跨 LOD 聚合。
+///
+/// 与 [`Neighbourhood`] 的分工：`Neighbourhood` 按 26 邻逐格提供 AO 的
+/// 面 / 棱 / 角采样；本枚举只描述 6 个面，供外部面掩码（剔除）和面 AO 使用。
+///
+/// 2:1 平衡（XZ）保证与本块共享面的邻居 `lod` 差 ≤ 1，所以只有三种情况：
+/// - [`FaceNeighbor::Same`]：同 LOD 的单棵树，按本块分辨率逐格采样。
+/// - [`FaceNeighbor::Coarser`]：邻居 LOD 大 1（粗邻居网格更大）。本块面正好
+///   落在粗邻居面的一个 `n/2 x n/2` 子块内，`offset` = 该子块首格在粗邻居面
+///   内的坐标（每个切向轴 0 或 `n/2`，单位 = 粗格）。一个粗格覆盖本块 2x2
+///   格，任一实心即视为全实心（保守）。
+/// - [`FaceNeighbor::Finer`]：邻居 LOD 小 1（细邻居网格更小）。本块面被 4 个
+///   细邻居按切向 2x2 象限覆盖，`finer` 行优先 `[q00, q01, q10, q11]`；本块
+///   一格对应细邻居 2x2 格，任一实心即遮挡本块该格。
+#[derive(Clone, Copy)]
+pub enum FaceNeighbor<'a> {
+    /// 面外无块（按空气处理，不遮挡）。
+    Missing,
+    /// 同 LOD 邻居。
+    Same(&'a VoxTree<u8>),
+    /// 更粗的邻居（LOD 大 1）。
+    Coarser {
+        /// 粗邻居的包装树。
+        tree: &'a VoxTree<u8>,
+        /// 本块面在粗邻居面内的首格（行、列；每轴 0 或 16）。
+        offset: [u8; 2],
+    },
+    /// 更细的邻居（LOD 小 1），按切向 2x2 象限行优先。
+    Finer([&'a VoxTree<u8>; 4]),
+}
+
+impl<'a> FaceNeighbor<'a> {
+    /// 同 LOD 面邻居（`None` = 缺失）。
+    #[must_use]
+    pub fn from_optional(tree: Option<&'a VoxTree<u8>>) -> Self {
+        match tree {
+            Some(tree) => FaceNeighbor::Same(tree),
+            None => FaceNeighbor::Missing,
+        }
+    }
+}
+
 pub(crate) struct PlaneData {
     pub(crate) plane: Plane,
     pub(crate) offset_factor: usize,
@@ -213,10 +341,29 @@ pub struct OccupancyData {
     pub external: Vec<u64>,
     /// Whether an external side was explicitly provided.
     pub external_exists: [bool; 6],
+    /// Optional padded occupancy halo for AO sampling.
+    ///
+    /// When present its length is `(n + 2)^3` (n = voxels_per_axis) and it is
+    /// indexed x-major: `(x + 1) + (n + 2) * ((y + 1) + (n + 2) * (z + 1))`
+    /// for block-relative `(x, y, z)` in `-1..=n`; a non-zero byte means
+    /// solid.  The raw-voxel mesher fills this from its 34^3 byte buffer so AO
+    /// reads face, edge and corner neighbours uniformly.  `None` keeps the
+    /// legacy `global` + six face-mask sampling used by the tree and
+    /// incremental paths.
+    pub halo: Option<Box<[u8]>>,
     /// Per-material occupancy masks, sorted by material id (deterministic).
     pub per_material: Vec<Vec<u64>>,
     /// (material_id, voxel_count), sorted by material id.
     pub materials: Vec<(usize, usize)>,
+}
+
+impl OccupancyData {
+    /// Padded halo dimension per axis (n + 2); only meaningful when
+    /// [`OccupancyData::halo`] is present.
+    #[must_use]
+    pub fn halo_dim(&self) -> usize {
+        self.voxels_per_axis as usize + 2
+    }
 }
 
 /// Mutable builder for OccupancyData.
@@ -236,6 +383,8 @@ pub struct OccupancyDataBuilder {
     pub external: Vec<u64>,
     /// Flags for explicitly provided external sides.
     pub external_exists: [bool; 6],
+    /// Optional padded halo, carried through to [`OccupancyData::halo`].
+    pub halo: Option<Box<[u8]>>,
     /// Per-material masks.  A BTreeMap keeps iteration deterministic.
     pub per_material: BTreeMap<usize, Vec<u64>>,
     /// Material voxel counts.
@@ -267,6 +416,7 @@ impl OccupancyDataBuilder {
             global_active: [0u64; 6],
             external: vec![0u64; 6 * n],
             external_exists: [false; 6],
+            halo: None,
             per_material: BTreeMap::new(),
             materials: BTreeMap::new(),
         }
@@ -292,6 +442,7 @@ impl OccupancyDataBuilder {
             global_active: self.global_active.map(AxisOccupancy::new),
             external: self.external,
             external_exists: self.external_exists,
+            halo: self.halo,
             per_material,
             materials,
         }
@@ -589,6 +740,33 @@ fn occupied_at<T: VoxelTrait, A: NodeAccess<T>>(
         }
     }
     false
+}
+
+/// Samples whether `tree` holds a non-default voxel at `position`.
+///
+/// `position` is in the tree's own frame and `max_depth` is the traversal
+/// depth to read at: for a wrapped depth-`(5 + lod)` block tree meshed at
+/// `lod`, pass `tree.max_depth(lod)` and coordinates in `0..32` to get the
+/// same lod-resolution value the occupancy extractors see.  This wraps the
+/// private [`occupied_at`] so the raw-halo producer can sample a neighbour
+/// tree without duplicating octree traversal.
+#[must_use]
+pub fn tree_voxel_is_solid(
+    tree: &VoxTree<u8>,
+    interner: &VoxInterner<u8>,
+    position: IVec3,
+    max_depth: MaxDepth,
+) -> bool {
+    let root = tree.get_root_id();
+    if root.is_empty() {
+        return false;
+    }
+    occupied_at(
+        &InternerAccess(interner),
+        root,
+        position,
+        max_depth.max() as u32,
+    )
 }
 
 fn fill_masks_for_region<T: VoxelTrait, A: NodeAccess<T>>(
@@ -948,6 +1126,157 @@ pub(crate) fn generate_external_occupancy_mask_fast<T: VoxelTrait, A: NodeAccess
             };
             for r in 0..side {
                 external_plane_masks[start_row + row0 + r] |= run_mask;
+            }
+        }
+    }
+}
+
+/// 粗邻居（LOD 大 1）在细块面掩码上的保守聚合。
+///
+/// 细块面正好落在粗邻居面的一个 `n/2 x n/2` 子块内，`offset` 给出该子块首格
+/// 在粗邻居面内的坐标（每个切向轴 0 或 `n/2`，单位 = 粗格）。一个粗格覆盖
+/// 细块 2x2 格：粗格实心则对应 2x2 细格全部置位（保守剔除）。
+pub(crate) fn generate_external_occupancy_mask_coarser<T: VoxelTrait, A: NodeAccess<T>>(
+    access: &A,
+    builder: &mut OccupancyDataBuilder,
+    root_id: A::Id,
+    max_depth: MaxDepth,
+    external_plane: ExternalPlane,
+    offset: [u8; 2],
+) {
+    let max_depth = max_depth.max() as u32;
+    let voxels_per_axis = 1usize << max_depth;
+    assert_eq!(
+        builder.voxels_per_axis as usize, voxels_per_axis,
+        "builder resolution does not match max_depth"
+    );
+
+    let offset_start = external_plane as usize * voxels_per_axis;
+    builder.external_exists[external_plane as usize] = true;
+    if access.is_empty(root_id) {
+        return;
+    }
+
+    let (plane, dir) = extract_plane_dir(external_plane);
+    let pos_vox = match dir {
+        Dir::Pos => 0,
+        Dir::Neg => (voxels_per_axis - 1) as i32,
+    };
+    let half = voxels_per_axis / 2;
+    let start_row = (offset[0] as usize).min(voxels_per_axis.saturating_sub(half));
+    let start_col = (offset[1] as usize).min(voxels_per_axis.saturating_sub(half));
+    let external_plane_masks = &mut builder.external[offset_start..offset_start + voxels_per_axis];
+
+    for cr in 0..half {
+        let coarse_row = start_row + cr;
+        let fine_row = cr * 2;
+        for cc in 0..half {
+            let coarse_col = start_col + cc;
+            let solid = match plane {
+                Plane::YZ => occupied_at(
+                    access,
+                    root_id,
+                    IVec3::new(pos_vox, coarse_row as i32, coarse_col as i32),
+                    max_depth,
+                ),
+                Plane::XZ => occupied_at(
+                    access,
+                    root_id,
+                    IVec3::new(coarse_col as i32, pos_vox, coarse_row as i32),
+                    max_depth,
+                ),
+                Plane::XY => occupied_at(
+                    access,
+                    root_id,
+                    IVec3::new(coarse_col as i32, coarse_row as i32, pos_vox),
+                    max_depth,
+                ),
+            };
+            if solid {
+                let bits = 0b11u64 << (cc * 2);
+                external_plane_masks[fine_row] |= bits;
+                external_plane_masks[fine_row + 1] |= bits;
+            }
+        }
+    }
+}
+
+/// 细邻居（LOD 小 1）在粗块面掩码上的保守聚合。
+///
+/// 粗块面被 4 个细邻居按切向 2x2 象限覆盖（`trees` 行优先 `[q00,q01,q10,q11]`，
+/// 对应面的行 / 列半区）。粗块一格对应细邻居 2x2 格：4 格任一实心即遮挡该
+/// 粗格（保守剔除，避免与细几何重叠）。
+pub(crate) fn generate_external_occupancy_mask_finer<T: VoxelTrait, A: NodeAccess<T>>(
+    access: &A,
+    builder: &mut OccupancyDataBuilder,
+    trees: [A::Id; 4],
+    max_depth: MaxDepth,
+    external_plane: ExternalPlane,
+) {
+    let max_depth = max_depth.max() as u32;
+    let voxels_per_axis = 1usize << max_depth;
+    assert_eq!(
+        builder.voxels_per_axis as usize, voxels_per_axis,
+        "builder resolution does not match max_depth"
+    );
+
+    let offset_start = external_plane as usize * voxels_per_axis;
+    builder.external_exists[external_plane as usize] = true;
+    if trees.iter().all(|id| access.is_empty(*id)) {
+        return;
+    }
+
+    let (plane, dir) = extract_plane_dir(external_plane);
+    let pos_vox = match dir {
+        Dir::Pos => 0,
+        Dir::Neg => (voxels_per_axis - 1) as i32,
+    };
+    let half = voxels_per_axis / 2;
+    let external_plane_masks = &mut builder.external[offset_start..offset_start + voxels_per_axis];
+
+    for row in 0..voxels_per_axis {
+        let row_half = usize::from(row >= half);
+        let fine_row = (row % half) * 2;
+        for col in 0..voxels_per_axis {
+            let col_half = usize::from(col >= half);
+            let root = trees[row_half * 2 + col_half];
+            if access.is_empty(root) {
+                continue;
+            }
+            let fine_col = (col % half) * 2;
+            let mut solid = false;
+            'quad: for dr in 0..2usize {
+                for dc in 0..2usize {
+                    let r = fine_row + dr;
+                    let c = fine_col + dc;
+                    let hit = match plane {
+                        Plane::YZ => occupied_at(
+                            access,
+                            root,
+                            IVec3::new(pos_vox, r as i32, c as i32),
+                            max_depth,
+                        ),
+                        Plane::XZ => occupied_at(
+                            access,
+                            root,
+                            IVec3::new(c as i32, pos_vox, r as i32),
+                            max_depth,
+                        ),
+                        Plane::XY => occupied_at(
+                            access,
+                            root,
+                            IVec3::new(c as i32, r as i32, pos_vox),
+                            max_depth,
+                        ),
+                    };
+                    if hit {
+                        solid = true;
+                        break 'quad;
+                    }
+                }
+            }
+            if solid {
+                external_plane_masks[row] |= 1u64 << col;
             }
         }
     }

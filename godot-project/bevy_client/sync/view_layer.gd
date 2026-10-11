@@ -162,7 +162,17 @@ func _present_view(data: EntityData, node: BevyEntityNode, kind: int, view: int)
 			if raw_value is Dictionary:
 				node.set_raw_voxel_view(
 					int(raw_value.get("lod", 0)),
-					raw_value.get("blocks", PackedByteArray())
+					raw_value.get("blocks", PackedByteArray()),
+					int(raw_value.get("skirt_mask", 0))
+				)
+		BevyEnums.View.RAWVOXELGROUP:
+			var group_value = data.get_component(kind)
+			if group_value is Dictionary:
+				# chunks 是 Array[{x, y, z, skirt_mask, blocks}]：逐块 mask 随字典一起
+				# 交给 VoxelGroupNode，再由它透传给各子 VoxelMeshNode。
+				node.set_raw_voxel_group_view(
+					int(group_value.get("lod", 0)),
+					group_value.get("chunks", [])
 				)
 
 
@@ -181,5 +191,7 @@ func _reset_view(node: BevyEntityNode, view: int) -> void:
 			node.visible = true
 		BevyEnums.View.RAWVOXEL:
 			node.reset_raw_voxel_view()
+		BevyEnums.View.RAWVOXELGROUP:
+			node.reset_raw_voxel_group_view()
 		_:
 			pass

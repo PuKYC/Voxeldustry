@@ -13,10 +13,16 @@ extends RefCounted
 enum Build {
 	PROTOTYPE_SCENE, ## 用 PROTOTYPE.prototype_id 从 EntityFactory 取 PackedScene
 	VOXEL_RAW,       ## 原始体素 halo：gdext mesher 现算矩形流后交给 VoxelMeshNode
+	VOXEL_GROUP,     ## 原始体素分组：VoxelGroupNode 内每块一个子 VoxelMeshNode
 }
 
 ## 从上到下取第一条满足的规则；没有返回 {}。
 var RULES: Array = [
+	{
+		"name": "voxel_group",
+		"require": [BevyEnums.Payload.TRANSFORM, BevyEnums.Payload.RAWVOXELGROUPS],
+		"build": Build.VOXEL_GROUP,
+	},
 	{
 		"name": "voxel_raw",
 		"require": [BevyEnums.Payload.TRANSFORM, BevyEnums.Payload.RAWVOXELS],

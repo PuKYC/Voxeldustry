@@ -29,9 +29,10 @@ use glam::{UVec2, UVec3};
 
 use crate::store::{ChunkKey, Lod, MaxDepth, VoxInterner, VoxOpsConfig, VoxTree};
 
-use self::greedy::extract_rects;
+use self::greedy::{append_skirts, extract_rects};
 use self::occupancy::{
-    build_local_block_tree, generate_external_occupancy_mask_fast,
+    build_local_block_tree, generate_external_occupancy_mask_coarser,
+    generate_external_occupancy_mask_fast, generate_external_occupancy_mask_finer,
     generate_external_occupancy_mask_generic, generate_occupancy_masks_generic, ExternalPlane,
     InternerAccess, OccupancyData,
 };
@@ -45,7 +46,8 @@ pub use self::incremental::{IncrementalMesh, SliceFaces, SliceKey, SliceRebuildR
 pub use self::lod::{voxels_per_axis, wrap_block};
 pub use self::occupancy::{
     extract_plane_dir, generate_external_occupancy_mask, generate_external_occupancy_mask_slow,
-    generate_occupancy_masks, AxisOccupancy, Dir, ExternalPlane as ExternalPlaneKind,
+    generate_occupancy_masks, tree_voxel_is_solid, AxisOccupancy, Dir,
+    ExternalPlane as ExternalPlaneKind, FaceNeighbor, Neighbourhood,
     OccupancyData as MeshOccupancyData, OccupancyDataBuilder, Plane,
 };
 
@@ -263,6 +265,48 @@ fn run(occupancy: &OccupancyData, origin: ChunkKey, lod: Lod) -> AoRectBatch {
     finish(origin, lod, pairs)
 }
 
+/// Meshes an already-built occupancy grid, returning greedy rects plus AO.
+///
+/// This is the "occupancy -> greedy rectangles" seam used by the raw-halo
+/// mesher: callers that can build an [OccupancyData] directly (from a 34^3 raw
+/// byte buffer, say) no longer need to materialise a temporary voxel tree just
+/// to feed the extractor.  The batch is sorted exactly like
+/// [`extract_block_tree_with_ao`]'s.
+#[must_use]
+pub fn mesh_occupancy_with_ao(
+    occupancy: &OccupancyData,
+    origin: ChunkKey,
+    lod: Lod,
+) -> AoRectBatch {
+    run(occupancy, origin, lod)
+}
+
+/// 与 [`mesh_occupancy_with_ao`] 相同，但在 `skirt_mask` 置位的面上追加跨 LOD
+/// 接缝裙边（AO 满亮）。`skirt_mask == 0` 时输出与前者逐位一致。
+#[must_use]
+pub fn mesh_occupancy_with_ao_and_skirts(
+    occupancy: &OccupancyData,
+    origin: ChunkKey,
+    lod: Lod,
+    skirt_mask: u8,
+) -> AoRectBatch {
+    let mut pairs: Vec<(RectInstance, [u8; 4])> = {
+        let mut rects = Vec::new();
+        let mut ao = Vec::new();
+        extract_rects(occupancy, &mut rects, &mut ao);
+        debug_assert_eq!(rects.len(), ao.len());
+        rects.into_iter().zip(ao).collect()
+    };
+    if skirt_mask != 0 {
+        let mut rects = Vec::new();
+        let mut ao = Vec::new();
+        append_skirts(occupancy, skirt_mask, &mut rects, &mut ao);
+        debug_assert_eq!(rects.len(), ao.len());
+        pairs.extend(rects.into_iter().zip(ao));
+    }
+    finish(origin, lod, pairs)
+}
+
 fn build_local_occupancy(
     chunks: &BTreeMap<ChunkKey, VoxTree<u8>>,
     interner: &VoxInterner<u8>,
@@ -356,6 +400,90 @@ pub fn build_tree_occupancy(
                     plane,
                     UVec2::ZERO,
                 );
+            }
+        }
+    }
+
+    builder.build()
+}
+
+/// LOD-aware counterpart of [`build_tree_occupancy`].
+///
+/// 与 `build_tree_occupancy` 相同，但六个面用 [`FaceNeighbor`] 描述：同 LOD
+/// 邻居逐格采样，粗邻居按 2x2 保守聚合，细邻居按 2x2 任一实心剔除。这样
+/// `extract_raw_halo` 在 LOD 交界处产出的 external 面掩码与 halo 自洽，粗 /
+/// 细两侧不会各自封边造成重叠。
+#[must_use]
+pub fn build_tree_occupancy_lod(
+    tree: &VoxTree<u8>,
+    interner: &VoxInterner<u8>,
+    lod: Lod,
+    external: [FaceNeighbor<'_>; 6],
+    clear_external_planes: [bool; 6],
+) -> OccupancyData {
+    let mesh_depth = tree.max_depth(lod);
+    let n = 1u32 << mesh_depth.max();
+    let mut builder = OccupancyDataBuilder::new(n);
+
+    for plane in ExternalPlane::ALL {
+        if clear_external_planes[plane as usize] {
+            builder.fill_external_side(plane);
+        }
+    }
+
+    let access = InternerAccess(interner);
+    generate_occupancy_masks_generic(
+        &access,
+        tree.get_root_id(),
+        &mut builder,
+        mesh_depth,
+        UVec3::ZERO,
+    );
+
+    for (face, neighbor) in external.iter().enumerate() {
+        let plane = ExternalPlane::from_index(face);
+        match neighbor {
+            FaceNeighbor::Missing => {}
+            FaceNeighbor::Same(neighbour) => {
+                let root = neighbour.get_root_id();
+                if !root.is_empty() {
+                    generate_external_occupancy_mask_fast(
+                        &access,
+                        &mut builder,
+                        root,
+                        mesh_depth,
+                        plane,
+                        UVec2::ZERO,
+                    );
+                }
+            }
+            FaceNeighbor::Coarser {
+                tree: neighbour,
+                offset,
+            } => {
+                let root = neighbour.get_root_id();
+                if !root.is_empty() {
+                    generate_external_occupancy_mask_coarser(
+                        &access,
+                        &mut builder,
+                        root,
+                        mesh_depth,
+                        plane,
+                        *offset,
+                    );
+                }
+            }
+            FaceNeighbor::Finer(trees) => {
+                let roots = trees.map(|neighbour| neighbour.get_root_id());
+                if roots.iter().any(|root| !root.is_empty()) {
+                    generate_external_occupancy_mask_finer(
+                        &access,
+                        &mut builder,
+                        roots,
+                        mesh_depth,
+                        plane,
+                    );
+                }
             }
         }
     }

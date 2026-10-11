@@ -302,6 +302,11 @@ fn payload_to_dictionary(payload: &SyncPayload) -> VarDictionary {
             // Dictionary 兼容通道不支持。
         }
 
+        SyncPayload::RawVoxelGroups(_) => {
+            // 原始体素分组同样只走 GPF1 紧凑通道（Godot 侧合并 MultiMesh）；
+            // Dictionary 兼容通道不支持。
+        }
+
         SyncPayload::Transform(sample) => {
             // `PackedArray` 是 ByRef 类型，必须传引用（`&x`）。
             // 下发插值两端点，Godot 在渲染时刻按帧上的 `alpha` 采样。

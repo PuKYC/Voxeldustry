@@ -84,20 +84,65 @@ fn ao_is_constant(code: [u8; 4]) -> bool {
     code[0] == code[1] && code[1] == code[2] && code[2] == code[3]
 }
 
-/// Reads one occupancy bit at (row, col) of the plane at normal index layer.
+/// Reads the solid bit at block-relative voxel coordinates `(x, y, z)`.
+///
+/// When [`OccupancyData::halo`] is present every coordinate in `-1..=n`
+/// (interior *and* the one-voxel pad) reads the padded 3-D array, so AO sees
+/// face, edge and corner neighbours through one uniform lookup; anything
+/// farther out reads air.
+///
+/// Without a halo: coordinates inside `0..n` read the block's own occupancy,
+/// exactly one coordinate of `-1` or `n` reads the matching face-neighbour
+/// mask in `OccupancyData::external` (the neighbour's adjacent layer), and two
+/// or more out-of-range coordinates read air.  That is the tree / incremental
+/// path's face-only AO.
 #[inline(always)]
-fn occupancy_bit(
-    occupancy: &OccupancyData,
-    plane_offset: usize,
-    n: usize,
-    layer: i64,
-    row: i64,
-    col: i64,
-) -> bool {
-    if layer < 0 || layer >= n as i64 || row < 0 || col < 0 || row >= n as i64 || col >= n as i64 {
-        return false;
+pub(crate) fn solid_at(occupancy: &OccupancyData, n: usize, x: i64, y: i64, z: i64) -> bool {
+    if let Some(halo) = occupancy.halo.as_deref() {
+        let nx = n as i64;
+        if x < -1 || x > nx || y < -1 || y > nx || z < -1 || z > nx {
+            return false;
+        }
+        let hd = n + 2;
+        let idx = (x + 1) as usize + hd * ((y + 1) as usize + hd * (z + 1) as usize);
+        return halo[idx] != 0;
     }
-    (occupancy.global[plane_offset + row as usize * n + col as usize] >> layer) & 1 != 0
+    let nx = n as i64;
+    let mut out = 0u32;
+    if x < 0 || x >= nx {
+        out += 1;
+    }
+    if y < 0 || y >= nx {
+        out += 1;
+    }
+    if z < 0 || z >= nx {
+        out += 1;
+    }
+    match out {
+        0 => (occupancy.global[y as usize * n + z as usize] >> x) & 1 != 0,
+        1 => {
+            // Face order [YZ+, YZ-, XZ+, XZ-, XY+, XY-]; each mask is indexed
+            // (row, col) per the plane convention, bit = normal axis.
+            let (face, row, col) = if x < 0 {
+                (1usize, y, z)
+            } else if x >= nx {
+                (0usize, y, z)
+            } else if y < 0 {
+                (3usize, z, x)
+            } else if y >= nx {
+                (2usize, z, x)
+            } else if z < 0 {
+                (5usize, y, x)
+            } else {
+                (4usize, y, x)
+            };
+            if row < 0 || col < 0 || row >= nx || col >= nx {
+                return false;
+            }
+            (occupancy.external[face * n + row as usize] >> col) & 1 != 0
+        }
+        _ => false,
+    }
 }
 
 /// Computes the 4-corner AO code of a single face.
@@ -114,14 +159,20 @@ pub fn compute_face_ao(
     col: usize,
 ) -> [u8; 4] {
     let n = occupancy.voxels_per_axis as usize;
-    let plane_offset = plane.plane_index() * n * n;
     let layer: i64 = match dir {
         Dir::Pos => slice_bit as i64 + 1,
         Dir::Neg => slice_bit as i64 - 1,
     };
     let r = row as i64;
     let c = col as i64;
-    let at = |dr: i64, dc: i64| occupancy_bit(occupancy, plane_offset, n, layer, r + dr, c + dc);
+    let at = |dr: i64, dc: i64| {
+        let (x, y, z) = match plane {
+            Plane::YZ => (layer, r + dr, c + dc),
+            Plane::XZ => (c + dc, layer, r + dr),
+            Plane::XY => (c + dc, r + dr, layer),
+        };
+        solid_at(occupancy, n, x, y, z)
+    };
 
     let neg_row = at(-1, 0);
     let pos_row = at(1, 0);
@@ -138,6 +189,122 @@ pub fn compute_face_ao(
         ao_level(pos_row, neg_col, pos_neg),
         ao_level(pos_row, pos_col, pos_pos),
     ]
+}
+
+/// 面索引 -> (平面, 方向, 法线轴, 边界层坐标)。
+///
+/// 面索引与 [`crate::mesh::ExternalPlane`] 顺序一致：`[+x, -x, +y, -y, +z, -z]`。
+fn skirt_face_geometry(face: usize, n: usize) -> (Plane, Dir, usize, usize) {
+    match face {
+        0 => (Plane::YZ, Dir::Pos, 0, n - 1),
+        1 => (Plane::YZ, Dir::Neg, 0, 0),
+        2 => (Plane::XZ, Dir::Pos, 1, n - 1),
+        3 => (Plane::XZ, Dir::Neg, 1, 0),
+        4 => (Plane::XY, Dir::Pos, 2, n - 1),
+        _ => (Plane::XY, Dir::Neg, 2, 0),
+    }
+}
+
+/// (平面, 边界层坐标, row, col) -> 体素坐标。
+fn skirt_plane_cell(plane: Plane, boundary: usize, row: usize, col: usize) -> (i64, i64, i64) {
+    match plane {
+        Plane::YZ => (boundary as i64, row as i64, col as i64),
+        Plane::XZ => (col as i64, boundary as i64, row as i64),
+        Plane::XY => (col as i64, row as i64, boundary as i64),
+    }
+}
+
+/// 读取体素 `(x, y, z)` 的 material id（`per_material` 三平面同时为 1 才命中）。
+fn material_at(occupancy: &OccupancyData, n: usize, x: usize, y: usize, z: usize) -> u8 {
+    let plane_len = n * n;
+    let xb = 1u64 << x;
+    let yb = 1u64 << y;
+    let zb = 1u64 << z;
+    for (mi, (material, _)) in occupancy.materials.iter().enumerate() {
+        let masks = &occupancy.per_material[mi];
+        if masks.len() < 3 * plane_len {
+            continue;
+        }
+        if (masks[y * n + z] & xb) != 0
+            && (masks[plane_len + z * n + x] & yb) != 0
+            && (masks[2 * plane_len + y * n + x] & zb) != 0
+        {
+            return *material as u8;
+        }
+    }
+    0
+}
+
+/// 跨 LOD 接缝裙边（blocky LOD skirts，对齐 godot_voxel `append_side_skirts`）。
+///
+/// 对 `skirt_mask` 置位的每个面，在该面的边界层里找出「自身实心、面外被邻居
+/// 遮挡、且切向暴露」的格，补一条与该面同向的 1x1 rect（位置在边界平面）。
+/// AO 取满亮 `[3, 3, 3, 3]`（裙边不参与 AO）。
+///
+/// `skirt_mask` 的 bit `face` 对应 [`crate::mesh::ExternalPlane`] 顺序
+/// `[+x, -x, +y, -y, +z, -z]`；调用方只在跨 LOD 面置位，同 LOD 面不加，
+/// 避免多余几何；`skirt_mask == 0` 时输出与不开裙边逐字相等。
+pub(crate) fn append_skirts(
+    occupancy: &OccupancyData,
+    skirt_mask: u8,
+    rects: &mut Vec<RectInstance>,
+    aos: &mut Vec<[u8; 4]>,
+) {
+    let n = occupancy.voxels_per_axis as usize;
+    if n < 2 || skirt_mask == 0 {
+        return;
+    }
+    let at = |x: i64, y: i64, z: i64| solid_at(occupancy, n, x, y, z);
+    for face in 0..6usize {
+        if (skirt_mask >> face) & 1 == 0 {
+            continue;
+        }
+        let (plane, dir, normal_axis, boundary) = skirt_face_geometry(face, n);
+        let outside_coord = if boundary == 0 { -1 } else { n as i64 };
+        let slice = if boundary == 0 { 0 } else { n as u8 };
+        for row in 0..n {
+            for col in 0..n {
+                let (x, y, z) = skirt_plane_cell(plane, boundary, row, col);
+                if !at(x, y, z) {
+                    continue;
+                }
+                // 面外被邻居遮挡：主 mesher 已经剔除该面，裙边补回边界平面。
+                let outside = match normal_axis {
+                    0 => at(outside_coord, y, z),
+                    1 => at(x, outside_coord, z),
+                    _ => at(x, y, outside_coord),
+                };
+                if !outside {
+                    continue;
+                }
+                // 切向暴露：4 个切向邻居至少一个空气。
+                let (t0, t1) = match normal_axis {
+                    0 => ([1i64, 0, 0], [0i64, 0, 1]),
+                    1 => ([0i64, 0, 1], [1i64, 0, 0]),
+                    _ => ([0i64, 1, 0], [1i64, 0, 0]),
+                };
+                let exposed = !at(x + t0[0], y + t0[1], z + t0[2])
+                    || !at(x - t0[0], y - t0[1], z - t0[2])
+                    || !at(x + t1[0], y + t1[1], z + t1[2])
+                    || !at(x - t1[0], y - t1[1], z - t1[2]);
+                if !exposed {
+                    continue;
+                }
+                let material = material_at(occupancy, n, x as usize, y as usize, z as usize);
+                rects.push(RectInstance {
+                    plane: plane.index(),
+                    dir: dir.index(),
+                    slice,
+                    row: row as u8,
+                    col: col as u8,
+                    w: 1,
+                    h: 1,
+                    material,
+                });
+                aos.push([3, 3, 3, 3]);
+            }
+        }
+    }
 }
 
 fn compute_ao_grid(

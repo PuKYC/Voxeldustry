@@ -21,6 +21,43 @@ fn perception_gated_kinds_are_explicitly_listed() {
     );
 }
 
+/// RAWVOXELS 端到端的一段：VoxChunkRaw::skirt_mask 必须原样进入载荷。
+#[test]
+fn vox_chunk_raw_carries_skirt_mask_into_payload() {
+    let component = VoxChunkRaw {
+        lod: 2,
+        blocks: vec![1, 2, 3, 4],
+        skirt_mask: 0b10_1010,
+    };
+    match component.to_presentation() {
+        SyncPayload::RawVoxels(payload) => {
+            assert_eq!(payload.lod, 2);
+            assert_eq!(payload.skirt_mask, 0b10_1010, "组分掩码必须进入载荷");
+            assert_eq!(payload.blocks, vec![1, 2, 3, 4]);
+        }
+        other => panic!("期望 RawVoxels，得到 {}", other.kind().as_str()),
+    }
+}
+
+/// RAWVOXELGROUPS 端到端：VoxChunkGroupRaw 的逐块 skirt_mask 必须原样进入载荷。
+#[test]
+fn vox_chunk_group_carries_skirt_masks_into_payload() {
+    use game_engine::voxel::ChunkKey;
+    let mut chunks = std::collections::BTreeMap::new();
+    chunks.insert(ChunkKey::new(0, 0, 0), (vec![1u8, 2, 3], 0b10_1010));
+    chunks.insert(ChunkKey::new(1, 0, 0), (vec![4u8, 5], 0));
+    let component = VoxChunkGroupRaw { lod: 2, chunks };
+    match component.to_presentation() {
+        SyncPayload::RawVoxelGroups(payload) => {
+            assert_eq!(payload.lod, 2);
+            assert_eq!(payload.chunks[&(0, 0, 0)].1, 0b10_1010, "逐块 mask 必须进入载荷");
+            assert_eq!(payload.chunks[&(0, 0, 0)].0, vec![1, 2, 3]);
+            assert_eq!(payload.chunks[&(1, 0, 0)].1, 0);
+        }
+        other => panic!("期望 RawVoxelGroups，得到 {}", other.kind().as_str()),
+    }
+}
+
 #[test]
 fn all_payload_kinds_have_round_trippable_labels() {
     for kind in PayloadKind::ALL.iter().copied() {
@@ -39,6 +76,12 @@ fn all_payload_kinds_have_round_trippable_labels() {
             PayloadKind::Prototype => SyncPayload::Prototype(PresentedPrototype::default()),
             PayloadKind::RawVoxels => SyncPayload::RawVoxels(
                 crate::presentation::payload::RawVoxelPayload::from_halo(1, vec![1, 2, 3, 4]),
+            ),
+            PayloadKind::RawVoxelGroups => SyncPayload::RawVoxelGroups(
+                crate::presentation::payload::RawVoxelGroupPayload::from_chunks(
+                    1,
+                    std::collections::BTreeMap::new(),
+                ),
             ),
         };
         assert_eq!(payload.kind(), kind);

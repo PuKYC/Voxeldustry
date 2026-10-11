@@ -18,9 +18,9 @@ use crate::privacy::ExactHealth;
 
 use super::payload::{
     InteractionHint, PayloadKind, PresentationState, PresentedHealth, PresentedPrototype,
-    RawVoxelPayload, SyncPayload, ToPresentation,
+    RawVoxelGroupPayload, RawVoxelPayload, SyncPayload, ToPresentation,
 };
-use super::voxel_mesh::VoxChunkRaw;
+use super::voxel_mesh::{VoxChunkGroupRaw, VoxChunkRaw};
 use super::PresentationAppExt;
 use super::PresentedTransform;
 use super::RenderTransformSample;
@@ -94,9 +94,16 @@ synced_components! {
         |c: &crate::static_data::prototype::Prototype| PresentedPrototype(c.0 .0);
     // 体素表现的唯一通道：一个 32³ 块 + halo 层（34³）的方块 id，走 RAWVOXELS
     // 载荷，由 Godot 侧自行贪婪 meshing。块原点由同一实体上的 Transform 载荷
-    //（PresentedTransform）携带。
+    //（PresentedTransform）携带；skirt_mask 一并下发，Godot 侧按它加跨 LOD 裙边。
     RawVoxels => VoxChunkRaw,
-        |c: &VoxChunkRaw| RawVoxelPayload::from_halo(c.lod, c.blocks.clone());
+        |c: &VoxChunkRaw| {
+            RawVoxelPayload::from_halo_with_skirts(c.lod, c.blocks.clone(), c.skirt_mask)
+        };
+    // 体素分组：一个组件承载同一 LOD 的多块（每块 34³ halo），走 RAWVOXELGROUPS
+    // 载荷；组内按 ChunkKey 升序序列化，Godot 物化「一个 LOD 分组一个节点」。
+    // 本阶段只接同步通道，地形生产者后续接入。
+    RawVoxelGroups => VoxChunkGroupRaw,
+        |c: &VoxChunkGroupRaw| RawVoxelGroupPayload::from_chunks(c.lod, c.chunks.clone());
 }
 
 // 逻辑侧 `Transform` **不直出**：真正注册的是表现侧 `PresentedTransform`

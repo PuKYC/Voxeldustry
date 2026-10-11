@@ -1,7 +1,7 @@
 [gd_scene load_steps=3 format=3]
 
-[ext_resource type="Script" path="res://test/voxel_perf.gd" id="1_perf"]
-[ext_resource type="PackedScene" path="res://bevy_client/bevy_client.tscn" id="2_client"]
+[ext_resource type="Script" uid="uid://7eb2h2p8fsor" path="res://test/voxel_perf.gd" id="1_perf"]
+[ext_resource type="PackedScene" uid="uid://n2wwv7h51fv5" path="res://bevy_client/bevy_client.tscn" id="2_client"]
 
 [node name="VoxelPerf" type="Node3D"]
 script = ExtResource("1_perf")
@@ -33,3 +33,8 @@ source_id = 1
 enable_input = true
 voxel_radius_blocks = 2
 voxel_max_lod = 0
+voxel_lod_thresholds = Vector3(32, 64, 128)
+voxel_ao_strength = 1.0
+voxel_ao_power = 1.0
+voxel_lod_fade_duration = 0.0
+voxel_lod_skirts = true

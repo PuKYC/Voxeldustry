@@ -10,8 +10,10 @@ extends Node3D
 ##   - frame_ms  = _process 的 delta（Godot 实测帧时长；开垂直同步时会被钳到刷新率）
 ##   - fps       = Engine.get_frames_per_second()
 ##   - script_ms = 本脚本 _process 自身耗时（不含 BevyClient / VoxelMeshNode 的工作）
-##   - entities  = BevyClient.entity_count()（稳定 id 记录数，含体素 mesh 块）
-##   - nodes     = ViewLayer.node_count()（已物化显示节点，含 VoxelMeshNode）
+##   - entities  = BevyClient.entity_count()（稳定 id 记录数；F2 起体素按
+##                 (LOD × 空间区域) 混合分组，一条记录 = 一个分组实体，
+##                 不再是「一块一条」，所以这里的计数语义从「块数」变「组数」）
+##   - nodes     = ViewLayer.node_count()（已物化显示节点，含 VoxelGroupNode）
 ##
 ## 启动：编辑器打开 test/voxel_perf.tscn 运行（F6）。Rust 侧对照数字来自
 ## cargo bench -p game-core --bench voxel_terrain（release）。

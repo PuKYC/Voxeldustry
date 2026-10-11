@@ -1,5 +1,5 @@
-//! 原始体素（raw voxel）通道：把块内部 32³ + halo 层的方块 id 直接编成一个
-//! 字节缓冲，供 Godot 侧自行做贪婪 meshing。
+//! 原始体素（raw voxel）通道：把块内部 32³ + 一整圈 halo 的方块 id 直接编成
+//! 一个字节缓冲，供 Godot 侧自行做贪婪 meshing。
 //!
 //! ## 数据布局（A / B 两侧逐字节一致，冻结）
 //!
@@ -9,20 +9,23 @@
 //! - 扁平下标 `i = hx + 34 * (hy + 34 * hz)`，`hx, hy, hz ∈ [0, 34)`；
 //! - 值 = 方块 id（`u8`，0 = 空气）；缺失的邻块 = 空气。
 //!
-//! halo 只是 6 个同 LOD 邻块的一层边界，仅用于剔除块边界面；矩形一律留在内部
-//! 32³，不跨缝合并。因此本模块与 LOD 无关：`extract_raw_halo` 先把
-//! depth-`(5 + lod)` 的包装树按 mesher 的分辨率降采样成 32³ 的方块 id 网格，
-//! `mesh_raw_halo` 再在 depth-5 的树上按 lod 0 网格化，二者输出逐位一致
-//! （见本文件 tests 的黄金等价测试）。
+//! halo 是 26 个同 LOD 邻块的一层边界（6 面 + 12 棱 + 8 角）：
+//! `extract_raw_halo` 把整圈都填上；`mesh_raw_halo` 直接把 34³ 当作「内部
+//! 32³ + 一层边界」的连续三维数组，用 `OccupancyData::halo` 做面 / 棱 / 角
+//! AO 采样，不再建任何树。矩形一律留在内部 32³，不跨缝合并。因此本模块与
+//! LOD 无关：`lod` 只决定 `extract_raw_halo` 采样包装树的降采样档，
+//! 矩形本身是 LOD 无关的整数单元。
 //!
 //! 确定性：只使用 BTreeMap / 排序 Vec；三平面掩码按 material id 排序遍历，
 //! halo 位按 trailing_zeros 升序展开，均不依赖 HashMap 迭代序。
 
 use bevy::math::IVec3;
 use voxel::mesh::{
-    build_tree_occupancy, extract_block_tree_with_ao, MeshBlock, BASE_DEPTH, MAX_LOD,
+    build_tree_occupancy_lod, mesh_occupancy_with_ao, mesh_occupancy_with_ao_and_skirts,
+    tree_voxel_is_solid, FaceNeighbor, MeshBlock, MeshOccupancyData, Neighbourhood,
+    OccupancyDataBuilder, MAX_LOD,
 };
-use voxel::store::{ChunkKey, Lod, MaxDepth, VoxInterner, VoxOpsWrite, VoxTree};
+use voxel::store::{ChunkKey, Lod, VoxInterner, VoxOpsConfig, VoxTree};
 
 use super::pack::pack_rect_batch_with_ao;
 
@@ -60,27 +63,10 @@ fn halo_coord_for_face(face: usize, row: usize, col: usize) -> (usize, usize, us
     }
 }
 
-/// 第 `face` 面邻块的 `(row, col)` 单元在邻树局部坐标中的体素位置。
-#[must_use]
-fn thin_neighbor_voxel(face: usize, row: usize, col: usize) -> IVec3 {
-    let last = (RAW_DIM - 1) as i32;
-    let row = row as i32;
-    let col = col as i32;
-    match face {
-        0 => IVec3::new(0, row, col),    // +X 邻块的 x=0 层
-        1 => IVec3::new(last, row, col), // -X 邻块的 x=31 层
-        2 => IVec3::new(col, 0, row),    // +Y：行 z、列 x
-        3 => IVec3::new(col, last, row), // -Y
-        4 => IVec3::new(col, row, 0),    // +Z：行 y、列 x
-        _ => IVec3::new(col, row, last), // -Z
-    }
-}
-
-/// 从一块已 wrap 的树提取「内部 32³ + 6 面一层 halo」的原始方块 id。
+/// 从一块已 wrap 的树提取「内部 32³ + 整圈 halo（6 面 + 12 棱 + 8 角）」。
 ///
 /// `tree` 是已经 wrap 好的块树（深度 `5 + block.lod`，mesher 采样到 32³），
-/// `external` 是 6 个同 LOD 邻树，顺序
-/// `[YZ+, YZ-, XZ+, XZ-, XY+, XY-]`。
+/// `neighbors` 是同 LOD 的 26 邻树（缺失 = 空气，顺序见 [`Neighbourhood`]）。
 ///
 /// - **内部 32³**：由 `build_tree_occupancy` 的 `per_material`（按 material id
 ///   排序的平面掩码）反推每个单元的材料。平面索引约定见
@@ -89,8 +75,10 @@ fn thin_neighbor_voxel(face: usize, row: usize, col: usize) -> IVec3 {
 ///   `plane1 = XZ`（法线 y）`index 1*n*n + z*n + x`，位索引 y；
 ///   `plane2 = XY`（法线 z）`index 2*n*n + y*n + x`，位索引 z。
 ///   三个平面掩码对应位同时为 1 的 material 即该单元的材料，找不到 = 空气 0。
-/// - **halo 层**：直接取 `occupancy.external`（位 = 邻块该面占据），非 0 即可，
-///   这里统一填 `1`（halo 只用于剔除，值本身不参与几何）。
+/// - **6 个面**：直接取 `occupancy.external`（位 = 邻块该面占据），非 0 即填
+///   `1`（halo 值只参与 AO / 剔除，不参与几何材质）。
+/// - **12 棱 + 8 角**：无表化实现——对每个 halo 边界单元，按它落在哪几侧推出
+///   所属邻树的符号三元组与局部坐标，直接采样该邻树是否实心。
 ///
 /// 输出长度恒为 [`RAW_VOXELS`]。
 #[must_use]
@@ -98,9 +86,26 @@ pub fn extract_raw_halo(
     tree: &VoxTree<u8>,
     interner: &VoxInterner<u8>,
     block: MeshBlock,
-    external: [Option<&VoxTree<u8>>; 6],
+    neighbors: Neighbourhood<'_>,
 ) -> Vec<u8> {
-    let occupancy = build_tree_occupancy(tree, interner, block.lod, external, [false; 6]);
+    let faces = neighbors.faces().map(FaceNeighbor::from_optional);
+    extract_raw_halo_with_faces(tree, interner, block, faces, neighbors)
+}
+
+/// 跨 LOD 版本的 [`extract_raw_halo`]：六个面由 [`FaceNeighbor`] 描述。
+///
+/// 与同 LOD 版本的区别只在 external 面掩码：粗邻居（LOD 大 1）按 2x2 保守
+/// 聚合，细邻居（LOD 小 1）按 2x2 任一实心剔除，因此 LOD 接缝两侧的剔除一致。
+/// 棱 / 角仍由 `neighbors` 的 26 邻提供（同 LOD 的逐格采样）。
+#[must_use]
+pub fn extract_raw_halo_with_faces(
+    tree: &VoxTree<u8>,
+    interner: &VoxInterner<u8>,
+    block: MeshBlock,
+    faces: [FaceNeighbor<'_>; 6],
+    neighbors: Neighbourhood<'_>,
+) -> Vec<u8> {
+    let occupancy = build_tree_occupancy_lod(tree, interner, block.lod, faces, [false; 6]);
     let n = occupancy.voxels_per_axis as usize;
     let mut out = vec![0u8; RAW_VOXELS];
 
@@ -136,7 +141,7 @@ pub fn extract_raw_halo(
         }
     }
 
-    // ── halo 层：直接取 external 掩码，非 0 即可 ──
+    // ── 6 个面：直接取 external 掩码，非 0 即可 ──
     for face in 0..6usize {
         let base = face * n;
         for row in 0..n.min(RAW_DIM) {
@@ -149,6 +154,77 @@ pub fn extract_raw_halo(
                 }
                 let (hx, hy, hz) = halo_coord_for_face(face, row, col);
                 out[raw_halo_index(hx, hy, hz)] = 1;
+            }
+        }
+    }
+
+    // ── 12 棱 + 8 角：无表化，按符号三元组分侧采样 ──
+    //
+    // 一个 halo 单元只要有两个及以上坐标落在 -1 / 32，就属于某个棱 / 角邻块。
+    // 越界轴固定在该邻块的 0 或 31 层，自由轴沿邻块边界线扫 0..32。
+    let mesh_depth = tree.max_depth(block.lod);
+    for dx in -1i8..=1 {
+        for dy in -1i8..=1 {
+            for dz in -1i8..=1 {
+                let non_zero = u8::from(dx != 0) + u8::from(dy != 0) + u8::from(dz != 0);
+                if non_zero < 2 {
+                    continue;
+                }
+                let Some(neighbor) = neighbors.get(dx, dy, dz) else {
+                    continue;
+                };
+                // 越界轴固定层：局部 0（正侧）/ 31（负侧），halo 33 / 0；
+                // 自由轴（该轴符号为 0）从 halo 1 / 局部 0 起扫 0..RAW_DIM。
+                let lx = if dx < 0 { (RAW_DIM - 1) as i32 } else { 0 };
+                let ly = if dy < 0 { (RAW_DIM - 1) as i32 } else { 0 };
+                let lz = if dz < 0 { (RAW_DIM - 1) as i32 } else { 0 };
+                let hx = if dx < 0 {
+                    0
+                } else if dx > 0 {
+                    RAW_HALO - 1
+                } else {
+                    1
+                };
+                let hy = if dy < 0 {
+                    0
+                } else if dy > 0 {
+                    RAW_HALO - 1
+                } else {
+                    1
+                };
+                let hz = if dz < 0 {
+                    0
+                } else if dz > 0 {
+                    RAW_HALO - 1
+                } else {
+                    1
+                };
+                let solid = |p: IVec3| tree_voxel_is_solid(neighbor, interner, p, mesh_depth);
+                if dx == 0 {
+                    // 沿 x 的棱（dy、dz 越界）。
+                    for x in 0..RAW_DIM as i32 {
+                        if solid(IVec3::new(x, ly, lz)) {
+                            out[raw_halo_index(x as usize + 1, hy, hz)] = 1;
+                        }
+                    }
+                } else if dy == 0 {
+                    // 沿 y 的棱。
+                    for y in 0..RAW_DIM as i32 {
+                        if solid(IVec3::new(lx, y, lz)) {
+                            out[raw_halo_index(hx, y as usize + 1, hz)] = 1;
+                        }
+                    }
+                } else if dz == 0 {
+                    // 沿 z 的棱。
+                    for z in 0..RAW_DIM as i32 {
+                        if solid(IVec3::new(lx, ly, z)) {
+                            out[raw_halo_index(hx, hy, z as usize + 1)] = 1;
+                        }
+                    }
+                } else if solid(IVec3::new(lx, ly, lz)) {
+                    // 角：单个单元。
+                    out[raw_halo_index(hx, hy, hz)] = 1;
+                }
             }
         }
     }
@@ -176,12 +252,13 @@ pub fn raw_halo_has_solid_interior(blocks: &[u8]) -> bool {
     false
 }
 
-/// 从 halo 缓冲直接做贪婪 meshing（把 meshing 放到消费侧的参考 / 校验入口）。
+/// 从 halo 缓冲直接做贪婪 meshing（生产 mesher：消费侧现算 39 bit + AO）。
 ///
-/// 内部 32³ 的非 0 单元重建一棵 depth-5 的体素树；halo 六面各重建一棵只含相邻
-/// 一层的「薄」邻树；再调用
-/// `extract_block_tree_with_ao(&tree, &interner, MeshBlock::new(origin, Lod::new(0)), external)`
-/// 并 `pack_rect_batch_with_ao` 成 39 bit + AO 的 u64 流。
+/// 直接把 34³ 当作「内部 32³ + 一层边界」的连续三维数组：
+/// - 内部 32³ 正向编码进 `global` / `per_material` / `global_active`；
+/// - 6 张 external 面掩码从 halo 的 6 个边界面直接读；
+/// - `halo = Some(blocks)`，AO 采样走该连续数组（面 / 棱 / 角统一）；
+/// - 不再建任何 32³ 树或 6 棵薄邻树，最后走 [`mesh_occupancy_with_ao`]。
 ///
 /// `lod` **不参与**网格化（矩形是 LOD 无关的整数单元，缩放由载荷的 lod 在渲染
 /// 侧做），仅为调用方语义保留。`blocks.len() != RAW_VOXELS` 时返回空 Vec
@@ -189,58 +266,104 @@ pub fn raw_halo_has_solid_interior(blocks: &[u8]) -> bool {
 #[must_use]
 pub fn mesh_raw_halo(lod: u8, blocks: &[u8]) -> Vec<u64> {
     debug_assert!(lod <= MAX_LOD, "lod exceeds MAX_LOD");
-    if blocks.len() != RAW_VOXELS {
+    let Some(occupancy) = raw_halo_occupancy(blocks) else {
         return Vec::new();
-    }
-
-    // 局部 interner：容量会按需自动增长，4 MiB 起步足够一棵 32³ + 6 薄邻树。
-    let mut interner = VoxInterner::<u8>::with_memory_budget(4 * 1024 * 1024);
-    let mut tree = VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH));
-
-    for z in 0..RAW_DIM {
-        for y in 0..RAW_DIM {
-            for x in 0..RAW_DIM {
-                let value = blocks[raw_halo_index(x + 1, y + 1, z + 1)];
-                if value != 0 {
-                    let _ = tree.set(
-                        &mut interner,
-                        IVec3::new(x as i32, y as i32, z as i32),
-                        value,
-                    );
-                }
-            }
-        }
-    }
-
-    // 6 棵薄邻树：只填与本块相邻的那一层 halo 值。
-    let mut thin: [VoxTree<u8>; 6] =
-        std::array::from_fn(|_| VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH)));
-    for (face, neighbor) in thin.iter_mut().enumerate() {
-        for row in 0..RAW_DIM {
-            for col in 0..RAW_DIM {
-                let (hx, hy, hz) = halo_coord_for_face(face, row, col);
-                let value = blocks[raw_halo_index(hx, hy, hz)];
-                if value != 0 {
-                    let _ = neighbor.set(&mut interner, thin_neighbor_voxel(face, row, col), value);
-                }
-            }
-        }
-    }
-
-    let external: [Option<&VoxTree<u8>>; 6] = [
-        Some(&thin[0]),
-        Some(&thin[1]),
-        Some(&thin[2]),
-        Some(&thin[3]),
-        Some(&thin[4]),
-        Some(&thin[5]),
-    ];
-
+    };
     // 原点只影响 RectBatch.origin（单 batch 排序键的前 3 项为常量），
     // 取规范原点 0 即可保证输出与直接 mesher 逐位一致。
     let block = MeshBlock::new(ChunkKey::new(0, 0, 0), Lod::new(0));
-    let batch = extract_block_tree_with_ao(&tree, &interner, block, external);
-    pack_rect_batch_with_ao(&batch)
+    pack_rect_batch_with_ao(&mesh_occupancy_with_ao(&occupancy, block.origin, block.lod))
+}
+
+/// 与 [`mesh_raw_halo`] 相同，额外在 `skirt_mask` 置位的面上追加跨 LOD 接缝
+/// 裙边（AO 满亮）。`skirt_mask == 0` 时逐位等于 [`mesh_raw_halo`]。
+///
+/// bit `face` 对应 [`voxel::mesh::ExternalPlane`] 顺序 `[+x, -x, +y, -y, +z, -z]`；
+/// 只有跨 LOD 面才应置位（由调用方按 2:1 面邻居报告决定）。
+#[must_use]
+pub fn mesh_raw_halo_with_skirts(lod: u8, blocks: &[u8], skirt_mask: u8) -> Vec<u64> {
+    debug_assert!(lod <= MAX_LOD, "lod exceeds MAX_LOD");
+    let Some(occupancy) = raw_halo_occupancy(blocks) else {
+        return Vec::new();
+    };
+    // 原点只影响 RectBatch.origin（单 batch 排序键的前 3 项为常量），
+    // 取规范原点 0 即可保证输出与直接 mesher 逐位一致。
+    let block = MeshBlock::new(ChunkKey::new(0, 0, 0), Lod::new(0));
+    pack_rect_batch_with_ao(&mesh_occupancy_with_ao_and_skirts(
+        &occupancy,
+        block.origin,
+        block.lod,
+        skirt_mask,
+    ))
+}
+
+/// 从 34³ halo 缓冲构造 [`OccupancyData`]（内部 32³ + 6 external + padded halo）。
+#[must_use]
+fn raw_halo_occupancy(blocks: &[u8]) -> Option<MeshOccupancyData> {
+    if blocks.len() != RAW_VOXELS {
+        return None;
+    }
+    let n = RAW_DIM;
+    let plane_len = n * n;
+    let mut builder = OccupancyDataBuilder::new(n as u32);
+
+    // ── 内部 32³：正向编码 global / per_material / global_active ──
+    for z in 0..n {
+        for y in 0..n {
+            let row = y * n;
+            for x in 0..n {
+                let material = blocks[raw_halo_index(x + 1, y + 1, z + 1)];
+                if material == 0 {
+                    continue;
+                }
+                let xb = 1u64 << x;
+                let yb = 1u64 << y;
+                let zb = 1u64 << z;
+                // YZ：法线 x，行 y，列 z。
+                builder.global[row + z] |= xb;
+                // XZ：法线 y，行 z，列 x。
+                builder.global[plane_len + z * n + x] |= yb;
+                // XY：法线 z，行 y，列 x。
+                builder.global[2 * plane_len + row + x] |= zb;
+                builder.global_active[0] |= yb; // YZ rows
+                builder.global_active[1] |= zb; // YZ cols
+                builder.global_active[2] |= zb; // XZ rows
+                builder.global_active[3] |= xb; // XZ cols
+                builder.global_active[4] |= yb; // XY rows
+                builder.global_active[5] |= xb; // XY cols
+
+                let per = builder
+                    .per_material
+                    .entry(material as usize)
+                    .or_insert_with(|| vec![0u64; 3 * plane_len]);
+                per[row + z] |= xb;
+                per[plane_len + z * n + x] |= yb;
+                per[2 * plane_len + row + x] |= zb;
+                *builder.materials.entry(material as usize).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // ── 6 张 external 面掩码：从 halo 边界层直接读 ──
+    for face in 0..6usize {
+        let base = face * n;
+        for row in 0..n {
+            let mut bits = 0u64;
+            for col in 0..n {
+                let (hx, hy, hz) = halo_coord_for_face(face, row, col);
+                if blocks[raw_halo_index(hx, hy, hz)] != 0 {
+                    bits |= 1u64 << col;
+                }
+            }
+            builder.external[base + row] = bits;
+        }
+        builder.external_exists[face] = true;
+    }
+
+    // ── padded halo：直接搬 34³（一次 39 KiB 分配，取代旧路径的整棵建树）──
+    builder.halo = Some(blocks.to_vec().into_boxed_slice());
+
+    Some(builder.build())
 }
 
 #[cfg(test)]
@@ -248,8 +371,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::presentation::voxel::unpack_rect;
-    use voxel::mesh::wrap_block;
+    use crate::presentation::voxel::{unpack_ao, unpack_rect};
+    use voxel::mesh::{extract_block_tree_with_ao, wrap_block, BASE_DEPTH};
+    use voxel::store::{MaxDepth, VoxOpsBulkWrite, VoxOpsWrite};
 
     fn key(x: i32, y: i32, z: i32) -> ChunkKey {
         ChunkKey::new(x, y, z)
@@ -408,7 +532,8 @@ mod tests {
             let block = MeshBlock::new(key(0, 0, 0), Lod::new(lod));
             let external: [Option<&VoxTree<u8>>; 6] = [None; 6];
 
-            let halo = extract_raw_halo(&tree, &interner, block, external);
+            let halo =
+                extract_raw_halo(&tree, &interner, block, Neighbourhood::from_faces(external));
             assert_eq!(halo.len(), RAW_VOXELS, "lod {lod}: halo 长度");
             let via_raw = mesh_raw_halo(lod, &halo);
             let via_ref = pack_rect_batch_with_ao(&extract_block_tree_with_ao(
@@ -458,7 +583,8 @@ mod tests {
             ];
 
             let block = MeshBlock::new(key(0, 0, 0), Lod::new(lod));
-            let halo = extract_raw_halo(&tree, &interner, block, external);
+            let halo =
+                extract_raw_halo(&tree, &interner, block, Neighbourhood::from_faces(external));
             let via_raw = mesh_raw_halo(lod, &halo);
             let via_ref = pack_rect_batch_with_ao(&extract_block_tree_with_ao(
                 &tree, &interner, block, external,
@@ -468,5 +594,404 @@ mod tests {
                 "lod {lod}: 带 6 邻 seam 时 raw 通道必须逐位一致"
             );
         }
+    }
+
+    /// 一个只含单个体素的同 LOD 邻树（用于棱 / 角邻居测试）。
+    fn single_voxel_neighbor(
+        interner: &mut VoxInterner<u8>,
+        origin: ChunkKey,
+        voxel: IVec3,
+        material: u8,
+    ) -> VoxTree<u8> {
+        let mut chunk = VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH));
+        let _ = chunk.set(interner, voxel, material);
+        let mut chunks: BTreeMap<ChunkKey, VoxTree<u8>> = BTreeMap::new();
+        chunks.insert(origin, chunk);
+        wrap_block(&chunks, interner, MeshBlock::new(origin, Lod::new(0)))
+    }
+
+    /// `extract_raw_halo` 必须把 12 棱 / 8 角的 halo 单元也填上。
+    #[test]
+    fn extract_raw_halo_fills_edges_and_corners_from_diagonal_neighbours() {
+        let mut interner = new_interner();
+        let mut own = VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH));
+        let _ = own.set(&mut interner, IVec3::new(0, 0, 0), 1);
+        let block = MeshBlock::new(key(0, 0, 0), Lod::new(0));
+
+        // +X+Y 棱邻块：它本地 (0,0,5) 实心 -> 本块 halo (33,33,6)。
+        let edge = single_voxel_neighbor(&mut interner, key(1, 1, 0), IVec3::new(0, 0, 5), 2);
+        // -X-Y-Z 角邻块：它本地 (31,31,31) 实心 -> 本块 halo (0,0,0)。
+        let corner =
+            single_voxel_neighbor(&mut interner, key(-1, -1, -1), IVec3::new(31, 31, 31), 3);
+
+        let mut nb = Neighbourhood::none();
+        nb.set(1, 1, 0, &edge);
+        nb.set(-1, -1, -1, &corner);
+        let halo = extract_raw_halo(&own, &interner, block, nb);
+        assert_ne!(
+            halo[raw_halo_index(RAW_HALO - 1, RAW_HALO - 1, 6)],
+            0,
+            "+X+Y 棱邻块必须填 halo 棱单元"
+        );
+        assert_ne!(
+            halo[raw_halo_index(0, 0, 0)],
+            0,
+            "-X-Y-Z 角邻块必须填 halo 角单元"
+        );
+
+        // 只有 6 面（无对角）时，棱 / 角仍是空气。
+        let faces_only = extract_raw_halo(&own, &interner, block, Neighbourhood::none());
+        assert_eq!(faces_only[raw_halo_index(RAW_HALO - 1, RAW_HALO - 1, 6)], 0);
+        assert_eq!(faces_only[raw_halo_index(0, 0, 0)], 0);
+    }
+
+    /// 独立暴力参考：直接从 34³ halo 数组按 MC 公式算某条 1x1 面的四角 AO。
+    ///
+    /// 刻意不调用被测 mesher 的任何函数；坐标映射独立重写一遍。
+    fn brute_face_ao(
+        blocks: &[u8],
+        plane: usize,
+        dir_pos: bool,
+        row: i32,
+        col: i32,
+        layer: i32,
+    ) -> [u8; 4] {
+        let sample = |r: i32, c: i32| -> bool {
+            let (x, y, z) = match plane {
+                0 => (layer, r, c), // YZ：行 y、列 z
+                1 => (c, layer, r), // XZ：行 z、列 x
+                _ => (c, r, layer), // XY：行 y、列 x
+            };
+            if x < -1
+                || x > RAW_DIM as i32
+                || y < -1
+                || y > RAW_DIM as i32
+                || z < -1
+                || z > RAW_DIM as i32
+            {
+                return false;
+            }
+            blocks[raw_halo_index((x + 1) as usize, (y + 1) as usize, (z + 1) as usize)] != 0
+        };
+        let level = |a: bool, b: bool, c: bool| {
+            if a && b {
+                0
+            } else {
+                3 - (a as u8 + b as u8 + c as u8)
+            }
+        };
+        let at = |dr: i32, dc: i32| sample(row + dr, col + dc);
+        [
+            level(at(-1, 0), at(0, -1), at(-1, -1)),
+            level(at(-1, 0), at(0, 1), at(-1, 1)),
+            level(at(1, 0), at(0, -1), at(1, -1)),
+            level(at(1, 0), at(0, 1), at(1, 1)),
+        ]
+    }
+
+    /// 棱 / 角处有实心邻居时，`mesh_raw_halo` 的边界 AO 必须与暴力参考逐位一致。
+    #[test]
+    fn edge_corner_ao_matches_brute_force() {
+        let mut blocks = vec![0u8; RAW_VOXELS];
+        // 块角 (0,0,0) 放一个体素 -> halo (1,1,1)。
+        blocks[raw_halo_index(1, 1, 1)] = 1;
+        // 在 -X/-Y/-Z 侧放 3 个棱邻居 + 1 个角邻居（都是对角，不剔除任何面）。
+        for &(hx, hy, hz) in &[(0usize, 0usize, 1usize), (0, 1, 0), (1, 0, 0), (0, 0, 0)] {
+            blocks[raw_halo_index(hx, hy, hz)] = 2;
+        }
+
+        let words = mesh_raw_halo(0, &blocks);
+
+        // (plane, dir, slice, row, col, dir_pos, ao_layer)
+        let cases = [
+            (0usize, 1u8, 0u8, 0usize, 0usize, false, -1i32), // -X
+            (1, 1, 0, 0, 0, false, -1),                       // -Y
+            (2, 1, 0, 0, 0, false, -1),                       // -Z
+            (0, 0, 1, 0, 0, true, 1),                         // +X
+            (1, 0, 1, 0, 0, true, 1),                         // +Y
+            (2, 0, 1, 0, 0, true, 1),                         // +Z
+        ];
+        for (plane, dir, slice, row, col, dir_pos, layer) in cases {
+            let expected = brute_face_ao(&blocks, plane, dir_pos, row as i32, col as i32, layer);
+            let word = words
+                .iter()
+                .find(|w| {
+                    let r = unpack_rect(**w);
+                    r.plane == plane as u8
+                        && r.dir == dir
+                        && r.slice == slice
+                        && r.row as usize == row
+                        && r.col as usize == col
+                        && r.w == 1
+                        && r.h == 1
+                })
+                .unwrap_or_else(|| panic!("face not found: plane={plane} dir={dir} slice={slice}"));
+            assert_eq!(
+                unpack_ao(*word),
+                expected,
+                "AO mismatch plane={plane} dir={dir}"
+            );
+        }
+
+        // 确认本用例真的让 -X 面读到了棱 / 角邻居（否则测试没覆盖新行为）。
+        let neg_x = words
+            .iter()
+            .find(|w| {
+                let r = unpack_rect(**w);
+                r.plane == 0 && r.dir == 1 && r.slice == 0
+            })
+            .expect("-X 面必须存在");
+        assert_ne!(unpack_ao(*neg_x), [3, 3, 3, 3], "-X 面应被棱 / 角邻居压暗");
+    }
+
+    /// 生成一个 origin/lod 的实心邻居块（所有基础子块填 material）。
+    fn solid_block(
+        interner: &mut VoxInterner<u8>,
+        origin: ChunkKey,
+        lod: u8,
+        material: u8,
+    ) -> VoxTree<u8> {
+        let span = 1i32 << lod;
+        let mut chunks: BTreeMap<ChunkKey, VoxTree<u8>> = BTreeMap::new();
+        for cy in 0..span {
+            for cz in 0..span {
+                for cx in 0..span {
+                    let mut chunk = VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH));
+                    chunk.fill(interner, material);
+                    chunks.insert(key(origin.x + cx, origin.y + cy, origin.z + cz), chunk);
+                }
+            }
+        }
+        wrap_block(&chunks, interner, MeshBlock::new(origin, Lod::new(lod)))
+    }
+
+    /// 跨 LOD 接缝剔除（requirement 4a）：lod-0 细块 +X 贴 lod-1 粗块。
+    ///
+    /// 粗块面对细邻居必须整面剔除（`Finer`），细块面对粗邻居也剔除接缝面
+    /// （`Coarser`），两侧不重复画几何。
+    #[test]
+    fn cross_lod_seam_culls_both_faces() {
+        let mut interner = new_interner();
+        let fine = solid_block(&mut interner, key(1, 0, 0), 0, 1);
+        let coarse = solid_block(&mut interner, key(2, 0, 0), 1, 2);
+        let f00 = solid_block(&mut interner, key(1, 0, 0), 0, 1);
+        let f01 = solid_block(&mut interner, key(1, 0, 1), 0, 1);
+        let f10 = solid_block(&mut interner, key(1, 1, 0), 0, 1);
+        let f11 = solid_block(&mut interner, key(1, 1, 1), 0, 1);
+
+        // 细块（lod0）+X 邻粗块（lod1）。
+        let mut fine_faces = [FaceNeighbor::Missing; 6];
+        fine_faces[0] = FaceNeighbor::Coarser {
+            tree: &coarse,
+            offset: [0, 0],
+        };
+        let fine_block = MeshBlock::new(key(1, 0, 0), Lod::new(0));
+        let fine_halo = extract_raw_halo_with_faces(
+            &fine,
+            &interner,
+            fine_block,
+            fine_faces,
+            Neighbourhood::none(),
+        );
+        let fine_words = mesh_raw_halo(0, &fine_halo);
+        assert!(
+            !fine_words.iter().any(|w| {
+                let r = unpack_rect(*w);
+                r.plane == 0 && r.dir == 0
+            }),
+            "细块 +X（plane 0 dir 0）接缝面必须被粗邻居剔除"
+        );
+        assert_eq!(fine_words.len(), 5, "细块应只剩 5 个非接缝面");
+
+        // before：面邻居缺失（修复前的行为）时接缝面被两侧各自画出来（重复几何）。
+        let fine_words_missing = mesh_raw_halo(
+            0,
+            &extract_raw_halo_with_faces(
+                &fine,
+                &interner,
+                fine_block,
+                [FaceNeighbor::Missing; 6],
+                Neighbourhood::none(),
+            ),
+        );
+        assert!(
+            fine_words_missing.iter().any(|w| {
+                let r = unpack_rect(*w);
+                r.plane == 0 && r.dir == 0
+            }),
+            "缺面邻居时 +X 接缝面会重复出现（修复前证据）"
+        );
+        assert_eq!(fine_words_missing.len(), 6, "修复前细块有 6 个面");
+
+        // 粗块（lod1）-X 邻 4 个细块（lod0）。
+        let mut coarse_faces = [FaceNeighbor::Missing; 6];
+        coarse_faces[1] = FaceNeighbor::Finer([&f00, &f01, &f10, &f11]);
+        let coarse_block = MeshBlock::new(key(2, 0, 0), Lod::new(1));
+        let coarse_halo = extract_raw_halo_with_faces(
+            &coarse,
+            &interner,
+            coarse_block,
+            coarse_faces,
+            Neighbourhood::none(),
+        );
+        let coarse_words = mesh_raw_halo(1, &coarse_halo);
+        assert!(
+            !coarse_words.iter().any(|w| {
+                let r = unpack_rect(*w);
+                r.plane == 0 && r.dir == 1
+            }),
+            "粗块 -X（plane 0 dir 1）接缝面必须被细几何剔除"
+        );
+        assert_eq!(coarse_words.len(), 5, "粗块应只剩 5 个非接缝面");
+
+        let coarse_words_missing = mesh_raw_halo(
+            1,
+            &extract_raw_halo_with_faces(
+                &coarse,
+                &interner,
+                coarse_block,
+                [FaceNeighbor::Missing; 6],
+                Neighbourhood::none(),
+            ),
+        );
+        assert!(
+            coarse_words_missing.iter().any(|w| {
+                let r = unpack_rect(*w);
+                r.plane == 0 && r.dir == 1
+            }),
+            "缺面邻居时 -X 接缝面会重复出现（修复前证据）"
+        );
+        assert_eq!(coarse_words_missing.len(), 6, "修复前粗块有 6 个面");
+    }
+
+    /// 独立暴力参考：手工构造 lod0 细块（+X 邻 lod1 粗块）的 34³ halo。
+    ///
+    /// 内部逐格采样细树；+X 面按粗格 2x2 保守聚合（粗格实心 → 覆盖的细格
+    /// 全实心）；其余面保持空气。刻意不调用被测 occupancy / external 代码。
+    fn brute_cross_lod_halo(
+        fine: &VoxTree<u8>,
+        coarse: &VoxTree<u8>,
+        interner: &VoxInterner<u8>,
+        coarse_col_offset: i32,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; RAW_VOXELS];
+        let fine_depth = fine.max_depth(Lod::new(0));
+        for z in 0..RAW_DIM as i32 {
+            for y in 0..RAW_DIM as i32 {
+                for x in 0..RAW_DIM as i32 {
+                    if tree_voxel_is_solid(fine, interner, IVec3::new(x, y, z), fine_depth) {
+                        out[raw_halo_index(x as usize + 1, y as usize + 1, z as usize + 1)] = 1;
+                    }
+                }
+            }
+        }
+        let coarse_depth = coarse.max_depth(Lod::new(1));
+        for y in 0..RAW_DIM as i32 {
+            for z in 0..RAW_DIM as i32 {
+                let coarse_row = y / 2;
+                let coarse_col = coarse_col_offset + z / 2;
+                if tree_voxel_is_solid(
+                    coarse,
+                    interner,
+                    IVec3::new(0, coarse_row, coarse_col),
+                    coarse_depth,
+                ) {
+                    out[raw_halo_index(RAW_HALO - 1, y as usize + 1, z as usize + 1)] = 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// 跨 LOD 接缝 AO（requirement 4b）：生产 halo 与独立暴力参考逐字节一致，
+    /// 且接缝附近暴露面的 AO 与暴力公式逐位一致。
+    #[test]
+    fn cross_lod_seam_ao_matches_brute_force() {
+        let mut interner = new_interner();
+        // 细块 (1,0,1) lod0：+X 面是粗邻居 (2,0,0) lod1 的 z 上半区（偏移 16）。
+        let fine = single_voxel_neighbor(&mut interner, key(1, 0, 1), IVec3::new(31, 10, 10), 1);
+        let coarse = solid_block(&mut interner, key(2, 0, 0), 1, 1);
+
+        let mut fine_faces = [FaceNeighbor::Missing; 6];
+        fine_faces[0] = FaceNeighbor::Coarser {
+            tree: &coarse,
+            offset: [0, 16],
+        };
+        let fine_block = MeshBlock::new(key(1, 0, 1), Lod::new(0));
+        let halo = extract_raw_halo_with_faces(
+            &fine,
+            &interner,
+            fine_block,
+            fine_faces,
+            Neighbourhood::none(),
+        );
+
+        let reference = brute_cross_lod_halo(&fine, &coarse, &interner, 16);
+        assert_eq!(halo, reference, "跨 LOD halo 必须与暴力参考逐字节一致");
+
+        // 接缝附近暴露的 +Y 面（Voxel (31,10,10) 顶面）AO。
+        let words = mesh_raw_halo(0, &reference);
+        let word = words
+            .iter()
+            .find(|w| {
+                let r = unpack_rect(**w);
+                r.plane == 1
+                    && r.dir == 0
+                    && r.slice == 11
+                    && r.row == 10
+                    && r.col == 31
+                    && r.w == 1
+                    && r.h == 1
+            })
+            .expect("+Y 面必须存在");
+        let expected = brute_face_ao(&reference, 1, true, 10, 31, 11);
+        assert_eq!(unpack_ao(*word), expected, "跨 LOD 接缝 AO 不一致");
+        assert_ne!(expected, [3, 3, 3, 3], "测试必须真正读到粗邻居的遮挡");
+    }
+
+    /// 跨 LOD 裙边：只在 `skirt_mask` 置位的面出现，AO 满亮；mask=0 时与不开
+    /// 裙边逐字相等（保护黄金测试）。
+    #[test]
+    fn skirts_only_on_masked_faces_and_ao_full_bright() {
+        let mut blocks = vec![0u8; RAW_VOXELS];
+        // 体素 (31,10,10)：+X 面被邻居 (halo hx=33) 遮挡，其余面暴露。
+        blocks[raw_halo_index(32, 11, 11)] = 5;
+        blocks[raw_halo_index(RAW_HALO - 1, 11, 11)] = 7;
+
+        let baseline = mesh_raw_halo(0, &blocks);
+        assert!(
+            !baseline.iter().any(|w| {
+                let r = unpack_rect(*w);
+                r.plane == 0 && r.dir == 0
+            }),
+            "主 mesher 已剔除 +X 面"
+        );
+
+        // +X（bit 0）置位：补一条满亮裙边。
+        let with = mesh_raw_halo_with_skirts(0, &blocks, 1 << 0);
+        assert_eq!(with.len(), baseline.len() + 1, "只应多一条裙边 rect");
+        let skirt = with
+            .iter()
+            .find(|w| {
+                let r = unpack_rect(**w);
+                r.plane == 0 && r.dir == 0 && r.slice == 32 && r.row == 10 && r.col == 10
+            })
+            .expect("+X 裙边必须存在");
+        let rect = unpack_rect(*skirt);
+        assert_eq!((rect.w, rect.h, rect.material), (1, 1, 5));
+        assert_eq!(unpack_ao(*skirt), [3, 3, 3, 3], "裙边 AO 必须满亮");
+
+        // 只在指定面出现：置 -Z（bit 5）不应产生 +X 裙边。
+        let other = mesh_raw_halo_with_skirts(0, &blocks, 1 << 5);
+        assert!(
+            !other.iter().any(|w| {
+                let r = unpack_rect(*w);
+                r.plane == 0 && r.dir == 0 && r.slice == 32
+            }),
+            "未置位的面不得出现裙边"
+        );
+
+        // mask = 0 必须与旧输出逐字相等。
+        assert_eq!(mesh_raw_halo_with_skirts(0, &blocks, 0), baseline);
     }
 }

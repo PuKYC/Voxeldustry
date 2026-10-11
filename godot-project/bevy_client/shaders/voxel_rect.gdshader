@@ -27,6 +27,18 @@ uniform vec3 sun_dir = vec3(0.35, 0.82, 0.45);
 uniform float ambient = 0.45;
 // AO：bit [39,47) 每角 2 bit（3 = 全亮）；ao_floor 是最暗角的环境光保底。
 uniform float ao_floor = 0.4;
+// AO 总强度：1.0 = 保持原观感（默认开启），0.0 = 完全关闭（ao_f == 1.0）。
+uniform float ao_strength : hint_range(0.0, 1.0) = 1.0;
+// AO 曲线指数：1.0 = 保持原观感（不做 pow）；>1 加深，<1 减淡。
+uniform float ao_power : hint_range(0.0, 8.0) = 1.0;
+// LOD 交叉淡入（机制同 godot_voxel 的 u_lod_fade）：
+//   x = 过渡进度；y = 1 淡入 / 0 淡出。默认 vec2(0,0) 是严格 no-op（不 discard）。
+uniform vec2 lod_fade = vec2(0.0);
+
+// 屏幕空间哈希：给每个像素一个稳定随机阈值，配合 lod_fade 做互补抖动淡入淡出。
+float lod_fade_hash(vec2 c) {
+	return fract(sin(dot(c, vec2(12.9898, 78.233))) * 43758.5453);
+}
 
 void vertex() {
 	int inst = INSTANCE_ID;
@@ -58,7 +70,18 @@ void vertex() {
 	// 角序 i = cx | (cy << 1)，与 Rust 的 rect_corner / compute_face_ao 同序。
 	int iao = int(cx) | (int(cy) << 1);
 	float ao = float((ao_bits >> uint(iao * 2)) & 3u) / 3.0;
-	float ao_f = mix(ao_floor, 1.0, ao);
+	// ao_power == 1.0（默认）时跳过 pow，保证与旧实现逐位一致。
+	float ao_curve = ao;
+	if (ao_power != 1.0) {
+		ao_curve = pow(ao, ao_power);
+	}
+	float ao_base = mix(ao_floor, 1.0, ao_curve);
+	// ao_strength == 1.0（默认）直通 ao_base，逐位保持旧观感；
+	// ao_strength == 0.0 时 mix 结果严格为 1.0（完全关闭 AO）。
+	float ao_f = ao_base;
+	if (ao_strength < 1.0) {
+		ao_f = mix(1.0, ao_base, ao_strength);
+	}
 	float cols = float(col) + cx * float(rect_w);
 	float rows = float(row) + cy * float(rect_h);
 	float s = float(slice);
@@ -89,4 +112,17 @@ void vertex() {
 
 void fragment() {
 	ALBEDO = COLOR.rgb;
+
+	// 渐进 discard 实现 LOD 交叉淡入。必须放在 fragment 末尾。
+	// lod_fade == vec2(0,0) 时两个分支都不 discard（严格保持旧行为）。
+	float h = lod_fade_hash(SCREEN_UV);
+	if (lod_fade.y > 0.5) {
+		if (lod_fade.x < h) {
+			discard;
+		}
+	} else {
+		if (lod_fade.x > h) {
+			discard;
+		}
+	}
 }

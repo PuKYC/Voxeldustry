@@ -10,6 +10,8 @@ var _poolable: Dictionary[int, bool] = {}
 var _pool: Dictionary[int, Array] = {}
 ## VoxelMeshNode 单独一个池（它们没有 prototype_id）。
 var _voxel_pool: Array = []
+## VoxelGroupNode 单独一个池（一个节点承载一组同 LOD 的块）。
+var _voxel_group_pool: Array = []
 var _root: Node
 
 func _init(root: Node) -> void:
@@ -20,6 +22,8 @@ func register_prototype(id: int, scene: PackedScene, poolable: bool = true) -> v
 	_poolable[id] = poolable
 
 func acquire(proto_id: int, build: int = ViewRules.Build.PROTOTYPE_SCENE) -> BevyEntityNode:
+	if build == ViewRules.Build.VOXEL_GROUP:
+		return _acquire_voxel_group()
 	if build == ViewRules.Build.VOXEL_RAW:
 		return _acquire_voxel()
 	var bucket: Array = _pool.get(proto_id, [])
@@ -43,8 +47,23 @@ func _acquire_voxel() -> BevyEntityNode:
 	e.visible = true
 	return e
 
+
+func _acquire_voxel_group() -> BevyEntityNode:
+	var e: VoxelGroupNode
+	if _voxel_group_pool.is_empty():
+		e = VoxelGroupNode.new()
+		_root.add_child(e)
+	else:
+		e = _voxel_group_pool.pop_back()
+	e.visible = true
+	return e
+
 func release(e: BevyEntityNode) -> void:
 	if e == null:
+		return
+	if e is VoxelGroupNode:
+		e.reset()
+		_voxel_group_pool.append(e)
 		return
 	if e is VoxelMeshNode:
 		e.reset()

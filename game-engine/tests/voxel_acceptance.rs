@@ -877,12 +877,14 @@ fn incremental_entry_external_only_skips_occupancy() {
         "external-only result must equal a full recompute bit for bit"
     );
 
-    // The dirty set only covers the affected (plane, dir) = YZPos (0, 0).
+    // A +X external change still dirties YZPos (plane 0, dir 0). It also
+    // conservatively dirties the other plane families, because AO reads the
+    // tangent coordinate and the +X mask can shade perpendicular faces.
     let report = cache.last_report().expect("report recorded");
     assert!(!report.dirty.is_empty());
     assert!(
-        report.dirty.iter().all(|k| k.plane == 0 && k.dir == 0),
-        "a +X external change may only dirty YZPos (plane 0, dir 0) slices"
+        report.dirty.iter().any(|k| k.plane == 0 && k.dir == 0),
+        "a +X external change must dirty YZPos (plane 0, dir 0) slices"
     );
 
     cache.clear();

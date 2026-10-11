@@ -43,12 +43,13 @@ enum Payload {
 	PROTOTYPE = 6,
 	## 7 是已删除的 RECTLIST 遗位：有意留空，禁止复用。
 	RAWVOXELS = 8, ## 原始体素 halo：Godot 调 gdext mesher 现算 39 bit 矩形流
+	RAWVOXELGROUPS = 9, ## 同一 LOD 的一组分块：每块 34³ halo，各一个子 VoxelMeshNode
 }
 
 ## attach / detach / despawn 命令的 payload_kinds 哨兵（packed::PAYLOAD_NONE）。
 const PAYLOAD_NONE := 0xFF
 ## 枚举条目数（Rust PayloadKind::ALL.len()），不进 enum 以免破坏契约测试。
-const PAYLOAD_COUNT := 8
+const PAYLOAD_COUNT := 9
 
 ## extension 载荷字段 tag（与 game-core payload/packed.rs 对齐）。
 const EXT_TAG_I32 := 0
@@ -70,6 +71,7 @@ enum Wire {
 	TAGS,    ## i32 池：n + n 个 int -> PackedInt32Array
 	EXT_BAG, ## i32 池：变长扩展袋（吃掉本条命令剩余槽位）
 	BYTES,   ## i32 池：[byte_len, chunk_count, chunk...] -> PackedByteArray（RAWVOXELS 用）
+	CHUNK_BLOCKS, ## i32 池：[count, (x, y, z, byte_len, skirt_mask, chunk_count, chunk...)*] -> Array[Dictionary]（RAWVOXELGROUPS 用；每块带 skirt_mask）
 }
 
 ## 视图呈现方式：PayloadCodec 只产数据，ViewLayer 按它决定怎么演。
@@ -77,7 +79,8 @@ enum View {
 	NONE,      ## 纯数据载荷，不接触节点
 	TRANSFORM, ## 位姿：codec.sample_position / sample_yaw
 	VISIBLE,   ## 可见性：node.visible
-	RAWVOXEL,  ## 原始体素 halo：gdext mesher 现算后 node.set_raw_voxel_view(lod, blocks)
+	RAWVOXEL,  ## 原始体素 halo：gdext mesher 现算后 node.set_raw_voxel_view(lod, blocks, skirt_mask)
+	RAWVOXELGROUP, ## 体素分组：每块一个子 VoxelMeshNode，node.set_raw_voxel_group_view(lod, chunks)
 }
 
 ## 载荷 schema。新增核心载荷 = 这里加一行（+ Rust 侧）。
@@ -125,12 +128,23 @@ const PAYLOAD_SCHEMA := {
 		"wire": [Wire.I32],
 		"view": View.NONE,
 	},
-	## 原始体素 halo：i32 池 = [lod, byte_len, chunk_count, chunk...]；BYTES 解成
-	## PackedByteArray，view=RAWVOXEL 交给 VoxelMeshNode 调 gdext mesher 现算
-	## 39 bit 矩形流后，再用 RenderingDevice 在 GPU 上展开。
+	## 原始体素 halo：i32 池 = [lod, skirt_mask, byte_len, chunk_count, chunk...]；
+	## BYTES 解成 PackedByteArray；skirt_mask 是 6 bit 跨 LOD 接缝裙边掩码
+	## （ExternalPlane 顺序 [+x,-x,+y,-y,+z,-z]，0 = 无裙边）。view=RAWVOXEL 交给
+	## VoxelMeshNode 调 gdext mesher 现算 39 bit 矩形流后，再用 RenderingDevice 展开。
 	Payload.RAWVOXELS: {
-		"fields": ["lod", "blocks"],
-		"wire": [Wire.I32, Wire.BYTES],
+		"fields": ["lod", "skirt_mask", "blocks"],
+		"wire": [Wire.I32, Wire.I32, Wire.BYTES],
 		"view": View.RAWVOXEL,
+	},
+	## 体素分组：i32 池 = [lod, count, (x, y, z, byte_len, skirt_mask, chunk_count, chunk...)*]；
+	## CHUNK_BLOCKS 解成 Array[{x, y, z, skirt_mask, blocks}]（每块带 6 bit 跨 LOD
+	## 裙边掩码，0 = 无裙边），view=RAWVOXELGROUP 交给 VoxelGroupNode：每块调 gdext
+	## mesher，各由一个按 key 复用的子 VoxelMeshNode 绘制。fields/wire 的顶层形状
+	## 不变（mask 在 CHUNK_BLOCKS 的逐块记录里，不是顶层字段）。
+	Payload.RAWVOXELGROUPS: {
+		"fields": ["lod", "chunks"],
+		"wire": [Wire.I32, Wire.CHUNK_BLOCKS],
+		"view": View.RAWVOXELGROUP,
 	},
 }
