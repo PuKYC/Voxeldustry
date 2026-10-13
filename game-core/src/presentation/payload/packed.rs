@@ -11,9 +11,9 @@ use crate::input::actions::ActionId;
 use std::collections::BTreeMap;
 
 use super::{
-    ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedHealth,
-    PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload, MAX_EXT_FIELDS,
-    MAX_EXT_TAGS,
+    ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedCamera,
+    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload,
+    MAX_EXT_FIELDS, MAX_EXT_TAGS,
 };
 
 impl PackedPayload for PresentationState {
@@ -93,6 +93,35 @@ impl PackedPayload for PresentedHealth {
         PresentedHealth {
             current: f[fo],
             max: f[fo + 1],
+        }
+    }
+}
+
+impl PackedPayload for PresentedCamera {
+    fn put_body(&self, out: &mut Vec<u8>) {
+        put_f32(out, self.yaw);
+        put_f32(out, self.pitch);
+    }
+
+    fn write_pools(&self, f: &mut Vec<f32>, _i: &mut Vec<i64>) {
+        f.push(self.yaw);
+        f.push(self.pitch);
+    }
+
+    fn read_body(
+        r: &mut Reader<'_>,
+        f: &mut Vec<f32>,
+        _i: &mut Vec<i64>,
+    ) -> Result<(), PackedError> {
+        f.push(r.f32()?);
+        f.push(r.f32()?);
+        Ok(())
+    }
+
+    fn from_pools(f: &[f32], _i: &[i64], fo: usize, _io: usize) -> Self {
+        PresentedCamera {
+            yaw: f[fo],
+            pitch: f[fo + 1],
         }
     }
 }

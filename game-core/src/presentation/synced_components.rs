@@ -17,8 +17,8 @@ use bevy::prelude::*;
 use crate::privacy::ExactHealth;
 
 use super::payload::{
-    InteractionHint, PayloadKind, PresentationState, PresentedHealth, PresentedPrototype,
-    RawVoxelGroupPayload, RawVoxelPayload, SyncPayload, ToPresentation,
+    InteractionHint, PayloadKind, PresentationState, PresentedCamera, PresentedHealth,
+    PresentedPrototype, RawVoxelGroupPayload, RawVoxelPayload, SyncPayload, ToPresentation,
 };
 use super::voxel_mesh::{VoxChunkGroupRaw, VoxChunkRaw};
 use super::PresentationAppExt;
@@ -104,6 +104,10 @@ synced_components! {
     // 本阶段只接同步通道，地形生产者后续接入。
     RawVoxelGroups => VoxChunkGroupRaw,
         |c: &VoxChunkGroupRaw| RawVoxelGroupPayload::from_chunks(c.lod, c.chunks.clone());
+    // 相机视角：带 CameraFlag 的实体由 camera_system 写 CameraView，变更才重发。
+    // 相机位置走同实体的 Transform 载荷（PresentedTransform），这里只有朝向。
+    Camera => crate::gameplay::CameraView,
+        |c: &crate::gameplay::CameraView| PresentedCamera { yaw: c.yaw, pitch: c.pitch };
 }
 
 // 逻辑侧 `Transform` **不直出**：真正注册的是表现侧 `PresentedTransform`

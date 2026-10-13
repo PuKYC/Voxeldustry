@@ -7,11 +7,15 @@ extends Node3D
 
 const BEVY_CLIENT_SCENE := preload("res://bevy_client/bevy_client.tscn")
 
-## 相机距离（纯表现，和逻辑无关）。
+## 相机模式：FOLLOW_BACKEND = 第一人称，视角由后端同步（鼠标转视角，Esc 释放鼠标）；
+## STATIC = 原来的固定俯视相机。
+@export var camera_mode: CameraRig.CameraMode = CameraRig.CameraMode.FOLLOW_BACKEND
+## STATIC 模式 / FOLLOW 模式首帧到达前的相机位置（纯表现，和逻辑无关）。
 @export var camera_height: float = 90.0
 @export var camera_distance: float = 110.0
 
 var _client: Node = null
+var _camera: CameraRig = null
 
 
 func _ready() -> void:
@@ -27,13 +31,17 @@ func _ready() -> void:
 	_client.connect(&"bevy_error", _on_bevy_error)
 	_client.connect(&"bevy_stopped", _on_bevy_stopped)
 
+	# 必须在首帧之前绑定，否则会错过只下发一次的 CAMERA 载荷。
+	_camera.bind(_client)
+
 
 func _setup_camera_and_light() -> void:
-	var camera := Camera3D.new()
-	camera.name = "Camera3D"
-	camera.fov = 60.0
-	add_child(camera)
-	camera.look_at_from_position(
+	_camera = CameraRig.new()
+	_camera.name = "Camera3D"
+	_camera.camera_mode = camera_mode
+	_camera.fov = 60.0
+	add_child(_camera)
+	_camera.look_at_from_position(
 		Vector3(0.0, camera_height, camera_distance),
 		Vector3.ZERO,
 		Vector3.UP

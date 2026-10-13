@@ -43,6 +43,9 @@ game_engine::define_payloads! {
     // 体素分组：一个组件承载同一 LOD 的多块（每块 34³ halo），按 ChunkKey 升序
     // 序列化，Godot 侧物化「一个 LOD 分组一个节点」。code 只追加。
     RawVoxelGroups = 9, "rawvoxelgroups", payload: RawVoxelGroupPayload;
+    // 相机视角（yaw / pitch，弧度）：由带 CameraFlag 的实体下发，Godot 的 CameraRig 消费。
+    // code 只追加：9 已被 RawVoxelGroups 占用，故为 10。
+    Camera       = 10, "camera",      payload: PresentedCamera;
 }
 
 /// L5：精简表现状态。
@@ -78,6 +81,17 @@ pub struct PresentedHealth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PresentedVisibility {
     pub visible: bool,
+}
+
+/// 相机视角载荷（弧度）。
+///
+/// 约定与 `gameplay::camera` 一致：yaw 绕 +Y（0 = 朝 -Z），pitch 绕 +X（正 = 抬头），
+/// 欧拉顺序 YXZ，即 Godot `Node3D.rotation = Vector3(pitch, yaw, 0)`。
+/// 相机**位置**不在这里：它走同一实体的 `Transform` 载荷。
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct PresentedCamera {
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 /// 静态原型 ID 载荷（曾经的 attach 附加负载，现在是普通载荷）。
@@ -282,7 +296,7 @@ mod tests {
         assert!(RawVoxelGroupPayload::default().is_empty());
     }
 
-    /// 0..6 与 8 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
+    /// 0..6、8、9、10 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
     #[test]
     fn payload_codes_are_append_only_and_code_seven_stays_vacant() {
         assert_eq!(
@@ -300,6 +314,7 @@ mod tests {
             (6, "prototype"),
             (8, "rawvoxels"),
             (9, "rawvoxelgroups"),
+            (10, "camera"),
         ] {
             assert_eq!(
                 PayloadKind::from_code(code).map(|kind| kind.as_str()),

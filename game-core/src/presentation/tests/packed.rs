@@ -575,6 +575,10 @@ fn sample_payload(kind: PayloadKind) -> SyncPayload {
                 ]),
             ))
         }
+        PayloadKind::Camera => SyncPayload::Camera(crate::presentation::payload::PresentedCamera {
+            yaw: -1.25,
+            pitch: 0.5,
+        }),
     }
 }
 

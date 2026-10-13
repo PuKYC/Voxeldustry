@@ -14,7 +14,7 @@
 use bevy::prelude::*;
 
 use super::spawn_local_player;
-use crate::gameplay::{GameplaySet, Velocity};
+use crate::gameplay::{spawn_camera_rig, Facing, GameplaySet, Velocity};
 use crate::input::control::{InputSourceId, LocalPlayer};
 use crate::input::snapshot::ResolvedInput;
 use crate::input::SimulationTick;
@@ -78,6 +78,12 @@ fn spawn_demo_world(world: &mut World) {
         observer = 70.0,
         extra = (),
     );
+
+    // ── 相机 ──
+    //
+    // 带 `CameraFlag` 的实体：camera_system 读玩家的 Facing 设置它的朝向并同步给
+    // Godot（Camera 载荷）。Godot 侧不接 CameraRig 时它只是一个看不见的实体。
+    let (_camera_entity, _camera_id) = spawn_camera_rig(world);
 
     // ── 游荡实体 ──
     let mut rng = RngState::from_seed(0x5EED);
@@ -199,14 +205,25 @@ fn demo_move_player(
     time: Res<Time<Fixed>>,
     // 直接读写真实速度组件（与 record_local_history 读的是同一份状态），
     // 回滚重演因此不会丢动量。
-    mut query: Query<(&mut Transform, &mut Velocity, &ResolvedInput), With<LocalPlayer>>,
+    // `Facing` 由 ensure_facing 补挂；缺失时按 yaw=0 处理（朝 -Z）。
+    mut query: Query<
+        (
+            &mut Transform,
+            &mut Velocity,
+            &ResolvedInput,
+            Option<&Facing>,
+        ),
+        With<LocalPlayer>,
+    >,
 ) {
     let dt = time.delta_secs();
 
-    for (mut transform, mut velocity, input) in &mut query {
+    for (mut transform, mut velocity, input, facing) in &mut query {
+        // 移动相对朝向：facing_system（Decision）已先于本系统（Motion）更新 yaw。
         let (translation, new_velocity) = apply_input(
             transform.translation,
             velocity.linear,
+            facing.map_or(0.0, |f| f.yaw),
             input.0,
             MAX_SPEED,
             ACCEL,

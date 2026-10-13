@@ -44,12 +44,13 @@ enum Payload {
 	## 7 是已删除的 RECTLIST 遗位：有意留空，禁止复用。
 	RAWVOXELS = 8, ## 原始体素 halo：Godot 调 gdext mesher 现算 39 bit 矩形流
 	RAWVOXELGROUPS = 9, ## 同一 LOD 的一组分块：每块 34³ halo，各一个子 VoxelMeshNode
+	CAMERA = 10,   ## 相机视角（弧度）：yaw 绕 +Y、pitch 绕 +X；由 CameraRig 消费
 }
 
 ## attach / detach / despawn 命令的 payload_kinds 哨兵（packed::PAYLOAD_NONE）。
 const PAYLOAD_NONE := 0xFF
 ## 枚举条目数（Rust PayloadKind::ALL.len()），不进 enum 以免破坏契约测试。
-const PAYLOAD_COUNT := 9
+const PAYLOAD_COUNT := 10
 
 ## extension 载荷字段 tag（与 game-core payload/packed.rs 对齐）。
 const EXT_TAG_I32 := 0
@@ -146,5 +147,12 @@ const PAYLOAD_SCHEMA := {
 		"fields": ["lod", "chunks"],
 		"wire": [Wire.I32, Wire.CHUNK_BLOCKS],
 		"view": View.RAWVOXELGROUP,
+	},
+	## 相机视角：不对应任何显示节点（view = NONE），由 CameraRig 直接读 EntityData 里的组件值。
+	## 约定：Godot 侧 rotation = Vector3(pitch, yaw, 0)，位置走同实体的 TRANSFORM 载荷。
+	Payload.CAMERA: {
+		"fields": ["yaw", "pitch"],
+		"wire": [Wire.ANGLE, Wire.ANGLE],
+		"view": View.NONE,
 	},
 }

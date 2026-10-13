@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 use game_engine::backend::GameModule;
 
-use crate::gameplay::{DeathPlugin, GameplayPlugin, MovementPlugin};
+use crate::gameplay::{CameraPlugin, DeathPlugin, GameplayPlugin, MovementPlugin};
 use crate::input::GameInputPlugin;
 use crate::prediction::PredictionPlugin;
 use crate::presentation::{register_synced_components, PresentationPlugin};
@@ -35,7 +35,7 @@ impl GameModule<CoreSpec> for CoreGame {
             AoIPlugin::<GlobalTransform>::default(),
         ));
         // 玩法层装配。
-        app.add_plugins((GameplayPlugin, MovementPlugin, DeathPlugin));
+        app.add_plugins((GameplayPlugin, MovementPlugin, DeathPlugin, CameraPlugin));
         // 体素世界层：游戏语义 / 数值 / 生成。v1 无执行。
         app.add_plugins(WorldPlugin);
         app.add_plugins(GameVoxelPlugin);

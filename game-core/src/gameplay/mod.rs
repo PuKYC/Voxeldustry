@@ -1,12 +1,17 @@
-//! 玩法层：阶段集装配 + movement / death 系统。
+//! 玩法层：阶段集装配 + movement / death / 朝向与相机系统。
 //!
 //! 玩法系统**不自己声明彼此顺序**，只挂到 [`GameplaySet`] 的某个阶段；
 //! [`GameplayPlugin`] 只挂引擎的 `EngineSetPlugin`；阶段顺序由 game-engine
 //! 在 `FixedUpdate` 里一次 `.chain()` 声明（见 `game-engine/src/sim.rs`）。
 
+mod camera;
 mod death;
 mod movement;
 
+pub use camera::{
+    camera_system, facing_system, spawn_camera_rig, CameraFlag, CameraPlugin, CameraView, Facing,
+    CAMERA_EYE_HEIGHT, LOOK_SENSITIVITY, PITCH_LIMIT,
+};
 pub use death::DeathPlugin;
 pub use movement::{MovementPlugin, Velocity};
 

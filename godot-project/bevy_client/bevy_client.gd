@@ -48,6 +48,9 @@ enum Mode {
 @export_group("Input")
 ## 自动注册 InputMap、采集 held/pressed/released 并每帧提交给 Bevy。
 @export var enable_input: bool = true
+## true 时只有鼠标被捕获（Input.MOUSE_MODE_CAPTURED）才把鼠标位移当视角输入。
+## CameraRig 在 FOLLOW_BACKEND 模式下会自动打开，避免光标在窗口里划过时视角乱转。
+@export var look_requires_mouse_capture: bool = false
 
 @export_group("Presentation")
 ## id 或语义名 -> 资源；配了就自动播放 / 实例化（EventPresenter）。
@@ -81,6 +84,8 @@ var _registry := EntityRegistry.new()
 var _interp: EntityInterpolator
 var _container: Node = null
 var _tick: int = 0
+## 最近一次采样的渲染插值 alpha（供 CameraRig 等需要与实体同步采样的外部节点读取）。
+var render_alpha: float = 1.0
 
 
 func _ready() -> void:
@@ -210,6 +215,8 @@ func register_extension(key: int, handler: Callable) -> void:
 
 func _input(event: InputEvent) -> void:
 	if enable_input and event is InputEventMouseMotion:
+		if look_requires_mouse_capture and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+			return
 		input.on_mouse_motion((event as InputEventMouseMotion).relative)
 
 
@@ -225,7 +232,8 @@ func _process(_dt: float) -> void:
 	events.route(_bridge.drain_events())
 	# 空闲/全静止时不进 interp，也不做 render_alpha 的 FFI。
 	if _registry.active().size() > 0:
-		_interp.tick(_bridge.render_alpha(), _tick)
+		render_alpha = _bridge.render_alpha()
+		_interp.tick(render_alpha, _tick)
 
 
 func get_entity(id: int) -> EntityData:
