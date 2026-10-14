@@ -22,16 +22,22 @@ env:
   # 必须与 godot-project/project.godot 的 config/features 一致。
   GODOT_VERSION: "4.7.2"
 
+# =============================================================================
+# 扩展指南：在 build.matrix.include 里追加一条即可（preset 名与
+# godot-project/export_presets.cfg 保持一致）。
+# =============================================================================
+
 jobs:
   build:
     name: ${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x86_64
+            runner: ubuntu-24.04
             targets: x86_64-unknown-linux-gnu
             cargo_cmd: cargo
             preset: Linux x86_64
@@ -39,6 +45,7 @@ jobs:
             artifact: game-linux-x86_64
             experimental: false
           - name: linux-arm64
+            runner: ubuntu-24.04
             targets: aarch64-unknown-linux-gnu
             cargo_cmd: cross
             preset: Linux arm64
@@ -46,6 +53,7 @@ jobs:
             artifact: game-linux-arm64
             experimental: false
           - name: windows-x86_64
+            runner: ubuntu-24.04
             targets: x86_64-pc-windows-gnu
             cargo_cmd: cargo
             preset: Windows Desktop x64
@@ -53,6 +61,7 @@ jobs:
             artifact: game-windows-x86_64
             experimental: false
           - name: android-arm64
+            runner: ubuntu-24.04
             targets: aarch64-linux-android armv7-linux-androideabi
             cargo_cmd: cargo
             preset: Android arm64
@@ -62,6 +71,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Godot 编辑器在导入包含 Android preset 的项目时，Android 插件会探测 adb。
+      # 提前装好并启动 server，避免导入/导出阶段报错。
+      # 注：Android 矩阵项后面还会通过 setup-android 安装 platform-tools（含 adb），
+      #     两者路径不同、互不冲突。
+      - name: Setup ADB
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y adb
+          adb start-server
+          adb version
+          adb devices
 
       - name: Setup Godot
         uses: chickensoft-games/setup-godot@v2
@@ -74,7 +96,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          # v1 默认 RUSTFLAGS=-D warnings；清空以避免把既有 warning 当错误。
           rustflags: ""
 
       - name: Add Rust targets
@@ -108,7 +129,7 @@ jobs:
           tool: cargo-ndk
 
       - name: Build host GDExtension (Linux x86_64, debug) for editor import
-        # Godot 编辑器在导入场景时会实例化原生类 BevyAppManager，
+        # Godot 编辑器导入场景时会实例化原生类 BevyAppManager，
         # 因此导出前必须提供宿主平台（linux.debug.x86_64）的动态库。
         run: bash ./build.sh
 
@@ -133,8 +154,6 @@ jobs:
           java-version: "17"
 
       - name: Setup Android SDK (Android export)
-        # Godot 4.7.2 的 Android 构建模板要求（见 platform/android/java/app/config.gradle）：
-        # compileSdk/targetSdk = 36，build-tools = 36.1.0，NDK = 29.0.14206865。
         if: contains(matrix.targets, 'android')
         uses: android-actions/setup-android@v3
         with:
@@ -154,7 +173,6 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME"
 
       - name: Create Android debug keystore
-        # godot-ci 镜像内置 debug keystore，改用 setup-godot 后需要自己生成。
         if: contains(matrix.targets, 'android')
         run: |
           set -euo pipefail
@@ -180,15 +198,12 @@ jobs:
       - name: Configure Android release signing
         if: contains(matrix.targets, 'android')
         env:
-          # 现在直接在 runner 上跑 Godot，使用仓库内的绝对路径。
           ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/.android-keystore/release.keystore
           ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: python3 .github/scripts/configure_android_keystore.py
 
       - name: Install Android build template (gradle build)
-        # export_presets.cfg 里 gradle_build/use_gradle_build=true，
-        # 而 godot-project/android/ 被 gitignore，干净检出时不存在，必须现场安装模板。
         if: contains(matrix.targets, 'android')
         run: |
           set -euo pipefail
@@ -213,11 +228,9 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
     needs: build
-    # 即使 experimental 平台失败（产物缺失）也照常发布其它平台。
     if: always()
     steps:
       - name: Download all builds
-        # 允许某个 experimental 平台缺失产物而不中断发布。
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:

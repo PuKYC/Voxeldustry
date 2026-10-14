@@ -15,9 +15,20 @@ env:
   # 必须与 godot-project/project.godot 的 config/features 一致。
   GODOT_VERSION: "4.7.2"
 
+# =============================================================================
+# 扩展指南：
+#   1) 加新平台 → gdext.matrix.include 追加一条（name 唯一）；
+#   2) 加新 Godot 导出 → godot.matrix.include 追加一条，preset 必须与
+#      godot-project/export_presets.cfg 中的 name 一致；
+#   3) 两个矩阵的 name 建议保持一致，方便对照与排查。
+# =============================================================================
+
 jobs:
-  rust:
-    name: Rust build (debug)
+  # ---------------------------------------------------------------------------
+  # Lint：只跑一次（rustfmt / clippy 与平台无关），非阻塞。
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -39,31 +50,160 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets -- -D warnings
 
+  # ---------------------------------------------------------------------------
+  # Test：平台矩阵，多 OS 并行跑单元测试。
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: windows-x86_64
+            os: windows-2022
+          - name: macos-arm64
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
       - name: Test
         run: cargo test --workspace
 
+  # ---------------------------------------------------------------------------
+  # GDExtension：平台矩阵，每个平台并行构建 native 库。
+  # artifact 命名统一为 gdext-debug-<name>，godot job 用 pattern 一次性拉取。
+  # ---------------------------------------------------------------------------
+  gdext:
+    name: GDExtension debug (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            targets: x86_64-unknown-linux-gnu
+            cargo_cmd: cargo
+          # -------- 追加平台的模板（按需取消注释/复制） --------
+          # - name: linux-arm64
+          #   runner: ubuntu-24.04
+          #   targets: aarch64-unknown-linux-gnu
+          #   cargo_cmd: cross
+          # - name: windows-x86_64
+          #   runner: ubuntu-24.04
+          #   targets: x86_64-pc-windows-gnu
+          #   cargo_cmd: cargo
+          # - name: macos-arm64
+          #   runner: macos-14
+          #   targets: aarch64-apple-darwin
+          #   cargo_cmd: cargo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Add Rust targets
+        if: matrix.targets != ''
+        run: rustup target add ${{ matrix.targets }}
+
+      - name: Install cross
+        if: matrix.cargo_cmd == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install MinGW (windows-gnu)
+        if: contains(matrix.targets, 'windows-gnu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
       - name: Build GDExtension library (debug)
-        run: bash ./build.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in ${{ matrix.targets }}; do
+            CARGO_CMD="${{ matrix.cargo_cmd }}" bash ./build.sh --target "$t"
+          done
 
       - name: Upload GDExtension library
         uses: actions/upload-artifact@v4
         with:
-          name: gdext-debug-linux-x86_64
+          name: gdext-debug-${{ matrix.name }}
           path: godot-project/bin/debug/
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Godot：先合并所有平台的 GDExtension 二进制到同一目录，再逐 preset 导出。
+  # ---------------------------------------------------------------------------
   godot:
-    name: Godot build (debug export)
+    name: Godot debug export (${{ matrix.name }})
     runs-on: ubuntu-24.04
-    needs: rust
+    needs: gdext
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            preset: Linux x86_64
+            out: build/linux/game.x86_64
+            artifact: godot-debug-linux-x86_64
+          # -------- 追加导出的模板（preset 名必须与 export_presets.cfg 一致） --------
+          # - name: linux-arm64
+          #   preset: Linux arm64
+          #   out: build/linux/game.arm64
+          #   artifact: godot-debug-linux-arm64
+          # - name: windows-x86_64
+          #   preset: Windows Desktop x64
+          #   out: build/windows/game.exe
+          #   artifact: godot-debug-windows-x86_64
+          # - name: android-arm64
+          #   preset: Android arm64
+          #   out: build/android/game.apk
+          #   artifact: godot-debug-android
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download GDExtension library
+      # Godot 编辑器在导入包含 Android preset 的项目时，Android 插件会探测 adb，
+      # 因此提前装好 adb 并启动 server，避免导入阶段报错/卡住。
+      - name: Setup ADB
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y adb
+          adb start-server
+          adb version
+          adb devices
+
+      # 合并所有 gdext-debug-* artifact 到 godot-project/bin/debug
+      - name: Download & merge all GDExtension libraries
         uses: actions/download-artifact@v4
         with:
-          name: gdext-debug-linux-x86_64
+          pattern: gdext-debug-*
+          merge-multiple: true
           path: godot-project/bin/debug
+
+      - name: List GDExtension binaries
+        run: find godot-project/bin -type f | sort
 
       - name: Setup Godot
         uses: chickensoft-games/setup-godot@v2
@@ -78,15 +218,15 @@ jobs:
       - name: Import project
         run: godot --headless --path godot-project --import
 
-      - name: Export debug build (Linux x86_64)
+      - name: Export debug build (${{ matrix.name }})
         run: |
           set -euo pipefail
-          mkdir -p build/linux
-          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64
+          mkdir -p "$(dirname '${{ matrix.out }}')"
+          godot --headless --path godot-project --export-debug '${{ matrix.preset }}' '${{ matrix.out }}'
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
         with:
-          name: godot-debug-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: build/
           if-no-files-found: error
