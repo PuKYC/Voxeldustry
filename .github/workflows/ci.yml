@@ -78,12 +78,11 @@ jobs:
             > /tmp/godot-export.log 2>&1
           code=$?
           echo "docker exit code: $code"
-          tail -n 150 /tmp/godot-export.log || true
-          if [ "$code" -ne 0 ]; then
-            payload=$(tail -n 150 /tmp/godot-export.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
-            echo "::error title=godot-export-failed::$payload"
-            exit "$code"
-          fi
+          tail -n 200 /tmp/godot-export.log || true
+          # 诊断期间无条件暴露日志（注解不改变步骤成败，退出码才决定）。
+          payload=$(tail -n 200 /tmp/godot-export.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+          echo "::error title=godot-export-log::$payload"
+          exit "$code"
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4

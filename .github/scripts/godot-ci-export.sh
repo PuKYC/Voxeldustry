@@ -21,6 +21,11 @@ godot --headless --verbose --path godot-project --import
 echo "IMPORT_NOEXT_EXIT=$?"
 mv /tmp/main.gdextension.bak godot-project/main.gdextension
 
-echo "=== probe 4: export debug (only if probe 2 ok) ==="
+echo "=== probe 4: export debug ==="
 godot --headless --verbose --path godot-project --export-debug "Linux x86_64" "build/linux/game.x86_64"
 echo "EXPORT_EXIT=$?"
+
+if [ -f build/linux/game.x86_64 ]; then
+  exit 0
+fi
+exit 1
