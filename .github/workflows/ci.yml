@@ -80,9 +80,25 @@ jobs:
 
       - name: Export debug build (Linux x86_64)
         run: |
-          set -euo pipefail
+          # 临时诊断：把导出日志写入注解，便于在无 token 的情况下读取。
+          set +e
           mkdir -p build/linux
-          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64
+          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64 > /tmp/export.log 2>&1
+          code=$?
+          {
+            echo "export exit=$code"
+            echo "=== export_templates ==="
+            ls -1 "$HOME/.local/share/godot/export_templates" 2>&1
+            ls -1 "$HOME/.local/share/godot/export_templates/4.7.2.stable" 2>&1 | head -n 40
+            echo "=== build/linux ==="
+            ls -la build/linux 2>&1 || true
+            echo "=== export log (tail 200) ==="
+            tail -n 200 /tmp/export.log
+          } > /tmp/diag.txt 2>&1
+          cat /tmp/diag.txt
+          payload=$(sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g' /tmp/diag.txt)
+          echo "::error title=godot-export-diag::$payload"
+          exit "$code"
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
