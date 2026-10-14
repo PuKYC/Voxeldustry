@@ -67,7 +67,8 @@ jobs:
 
       - name: Import project & export debug build
         run: |
-          set -uo pipefail
+          # GitHub 默认用 `bash -e`，docker 失败会立即退出；先关掉 -e 才能捕获日志。
+          set +e -o pipefail
           mkdir -p build/linux
           docker run --rm \
             -v "$PWD:/project" \
