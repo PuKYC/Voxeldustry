@@ -76,20 +76,25 @@ jobs:
         run: godot --version
 
       - name: Import project
-        run: godot --headless --path godot-project --import
+        run: |
+          mkdir -p /tmp/godot-logs
+          godot --headless --path godot-project --import > /tmp/godot-logs/import.log 2>&1
 
       - name: Export debug build (Linux x86_64)
         run: |
-          # 临时诊断：setsid 隔离进程组，日志尾部写成注解（无需 token 读取）。
-          set +e
           mkdir -p build/linux
-          setsid --wait godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64 > /tmp/export.log 2>&1
-          code=$?
-          echo "export exit=$code"
-          tail -n 30 /tmp/export.log
-          payload=$(tail -n 30 /tmp/export.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
-          echo "::error title=godot-export::$payload"
-          exit "$code"
+          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64 > /tmp/godot-logs/export.log 2>&1
+
+      - name: Dump Godot logs (diagnostic)
+        if: always()
+        run: |
+          for f in /tmp/godot-logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            tail -n 200 "$f" || true
+            payload=$(tail -n 80 "$f" 2>/dev/null | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::error title=godot-diag-$(basename "$f")::$payload"
+          done
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
