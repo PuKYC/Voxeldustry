@@ -7,7 +7,6 @@
 **/.godot/
 /android/
 /export/
-export_presets.cfg
 *.pck
 *.translation
 
