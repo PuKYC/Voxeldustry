@@ -14,6 +14,8 @@ env:
   RUST_TOOLCHAIN: "1.95"
   # 必须与 godot-project/project.godot 的 config/features 一致。
   GODOT_VERSION: "4.7.2"
+  # Android NDK 版本（r26d 与 Godot 4.7 官方推荐一致）。
+  ANDROID_NDK_VERSION: "r26d"
 
 # =============================================================================
 # 扩展指南：
@@ -96,11 +98,16 @@ jobs:
             runner: ubuntu-22.04
             targets: x86_64-unknown-linux-gnu
             cargo_cmd: cargo
+          - name: linux-arm64
+            runner: ubuntu-22.04
+            targets: aarch64-unknown-linux-gnu
+            cargo_cmd: cross
+          - name: android-arm64
+            runner: ubuntu-22.04
+            targets: aarch64-linux-android
+            cargo_cmd: cargo-ndk
+            ndk_abi: arm64-v8a
           # -------- 追加平台的模板（按需取消注释/复制） --------
-          # - name: linux-arm64
-          #   runner: ubuntu-24.04
-          #   targets: aarch64-unknown-linux-gnu
-          #   cargo_cmd: cross
           # - name: windows-x86_64
           #   runner: ubuntu-24.04
           #   targets: x86_64-pc-windows-gnu
@@ -131,6 +138,20 @@ jobs:
         with:
           tool: cross
 
+      - name: Install cargo-ndk
+        if: matrix.cargo_cmd == 'cargo-ndk'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Setup Android NDK
+        if: matrix.cargo_cmd == 'cargo-ndk'
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+          add-to-path: false
+
       - name: Install MinGW (windows-gnu)
         if: contains(matrix.targets, 'windows-gnu')
         run: |
@@ -139,10 +160,26 @@ jobs:
 
       - name: Build GDExtension library (debug)
         shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
           for t in ${{ matrix.targets }}; do
-            CARGO_CMD="${{ matrix.cargo_cmd }}" bash ./build.sh --target "$t"
+            case "${{ matrix.cargo_cmd }}" in
+              cargo-ndk)
+                # 输出到 bin/debug/android/<abi>/，与 *.gdextension 的
+                # android.debug.arm64 路径保持一致。
+                cargo ndk \
+                  --target "$t" \
+                  --platform 21 \
+                  --output-dir godot-project/bin/debug/android \
+                  build
+                ;;
+              *)
+                CARGO_CMD="${{ matrix.cargo_cmd }}" bash ./build.sh --target "$t"
+                ;;
+            esac
           done
 
       - name: Upload GDExtension library
@@ -167,19 +204,19 @@ jobs:
             preset: Linux x86_64
             out: build/linux/game.x86_64
             artifact: godot-debug-linux-x86_64
+          - name: linux-arm64
+            preset: Linux arm64
+            out: build/linux/game.arm64
+            artifact: godot-debug-linux-arm64
+          - name: android-arm64
+            preset: Android arm64
+            out: build/android/game.apk
+            artifact: godot-debug-android-arm64
           # -------- 追加导出的模板（preset 名必须与 export_presets.cfg 一致） --------
-          # - name: linux-arm64
-          #   preset: Linux arm64
-          #   out: build/linux/game.arm64
-          #   artifact: godot-debug-linux-arm64
           # - name: windows-x86_64
           #   preset: Windows Desktop x64
           #   out: build/windows/game.exe
           #   artifact: godot-debug-windows-x86_64
-          # - name: android-arm64
-          #   preset: Android arm64
-          #   out: build/android/game.apk
-          #   artifact: godot-debug-android
     steps:
       - uses: actions/checkout@v4
 
@@ -194,7 +231,27 @@ jobs:
           adb version
           adb devices
 
+      - name: Setup Android SDK
+        if: startsWith(matrix.name, 'android')
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      - name: Setup Android debug keystore
+        if: startsWith(matrix.name, 'android')
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey \
+              -keypass android -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -validity 9999 -deststoretype pkcs12
+          fi
+
       # 合并所有 gdext-debug-* artifact 到 godot-project/bin/debug
+      # （Android 的子目录 bin/debug/android/arm64-v8a/ 会一并保留）
       - name: Download & merge all GDExtension libraries
         uses: actions/download-artifact@v4
         with:
@@ -220,13 +277,22 @@ jobs:
 
       - name: Export debug build (${{ matrix.name }})
         run: |
-          set -euo pipefail
-          mkdir -p "$(dirname '${{ matrix.out }}')"
-          godot --headless --path godot-project --verbose --export-debug '${{ matrix.preset }}' '${{ matrix.out }}' "$PWD/build/linux/game.x86_64" || echo "export exit=$? (ignored)"
+          set +e
+          OUT="$PWD/${{ matrix.out }}"
+          mkdir -p "$(dirname "$OUT")"
+          godot --headless --path godot-project --verbose \
+            --export-debug '${{ matrix.preset }}' "$OUT" 2>&1 | tee /tmp/export.log
+          echo "godot exit=${PIPESTATUS[0]} (ignored: import/exit may abort)"
+          ls -la "$(dirname "$OUT")"
+          if [ ! -s "$OUT" ]; then
+            echo "::error::export produced no binary"
+            tail -n 60 /tmp/export.log
+            exit 1
+          fi
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: build/
-          if-no-files-found: error
+          if-no-files-found: errors
