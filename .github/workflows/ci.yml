@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95"
+  # godot-ci 镜像的 tag 必须与 project.godot 的 Godot 版本一致。
+  GODOT_CI_IMAGE: barichello/godot-ci:4.7.2
+
+jobs:
+  rust:
+    name: Rust build (debug)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Lint (non-blocking)
+        continue-on-error: true
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build GDExtension library (debug)
+        run: bash ./build.sh
+
+      - name: Upload GDExtension library
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdext-debug-linux-x86_64
+          path: godot-project/bin/debug/
+          if-no-files-found: error
+
+  godot:
+    name: Godot build (debug export)
+    runs-on: ubuntu-24.04
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download GDExtension library
+        uses: actions/download-artifact@v4
+        with:
+          name: gdext-debug-linux-x86_64
+          path: godot-project/bin/debug
+
+      - name: Import project & export debug build
+        run: |
+          set -euo pipefail
+          mkdir -p build/linux
+          docker run --rm \
+            -v "$PWD:/project" \
+            -w /project \
+            "$GODOT_CI_IMAGE" \
+            bash -lc "godot --headless --path godot-project --import && godot --headless --path godot-project --export-debug 'Linux x86_64' 'build/linux/game.x86_64'"
+
+      - name: Upload Godot debug build
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-debug-linux-x86_64
+          path: build/
+          if-no-files-found: error
