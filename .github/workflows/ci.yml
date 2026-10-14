@@ -76,25 +76,13 @@ jobs:
         run: godot --version
 
       - name: Import project
-        run: |
-          mkdir -p /tmp/godot-logs
-          godot --headless --path godot-project --import > /tmp/godot-logs/import.log 2>&1
+        run: godot --headless --path godot-project --import
 
       - name: Export debug build (Linux x86_64)
         run: |
+          set -euo pipefail
           mkdir -p build/linux
-          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64 > /tmp/godot-logs/export.log 2>&1
-
-      - name: Dump Godot logs (diagnostic)
-        if: always()
-        run: |
-          for f in /tmp/godot-logs/*.log; do
-            [ -f "$f" ] || continue
-            echo "===== $f ====="
-            tail -n 200 "$f" || true
-            payload=$(tail -n 80 "$f" 2>/dev/null | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
-            echo "::error title=godot-diag-$(basename "$f")::$payload"
-          done
+          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
