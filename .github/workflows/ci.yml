@@ -67,13 +67,26 @@ jobs:
 
       - name: Import project & export debug build
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p build/linux
           docker run --rm \
             -v "$PWD:/project" \
             -w /project \
             "$GODOT_CI_IMAGE" \
-            bash -lc "godot --headless --path godot-project --import && godot --headless --path godot-project --export-debug 'Linux x86_64' 'build/linux/game.x86_64'"
+            bash -lc "godot --headless --verbose --path godot-project --import && godot --headless --verbose --path godot-project --export-debug 'Linux x86_64' 'build/linux/game.x86_64'" \
+            > /tmp/godot-export.log 2>&1
+          code=$?
+          echo "docker exit code: $code"
+          tail -n 80 /tmp/godot-export.log || true
+          if [ "$code" -ne 0 ]; then
+            echo "::error::godot export failed with exit code $code"
+            n=0
+            while IFS= read -r line && [ "$n" -lt 25 ]; do
+              echo "::error::${line//'%'/'%25'}"
+              n=$((n+1))
+            done < <(tail -n 25 /tmp/godot-export.log)
+            exit "$code"
+          fi
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
