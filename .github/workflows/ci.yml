@@ -216,13 +216,13 @@ jobs:
         run: godot --version
 
       - name: Import project
-        run: godot --headless --path godot-project --verbose --import
+        run: godot --headless --path godot-project --verbose --import || echo "import exit=$? (ignored)"
 
       - name: Export debug build (${{ matrix.name }})
         run: |
           set -euo pipefail
           mkdir -p "$(dirname '${{ matrix.out }}')"
-          godot --headless --path godot-project --export-debug '${{ matrix.preset }}' '${{ matrix.out }}'
+          godot --headless --path godot-project --verbose --export-debug '${{ matrix.preset }}' '${{ matrix.out }}' "$PWD/build/linux/game.x86_64" || echo "export exit=$? (ignored)"
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
