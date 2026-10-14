@@ -80,22 +80,15 @@ jobs:
 
       - name: Export debug build (Linux x86_64)
         run: |
-          # 临时诊断：setsid 隔离进程组（Godot 崩溃可能带走整个进程组），
-          # 日志写入 job summary，无 token 也能从 check-run API 读取。
+          # 临时诊断：setsid 隔离进程组，日志尾部写成注解（无需 token 读取）。
           set +e
           mkdir -p build/linux
           setsid --wait godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64 > /tmp/export.log 2>&1
           code=$?
-          {
-            echo "export exit=$code"
-            echo ""
-            echo '~~~'
-            echo "templates: $(ls -1 "$HOME/.local/share/godot/export_templates/4.7.2.stable" 2>&1 | tr '\\n' ' ')"
-            echo "--- export log (tail 150) ---"
-            tail -n 150 /tmp/export.log
-            echo '~~~'
-          } >> "$GITHUB_STEP_SUMMARY"
           echo "export exit=$code"
+          tail -n 30 /tmp/export.log
+          payload=$(tail -n 30 /tmp/export.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+          echo "::error title=godot-export::$payload"
           exit "$code"
 
       - name: Upload Godot debug build
