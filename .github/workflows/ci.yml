@@ -93,7 +93,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             targets: x86_64-unknown-linux-gnu
             cargo_cmd: cargo
           # -------- 追加平台的模板（按需取消注释/复制） --------
@@ -216,7 +216,7 @@ jobs:
         run: godot --version
 
       - name: Import project
-        run: godot --headless --path godot-project --import
+        run: godot --headless --path godot-project --verbose --import
 
       - name: Export debug build (${{ matrix.name }})
         run: |
