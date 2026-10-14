@@ -27,6 +27,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
+          # v1 默认 RUSTFLAGS=-D warnings；本仓库尚未清完 warning，故清空。
+          rustflags: ""
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

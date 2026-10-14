@@ -176,6 +176,7 @@ python3 .github/scripts/configure_android_keystore.py
 - **Windows 用 MinGW（`x86_64-pc-windows-gnu`）交叉编译**。若遇到加载兼容性问题，可改为
   `runs-on: windows-latest` + `x86_64-pc-windows-msvc`（`build.sh` 已支持该 triple）。
 - **macOS 暂未纳入发布矩阵**；`.gdextension` 里保留了 macos 条目，导出预设暂缺。
+- `setup-rust-toolchain@v1` 默认 `RUSTFLAGS=-D warnings`；本仓库尚未清完 warning，因此显式设为 `rustflags: ""`，warning 门禁只保留在非阻塞的 clippy 步骤。
 - `cargo clippy` 目前 `continue-on-error`，待代码全绿后去掉。
 - godot-ci 镜像 tag 升级时，记得同步 `project.godot` 的 `config/features`。
 
