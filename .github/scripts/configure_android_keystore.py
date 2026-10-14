@@ -2,8 +2,9 @@
 """把 Android release keystore 写进 godot-project/export_presets.cfg。
 
 在 CI（或本地）导出 Android release 前运行。读取下列环境变量：
-  ANDROID_KEYSTORE_PATH       keystore 路径（注意：导出在 godot-ci 容器里跑，
-                              要写容器内可见的路径，例如 /project/.android-keystore/release.keystore）
+  ANDROID_KEYSTORE_PATH       keystore 路径（导出直接在 runner 上跑 Godot，
+                              写 runner 上可见的绝对路径，例如
+                              /home/runner/work/<repo>/<repo>/.android-keystore/release.keystore）
   ANDROID_KEYSTORE_ALIAS      key alias（Godot 的 keystore/release_user）
   ANDROID_KEYSTORE_PASSWORD   store / key 密码
 可选：

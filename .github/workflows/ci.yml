@@ -12,8 +12,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.95"
-  # godot-ci 镜像的 tag 必须与 project.godot 的 Godot 版本一致。
-  GODOT_CI_IMAGE: barichello/godot-ci:4.7.2
+  # 必须与 godot-project/project.godot 的 config/features 一致。
+  GODOT_VERSION: "4.7.2"
 
 jobs:
   rust:
@@ -65,24 +65,24 @@ jobs:
           name: gdext-debug-linux-x86_64
           path: godot-project/bin/debug
 
-      - name: Import project & export debug build
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: ${{ env.GODOT_VERSION }}
+          use-dotnet: false
+          include-templates: true
+
+      - name: Verify Godot
+        run: godot --version
+
+      - name: Import project
+        run: godot --headless --path godot-project --import
+
+      - name: Export debug build (Linux x86_64)
         run: |
-          # GitHub 默认用 `bash -e`，docker 失败会立即退出；先关掉 -e 才能捕获日志。
-          set +e -o pipefail
+          set -euo pipefail
           mkdir -p build/linux
-          docker run --rm \
-            -v "$PWD:/project" \
-            -w /project \
-            "$GODOT_CI_IMAGE" \
-            bash -lc "bash /project/.github/scripts/godot-ci-export.sh" \
-            > /tmp/godot-export.log 2>&1
-          code=$?
-          echo "docker exit code: $code"
-          tail -n 200 /tmp/godot-export.log || true
-          # 诊断期间无条件暴露日志（注解不改变步骤成败，退出码才决定）。
-          payload=$(tail -n 200 /tmp/godot-export.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
-          echo "::error title=godot-export-log::$payload"
-          exit "$code"
+          godot --headless --path godot-project --export-debug "Linux x86_64" build/linux/game.x86_64
 
       - name: Upload Godot debug build
         uses: actions/upload-artifact@v4
