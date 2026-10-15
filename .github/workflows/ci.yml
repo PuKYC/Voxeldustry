@@ -292,6 +292,12 @@ jobs:
       - name: Verify Godot
         run: godot --version
 
+      # Android Gradle 构建模板仍需单独安装
+      - name: Install Android build template
+        if: startsWith(matrix.name, 'android')
+        run: godot --headless --path godot-project --install-android-build-template
+
+
       # -----------------------------------------------------------------------
       # 关键修正：不再调用 `godot --set_editor_setting`（该参数不存在，
       # 会导致 Godot 以编辑器模式启动并永久挂起），改为直接写编辑器设置文件。
