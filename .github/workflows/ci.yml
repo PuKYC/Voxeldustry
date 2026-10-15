@@ -102,11 +102,12 @@ jobs:
             runner: ubuntu-22.04
             targets: aarch64-unknown-linux-gnu
             cargo_cmd: cross
-          - name: android-arm64
+          # 同一个 job 内依次编译 arm64 + armv7，输出到
+          # bin/debug/android/{arm64-v8a,armeabi-v7a}/
+          - name: android
             runner: ubuntu-24.04
-            targets: aarch64-linux-android
+            targets: aarch64-linux-android armv7-linux-androideabi
             cargo_cmd: cargo-ndk
-            ndk_abi: arm64-v8a
           # -------- 追加平台的模板（按需取消注释/复制） --------
           # - name: windows-x86_64
           #   runner: ubuntu-24.04
@@ -177,8 +178,8 @@ jobs:
           for t in ${{ matrix.targets }}; do
             case "${{ matrix.cargo_cmd }}" in
               cargo-ndk)
-                # 输出到 bin/debug/android/<abi>/，与 *.gdextension 的
-                # android.debug.arm64 路径保持一致。
+                # 输出到 bin/debug/android/<abi>/（arm64-v8a / armeabi-v7a），
+                # 需与 *.gdextension 里 android.debug.arm64 / arm32 的路径一致。
                 cargo ndk \
                   --target "$t" \
                   --platform 21 \
@@ -219,10 +220,18 @@ jobs:
             preset: Linux arm64
             out: build/linux/game.arm64
             artifact: godot-debug-linux-arm64
-          - name: android-arm64
+          # 同一个 Android 预设分别导出 APK（直接安装）和 AAB（上架 Google Play）。
+          # export_format：0 = APK，1 = AAB（后缀必须与之匹配）。
+          - name: android-apk
             preset: Android arm64
             out: build/android/game.apk
-            artifact: godot-debug-android-arm64
+            export_format: 0
+            artifact: godot-debug-android-apk
+          - name: android-aab
+            preset: Android arm64
+            out: build/android/game.aab
+            export_format: 1
+            artifact: godot-debug-android-aab
           # -------- 追加导出的模板（preset 名必须与 export_presets.cfg 一致） --------
           # - name: windows-x86_64
           #   preset: Windows Desktop x64
@@ -345,6 +354,30 @@ jobs:
 
           echo "--- editor_settings after configuration ---"
           cat "$SETTINGS_FILE"
+
+      # 按矩阵项设置导出格式（APK/AAB），并同时启用 arm64-v8a + armeabi-v7a
+      # （gdext job 已编译这两个 ABI 的 Rust 库）。
+      # 只在 CI 工作区里临时改 export_presets.cfg，不影响仓库里的文件。
+      - name: Patch Android export preset for CI
+        if: startsWith(matrix.name, 'android')
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFG="godot-project/export_presets.cfg"
+          test -f "$CFG"
+          for kv in \
+            "gradle_build/export_format=${{ matrix.export_format }}" \
+            "architectures/armeabi-v7a=true" \
+            "architectures/arm64-v8a=true"; do
+            key="${kv%%=*}"
+            if grep -q "^${key}=" "$CFG"; then
+              sed -i "s|^${key}=.*|${kv}|" "$CFG"
+            else
+              echo "::error::export_presets.cfg 中找不到 ${key}，请确认 Android 预设已保存过一次"
+              exit 1
+            fi
+          done
+          grep -nE "^(name=|gradle_build/(use_gradle_build|export_format)=|architectures/)" "$CFG"
 
       - name: Import project
         timeout-minutes: 10

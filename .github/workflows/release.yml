@@ -62,13 +62,26 @@ jobs:
             out: build/windows/game.exe
             artifact: game-windows-x86_64
             experimental: false
-          - name: android-arm64
+          # 同一个 Android 预设分别导出 APK（直接安装）和 AAB（上架 Google Play）。
+          # export_format：0 = APK，1 = AAB（输出后缀必须与之匹配）。
+          # 两者都包含 arm64-v8a + armeabi-v7a。
+          - name: android-apk
             runner: ubuntu-24.04
             targets: aarch64-linux-android armv7-linux-androideabi
             cargo_cmd: cargo
             preset: Android arm64
             out: build/android/game.apk
-            artifact: game-android
+            export_format: 0
+            artifact: game-android-apk
+            experimental: true
+          - name: android-aab
+            runner: ubuntu-24.04
+            targets: aarch64-linux-android armv7-linux-androideabi
+            cargo_cmd: cargo
+            preset: Android arm64
+            out: build/android/game.aab
+            export_format: 1
+            artifact: game-android-aab
             experimental: true
 
     steps:
@@ -211,6 +224,31 @@ jobs:
           ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: python3 .github/scripts/configure_android_keystore.py
+
+      # 按矩阵项设置导出格式（APK/AAB，需与输出后缀一致，否则会报
+      # "Android App Bundle requires the *.aab extension"），并同时启用
+      # arm64-v8a + armeabi-v7a（与上面编译的两个 Rust 目标一致）。
+      # 在签名配置之后执行，只改这三个键，不影响脚本写入的签名信息。
+      - name: Patch Android export preset
+        if: contains(matrix.targets, 'android')
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFG="godot-project/export_presets.cfg"
+          test -f "$CFG"
+          for kv in \
+            "gradle_build/export_format=${{ matrix.export_format }}" \
+            "architectures/armeabi-v7a=true" \
+            "architectures/arm64-v8a=true"; do
+            key="${kv%%=*}"
+            if grep -q "^${key}=" "$CFG"; then
+              sed -i "s|^${key}=.*|${kv}|" "$CFG"
+            else
+              echo "::error::export_presets.cfg 中找不到 ${key}，请确认 Android 预设已保存过一次"
+              exit 1
+            fi
+          done
+          grep -nE "^(name=|gradle_build/(use_gradle_build|export_format)=|architectures/)" "$CFG"
 
       - name: Import project & export release build
         run: |
