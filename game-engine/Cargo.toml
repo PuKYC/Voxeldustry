@@ -17,7 +17,7 @@ voxel = { path = "../crates/voxel", optional = true }
 avian3d = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-bevy = { workspace = true, features = ["android-game-activity"] }
+# bevy = { workspace = true, features = ["android-game-activity"] }
 
 [features]
 default = []
