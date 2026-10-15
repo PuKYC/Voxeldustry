@@ -21,6 +21,8 @@ env:
   RUST_TOOLCHAIN: "1.95"
   # 必须与 godot-project/project.godot 的 config/features 一致。
   GODOT_VERSION: "4.7.2"
+  # Godot 4.7 官方 Android 导出要求：NDK r28b / build-tools 35.0.1 / android-35。
+  ANDROID_NDK_VERSION: "r28b"
 
 # =============================================================================
 # 扩展指南：在 build.matrix.include 里追加一条即可（preset 名与
@@ -37,7 +39,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             targets: x86_64-unknown-linux-gnu
             cargo_cmd: cargo
             preset: Linux x86_64
@@ -71,6 +73,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 手动触发时按输入的 tag 构建；tag push 时即 github.ref。
+          ref: ${{ inputs.tag || github.ref }}
 
       # Godot 编辑器在导入包含 Android preset 的项目时，Android 插件会探测 adb。
       # 提前装好并启动 server，避免导入/导出阶段报错。
@@ -123,7 +128,7 @@ jobs:
         if: contains(matrix.targets, 'android')
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r25b
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
 
       - name: Install cargo-ndk
         if: contains(matrix.targets, 'android')
@@ -162,15 +167,16 @@ jobs:
         with:
           packages: >-
             platform-tools
-            platforms;android-36
-            build-tools;36.1.0
-            ndk;29.0.14206865
+            platforms;android-35
+            build-tools;35.0.1
+            cmake;3.10.2.4988404
+            ndk;28.1.13356709
 
       - name: Verify Android SDK components
         if: contains(matrix.targets, 'android')
         run: |
           set -euo pipefail
-          for d in "platforms/android-36" "build-tools/36.1.0" "ndk/29.0.14206865"; do
+          for d in "platforms/android-35" "build-tools/35.0.1" "ndk/28.1.13356709"; do
             test -d "$ANDROID_HOME/$d" || { echo "缺少 Android SDK 组件: $ANDROID_HOME/$d"; exit 1; }
           done
           echo "ANDROID_HOME=$ANDROID_HOME"
@@ -206,19 +212,19 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: python3 .github/scripts/configure_android_keystore.py
 
-      - name: Install Android build template (gradle build)
-        if: contains(matrix.targets, 'android')
-        run: |
-          set -euo pipefail
-          godot --headless --path godot-project --import
-          godot --headless --path godot-project --install-android-build-template
-
       - name: Import project & export release build
         run: |
           set -euo pipefail
           mkdir -p "$(dirname '${{ matrix.out }}')"
           godot --headless --path godot-project --import
-          godot --headless --path godot-project --export-release '${{ matrix.preset }}' '${{ matrix.out }}'
+          # --install-android-build-template 不能单独运行，必须与
+          # --export-release 同一条命令使用（仅 Android 需要）。
+          EXTRA_ARGS=()
+          if [[ "${{ matrix.targets }}" == *android* ]]; then
+            EXTRA_ARGS+=(--install-android-build-template)
+          fi
+          godot --headless --path godot-project "${EXTRA_ARGS[@]}" \
+            --export-release '${{ matrix.preset }}' '${{ matrix.out }}'
 
       - name: Upload build
         uses: actions/upload-artifact@v4
@@ -231,7 +237,9 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
     needs: build
-    if: always()
+    # 稳定平台失败（result=failure）时不发布；experimental 失败因
+    # continue-on-error 会记为 success，不受影响。
+    if: ${{ !cancelled() && needs.build.result != 'failure' }}
     steps:
       - name: Download all builds
         continue-on-error: true

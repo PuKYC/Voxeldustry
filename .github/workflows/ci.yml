@@ -14,8 +14,8 @@ env:
   RUST_TOOLCHAIN: "1.95"
   # 必须与 godot-project/project.godot 的 config/features 一致。
   GODOT_VERSION: "4.7.2"
-  # Android NDK 版本（r26d 与 Godot 4.7 官方推荐一致）。
-  ANDROID_NDK_VERSION: "r26d"
+  # Android NDK 版本：Godot 4.7 官方要求 r28b（= 28.1.13356709）。
+  ANDROID_NDK_VERSION: "r28b"
 
 # =============================================================================
 # 扩展指南：
@@ -255,7 +255,12 @@ jobs:
         if: startsWith(matrix.name, 'android')
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+          packages: >-
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.1
+            cmake;3.10.2.4988404
+            ndk;28.1.13356709
 
       - name: Setup Android debug keystore
         if: startsWith(matrix.name, 'android')
@@ -349,11 +354,6 @@ jobs:
           echo "import exit=$? (ignored)"
           exit 0
 
-      # Android Gradle 构建模板仍需单独安装
-      - name: Install Android build template
-        if: startsWith(matrix.name, 'android')
-        run: godot --headless --path godot-project --install-android-build-template
-
       - name: Export debug build (${{ matrix.name }})
         timeout-minutes: 30
         shell: bash
@@ -370,7 +370,13 @@ jobs:
           mkdir -p "$(dirname "$OUT")"
           echo "JAVA_HOME=$JAVA_HOME"
           java -version
-          godot --headless --path godot-project --verbose \
+          # --install-android-build-template 不能单独运行，必须与
+          # --export-debug / --export-release 同一条命令使用。
+          EXTRA_ARGS=()
+          if [[ "${{ matrix.name }}" == android* ]]; then
+            EXTRA_ARGS+=(--install-android-build-template)
+          fi
+          godot --headless --path godot-project --verbose "${EXTRA_ARGS[@]}" \
             --export-debug '${{ matrix.preset }}' "$OUT" 2>&1 | tee /tmp/export.log
           echo "godot exit=${PIPESTATUS[0]} (ignored: import/exit may abort)"
           ls -la "$(dirname "$OUT")"
@@ -385,4 +391,4 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: build/
-          if-no-files-found: errors
+          if-no-files-found: error
