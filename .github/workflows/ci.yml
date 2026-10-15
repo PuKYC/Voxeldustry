@@ -144,7 +144,7 @@ jobs:
         with:
           tool: cargo-ndk
 
-      # 新增：显式安装 JDK 17（Android Gradle 工具链要求 17+）
+      # 显式安装 JDK 17（Android Gradle 工具链要求 17+）。
       - name: Setup Java 17
         if: matrix.cargo_cmd == 'cargo-ndk'
         uses: actions/setup-java@v4
@@ -200,8 +200,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Godot：先合并所有平台的 GDExtension 二进制到同一目录，再逐 preset 导出。
-  # 注意：Android 导出开启了 Gradle 构建（gradle_build/use_gradle_build=true），
-  # 因此必须安装 JDK 17 并让 Godot 知道 JAVA_HOME 和 Android SDK 路径。
+  # Android 导出开启了 Gradle 构建（gradle_build/use_gradle_build=true），
+  # 因此必须安装 JDK 17，并让 Godot 在编辑器设置里知道 Java / Android SDK 路径。
   # ---------------------------------------------------------------------------
   godot:
     name: Godot debug export (${{ matrix.name }})
@@ -242,7 +242,8 @@ jobs:
           adb version
           adb devices
 
-      # 新增：Android 导出依赖 JDK 17+（Gradle / keytool / apksigner）
+      # Android 导出依赖 JDK 17+（Gradle / keytool / apksigner）。
+      # actions/setup-java 会自动设置 JAVA_HOME 环境变量。
       - name: Setup Java 17
         if: startsWith(matrix.name, 'android')
         uses: actions/setup-java@v4
@@ -291,38 +292,86 @@ jobs:
       - name: Verify Godot
         run: godot --version
 
-      # Android Gradle 构建需要 Godot 知道 Java SDK 和 Android SDK 的路径。
-      # 通过编辑器设置持久化到 CI 环境，Godot 在无头模式下才能找到 Gradle 所需的工具链。
+      # -----------------------------------------------------------------------
+      # 关键修正：不再调用 `godot --set_editor_setting`（该参数不存在，
+      # 会导致 Godot 以编辑器模式启动并永久挂起），改为直接写编辑器设置文件。
+      # 注意：Godot 4.x 的配置文件命名带版本号，这里按 GODOT_VERSION 的前两位
+      # 推导（4.7.2 → editor_settings-4.7.tres）。如果换 Godot 版本需同步。
+      # -----------------------------------------------------------------------
       - name: Configure Godot Android paths (Gradle build)
         if: startsWith(matrix.name, 'android')
+        shell: bash
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           set -euo pipefail
-          godot --headless --set_editor_setting "export/android/java_sdk_path" "$JAVA_HOME"
-          godot --headless --set_editor_setting "export/android/android_sdk_path" "$ANDROID_SDK_ROOT"
-        env:
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          GODOT_VER_MAJOR_MINOR="$(echo "$GODOT_VERSION" | cut -d. -f1-2)"
+          SETTINGS_DIR="$HOME/.config/godot"
+          SETTINGS_FILE="$SETTINGS_DIR/editor_settings-${GODOT_VER_MAJOR_MINOR}.tres"
+
+          mkdir -p "$SETTINGS_DIR"
+
+          # 如果文件不存在，写一个最小可用的 tres 头部；
+          # 如果已存在（例如 Godot 之前运行过），保持原有内容。
+          if [ ! -f "$SETTINGS_FILE" ]; then
+            cat > "$SETTINGS_FILE" <<'EOF'
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          EOF
+          fi
+
+          # 以幂等方式写入 / 覆盖两个路径键。
+          # 若键已存在则替换整行；否则追加到文件末尾。
+          set_kv() {
+            local key="$1"
+            local value="$2"
+            if grep -q "^${key}=" "$SETTINGS_FILE"; then
+              # 使用 | 作为分隔符，避免路径里的 / 引发 sed 报错。
+              sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$SETTINGS_FILE"
+            else
+              echo "${key}=\"${value}\"" >> "$SETTINGS_FILE"
+            fi
+          }
+
+          set_kv "export/android/java_sdk_path" "$JAVA_HOME"
+          set_kv "export/android/android_sdk_path" "$ANDROID_SDK_ROOT"
+
+          echo "--- editor_settings after configuration ---"
+          cat "$SETTINGS_FILE"
 
       - name: Import project
-        run: godot --headless --path godot-project --verbose --import || echo "import exit=$? (ignored)"
+        timeout-minutes: 10
+        run: |
+          set +e
+          timeout 480 godot --headless --path godot-project --verbose --import
+          echo "import exit=$? (ignored)"
+          exit 0
 
       - name: Export debug build (${{ matrix.name }})
+        timeout-minutes: 30
         shell: bash
         env:
           JAVA_HOME: ${{ env.JAVA_HOME }}
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
           GRADLE_USER_HOME: ${{ github.workspace }}/.gradle
+          # 关闭 Gradle daemon（CI 中不需要），并降低日志级别，减少日志体积。
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.logging.level=lifecycle"
         run: |
           set +e
           OUT="$PWD/${{ matrix.out }}"
           mkdir -p "$(dirname "$OUT")"
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
           godot --headless --path godot-project --verbose \
             --export-debug '${{ matrix.preset }}' "$OUT" 2>&1 | tee /tmp/export.log
           echo "godot exit=${PIPESTATUS[0]} (ignored: import/exit may abort)"
           ls -la "$(dirname "$OUT")"
           if [ ! -s "$OUT" ]; then
             echo "::error::export produced no binary"
-            tail -n 60 /tmp/export.log
+            tail -n 80 /tmp/export.log
             exit 1
           fi
 
