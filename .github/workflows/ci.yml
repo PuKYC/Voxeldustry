@@ -144,6 +144,14 @@ jobs:
         with:
           tool: cargo-ndk
 
+      # 新增：显式安装 JDK 17（Android Gradle 工具链要求 17+）
+      - name: Setup Java 17
+        if: matrix.cargo_cmd == 'cargo-ndk'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Setup Android NDK
         if: matrix.cargo_cmd == 'cargo-ndk'
         id: ndk
@@ -163,6 +171,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          JAVA_HOME: ${{ env.JAVA_HOME }}
         run: |
           set -euo pipefail
           for t in ${{ matrix.targets }}; do
@@ -191,6 +200,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Godot：先合并所有平台的 GDExtension 二进制到同一目录，再逐 preset 导出。
+  # 注意：Android 导出开启了 Gradle 构建（gradle_build/use_gradle_build=true），
+  # 因此必须安装 JDK 17 并让 Godot 知道 JAVA_HOME 和 Android SDK 路径。
   # ---------------------------------------------------------------------------
   godot:
     name: Godot debug export (${{ matrix.name }})
@@ -230,6 +241,14 @@ jobs:
           adb start-server
           adb version
           adb devices
+
+      # 新增：Android 导出依赖 JDK 17+（Gradle / keytool / apksigner）
+      - name: Setup Java 17
+        if: startsWith(matrix.name, 'android')
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Setup Android SDK
         if: startsWith(matrix.name, 'android')
@@ -272,10 +291,27 @@ jobs:
       - name: Verify Godot
         run: godot --version
 
+      # Android Gradle 构建需要 Godot 知道 Java SDK 和 Android SDK 的路径。
+      # 通过编辑器设置持久化到 CI 环境，Godot 在无头模式下才能找到 Gradle 所需的工具链。
+      - name: Configure Godot Android paths (Gradle build)
+        if: startsWith(matrix.name, 'android')
+        run: |
+          set -euo pipefail
+          godot --headless --set_editor_setting "export/android/java_sdk_path" "$JAVA_HOME"
+          godot --headless --set_editor_setting "export/android/android_sdk_path" "$ANDROID_SDK_ROOT"
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+
       - name: Import project
         run: godot --headless --path godot-project --verbose --import || echo "import exit=$? (ignored)"
 
       - name: Export debug build (${{ matrix.name }})
+        shell: bash
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          GRADLE_USER_HOME: ${{ github.workspace }}/.gradle
         run: |
           set +e
           OUT="$PWD/${{ matrix.out }}"
