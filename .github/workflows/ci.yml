@@ -102,8 +102,7 @@ jobs:
             runner: ubuntu-22.04
             targets: aarch64-unknown-linux-gnu
             cargo_cmd: cross
-          # 同一个 job 内依次编译 arm64 + armv7，输出到
-          # bin/debug/android/{arm64-v8a,armeabi-v7a}/
+          # 同一个 job 内依次编译 arm64 + armv7（通过 build.sh + cargo-ndk）
           - name: android
             runner: ubuntu-24.04
             targets: aarch64-linux-android armv7-linux-androideabi
@@ -178,13 +177,14 @@ jobs:
           for t in ${{ matrix.targets }}; do
             case "${{ matrix.cargo_cmd }}" in
               cargo-ndk)
-                # 输出到 bin/debug/android/<abi>/（arm64-v8a / armeabi-v7a），
-                # 需与 *.gdextension 里 android.debug.arm64 / arm32 的路径一致。
-                cargo ndk \
-                  --target "$t" \
-                  --platform 21 \
-                  --output-dir godot-project/bin/debug/android \
-                  build
+                # 与 release.yml 一致，统一走 build.sh：产物为
+                # bin/debug/libgodot_client_ext_android_{arm64,arm32}.so
+                abi=""
+                case "$t" in
+                  aarch64-linux-android)   abi="arm64-v8a" ;;
+                  armv7-linux-androideabi) abi="armeabi-v7a" ;;
+                esac
+                CARGO_CMD=cargo NDK_ABI="$abi" bash ./build.sh --target "$t"
                 ;;
               *)
                 CARGO_CMD="${{ matrix.cargo_cmd }}" bash ./build.sh --target "$t"
