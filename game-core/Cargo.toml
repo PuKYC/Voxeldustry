@@ -16,7 +16,7 @@ rstar = { workspace = true }
 crossbeam-channel = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-# bevy = { workspace = true, features = ["android-game-activity"] }
+bevy = { workspace = true, features = ["android-game-activity"] }
 
 [features]
 # 默认启用体素物理碰撞（avian3d）；不需要物理的构建可用 --no-default-features。
