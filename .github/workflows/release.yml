@@ -6,8 +6,18 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "发布 tag（例如 v0.1.0）"
-        required: true
+        description: "发布 tag（如 v0.1.0）。留空 = 只构建 artifact，不发布 Release。"
+        required: false
+        default: ""
+      platforms:
+        description: "只构建指定平台，逗号分隔；留空 = 全部。可选：linux-x86_64, linux-arm64, windows-x86_64, android-apk, android-aab"
+        required: false
+        default: ""
+      publish:
+        description: "是否创建 / 更新 GitHub Release（仅当 tag 非空时生效）"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -25,69 +35,101 @@ env:
   ANDROID_NDK_VERSION: "r28b"
 
 # =============================================================================
-# 扩展指南：在 build.matrix.include 里追加一条即可（preset 名与
-# godot-project/export_presets.cfg 保持一致）。
+# 扩展指南：在 prepare 步骤的 ALL 数组里追加一条即可
+# （preset 名与 godot-project/export_presets.cfg 保持一致）。
+#
+# 手动触发（workflow_dispatch）用法：
+#   - 只勾 platforms 里的某个 name → 只构建该平台（适合调试）。
+#   - tag 留空 → 只上传 artifact，不发布 Release。
+#   - tag 填 vX.Y.Z + publish=true → 构建并发布 / 更新 Release。
 # =============================================================================
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Prepare：把手动输入的 platforms 过滤成 matrix.include。
+  # 之所以单独拆一个 job，是因为 job 级 if 里访问不到 matrix.*。
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+
+          # 所有平台的完整定义（与 build matrix.include 一致）。
+          ALL='[
+            {
+              "name":"linux-x86_64","runner":"ubuntu-22.04",
+              "targets":"x86_64-unknown-linux-gnu","cargo_cmd":"cargo",
+              "preset":"Linux x86_64","out":"build/linux/game.x86_64",
+              "artifact":"game-linux-x86_64","experimental":false
+            },
+            {
+              "name":"linux-arm64","runner":"ubuntu-24.04",
+              "targets":"aarch64-unknown-linux-gnu","cargo_cmd":"cross",
+              "preset":"Linux arm64","out":"build/linux/game.arm64",
+              "artifact":"game-linux-arm64","experimental":false
+            },
+            {
+              "name":"windows-x86_64","runner":"ubuntu-24.04",
+              "targets":"x86_64-pc-windows-gnu","cargo_cmd":"cargo",
+              "preset":"Windows Desktop x64","out":"build/windows/game.exe",
+              "artifact":"game-windows-x86_64","experimental":false
+            },
+            {
+              "name":"android-apk","runner":"ubuntu-24.04",
+              "targets":"aarch64-linux-android armv7-linux-androideabi","cargo_cmd":"cargo",
+              "preset":"Android arm64","out":"build/android/game.apk",
+              "export_format":0,"artifact":"game-android-apk","experimental":true
+            },
+            {
+              "name":"android-aab","runner":"ubuntu-24.04",
+              "targets":"aarch64-linux-android armv7-linux-androideabi","cargo_cmd":"cargo",
+              "preset":"Android arm64","out":"build/android/game.aab",
+              "export_format":1,"artifact":"game-android-aab","experimental":true
+            }
+          ]'
+
+          if [ -z "${PLATFORMS:-}" ]; then
+            echo "未指定 platforms，使用全部平台"
+            echo "matrix=$ALL" >> "$GITHUB_OUTPUT"
+          else
+            echo "过滤 platforms: $PLATFORMS"
+            FILTERED="$(jq -c --arg list "$PLATFORMS" '
+              ($list | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length>0))) as $names
+              | map(select(.name as $n | $names | index($n)))
+            ' <<< "$ALL")"
+            echo "过滤结果: $FILTERED"
+            if [ "$FILTERED" = "[]" ]; then
+              echo "::error::platforms 里没有匹配到任何平台：$PLATFORMS"
+              exit 1
+            fi
+            echo "matrix=$FILTERED" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build：每个平台构建 GDExtension + Godot 导出。
+  # ---------------------------------------------------------------------------
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    needs: prepare
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-x86_64
-            runner: ubuntu-22.04
-            targets: x86_64-unknown-linux-gnu
-            cargo_cmd: cargo
-            preset: Linux x86_64
-            out: build/linux/game.x86_64
-            artifact: game-linux-x86_64
-            experimental: false
-          - name: linux-arm64
-            runner: ubuntu-24.04
-            targets: aarch64-unknown-linux-gnu
-            cargo_cmd: cross
-            preset: Linux arm64
-            out: build/linux/game.arm64
-            artifact: game-linux-arm64
-            experimental: false
-          - name: windows-x86_64
-            runner: ubuntu-24.04
-            targets: x86_64-pc-windows-gnu
-            cargo_cmd: cargo
-            preset: Windows Desktop x64
-            out: build/windows/game.exe
-            artifact: game-windows-x86_64
-            experimental: false
-          # 同一个 Android 预设分别导出 APK（直接安装）和 AAB（上架 Google Play）。
-          # export_format：0 = APK，1 = AAB（输出后缀必须与之匹配）。
-          # 两者都包含 arm64-v8a + armeabi-v7a。
-          - name: android-apk
-            runner: ubuntu-24.04
-            targets: aarch64-linux-android armv7-linux-androideabi
-            cargo_cmd: cargo
-            preset: Android arm64
-            out: build/android/game.apk
-            export_format: 0
-            artifact: game-android-apk
-            experimental: true
-          - name: android-aab
-            runner: ubuntu-24.04
-            targets: aarch64-linux-android armv7-linux-androideabi
-            cargo_cmd: cargo
-            preset: Android arm64
-            out: build/android/game.aab
-            export_format: 1
-            artifact: game-android-aab
-            experimental: true
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          # 手动触发时按输入的 tag 构建；tag push 时即 github.ref。
+          # tag push → github.ref；手动触发 → inputs.tag（可留空回退到 github.ref）
           ref: ${{ inputs.tag || github.ref }}
 
       # Godot 编辑器在导入包含 Android preset 的项目时，Android 插件会探测 adb。
@@ -112,7 +154,7 @@ jobs:
 
       - name: Verify Godot
         run: godot --version
-        
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -207,12 +249,18 @@ jobs:
               -validity 9999 -deststoretype pkcs12
           fi
 
+      # 有 secret → 用 release keystore；没有 → 静默降级（走 debug 签名），
+      # 让手动干跑 / fork 场景也能通过。
       - name: Decode Android release keystore
         if: contains(matrix.targets, 'android')
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "::notice::ANDROID_KEYSTORE_BASE64 未设置，跳过 release keystore（将使用 debug 签名）"
+            exit 0
+          fi
           mkdir -p .android-keystore
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > .android-keystore/release.keystore
           test -s .android-keystore/release.keystore
@@ -223,7 +271,13 @@ jobs:
           ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/.android-keystore/release.keystore
           ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        run: python3 .github/scripts/configure_android_keystore.py
+        run: |
+          set -euo pipefail
+          if [ ! -f "$ANDROID_KEYSTORE_PATH" ]; then
+            echo "::notice::未找到 release keystore，跳过签名配置（将使用 debug 签名）"
+            exit 0
+          fi
+          python3 .github/scripts/configure_android_keystore.py
 
       # 按矩阵项设置导出格式（APK/AAB，需与输出后缀一致，否则会报
       # "Android App Bundle requires the *.aab extension"），并同时启用
@@ -271,13 +325,24 @@ jobs:
           path: build/
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Release：打包所有 artifact 并创建 / 更新 GitHub Release。
+  # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    needs: build
-    # 稳定平台失败（result=failure）时不发布；experimental 失败因
-    # continue-on-error 会记为 success，不受影响。
-    if: ${{ !cancelled() && needs.build.result != 'failure' }}
+    needs: [prepare, build]
+    # 发布条件：
+    #   - tag push（v*）→ 始终发布；
+    #   - workflow_dispatch → 需要 tag 非空 且 publish=true；
+    #   - 任一稳定平台 failure 时不发布（experimental 失败不算）。
+    if: >-
+      !cancelled()
+      && needs.build.result != 'failure'
+      && (
+           github.event_name == 'push'
+           || (inputs.tag != '' && inputs.publish)
+         )
     steps:
       - name: Download all builds
         continue-on-error: true
