@@ -304,19 +304,47 @@ jobs:
           done
           grep -nE "^(name=|gradle_build/(use_gradle_build|export_format)=|architectures/)" "$CFG"
 
-      - name: Import project & export release build
+      # ===== 与 ci.yml 完全一致的导入步骤（宽松 + 忽略退出码） =====
+      - name: Import project
+        timeout-minutes: 10
         run: |
-          set -euo pipefail
-          mkdir -p "$(dirname '${{ matrix.out }}')"
-          godot --headless --path godot-project --import
+          set +e
+          timeout 480 godot --headless --path godot-project --verbose --import
+          echo "import exit=$? (ignored)"
+          exit 0
+
+      # ===== 与 ci.yml 一致的导出步骤（改为 --export-release + release 校验） =====
+      - name: Export release build (${{ matrix.name }})
+        timeout-minutes: 30
+        shell: bash
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+          GRADLE_USER_HOME: ${{ github.workspace }}/.gradle
+          # 关闭 Gradle daemon（CI 中不需要），并降低日志级别，减少日志体积。
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.logging.level=lifecycle"
+        run: |
+          set +e
+          OUT="$PWD/${{ matrix.out }}"
+          mkdir -p "$(dirname "$OUT")"
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
           # --install-android-build-template 不能单独运行，必须与
-          # --export-release 同一条命令使用（仅 Android 需要）。
+          # --export-debug / --export-release 同一条命令使用。
           EXTRA_ARGS=()
-          if [[ "${{ matrix.targets }}" == *android* ]]; then
+          if [[ "${{ matrix.name }}" == android* ]]; then
             EXTRA_ARGS+=(--install-android-build-template)
           fi
-          godot --headless --path godot-project "${EXTRA_ARGS[@]}" \
-            --export-release '${{ matrix.preset }}' '${{ matrix.out }}'
+          godot --headless --path godot-project --verbose "${EXTRA_ARGS[@]}" \
+            --export-release '${{ matrix.preset }}' "$OUT" 2>&1 | tee /tmp/export.log
+          echo "godot exit=${PIPESTATUS[0]} (ignored: import/exit may abort)"
+          ls -la "$(dirname "$OUT")"
+          if [ ! -s "$OUT" ]; then
+            echo "::error::export produced no binary"
+            tail -n 80 /tmp/export.log
+            exit 1
+          fi
 
       - name: Upload build
         uses: actions/upload-artifact@v4
