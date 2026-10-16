@@ -266,6 +266,22 @@ pub fn voxel_size_meters() -> f64 {
     DEFAULT_VOXEL_SIZE.to_num::<f64>()
 }
 
+/// 棱 / 角邻块（符号三元组里至少两个非零）是否被面邻居报告支持：
+/// 它涉及的每个轴向面邻居都不是 `Missing` 才可用于 halo 的 AO 采样。
+/// 面邻居（`dx/dy/dz` 中恰好一个非零）不受影响。
+/// `plan` 顺序 = `[+x, -x, +y, -y, +z, -z]`。
+fn edge_corner_supported(plan: &[TerrainFaceNeighbor; 6], dx: i32, dy: i32, dz: i32) -> bool {
+    let non_zero = i32::from(dx != 0) + i32::from(dy != 0) + i32::from(dz != 0);
+    if non_zero < 2 {
+        return true;
+    }
+    let face_present = |index: usize| !matches!(plan[index], TerrainFaceNeighbor::Missing);
+    let x_ok = dx == 0 || face_present(if dx > 0 { 0 } else { 1 });
+    let y_ok = dy == 0 || face_present(if dy > 0 { 2 } else { 3 });
+    let z_ok = dz == 0 || face_present(if dz > 0 { 4 } else { 5 });
+    x_ok && y_ok && z_ok
+}
+
 /// Startup：生成子块 -> 逐块网格化 -> 产出 stable id 实体。
 ///
 /// 体素容器在本地构建，生成完成后作为 `VoxVolume` **组件** spawn 到地形
@@ -366,6 +382,13 @@ fn extract_block_raw(
                         mesh_block.origin.y + i32::from(dy) * span,
                         mesh_block.origin.z + i32::from(dz) * span,
                     );
+                    // 棱 / 角邻块必须与面邻居报告一致：只要它所依赖的任一面邻居
+                    // 是 Missing（落在 mesh 区域之外，面上按空气处理），就不能再从
+                    // margin 块里读到实心，否则外墙面的 AO 会在块边界处被误遮挡
+                    // （表现为块间一格宽的渐变暗线）。
+                    if !edge_corner_supported(&plan, i32::from(dx), i32::from(dy), i32::from(dz)) {
+                        continue;
+                    }
                     if let Some(tree) = neighbor_cache.get(neighbor, lod) {
                         out.set(dx, dy, dz, tree);
                     }
