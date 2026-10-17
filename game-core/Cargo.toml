@@ -29,7 +29,13 @@ physics = ["game-engine/physics"]
 [dev-dependencies]
 serde_json = "1"
 criterion = { workspace = true }
+gungraun = { workspace = true }
 
 [[bench]]
 name = "voxel_terrain"
+harness = false
+
+# 同一批路径的指令数基准（gungraun + valgrind），CI 门禁用。
+[[bench]]
+name = "terrain_inst"
 harness = false

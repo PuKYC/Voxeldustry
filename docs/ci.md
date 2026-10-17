@@ -9,8 +9,9 @@
 | `.github/workflows/ci.yml` | 每次 push（任意分支）、PR | Rust **debug** 构建 + 测试；Godot **debug** 导出 |
 | `.github/workflows/release.yml` | 推送 `v*` tag，或手动 `workflow_dispatch` | Rust **release** 构建 + Godot **release** 导出，汇总为 GitHub Release |
 | `.github/workflows/generate-android-keystore.yml` | 手动 `workflow_dispatch` | 一次性生成 Android release keystore，并（可选）自动写入 Secrets |
+| `.github/workflows/perf.yml` | 改动 `crates/**`、`game-core/**`、`game-engine/**` 的 PR / push 到 `main`，或手动触发 | 性能门禁：criterion 墙钟 A/B + gungraun 指令数 |
 
-两者都用 `ubuntu-24.04`（Godot 4 需要 24.04），Godot 由 `chickensoft-games/setup-godot` 安装到 runner。
+这些工作流都跑在 `ubuntu-24.04`（Godot 4 需要 24.04），Godot 由 `chickensoft-games/setup-godot` 安装到 runner。
 
 ## 2. 版本固定
 
@@ -185,7 +186,89 @@ python3 .github/scripts/configure_android_keystore.py
 - Android 导出不再依赖 godot-ci 镜像，改为 runner 上的 `actions/setup-java`（temurin 17）+ `android-actions/setup-android`（显式安装 android-36 / build-tools 36.1.0 / NDK 29.0.14206865）+ 自建 debug keystore。
   Godot 升级时这三个版本要跟着 `platform/android/java/app/config.gradle` 一起改。
 
-## 9. 故障排查
+## 9. 性能基准（.github/workflows/perf.yml）
+
+`crates/voxel`、`game-engine`、`game-core` 用 criterion 写了 4 个 bench target：
+
+| 包 | bench target | 内容 |
+| --- | --- | --- |
+| `voxel` | `mesh_rebuild` | mesh 重建 / 体素收集 / 增量更新 / 外部邻接 |
+| `game-engine` | `voxel_rebuild` | 体素世界重建（需 `voxel` feature） |
+| `game-engine` | `voxel_collider` | 碰撞几何构建：全体素 vs 外壳（需 `voxel,physics`） |
+| `game-core` | `voxel_terrain` | LOD 划分 / 网格化 / 打包 |
+
+### 为什么是「同机 A/B」而不是「对比入库基线」
+
+托管 runner 的 CPU 型号、频率、邻居负载每次都不一样，跨机器的绝对耗时很容易差 20% 以上，
+拿它直接当门禁只会刷出假警报。所以 perf job：
+
+1. 用 `git worktree` 在基线 commit（PR 取 `base.sha`、push 取 `HEAD^`）上开一份干净检出；
+2. 两侧各跑若干轮，**顺序对调**（基线→当前，当前→基线），抵消整机状态漂移；
+3. 按轮次配对算 `Δ = 当前 / 基线 - 1`，取各轮 Δ 里最小的那个：
+   **每一轮都变慢才算回归**（真实回归在顺序对调后依然存在，整机抖动不会）；
+4. 超过 `.github/scripts/perf/thresholds.json` 的阈值 → job 失败，同时写 job summary
+   并在 PR 上留言（fork 的 PR 只有只读 token，跳过留言）。
+
+### 阈值
+
+- 默认 15%。`wrap_block`、`external_occupancy/fast`、`terrain_pack`、
+  `terrain_lod_partition` 这些微秒级基准单独放宽到 20–30%：纳秒/微秒级的测量受缓存与
+  频率影响太大，收紧了只会误报。
+- 报回归时先看报告的「波动」列：变异系数 > 10% 说明这一轮测得不稳。
+  可以 `PERF_REPEAT=3` 重跑确认，再决定是改代码、还是调阈值。
+- `single_edit/old_local_e2e` 是旧通道对照组，已列入 `ignore`。
+
+### 指令数门禁（gungraun，job `instructions`）
+
+墙钟 A/B 再稳也只是「相对时间」；真正在 CI 里不怕抖的是**指令数**。所以两条最贵的
+热路径同时做了 gungraun 版本：
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `game-core/benches/terrain_inst.rs` | mesh+打包（LOD0/LOD3）、只打包、LOD 划分 |
+| `game-engine/benches/voxel_collider_inst.rs` | 逐 chunk 收集实心体素、构建 parry Voxels |
+
+gungraun 在 Valgrind Callgrind 下跑，统计执行了多少条指令，与 CPU 型号、频率、邻居负载
+完全无关，所以**基线可以跨 runner 复用**，不用像墙钟那样同机 A/B：
+
+- 基线目录 `.gungraun/`（已 gitignore），CI 用 `actions/cache`：`main` 上
+  `--save-baseline=ci` 先比较再更新，PR 上 `--baseline=ci` 只读比较。
+- 默认软阈值：`Ir` 涨幅 > 10% 退出码 3。要收紧/放松在 bench 的 `config` 里设
+  `CallgrindMetrics`，或者直接用 CLI 的 `--callgrind-limits`。
+- 局限：指令数**不反映缓存未命中/分配器行为**。它和墙钟 A/B 是互补关系，别只看一个。
+
+本地跑（需要 valgrind + 独立的 runner，macOS/Windows 没有）：
+
+```bash
+sudo apt-get install -y valgrind
+cargo install gungraun-runner --version 0.20.0 --locked   # 版本要和 Cargo.toml 的 gungraun 对齐
+cargo bench -p game-core --bench terrain_inst -- --baseline=ci
+cargo bench -p game-engine --features voxel,physics --bench voxel_collider_inst -- --baseline=ci
+```
+
+> instructions job 目前带 `continue-on-error: true`（和 clippy 一样，先观察几次）。
+> 第一次在 CI 上跑通、数字稳定后，把 `.github/workflows/perf.yml` 里那一行删掉即可。
+
+### 本地复现
+
+```bash
+# 完整 A/B（和 CI 一样的 2 轮）
+bash .github/scripts/perf/ab.sh origin/main
+
+# 只跑一个 bench、只跑 1 轮，快速看数字
+PERF_ONLY=voxel_collider PERF_REPEAT=1 bash .github/scripts/perf/ab.sh origin/main
+
+# 不看门禁，只跑出 criterion 报告
+cargo bench -p game-core --bench voxel_terrain
+```
+
+产物在 `target/perf-out/`：`report.md`、`report.json`（每项的 mean / Δ / 波动）、
+`base.log`、`head.log`。
+
+> CI 用 `PERF_PROFILE=ci`：1s 预热 / 3s 采样 / 30 样本；本地想要更准可以
+> `PERF_PROFILE=full`（criterion 默认的 3s 预热 / 5s 采样 / 100 样本）。
+
+## 10. 故障排查
 
 | 现象 | 可能原因 / 处理 |
 | --- | --- |

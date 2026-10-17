@@ -1,0 +1,32 @@
+{
+  "_comment": "性能门禁阈值（百分比）。改这里就能调松/调紧，无需改脚本。条目按最长前缀匹配基准 id。",
+  "default_max_regression_pct": 15.0,
+  "overrides": [
+    {
+      "match": "wrap_block",
+      "max_regression_pct": 30.0,
+      "reason": "纳秒级微基准（~19ns），受缓存与频率影响大，靠 CI 只能粗筛"
+    },
+    {
+      "match": "external_occupancy/fast",
+      "max_regression_pct": 25.0,
+      "reason": "微秒级（~1.5µs），分支预测噪声占比高"
+    },
+    {
+      "match": "terrain_pack",
+      "max_regression_pct": 20.0,
+      "reason": "微秒级（~4µs），只测打包与网格化脱钩后的单段"
+    },
+    {
+      "match": "terrain_lod_partition",
+      "max_regression_pct": 25.0,
+      "reason": "微秒级纯计算，分配器噪声占比高"
+    }
+  ],
+  "ignore": [
+    {
+      "match": "single_edit/old_local_e2e",
+      "reason": "旧 Dictionary 通道的对照组，只用于对比新旧路径，不参与门禁"
+    }
+  ]
+}

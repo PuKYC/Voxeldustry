@@ -1,0 +1,216 @@
+name: Perf
+
+# 两个互补的性能门禁。
+#
+#   bench         墙钟时间。同一台 runner 上交替跑「基线代码」和「当前代码」，
+#                 由 gate.py 按 thresholds.json 判定回归，抵消 runner 机型差异。
+#   instructions  指令数。gungraun + Valgrind Callgrind，结果与机器无关，
+#                 基线可跨 runner 复用，默认 Ir 涨幅 > 10% 失败。
+#
+# 本地复现：
+#   bash .github/scripts/perf/ab.sh origin/main
+#   cargo bench -p game-core --bench terrain_inst -- --baseline=ci
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "game-core/**"
+      - "game-engine/**"
+      - ".github/workflows/perf.yml"
+      - ".github/scripts/perf/**"
+  push:
+    branches: ["main"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "game-core/**"
+      - "game-engine/**"
+      - ".github/workflows/perf.yml"
+      - ".github/scripts/perf/**"
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "对比基线 ref（留空则自动：PR 取 base.sha，push 取 HEAD^）"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95"
+
+jobs:
+  bench:
+    name: Criterion A/B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 需要在基线 commit 上开 git worktree，必须拿完整历史。
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          # v1 默认 RUSTFLAGS=-D warnings；本仓库尚未清完 warning。
+          rustflags: ""
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 与 CI 的 debug 构建分开缓存，避免互相挤占。
+          shared-key: perf
+          # 只缓存依赖与 bench 产物，criterion 结果每次以基线侧实跑为准。
+          cache-on-failure: false
+
+      - name: Runner info
+        run: |
+          nproc
+          grep -m1 "model name" /proc/cpuinfo || true
+
+      - name: Resolve base ref
+        id: base
+        env:
+          INPUT_BASE_REF: ${{ inputs.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_BASE_REF:-}" ]; then
+            echo "ref=${INPUT_BASE_REF}" >> "$GITHUB_OUTPUT"
+          elif [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ]; then
+            echo "ref=${PR_BASE_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            # push / 手动触发：与上一个 commit 比，等价于「这次合并带来了多少变化」。
+            echo "ref=HEAD^" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run A/B benchmark
+        env:
+          PERF_PROFILE: ci
+          # 每侧轮数。2 轮 = 顺序对调各跑一次，用来抵消整机状态漂移；
+          # 只想快速看数字时可以手动触发并改成 1。
+          PERF_REPEAT: "2"
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: bash .github/scripts/perf/ab.sh "$BASE_REF"
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ github.run_id }}
+          path: |
+            target/perf-out/report.md
+            target/perf-out/report.json
+            target/perf-out/base.log
+            target/perf-out/head.log
+            target/perf-out/results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # 同一仓库的 PR 才写评论：fork 的 PR 只有只读 token，写评论会 403。
+      - name: Comment on PR
+        if: >-
+          always() && github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -f target/perf-out/report.md ]; then
+            echo "::warning:: 没有 report.md，跳过评论"
+            exit 0
+          fi
+          gh pr comment "$PR_NUMBER" --body-file target/perf-out/report.md \
+            --edit-last --create-if-none \
+            || echo "::warning:: 写 PR 评论失败（gh 版本或权限），报告见 job summary / artifact"
+
+  # ---------------------------------------------------------------------------
+  # 指令数门禁（gungraun + Valgrind Callgrind）。
+  #
+  # 与上面的墙钟 A/B 互补：指令数与机器负载/频率无关，同一份代码 + 同一工具链
+  # 跑出来完全一致，所以基线可以跨 runner 直接复用，阈值能卡到 10%（gungraun
+  # 默认的 Ir 软阈值，超过即退出码 3）。
+  #
+  # 目前只移植了两组最贵的热路径；其余基准仍由上面的 criterion job 覆盖。
+  # 移植新基准：照 game-core/benches/terrain_inst.rs 写一个 *_inst.rs，在 Cargo.toml
+  # 加 [[bench]]，再在这里补一行 cargo bench。
+  # ---------------------------------------------------------------------------
+  instructions:
+    name: Gungraun (instruction counts)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      # 基线目录，故意放在 target/ 之外，方便单独缓存。
+      GUNGRAUN_HOME: ${{ github.workspace }}/.gungraun
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          rustflags: ""
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf-ir
+
+      - name: Install valgrind + gungraun-runner
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          valgrind --version
+          # gungraun crate 只是客户端，真正跑基准的是独立的 runner 可执行文件。
+          # 版本要和 benches 依赖的 gungraun 对齐（Cargo.toml 里是 "0.20"）。
+          cargo install gungraun-runner --version 0.20.0 --locked
+          gungraun-runner --version
+
+      - name: Restore instruction baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.GUNGRAUN_HOME }}
+          key: gungraun-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gungraun-${{ runner.os }}-
+
+      # PR 只读基线；main 上先比较、通过了再更新基线。
+      - name: Run instruction benchmarks
+        id: inst
+        # 第一次在 CI 上真正跑通并稳定后再删掉这一行，让它变成强门禁。
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            flag="--save-baseline=ci"
+          else
+            flag="--baseline=ci"
+          fi
+          echo "gungraun 参数: ${flag}"
+          cargo bench -p game-core --bench terrain_inst -- "${flag}"
+          cargo bench -p game-engine --features voxel,physics --bench voxel_collider_inst -- "${flag}"
+
+      # 只保存跑成功的基线：没通过就说明有回归或环境问题，别把坏数据写成新基线。
+      - name: Save instruction baseline
+        if: github.ref == 'refs/heads/main' && steps.inst.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.GUNGRAUN_HOME }}
+          key: gungraun-${{ runner.os }}-${{ github.run_id }}
+

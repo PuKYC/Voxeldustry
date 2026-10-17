@@ -29,6 +29,9 @@ glam = "0.32"
 rustc-hash = "1"
 
 # 基准。
+# criterion：墙钟时间（cargo bench 默认，本地开发看数用）。
 criterion = "0.5"
+# gungraun：Valgrind Callgrind 指令数，确定性，适合 CI 门禁（仅 Linux）。
+gungraun = "0.20"
 
 
