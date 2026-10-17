@@ -254,8 +254,6 @@ func _upload(words: PackedInt64Array, count: int) -> void:
 		_rd.texture_update(_texture_rid, 0, bytes)
 		return
 
-	_free_texture()
-
 	var fmt := RDTextureFormat.new()
 	fmt.texture_type = RenderingDevice.TEXTURE_TYPE_2D
 	# 关键：用 SFLOAT 承载 u64 位模式，Texture2DRD 才认得 (Image::FORMAT_RGF)。
@@ -270,21 +268,38 @@ func _upload(words: PackedInt64Array, count: int) -> void:
 		| RenderingDevice.TEXTURE_USAGE_CAN_UPDATE_BIT
 	)
 
-	_texture_rid = _rd.texture_create(fmt, RDTextureView.new(), [bytes])
-	if not _texture_rid.is_valid():
+	# 先建新纹理，再把 Texture2DRD 切到新 RID，最后才释放旧 RID。
+	# 旧写法先 free_rid 再建新的：材质的 uniform set 还指着已释放的 RID，
+	# 渲染线程在这段空隙里绘制就会刷 "Texture (binding: 1, index 0) is not a
+	# valid texture" / "Parameter 'us' is null"（binding 1 = rect_data）。
+	var old_rid := _texture_rid
+	var new_rid := _rd.texture_create(fmt, RDTextureView.new(), [bytes])
+	if not new_rid.is_valid():
 		push_error("[VoxelMeshNode] RD 纹理创建失败（%d x %d，%d 个矩形）" % [width, height, count])
 		return
+	_texture_rid = new_rid
 	_tex_capacity = needed
 
-	_texture = Texture2DRD.new()
-	_texture.texture_rd_rid = _texture_rid
-	_material.set_shader_parameter("rect_data", _texture)
+	if _texture == null:
+		_texture = Texture2DRD.new()
+		_texture.texture_rd_rid = new_rid
+		_material.set_shader_parameter("rect_data", _texture)
+	else:
+		# 同一个 Texture2DRD 换底层 RID：引擎会让依赖它的 uniform set 失效重建。
+		_texture.texture_rd_rid = new_rid
+
+	if old_rid.is_valid():
+		_rd.free_rid(old_rid)
 
 	if debug_self_check and OS.is_debug_build():
 		_debug_verify(words)
 
 
 func _free_texture() -> void:
+	# 先让 Texture2DRD 放开底层 RID，再释放 RID；材质可能还引用着这个
+	# Texture2DRD 对象，直接 free_rid 会让它指向一个已释放的纹理。
+	if _texture != null:
+		_texture.texture_rd_rid = RID()
 	if _rd != null and _texture_rid.is_valid():
 		_rd.free_rid(_texture_rid)
 	_texture_rid = RID()
