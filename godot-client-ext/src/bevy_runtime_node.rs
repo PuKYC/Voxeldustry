@@ -166,7 +166,7 @@ impl BevyAppManager {
     /// 地形在 Startup 生成一次，产出带 `VoxChunkRaw` 的 mesh 块实体；
     /// 贪婪 meshing 在 Godot 侧调 gdext `mesh_voxel_halo` 现算，再由 VoxelMeshNode 渲染。
     ///
-    /// 默认 radius 2 / max_lod 1（196 子块）：release ≈ 2–4 s，**debug ≈ 30 s**
+    /// 默认 radius 2 / max_lod 1（144 子块）：release ≈ 2–4 s，**debug ≈ 30 s**
     /// （生成是 debug 下的瓶颈）。只想快速看一眼可以用
     /// `start_bevy_voxel_perf(fixed_hz, runner_hz, 0, 0)`（36 子块，≈ 5 s）。
     #[func]

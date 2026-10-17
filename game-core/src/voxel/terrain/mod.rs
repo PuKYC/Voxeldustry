@@ -78,7 +78,7 @@ pub use blocks::{
 ///
 /// `radius_blocks` 是 x/z 上围绕世界原点的基础子块半径（1 个基础子块 = 32
 /// 体素 ≈ 14.4 m）。debug 构建生成很慢（实测约 150 ms/子块），所以默认值刻意小：
-/// - [TerrainConfig::default]：radius 2 / max_lod 1（7×7×4 ≈ 196 子块；debug ≈ 30 s，
+/// - [TerrainConfig::default]：radius 2 / max_lod 1（6×6×4 = 144 子块；debug ≈ 30 s，
 ///   release ≈ 2–4 s）；
 /// - [TerrainConfig::demo]：radius 0 / max_lod 0（36 子块；debug ≈ 5 s）。
 ///
@@ -1121,7 +1121,9 @@ mod tests {
 
     #[test]
     fn stream_terrain_lod_restreams_around_observer() {
-        let mut app = streaming_app(1, 1);
+        // 半径 2 半开 [-2,2) 才有对齐的 2×2 母块可合并；半开半径 1 只有 2×2 格，
+        // 凑不齐任何对齐母块，永远停在 LOD0（闭区间下靠 x/z=1 的多余格才够）。
+        let mut app = streaming_app(2, 1);
         set_stream_config(
             &mut app,
             VoxelLodConfig {

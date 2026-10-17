@@ -17,8 +17,8 @@ use crate::voxel::terrain::generation::CHUNK_SIZE;
 ///
 /// 多生成一圈是为了让边缘 mesh 块的 26 邻（6 面 + 12 棱 + 8 角）采样有数据：
 /// `extract_raw_halo` 要求传同 LOD 的已包装邻块；缺子块会被 wrap_block 当成
-/// 空气。LOD 合并只在完整子块组内发生，所以邻块原点最多到 `radius + 1`，
-/// 一圈 margin 足够覆盖 26 邻。
+/// 空气。LOD 合并只在完整子块组内发生，半开区域 `[-radius, radius)` 里
+/// 邻块原点最多到 `radius`，一圈 margin 足够覆盖 26 邻。
 pub const TERRAIN_MARGIN_CHUNKS: i32 = 1;
 
 /// y 方向层数（从 y=0 起算）。
@@ -43,10 +43,12 @@ pub struct TerrainBlock {
 pub fn chunk_keys_to_generate(radius_blocks: i32, max_lod: u8) -> Vec<ChunkKey> {
     let radius = radius_blocks.max(0);
     let margin = TERRAIN_MARGIN_CHUNKS;
+    // 半开区域：x/z ∈ [-radius, radius)，radius = 0 退化成原点单块 [0, 1)。
+    let extent = radius.max(1);
     let layers = y_band_layers(max_lod);
     let mut out = Vec::new();
-    for x in (-radius - margin)..=(radius + margin) {
-        for z in (-radius - margin)..=(radius + margin) {
+    for x in (-radius - margin)..(extent + margin) {
+        for z in (-radius - margin)..(extent + margin) {
             for y in 0..layers {
                 out.push(chunk_key(x, y, z));
             }
@@ -73,7 +75,7 @@ pub fn lod_blocks(radius_blocks: i32, max_lod: u8, voxel_size_m: f64) -> Vec<Ter
 /// XZ 上按到**观察者**的距离做 LOD 合并，再按 y 层展开成块列表（确定性升序）。
 ///
 /// 划分规则（XZ 部分委托给 `voxel::restricted_quadtree`）：
-/// 1. level 0 单元 = 区域内每个基础子块 (x, z) ∈ [-radius, radius]²（与观察者无关）；
+/// 1. level 0 单元 = 区域内每个基础子块 (x, z) ∈ [-radius, radius)²（半开，与观察者无关）；
 /// 2. 自下而上合并：若某对齐父块（边长 2^(level+1) 个子块）的 4 个 level 子块
 ///    都存在，且父块 XZ AABB 到观察者的**最近切比雪夫距离**已经落在
 ///    [VoxelLodConfig::lod_for_distance_m] 允许的 level+1 档，则合并；
@@ -489,6 +491,7 @@ mod tests {
     /// 区域里每个 (x, y, z) 基础子块被叶子恰好覆盖一次（3D 划分不重叠、无空洞）。
     fn assert_partition_of(blocks: &[TerrainBlock], radius_blocks: i32, max_lod: u8) {
         assert!(!blocks.is_empty());
+        let extent = radius_blocks.max(1);
         let layers = y_band_layers(max_lod);
 
         let mut covered: BTreeMap<(i32, i32, i32), usize> = BTreeMap::new();
@@ -516,9 +519,9 @@ mod tests {
 
         // 覆盖 = 区域 × band 恰好一次，不越界、不重叠。
         let mut expected = Vec::new();
-        for x in -radius_blocks..=radius_blocks {
+        for x in -radius_blocks..extent {
             for y in 0..layers {
-                for z in -radius_blocks..=radius_blocks {
+                for z in -radius_blocks..extent {
                     expected.push((x, y, z));
                 }
             }
@@ -539,6 +542,7 @@ mod tests {
     ///
     /// 这是跨 LOD 邻居采样 / 接缝修复的前提，缺失时会出现裂缝与未剔除面。
     fn assert_two_to_one_xz(blocks: &[TerrainBlock], radius_blocks: i32) {
+        let extent = radius_blocks.max(1);
         let mut lod_at: BTreeMap<(i32, i32), u8> = BTreeMap::new();
         for block in blocks {
             let span = block_span(block.lod);
@@ -553,11 +557,11 @@ mod tests {
             }
         }
 
-        for x in -radius_blocks..=radius_blocks {
-            for z in -radius_blocks..=radius_blocks {
+        for x in -radius_blocks..extent {
+            for z in -radius_blocks..extent {
                 let a = lod_at[&(x, z)];
                 for (nx, nz) in [(x + 1, z), (x, z + 1)] {
-                    if nx > radius_blocks || nz > radius_blocks {
+                    if nx >= extent || nz >= extent {
                         continue;
                     }
                     let b = lod_at[&(nx, nz)];
@@ -583,8 +587,8 @@ mod tests {
     fn small_region_is_all_lod0() {
         let blocks = lod_blocks(2, 1, VOXEL_SIZE_METERS);
         assert!(blocks.iter().all(|block| block.lod == 0));
-        // x/z = 5 × 5 个单元，y band = 4 层。
-        assert_eq!(blocks.len(), 25 * 4);
+        // 半开 [-2, 2)：x/z = 4 × 4 个单元，y band = 4 层。
+        assert_eq!(blocks.len(), 16 * 4);
         assert_partition(2, 1);
         assert_partition(2, 0);
     }
@@ -752,11 +756,11 @@ mod tests {
         );
         assert_partition_of(&blocks, 8, 3);
 
-        // 观察者附近（x = +8 边缘子块）必须保持 LOD0。
+        // 观察者附近（半开区域 +X 边缘 x = 7）必须保持 LOD0。
         assert!(
             blocks
                 .iter()
-                .any(|block| block.origin.x == 8 && block.lod == 0),
+                .any(|block| block.origin.x == 7 && block.lod == 0),
             "观察者附近必须保持 LOD0"
         );
         // 远离观察者（x <= -4）必须出现粗于 LOD0 的块。
@@ -767,6 +771,47 @@ mod tests {
             .max()
             .expect("远端必须有块");
         assert!(far_max >= 1, "远端必须变粗，实测最粗 {far_max}");
+    }
+
+    /// R=12 半开 + 默认配置 + 观察者在原点：闭区间下 x=+12 整列 / z=+12 整行
+    /// 恒为 LOD0（可见的细带），半开后远角必须变粗，且 LOD0 核心四边对称。
+    #[test]
+    fn observer_at_origin_has_symmetric_lod0_core() {
+        let radius = 12;
+        let max_lod = 3;
+        let blocks = lod_blocks(radius, max_lod, VOXEL_SIZE_METERS);
+        assert_partition_of(&blocks, radius, max_lod);
+        let partition = TerrainPartition::new(&blocks);
+
+        // 远角 (11, 11)：闭区间下是 LOD0，半开后必须至少 LOD1。
+        let corner = partition.xz_lod(11, 11).expect("(11,11) 必须被覆盖");
+        assert!(corner >= 1, "远角 (11,11) 必须粗于 LOD0，实测 LOD{corner}");
+
+        // LOD0 叶子覆盖集合：实际分区里是以原点为中心的 8×8 方块 [-4, 4)²。
+        let lod0: BTreeSet<(i32, i32)> = blocks
+            .iter()
+            .filter(|block| block.lod == 0)
+            .flat_map(|block| {
+                let span = block_span(block.lod);
+                (0..span).flat_map(move |dx| {
+                    (0..span).map(move |dz| (block.origin.x + dx, block.origin.z + dz))
+                })
+            })
+            .collect();
+        let want: BTreeSet<(i32, i32)> =
+            (-4..4).flat_map(|x| (-4..4).map(move |z| (x, z))).collect();
+        assert_eq!(lod0, want, "LOD0 覆盖必须是中心对称的 [-4,4)²");
+
+        // 四边对称：半开网格关于 x -> -1-x（z 同理）镜像，lod 必须一致。
+        for x in -radius..radius {
+            for z in -radius..radius {
+                assert_eq!(
+                    partition.xz_lod(x, z),
+                    partition.xz_lod(-1 - x, -1 - z),
+                    "({x},{z}) 与镜像格 lod 不一致"
+                );
+            }
+        }
     }
 
     #[test]

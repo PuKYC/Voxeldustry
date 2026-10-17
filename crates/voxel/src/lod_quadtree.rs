@@ -1,7 +1,8 @@
 //! 受限四叉树（Restricted Quadtree）：XZ 平面上的 2:1 平衡 LOD 划分。
 //!
-//! 把基础子块区域 `[-radius, radius]²` 划分成若干**对齐方块叶子**（边长
-//! `2^lod` 个基础子块），保证：
+//! 把基础子块区域 `[-radius, radius)` 划分成若干**对齐方块叶子**（边长
+//! `2^lod` 个基础子块）；区域是半开的（每轴 `2 * radius` 格），`radius = 0`
+//! 退化成原点单个基础子块 `[0, 1)²`，保证半径 0 也有非空地形。保证：
 //!
 //! 1. **精确划分**：区域内每个基础子块恰好被一个叶子覆盖，不越界、不重叠；
 //! 2. **2:1 平衡**：共享一条边的两个叶子，`lod` 差 ≤ 1
@@ -39,7 +40,10 @@ impl QuadLeaf {
     }
 }
 
-/// 生成 `[-radius, radius]²` 上满足 2:1 平衡的受限四叉树叶子（升序）。
+/// 生成 `[-radius, radius)` 上满足 2:1 平衡的受限四叉树叶子（升序）。
+///
+/// 区域半开：每轴 `2 * radius` 格；`radius = 0` 时退化为原点单块
+/// `[0, 1)²`（恰好一个 `QuadLeaf { x: 0, z: 0, lod: 0 }`）。
 ///
 /// `may_coarsen(px, pz, size, level)` 判断**对齐到 `size`、原点 `(px, pz)` 的
 /// 父块**是否允许成为 `level` 的叶子（`size` = `2^level`，单位为 1 个基础子块）。
@@ -68,9 +72,10 @@ fn base_merge<F>(radius: i32, max_lod: u8, may_coarsen: &F) -> BTreeMap<(i32, i3
 where
     F: Fn(i32, i32, i32, u8) -> bool,
 {
+    let extent = radius.max(1);
     let mut cells: BTreeMap<(i32, i32), u8> = BTreeMap::new();
-    for x in -radius..=radius {
-        for z in -radius..=radius {
+    for x in -radius..extent {
+        for z in -radius..extent {
             cells.insert((x, z), 0);
         }
     }
@@ -131,16 +136,17 @@ where
 /// 所以一定在有限步内到达不动点；同时分裂保持对齐与精确划分，因此不变量
 /// 在每一步之后都成立。
 fn balance_2_to_1(cells: &mut BTreeMap<(i32, i32), u8>, radius: i32, max_lod: u8) {
+    let extent = radius.max(1);
     loop {
         let mut to_split: BTreeSet<(i32, i32)> = BTreeSet::new();
 
-        for x in -radius..=radius {
-            for z in -radius..=radius {
+        for x in -radius..extent {
+            for z in -radius..extent {
                 let Some(a_lod) = leaf_lod(cells, x, z, max_lod) else {
                     continue;
                 };
                 for (nx, nz) in [(x + 1, z), (x, z + 1)] {
-                    if nx > radius || nz > radius {
+                    if nx >= extent || nz >= extent {
                         continue;
                     }
                     let Some(b_lod) = leaf_lod(cells, nx, nz, max_lod) else {
@@ -200,17 +206,18 @@ mod tests {
     /// 覆盖 = 区域 × 恰好一次，且每个叶子对齐、不越界、不超 LOD 上限。
     fn assert_valid_partition(leaves: &[QuadLeaf], radius: i32, max_lod: u8) {
         assert!(!leaves.is_empty(), "非空区域必须至少有一个叶子");
+        let extent = radius.max(1);
         let mut covered: BTreeMap<(i32, i32), usize> = BTreeMap::new();
         for leaf in leaves {
             assert!(leaf.lod <= max_lod, "lod 超上限: {leaf:?}");
             assert_eq!(leaf.x.rem_euclid(leaf.span()), 0, "x 未对齐: {leaf:?}");
             assert_eq!(leaf.z.rem_euclid(leaf.span()), 0, "z 未对齐: {leaf:?}");
             assert!(
-                leaf.x >= -radius && leaf.x + leaf.span() - 1 <= radius,
+                leaf.x >= -radius && leaf.x + leaf.span() <= extent,
                 "x 越界: {leaf:?}"
             );
             assert!(
-                leaf.z >= -radius && leaf.z + leaf.span() - 1 <= radius,
+                leaf.z >= -radius && leaf.z + leaf.span() <= extent,
                 "z 越界: {leaf:?}"
             );
             for dx in 0..leaf.span() {
@@ -220,8 +227,8 @@ mod tests {
             }
         }
         let mut expected = 0usize;
-        for x in -radius..=radius {
-            for z in -radius..=radius {
+        for x in -radius..extent {
+            for z in -radius..extent {
                 assert_eq!(covered.get(&(x, z)), Some(&1), "({x},{z}) 覆盖数不为 1");
                 expected += 1;
             }
@@ -235,14 +242,15 @@ mod tests {
             .iter()
             .map(|leaf| ((leaf.x, leaf.z), leaf.lod))
             .collect();
+        let extent = radius.max(1);
         let mut count = 0usize;
-        for x in -radius..=radius {
-            for z in -radius..=radius {
+        for x in -radius..extent {
+            for z in -radius..extent {
                 let Some(a) = leaf_lod(&cells, x, z, max_lod) else {
                     continue;
                 };
                 for (nx, nz) in [(x + 1, z), (x, z + 1)] {
-                    if nx > radius || nz > radius {
+                    if nx >= extent || nz >= extent {
                         continue;
                     }
                     if let Some(b) = leaf_lod(&cells, nx, nz, max_lod) {
@@ -267,7 +275,7 @@ mod tests {
     fn never_coarsen_keeps_every_cell_at_lod0() {
         let radius = 3;
         let leaves = restricted_quadtree(radius, 3, |_, _, _, _| false);
-        assert_eq!(leaves.len(), 49);
+        assert_eq!(leaves.len(), 36);
         assert!(leaves.iter().all(|leaf| leaf.lod == 0));
         assert_valid_partition(&leaves, radius, 3);
         assert_eq!(two_to_one_violations(&leaves, radius, 3), 0);
@@ -275,14 +283,78 @@ mod tests {
 
     #[test]
     fn always_coarsen_merges_aligned_blocks() {
-        // 半径 2、LOD 上限 1：只有原点是 (-2|-0) 的 4 个父块凑齐 4 个子块，
-        // 所以恰好 4 个 LOD1 + 9 个 LOD0（x=2 列 + z=2 行）。
+        // 半径 2 半开 = 每轴 4 格，正好是 4 个对齐的 LOD1 父块：
+        // 全部合并，不残留任何 LOD0（闭区间会剩 x=2 列 + z=2 行）。
         let radius = 2;
         let leaves = restricted_quadtree(radius, 1, |_, _, _, _| true);
         assert_valid_partition(&leaves, radius, 1);
         assert_eq!(two_to_one_violations(&leaves, radius, 1), 0);
         assert_eq!(leaves.iter().filter(|leaf| leaf.lod == 1).count(), 4);
-        assert_eq!(leaves.iter().filter(|leaf| leaf.lod == 0).count(), 9);
+        assert_eq!(leaves.iter().filter(|leaf| leaf.lod == 0).count(), 0);
+    }
+
+    #[test]
+    fn always_coarsen_eats_aligned_half_open_region() {
+        // 半开区域被对齐的粗块整除时，不允许留下细带（闭区间总会剩 1 格）。
+        // R=4 半开 = 8 格 = 2×2 个对齐的 LOD2 块（[-4,4) 不是 8 的倍数）。
+        let leaves = restricted_quadtree(4, 3, |_, _, _, _| true);
+        assert_eq!(
+            leaves,
+            vec![
+                QuadLeaf {
+                    x: -4,
+                    z: -4,
+                    lod: 2
+                },
+                QuadLeaf {
+                    x: -4,
+                    z: 0,
+                    lod: 2
+                },
+                QuadLeaf {
+                    x: 0,
+                    z: -4,
+                    lod: 2
+                },
+                QuadLeaf { x: 0, z: 0, lod: 2 },
+            ]
+        );
+        assert_valid_partition(&leaves, 4, 3);
+
+        // R=8 半开 = 16 格 = 4 个对齐的 LOD3 块（2×2，无残留）。
+        let leaves = restricted_quadtree(8, 3, |_, _, _, _| true);
+        assert_eq!(leaves.len(), 4);
+        assert!(leaves.iter().all(|leaf| leaf.lod == 3), "{leaves:?}");
+        assert_valid_partition(&leaves, 8, 3);
+        assert_eq!(two_to_one_violations(&leaves, 8, 3), 0);
+    }
+
+    #[test]
+    fn half_open_radius_12_has_no_constant_lod0_band() {
+        // 闭区间 [-12, 12] 每轴 25 格（奇数），对齐的 4 子块合并永远差一格，
+        // x=+12 整列 / z=+12 整行恒为 LOD0；半开 [-12, 12) 共 24 格后消失。
+        let radius = 12;
+        let max_lod = 3;
+        let leaves = restricted_quadtree(radius, max_lod, |_, _, _, _| true);
+        assert_valid_partition(&leaves, radius, max_lod);
+        assert_eq!(two_to_one_violations(&leaves, radius, max_lod), 0);
+        assert!(
+            leaves.iter().all(|leaf| leaf.lod > 0),
+            "半开区域不允许出现 LOD0 残留列/行: {leaves:?}"
+        );
+
+        // 四角最粗只能到 LOD2：-12 不是 8 的倍数，凑不齐对齐的 LOD3 父块。
+        let cells: BTreeMap<(i32, i32), u8> = leaves
+            .iter()
+            .map(|leaf| ((leaf.x, leaf.z), leaf.lod))
+            .collect();
+        for (cx, cz) in [(-12, -12), (-12, 11), (11, -12), (11, 11)] {
+            assert_eq!(
+                leaf_lod(&cells, cx, cz, max_lod),
+                Some(2),
+                "({cx},{cz}) 最粗只能到 LOD2"
+            );
+        }
     }
 
     #[test]
