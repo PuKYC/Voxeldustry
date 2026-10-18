@@ -218,8 +218,10 @@ impl<'a> Neighbourhood<'a> {
 /// 面 / 棱 / 角采样；本枚举只描述 6 个面，供外部面掩码（剔除）和面 AO 使用。
 ///
 /// **只看同 LOD**：跨 LOD 面一律报 [`FaceNeighbor::Missing`]（按空气处理），
-/// 每块自己封边（godot_voxel 的块自闭合）。相邻 LOD 的几何错位由网格侧裙子
-/// 掩盖，不靠跨 LOD 剔除 —— 那条路径会产生「两侧都剔」的穿透洞。
+/// 每块自己封边（godot_voxel 的块自闭合）。相邻 LOD 的可见表现是台阶墙，
+/// 不是穿透洞；网格侧裙边只在面外残留实心 halo 时作为安全网生效（当前
+/// extract 路径下是 no-op）。不靠跨 LOD 剔除 —— 那条路径会产生「两侧都剔」
+/// 的穿透洞。
 #[derive(Clone, Copy)]
 pub enum FaceNeighbor<'a> {
     /// 面外无块（按空气处理，不遮挡）。

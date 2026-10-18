@@ -67,9 +67,9 @@ use crate::world::WorldSeed;
 use blocks::FaceNeighbor as TerrainFaceNeighbor;
 pub use blocks::{
     block_origin_meters, block_span, chunk_keys_to_generate, face_neighbors, group_key,
-    group_origin, lod_blocks, lod_blocks_for_observer, lod_mismatch_mask, nearest_axis_distance_m,
-    nearest_block_distance_m, neighbor_origins, skirt_mask, y_band_layers, FaceNeighbor, GroupKey,
-    TerrainBlock, TerrainPartition, REGION_BLOCKS, TERRAIN_MARGIN_CHUNKS,
+    group_origin, lod_blocks, lod_blocks_for_observer, lod_mismatch_mask, missing_face_mask,
+    nearest_axis_distance_m, nearest_block_distance_m, neighbor_origins, skirt_mask, y_band_layers,
+    FaceNeighbor, GroupKey, TerrainBlock, TerrainPartition, REGION_BLOCKS, TERRAIN_MARGIN_CHUNKS,
 };
 use generated::GeneratedBlockCache;
 
@@ -332,10 +332,10 @@ fn prime_block_tree(
 /// `StableIdAllocator` 立即分配并登记进 `StableEntityIndex`（等价
 /// `spawn_stable` 的当帧语义）。
 ///
-/// 提取一个块的原始体素 halo（34³）与跨 LOD 裙边掩码；内部无实心体素返回 None。
+/// 提取一个块的原始体素 halo（34³）与接缝裙边掩码；内部无实心体素返回 None。
 ///
-/// 返回 (halo 字节, skirt_mask)：掩码由 face_neighbors 报告经 [skirt_mask] 求得，
-/// 只有面外邻居 LOD 不同（更粗 / 更细）的面置位，0 = 无裙边。
+/// 返回 (halo 字节, skirt_mask)：掩码 = 跨 LOD 错位面 | 面外没有同 LOD 邻居的面，
+/// 0 = 无裙边。当前 extract 路径下掩码不额外产出裙边几何（见 `append_skirts`）。
 ///
 /// 共享给 Startup 生成与运行期流式重划分，避免两条路径分叉。邻块缓存与本块
 /// 包装缓存必须是两个资源（external 只读借用与 &mut 本块缓存冲突）。
@@ -357,8 +357,10 @@ fn extract_block_raw(
     // 面邻居报告只保留同 LOD（跨 LOD 已映射成 Missing）：块只看同 LOD 邻居，
     // 缺失按空气处理 -> 每块自己封边，不会再有「两侧都剔除」的穿透洞。
     let plan = face_neighbors(&block, partition);
-    // 跨 LOD 接缝裙边掩码：错位面单独从完整 LOD 报告里取。
-    let skirt = lod_mismatch_mask(&block, partition);
+    // 裙边掩码 = 跨 LOD 错位面 + 面外没有同 LOD 邻居的面（缺失按空气处理）。
+    // 注意：自闭合后这些面的面外 halo 是空气，主 mesher 已画出边界格，裙边
+    // 当前的覆盖位图会全部跳过 -> 本掩码不额外产生几何，保留为安全网。
+    let skirt = lod_mismatch_mask(&block, partition) | missing_face_mask(&plan);
     // 树来源按 LOD 分流（godot_voxel 的做法）：
     // - lod == 0：直接从已生成的 VoxVolume 包装（逐位不变，physics / 近景用）；
     // - lod > 0：按自己的 LOD 直接生成（WorldGenerator::generate_block_at_lod）。
@@ -920,6 +922,8 @@ mod tests {
 
         let groups = app.world().resource::<TerrainGroups>();
         assert_eq!(groups.len(), stats.groups);
+        // 与 build_terrain 相同的静态分区：用来重算每块的期望 skirt_mask。
+        let partition = TerrainPartition::new(&lod_blocks(0, 0, voxel_size_meters()));
         assert!(stats.groups > 0 && stats.groups <= layers, "组数应少于块数");
         assert_eq!(stats.lod_groups[0], stats.groups);
 
@@ -940,8 +944,14 @@ mod tests {
                 assert_eq!(group_key(*origin, 0), key, "成员块必须属于该组");
                 assert_eq!(blocks.len(), RAW_VOXELS);
                 assert!(raw_halo_has_solid_interior(blocks));
-                // LOD0 + 全 LOD0 划分：任何面都不跨 LOD -> mask = 0。
-                assert_eq!(*mask, 0);
+                // LOD0 划分没有跨 LOD 面；非零位只来自「面外没有同 LOD 邻居」。
+                let block = TerrainBlock {
+                    origin: *origin,
+                    lod: 0,
+                };
+                let expected = lod_mismatch_mask(&block, &partition)
+                    | missing_face_mask(&face_neighbors(&block, &partition));
+                assert_eq!(*mask, expected, "skirt_mask 必须是错位面 | 无同 LOD 邻居面");
                 total_chunks += 1;
             }
 
@@ -958,7 +968,7 @@ mod tests {
     }
 
     /// 手搭含跨 LOD 面的划分：extract_block_raw 的 skirt_mask 必须等于
-    /// skirt_mask(face_neighbors(...))，且只有跨 LOD 面置位。
+    /// 「跨 LOD 错位面 | 面外没有同 LOD 邻居的面」。
     #[test]
     fn extract_block_raw_reports_cross_lod_skirt_mask() {
         // 被测块 (1,0,0) LOD0；+X 面外是 LOD1 粗块 (2,0,0)（跨 LOD），
@@ -976,8 +986,16 @@ mod tests {
             lod: 0,
         };
         let partition = TerrainPartition::new(&[block, coarse, same_y]);
-        let expected = lod_mismatch_mask(&block, &partition);
-        assert_eq!(expected, 1 << 0, "只有 +X 面跨 LOD");
+        let faces = face_neighbors(&block, &partition);
+        let expected = lod_mismatch_mask(&block, &partition) | missing_face_mask(&faces);
+        assert_eq!(
+            lod_mismatch_mask(&block, &partition),
+            1 << 0,
+            "只有 +X 面跨 LOD"
+        );
+        assert_eq!(face_neighbors(&block, &partition)[0], FaceNeighbor::Missing);
+        // +Y 面是同 LOD 块，不进掩码。
+        assert_eq!(expected & (1 << 2), 0);
 
         // 只放被测块自己的实心 base 子块；缺失邻块按空气处理，不影响掩码。
         let mut interner = VoxelInterner::new(4 * 1024 * 1024);
@@ -1006,11 +1024,9 @@ mod tests {
         assert_eq!(raw.len(), RAW_VOXELS);
         assert!(raw_halo_has_solid_interior(&raw));
         assert_eq!(
-            mask,
-            lod_mismatch_mask(&block, &partition),
+            mask, expected,
             "extract_block_raw 的掩码必须与纯函数报告一致"
         );
-        assert_eq!(mask, expected);
     }
 
     #[test]

@@ -235,18 +235,30 @@ fn material_at(occupancy: &OccupancyData, n: usize, x: usize, y: usize, z: usize
     0
 }
 
-/// 跨 LOD 接缝裙边（blocky LOD skirts，对齐 godot_voxel `append_side_skirts`）。
+/// 接缝裙边（blocky LOD skirts；判据改编自 godot_voxel `append_side_skirts`）。
 ///
-/// 对 `skirt_mask` 置位的每个面，在该面的边界层里找出「自身实心、面外被邻居
-/// 遮挡、且切向暴露」的格，补一条与该面同向的 1x1 rect（位置在边界平面）。
-/// AO 取满亮 `[3, 3, 3, 3]`（裙边不参与 AO）。
+/// 判据：**边界格实心 + 内侧格实心 + 切向 4 邻至少一个空气**，不看面外邻居。
+/// 主 mesher 已在边界平面画过的格由覆盖位图跳过，避免共面重复 / z-fighting；
+/// `skirt_mask == 0` 时输出与不开裙边逐字相等。材质取内侧格，AO 满亮
+/// `[3, 3, 3, 3]`（裙边不参与 AO）。
+///
+/// **当前 extract 路径下通常是 no-op**：块自闭合后，masked 面（跨 LOD / 缺失）
+/// 的面外 halo 是空气，主 mesher 已经画出这些边界格，覆盖位图必然全部命中。
+/// 只有调用方传入的 halo 在 masked 面残留实心面外格（跨 LOD 采样回归 / 人造
+/// halo 的测试场景）时才会产出几何；保留它是正确性安全网 + 切向轴回归测试。
+///
+/// 与 godot 的已知偏差：判据整体向块内缩了一格。godot 用 outer halo 格 +
+/// 块边界格 n-1 + outer 的切向暴露，材质/模型取 n-1；我们不看面外，改用
+/// 块边界格 + n-2 + 边界格的切向暴露，材质取 n-2。副作用是 1 格厚墙补不出、
+/// 材质可能深一层。将来真要严格对齐就恢复 outer 判据，而不是继续加裙边。
 ///
 /// `skirt_mask` 的 bit `face` 对应 [`crate::mesh::ExternalPlane`] 顺序
-/// `[+x, -x, +y, -y, +z, -z]`；调用方只在跨 LOD 面置位，同 LOD 面不加，
-/// 避免多余几何；`skirt_mask == 0` 时输出与不开裙边逐字相等。
+/// `[+x, -x, +y, -y, +z, -z]`；调用方只在「跨 LOD 错位 / 面外没有同 LOD 邻居」
+/// 的面置位。
 pub(crate) fn append_skirts(
     occupancy: &OccupancyData,
     skirt_mask: u8,
+    existing: &[RectInstance],
     rects: &mut Vec<RectInstance>,
     aos: &mut Vec<[u8; 4]>,
 ) {
@@ -255,31 +267,55 @@ pub(crate) fn append_skirts(
         return;
     }
     let at = |x: i64, y: i64, z: i64| solid_at(occupancy, n, x, y, z);
+    let mut covered = vec![false; n * n];
     for face in 0..6usize {
         if (skirt_mask >> face) & 1 == 0 {
             continue;
         }
         let (plane, dir, normal_axis, boundary) = skirt_face_geometry(face, n);
-        let outside_coord = if boundary == 0 { -1 } else { n as i64 };
+        let inside_coord = if boundary == 0 { 1 } else { n as i64 - 2 };
         let slice = if boundary == 0 { 0 } else { n as u8 };
+
+        // 主 mesher 在该边界平面上已经画过的格（大矩形覆盖多格）。
+        covered.iter_mut().for_each(|hit| *hit = false);
+        for rect in existing {
+            if rect.plane != plane.index() || rect.dir != dir.index() || rect.slice != slice {
+                continue;
+            }
+            let row_end = (rect.row as usize + rect.h as usize).min(n);
+            let col_end = (rect.col as usize + rect.w as usize).min(n);
+            for row in rect.row as usize..row_end {
+                for col in rect.col as usize..col_end {
+                    covered[row * n + col] = true;
+                }
+            }
+        }
+
         for row in 0..n {
             for col in 0..n {
+                if covered[row * n + col] {
+                    // 边界平面已有真实面，不必再补。
+                    continue;
+                }
                 let (x, y, z) = skirt_plane_cell(plane, boundary, row, col);
                 if !at(x, y, z) {
                     continue;
                 }
-                // 面外被邻居遮挡：主 mesher 已经剔除该面，裙边补回边界平面。
-                let outside = match normal_axis {
-                    0 => at(outside_coord, y, z),
-                    1 => at(x, outside_coord, z),
-                    _ => at(x, y, outside_coord),
+                // 块内再向里一格也必须实心：避免给「只有边界一层」的薄片补墙。
+                //（godot 的 inner 其实是我们的边界格；多查一层是 §6.2 的已知偏差。）
+                let (ix, iy, iz) = match normal_axis {
+                    0 => (inside_coord, y, z),
+                    1 => (x, inside_coord, z),
+                    _ => (x, y, inside_coord),
                 };
-                if !outside {
+                if !at(ix, iy, iz) {
                     continue;
                 }
                 // 切向暴露：4 个切向邻居至少一个空气。
+                // 切向两轴必须与法线轴正交：±X 面取 y / z，±Y 面取 z / x，
+                // ±Z 面取 y / x（漏掉任一轴会让只沿该轴暴露的墙补不出裙边）。
                 let (t0, t1) = match normal_axis {
-                    0 => ([1i64, 0, 0], [0i64, 0, 1]),
+                    0 => ([0i64, 1, 0], [0i64, 0, 1]),
                     1 => ([0i64, 0, 1], [1i64, 0, 0]),
                     _ => ([0i64, 1, 0], [1i64, 0, 0]),
                 };
@@ -290,7 +326,7 @@ pub(crate) fn append_skirts(
                 if !exposed {
                     continue;
                 }
-                let material = material_at(occupancy, n, x as usize, y as usize, z as usize);
+                let material = material_at(occupancy, n, ix as usize, iy as usize, iz as usize);
                 rects.push(RectInstance {
                     plane: plane.index(),
                     dir: dir.index(),

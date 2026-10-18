@@ -275,11 +275,15 @@ pub fn mesh_raw_halo(lod: u8, blocks: &[u8]) -> Vec<u64> {
     pack_rect_batch_with_ao(&mesh_occupancy_with_ao(&occupancy, block.origin, block.lod))
 }
 
-/// 与 [`mesh_raw_halo`] 相同，额外在 `skirt_mask` 置位的面上追加跨 LOD 接缝
-/// 裙边（AO 满亮）。`skirt_mask == 0` 时逐位等于 [`mesh_raw_halo`]。
+/// 与 [`mesh_raw_halo`] 相同，额外在 `skirt_mask` 置位的面上追加接缝裙边
+/// （AO 满亮）。`skirt_mask == 0` 时逐位等于 [`mesh_raw_halo`]。
 ///
 /// bit `face` 对应 [`voxel::mesh::ExternalPlane`] 顺序 `[+x, -x, +y, -y, +z, -z]`；
-/// 只有跨 LOD 面才应置位（由调用方按 2:1 面邻居报告决定）。
+/// 调用方在「跨 LOD 错位 / 面外没有同 LOD 邻居」的面置位。判据：边界格 +
+/// 内侧格实心、切向暴露；已在边界平面画过的格不会重复补。
+///
+/// 注意当前 extract 路径下 masked 面的面外 halo 是空气，主 mesher 已画出这些
+/// 边界格，覆盖位图全部命中 -> 本函数通常不产出额外几何；保留为正确性安全网。
 #[must_use]
 pub fn mesh_raw_halo_with_skirts(lod: u8, blocks: &[u8], skirt_mask: u8) -> Vec<u64> {
     debug_assert!(lod <= MAX_LOD, "lod exceeds MAX_LOD");
@@ -758,12 +762,13 @@ mod tests {
         wrap_block(&chunks, interner, MeshBlock::new(origin, Lod::new(lod)))
     }
 
-    /// 跨 LOD 裙边：只在 `skirt_mask` 置位的面出现，AO 满亮；mask=0 时与不开
-    /// 裙边逐字相等（保护黄金测试）。
+    /// 接缝裙边：只在 `skirt_mask` 置位的面出现，判据是「边界格 + 内侧格实心
+    /// + 切向暴露」，材质取内侧格，AO 满亮；已画过的边界平面不重复补。
     #[test]
-    fn skirts_only_on_masked_faces_and_ao_full_bright() {
+    fn skirts_follow_godot_rules_and_never_duplicate() {
         let mut blocks = vec![0u8; RAW_VOXELS];
-        // 体素 (31,10,10)：+X 面被邻居 (halo hx=33) 遮挡，其余面暴露。
+        // 内侧 (30,10,10)=6、边界 (31,10,10)=5；面外 halo(33,11,11)=7 遮挡 +X。
+        blocks[raw_halo_index(31, 11, 11)] = 6;
         blocks[raw_halo_index(32, 11, 11)] = 5;
         blocks[raw_halo_index(RAW_HALO - 1, 11, 11)] = 7;
 
@@ -776,7 +781,7 @@ mod tests {
             "主 mesher 已剔除 +X 面"
         );
 
-        // +X（bit 0）置位：补一条满亮裙边。
+        // +X（bit 0）置位：补一条满亮裙边，材质取内侧格（6）。
         let with = mesh_raw_halo_with_skirts(0, &blocks, 1 << 0);
         assert_eq!(with.len(), baseline.len() + 1, "只应多一条裙边 rect");
         let skirt = with
@@ -787,8 +792,27 @@ mod tests {
             })
             .expect("+X 裙边必须存在");
         let rect = unpack_rect(*skirt);
-        assert_eq!((rect.w, rect.h, rect.material), (1, 1, 5));
+        assert_eq!((rect.w, rect.h, rect.material), (1, 1, 6), "材质取内侧格");
         assert_eq!(unpack_ao(*skirt), [3, 3, 3, 3], "裙边 AO 必须满亮");
+
+        // 面外是空气：主 mesher 已在边界平面画了真实面 -> 不得再补（防共面重复）。
+        let mut open = blocks.clone();
+        open[raw_halo_index(RAW_HALO - 1, 11, 11)] = 0;
+        let open_base = mesh_raw_halo(0, &open);
+        assert_eq!(
+            mesh_raw_halo_with_skirts(0, &open, 1 << 0),
+            open_base,
+            "已有真实面的格不得重复补裙边"
+        );
+
+        // 只有内侧格实心、边界格是空气时没有墙可补。
+        let mut no_wall = blocks.clone();
+        no_wall[raw_halo_index(32, 11, 11)] = 0;
+        assert_eq!(
+            mesh_raw_halo_with_skirts(0, &no_wall, 1 << 0),
+            mesh_raw_halo(0, &no_wall),
+            "边界格是空气时不得补裙边"
+        );
 
         // 只在指定面出现：置 -Z（bit 5）不应产生 +X 裙边。
         let other = mesh_raw_halo_with_skirts(0, &blocks, 1 << 5);
@@ -802,5 +826,67 @@ mod tests {
 
         // mask = 0 必须与旧输出逐字相等。
         assert_eq!(mesh_raw_halo_with_skirts(0, &blocks, 0), baseline);
+    }
+
+    /// ±X 面的切向暴露必须同时看 y 与 z：沿 z 连成一片、仅 y 方向暴露的墙
+    /// 也要补裙边（回归：曾把法线轴 x 误当成一个切向轴，导致只看 z）。
+    #[test]
+    fn skirts_check_both_tangential_axes_on_x_faces() {
+        let mut blocks = vec![0u8; RAW_VOXELS];
+        // +X 面：x=30 内侧、x=31 边界，沿 z=9..=11 连成一条墙，y 只有一层。
+        for z in 9..=11 {
+            blocks[raw_halo_index(31, 12, z + 1)] = 4; // 内侧格 (30, 11, z)
+            blocks[raw_halo_index(32, 12, z + 1)] = 4; // 边界格 (31, 11, z)
+            blocks[raw_halo_index(RAW_HALO - 1, 12, z + 1)] = 1; // 面外遮挡
+        }
+        let with = mesh_raw_halo_with_skirts(0, &blocks, 1 << 0);
+        let center = with
+            .iter()
+            .find(|w| {
+                let r = unpack_rect(**w);
+                r.plane == 0 && r.dir == 0 && r.slice == 32 && r.row == 11 && r.col == 10
+            })
+            .expect("z 向两侧都实心时，仅 y 向暴露也必须补 +X 裙边");
+        assert_eq!(unpack_rect(*center).material, 4);
+    }
+
+    /// 真实 extract 路径的 masked 面（`FaceNeighbor::Missing`）外侧是空气：
+    /// 主 mesher 已经画出全部边界格，覆盖位图全部命中 -> 裙边是 no-op。
+    /// 这是 C 阶段在「块自闭合」前提下的已知行为，不是补缝手段。
+    #[test]
+    fn masked_face_halo_is_air_so_skirts_are_noop() {
+        let mut interner = new_interner();
+        let mut chunk = VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH));
+        chunk.fill(&mut interner, 1);
+        let mut chunks: BTreeMap<ChunkKey, VoxTree<u8>> = BTreeMap::new();
+        chunks.insert(key(0, 0, 0), chunk);
+        let tree = wrap_block(
+            &chunks,
+            &mut interner,
+            MeshBlock::new(key(0, 0, 0), Lod::new(0)),
+        );
+        let block = MeshBlock::new(key(0, 0, 0), Lod::new(0));
+        let halo = extract_raw_halo_with_faces(
+            &tree,
+            &interner,
+            block,
+            [FaceNeighbor::Missing; 6],
+            Neighbourhood::none(),
+        );
+        for row in 0..RAW_DIM {
+            for col in 0..RAW_DIM {
+                let (hx, hy, hz) = halo_coord_for_face(0, row, col);
+                assert_eq!(
+                    halo[raw_halo_index(hx, hy, hz)],
+                    0,
+                    "Missing 面的面外 halo 必须是空气"
+                );
+            }
+        }
+        assert_eq!(
+            mesh_raw_halo_with_skirts(0, &halo, 0x3F),
+            mesh_raw_halo(0, &halo),
+            "面外全空时主 mesher 已封边，裙边不得增加几何"
+        );
     }
 }

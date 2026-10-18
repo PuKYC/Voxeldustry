@@ -260,11 +260,29 @@ pub fn lod_mismatch_mask(block: &TerrainBlock, partition: &TerrainPartition) -> 
     skirt_mask(&neighbour_lod_report(block, partition))
 }
 
+/// 面外没有同 LOD 邻居（按空气处理）的面掩码。
+///
+/// 与 [`lod_mismatch_mask`] 一起构成 skirt_mask。**当前 extract 路径下本掩码
+/// 不产生额外几何**：这些面的面外 halo 是空气，主 mesher 已经画出边界格，
+/// 裙边的覆盖位图会全部跳过。保留它是因为语义上这些面确实没有同 LOD 邻居，
+/// 且 wire 输出不变。
+#[must_use]
+pub fn missing_face_mask(neighbours: &[FaceNeighbor; 6]) -> u8 {
+    let mut mask = 0u8;
+    for (face, neighbour) in neighbours.iter().enumerate() {
+        if matches!(neighbour, FaceNeighbor::Missing) {
+            mask |= 1 << face;
+        }
+    }
+    mask
+}
+
 /// 由面邻居报告得到跨 LOD 面掩码（bit `face` 对应 [`face_neighbors`] 顺序
 /// `[+x, -x, +y, -y, +z, -z]`）。
 ///
 /// 只有 `Coarser` / `Finer` 面置位；`Same` / `Missing` 为 0（同 LOD 面不加裙边，
-/// 避免多余几何 / z-fighting）。
+/// 避免多余几何 / z-fighting）。注意这是「跨 LOD 错位」子集；实际载荷 mask 还会
+/// 并上 [`missing_face_mask`]。
 #[must_use]
 pub fn skirt_mask(neighbours: &[FaceNeighbor; 6]) -> u8 {
     let mut mask = 0u8;

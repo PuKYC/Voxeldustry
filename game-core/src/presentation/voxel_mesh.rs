@@ -43,11 +43,12 @@ pub struct VoxChunkRaw {
     pub lod: u8,
     /// `extract_raw_halo` 产出的 34³ 方块 id 缓冲。
     pub blocks: Vec<u8>,
-    /// 跨 LOD 接缝裙边掩码（0 = 无裙边）。
+    /// 接缝裙边掩码（0 = 无裙边）。
     ///
     /// bit `face` 对应 ExternalPlane 顺序 `[+x, -x, +y, -y, +z, -z]`，
-    /// 由 `skirt_mask(&face_neighbors(&block, &partition))` 得到：只有面外邻居
-    /// LOD 不同（更粗 / 更细）的面才置位，同 LOD / 缺失为 0。
+    /// 取 `lod_mismatch_mask(...) | missing_face_mask(&face_neighbors(...))`：
+    /// 跨 LOD 错位面与面外没有同 LOD 邻居的面都置位。当前 extract 路径下这些
+    /// 面的面外 halo 是空气，主 mesher 已覆盖边界格，mask 不额外产生几何。
     pub skirt_mask: u8,
 }
 /// 一组同一 LOD 的 mesh 块（每块 32³ 基础跨度 + halo，共 34³）。

@@ -280,8 +280,13 @@ pub fn mesh_occupancy_with_ao(
     run(occupancy, origin, lod)
 }
 
-/// 与 [`mesh_occupancy_with_ao`] 相同，但在 `skirt_mask` 置位的面上追加跨 LOD
-/// 接缝裙边（AO 满亮）。`skirt_mask == 0` 时输出与前者逐位一致。
+/// 与 [`mesh_occupancy_with_ao`] 相同，但在 `skirt_mask` 置位的面上追加接缝
+/// 裙边（AO 满亮）。`skirt_mask == 0` 时输出与前者逐位一致。
+///
+/// 裙边判据：只看「边界格 + 内侧格实心 + 切向暴露」，不看面外邻居；已在边界
+/// 平面画过的格会被跳过（不产生共面重复）。注意自闭合后 masked 面的面外 halo
+/// 是空气，主 mesher 已覆盖这些格，因此当前 extract 路径下通常不产出裙边几何
+/// （保留为安全网 / 测试场景）。
 #[must_use]
 pub fn mesh_occupancy_with_ao_and_skirts(
     occupancy: &OccupancyData,
@@ -297,9 +302,11 @@ pub fn mesh_occupancy_with_ao_and_skirts(
         rects.into_iter().zip(ao).collect()
     };
     if skirt_mask != 0 {
+        // 主 mesher 已画过的格不能再补（共面重复会 z-fighting）。
+        let existing: Vec<RectInstance> = pairs.iter().map(|(rect, _)| *rect).collect();
         let mut rects = Vec::new();
         let mut ao = Vec::new();
-        append_skirts(occupancy, skirt_mask, &mut rects, &mut ao);
+        append_skirts(occupancy, skirt_mask, &existing, &mut rects, &mut ao);
         debug_assert_eq!(rects.len(), ao.len());
         pairs.extend(rects.into_iter().zip(ao));
     }
