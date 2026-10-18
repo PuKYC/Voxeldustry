@@ -90,6 +90,7 @@ fn all_payload_kinds_have_round_trippable_labels() {
             PayloadKind::Camera => {
                 SyncPayload::Camera(crate::presentation::payload::PresentedCamera::default())
             }
+            PayloadKind::InputCaps => SyncPayload::InputCaps(PresentedInputCaps::default()),
         };
         assert_eq!(payload.kind(), kind);
         assert_eq!(payload.type_name(), kind.as_str());

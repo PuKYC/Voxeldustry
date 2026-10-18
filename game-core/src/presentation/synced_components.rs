@@ -18,7 +18,8 @@ use crate::privacy::ExactHealth;
 
 use super::payload::{
     InteractionHint, PayloadKind, PresentationState, PresentedCamera, PresentedHealth,
-    PresentedPrototype, RawVoxelGroupPayload, RawVoxelPayload, SyncPayload, ToPresentation,
+    PresentedInputCaps, PresentedPrototype, RawVoxelGroupPayload, RawVoxelPayload, SyncPayload,
+    ToPresentation,
 };
 use super::voxel_mesh::{VoxChunkGroupRaw, VoxChunkRaw};
 use super::PresentationAppExt;
@@ -108,6 +109,17 @@ synced_components! {
     // 相机位置走同实体的 Transform 载荷（PresentedTransform），这里只有朝向。
     Camera => crate::gameplay::CameraView,
         |c: &crate::gameplay::CameraView| PresentedCamera { yaw: c.yaw, pitch: c.pitch };
+    // 输入能力：present（能力组件并集）/ available（可用位）/ source / local /
+    // look（视角轴）。逻辑侧 compute_input_availability 已做全字段比较后才写，
+    // 故这里只会在能力 / 禁用 / 控制关系真正变化时收到 Changed，不会每 tick 重发。
+    InputCaps => crate::input::capability::InputAvailability,
+        |c: &crate::input::capability::InputAvailability| PresentedInputCaps {
+            present: c.present,
+            available: c.mask,
+            source: c.source.0,
+            local: c.local,
+            look: c.look,
+        };
 }
 
 // 逻辑侧 `Transform` **不直出**：真正注册的是表现侧 `PresentedTransform`

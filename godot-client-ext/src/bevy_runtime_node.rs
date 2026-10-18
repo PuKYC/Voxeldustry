@@ -245,12 +245,21 @@ impl BevyAppManager {
 
     // ───────────────────── 输入通道（Godot → game-core） ─────────────────────
 
-    /// 启动时拉取动作表：`Array[{ name, bit }]`（按键由 Godot 侧配置）。
+    /// 启动时拉取动作表：`Array[{ name, bit, channel? }]`（按键由 Godot 侧配置）。
     ///
     /// 名字与通道位的唯一真相源是 `game_core::input::actions::ACTION_TABLE`。
     #[func]
     fn get_action_table(&self) -> Array<VarDictionary> {
         presentation_bridge::action_table_to_variant()
+    }
+
+    /// 输入通道表：`Array[{ key, mask, mode, actions }]`。
+    ///
+    /// 供 Godot 的 BevyInputContext 把 INPUTCAPS 的位掩码翻译成通道级
+    /// present / available；通道定义与掩码的唯一真相源在 game-core。
+    #[func]
+    fn get_input_channels(&self) -> Array<VarDictionary> {
+        presentation_bridge::input_channels_to_variant()
     }
 
     /// 每帧一次批量提交（避免 N 次跨 FFI）。

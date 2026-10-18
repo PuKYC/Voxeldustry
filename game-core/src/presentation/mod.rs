@@ -61,8 +61,8 @@ pub use game_engine::presentation::pipeline::{PresentationRuntime, PresentationV
 pub use payload::{
     project, ExtError, ExtField, ExtValue, ExtensionBag, ExtensionFieldSchema, ExtensionPayload,
     ExtensionSchema, FieldVisibility, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload,
-    RawVoxelPayload, SetOutcome, SyncPayload, ToPresentation,
+    PresentedHealth, PresentedInputCaps, PresentedPrototype, PresentedVisibility,
+    RawVoxelGroupPayload, RawVoxelPayload, SetOutcome, SyncPayload, ToPresentation,
 };
 pub use semantics::{
     action_state_name, anim_name, domain_table, is_core_domain, locomotion_name, mod_hash_id,

@@ -46,6 +46,10 @@ game_engine::define_payloads! {
     // 相机视角（yaw / pitch，弧度）：由带 CameraFlag 的实体下发，Godot 的 CameraRig 消费。
     // code 只追加：9 已被 RawVoxelGroups 占用，故为 10。
     Camera       = 10, "camera",      payload: PresentedCamera;
+    // 输入能力：present（能力组件并集）/ available（经禁用削减后的可用位）/
+    // source（ControlledBy.source）/ local（是否挂 LocalPlayer）。code 11 是
+    // code 7 留空后的下一个可用位，只追加。
+    InputCaps    = 11, "inputcaps",   payload: PresentedInputCaps;
 }
 
 /// L5：精简表现状态。
@@ -97,6 +101,26 @@ pub struct PresentedCamera {
 /// 静态原型 ID 载荷（曾经的 attach 附加负载，现在是普通载荷）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PresentedPrototype(pub u32);
+
+/// 输入能力载荷（本地玩家 / 当前被操纵对象的输入能力快照）。
+///
+/// - `present`：能力组件（MoveChannel / JumpChannel / …）存在 -> 动作位并集；
+/// - `available`：`present` 经 `InputDisabled` / `Stunned` / `Rooted` 削减后的
+///   当前可用位（对应逻辑侧 `InputAvailability.mask`）；
+/// - `source`：`ControlledBy.source.0`（0 = 无控制源哨兵）；
+/// - `local`：实体是否挂 `LocalPlayer`（表现侧据此筛选本地玩家）；
+/// - `look`：视角轴是否开放（`LookChannel`）。视角不占动作位，所以单独一列；
+///   UI 据此决定要不要显示 / 启用视角区。
+///
+/// 位掩码按 u64 保存，GPF1 里按位写成 i64（S 侧不做真假判断，只做展示）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PresentedInputCaps {
+    pub present: u64,
+    pub available: u64,
+    pub source: u64,
+    pub local: bool,
+    pub look: bool,
+}
 
 /// 一个 mesh 块的原始体素缓冲（内部 32³ + halo 层，共 34³）。
 ///
@@ -296,7 +320,7 @@ mod tests {
         assert!(RawVoxelGroupPayload::default().is_empty());
     }
 
-    /// 0..6、8、9、10 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
+    /// 0..6、8..=11 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
     #[test]
     fn payload_codes_are_append_only_and_code_seven_stays_vacant() {
         assert_eq!(
@@ -315,6 +339,7 @@ mod tests {
             (8, "rawvoxels"),
             (9, "rawvoxelgroups"),
             (10, "camera"),
+            (11, "inputcaps"),
         ] {
             assert_eq!(
                 PayloadKind::from_code(code).map(|kind| kind.as_str()),

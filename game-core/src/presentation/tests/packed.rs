@@ -10,8 +10,8 @@ use game_engine::presentation::packed::{
 
 use super::payload::{
     ExtField, ExtValue, ExtensionPayload, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload,
-    RawVoxelPayload, SyncPayload,
+    PresentedHealth, PresentedInputCaps, PresentedPrototype, PresentedVisibility,
+    RawVoxelGroupPayload, RawVoxelPayload, SyncPayload,
 };
 use super::RenderTransformSample;
 use super::{PresentationCommand, PresentationFrame, PresentationSlot};
@@ -578,6 +578,13 @@ fn sample_payload(kind: PayloadKind) -> SyncPayload {
         PayloadKind::Camera => SyncPayload::Camera(crate::presentation::payload::PresentedCamera {
             yaw: -1.25,
             pitch: 0.5,
+        }),
+        PayloadKind::InputCaps => SyncPayload::InputCaps(PresentedInputCaps {
+            present: 0b1111_1111_1111,
+            available: 0b0000_0101_0101,
+            source: 3,
+            local: true,
+            look: true,
         }),
     }
 }

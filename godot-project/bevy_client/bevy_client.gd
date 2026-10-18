@@ -66,11 +66,19 @@ signal entity_state_changed(entity: EntityData)
 signal entity_removed(entity: EntityData, reason: int)
 signal bevy_error(message: String)
 signal bevy_stopped(exit_code: int)
+## 本地控制对象切换（来源：INPUTCAPS 载荷的 local / 实体变化）。
+signal controlled_entity_changed(entity: EntityData)
+## 输入能力位变化（present = 能力组件并集，available = 当前可用位）。
+signal input_capabilities_changed(present: int, available: int)
+## 视角轴（LookChannel）开关；视角不占动作位，单独转发。
+signal input_look_changed(available: bool)
 
 var tables: StaticTables
 var events := EventRouter.new()
 var presenter := EventPresenter.new()
 var input := BevyInput.new()
+## 输入能力上下文：INPUTCAPS -> controlled / capabilities / channel 信号。
+var input_context := BevyInputContext.new()
 var dispatcher: PresentationDispatcher
 ## [data] wire -> 组件值。
 var codec: PayloadCodec
@@ -123,6 +131,12 @@ func _ready() -> void:
 	dispatcher.entity_released.connect(_on_entity_released)
 	dispatcher.entity_state_changed.connect(_on_entity_state_changed)
 	_interp = EntityInterpolator.new(_registry, dispatcher)
+
+	# 输入能力上下文：dispatcher 就绪后订阅 INPUTCAPS，并转发成客户端信号。
+	input_context.bind(self)
+	input_context.controlled_changed.connect(_on_input_controlled_changed)
+	input_context.capabilities_changed.connect(_on_input_capabilities_changed)
+	input_context.look_changed.connect(_on_input_look_changed)
 
 	presenter.sound_library = sound_library
 	presenter.anim_library = anim_library
@@ -220,6 +234,21 @@ func register_extension(key: int, handler: Callable) -> void:
 	codec.register_ext_handler(key, handler)
 
 
+## 订阅某个载荷 kind 的 ADD / UPDATE（回调：func(e: EntityData)）。
+func listen_component(kind: int, callable: Callable) -> void:
+	if dispatcher != null:
+		dispatcher.listen(kind, callable)
+
+
+## 输入通道表：Array[{ key, mask, mode, actions }]（定义在 game-core）。
+## 扩展未编译进 get_input_channels() 时返回空表并告警。
+func input_channels() -> Array:
+	if _mgr != null and _mgr.has_method("get_input_channels"):
+		return _mgr.get_input_channels()
+	push_warning("[BevyClient] 扩展缺少 get_input_channels()，输入通道表为空")
+	return []
+
+
 func _input(event: InputEvent) -> void:
 	if enable_input and event is InputEventMouseMotion:
 		if look_requires_mouse_capture and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
@@ -273,5 +302,19 @@ func _on_bevy_error(message: String) -> void:
 	bevy_error.emit(message)
 
 
+func _on_input_controlled_changed(e: EntityData) -> void:
+	controlled_entity_changed.emit(e)
+
+
+func _on_input_capabilities_changed(present: int, available: int) -> void:
+	input_capabilities_changed.emit(present, available)
+
+
+func _on_input_look_changed(available: bool) -> void:
+	input_look_changed.emit(available)
+
+
 func _on_bevy_stopped(exit_code: int) -> void:
+	# 后端停止后不会再有 INPUTCAPS：先清空能力上下文，再通知外部。
+	input_context.reset()
 	bevy_stopped.emit(exit_code)

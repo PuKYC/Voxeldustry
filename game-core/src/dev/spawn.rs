@@ -53,6 +53,12 @@ macro_rules! spawn_local_player {
             $($extra,)*
         ));
 
+        // Bevy Bundle 元组上限 15：LookChannel 单独 insert，避免 gameplay_test
+        // 的 4 个 extra 把元组顶到 16（编译期 Bundle 约束会报错）。
+        $world
+            .entity_mut(entity)
+            .insert(crate::input::capability::LookChannel);
+
         // 输入源实体：把 Godot 的输入通道指向刚建好的玩家。
         $world.spawn((
             crate::input::control::InputSource { id: $source },

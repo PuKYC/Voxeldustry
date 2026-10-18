@@ -3,7 +3,7 @@
 //! 字节布局知识在引擎的 packed 模块提供原语；这里只把「字段 -> 字节」接上。
 
 use game_engine::presentation::packed::{
-    put_bool, put_f32, put_u32, put_u8, PackedError, PackedPayload, Reader, MAX_TAGS,
+    put_bool, put_f32, put_u32, put_u64, put_u8, PackedError, PackedPayload, Reader, MAX_TAGS,
 };
 
 use crate::input::actions::ActionId;
@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use super::{
     ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedCamera,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload,
-    RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
+    PresentedHealth, PresentedInputCaps, PresentedPrototype, PresentedVisibility,
+    RawVoxelGroupPayload, RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
 };
 
 impl PackedPayload for PresentationState {
@@ -172,6 +172,76 @@ impl PackedPayload for PresentedPrototype {
     fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
         // 脏池 / 越界 offset 一律退化为 0，绝不 panic。
         PresentedPrototype(i.get(io).copied().unwrap_or(0) as u32)
+    }
+}
+
+// ── 输入能力载荷：present u64 + available u64 + source u64 + local bool + look bool ──
+//
+// 载荷体（不含 kind 码）字节布局（小端）：
+//   [0,8)    present     u64 LE
+//   [8,16)   available   u64 LE
+//   [16,24)  source      u64 LE
+//   [24]     local       u8（0 / 1）
+//   [25]     look        u8（0 / 1）
+//
+// SoA 池布局（write_pools 与 read_body 必须逐槽一致）：
+//   i64 池依次 [present, available, source, local, look]，u64 一律按位 as i64。
+impl PackedPayload for PresentedInputCaps {
+    fn put_body(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.present);
+        put_u64(out, self.available);
+        put_u64(out, self.source);
+        put_bool(out, self.local);
+        put_bool(out, self.look);
+    }
+
+    fn write_pools(&self, _f: &mut Vec<f32>, i: &mut Vec<i64>) {
+        i.push(self.present as i64);
+        i.push(self.available as i64);
+        i.push(self.source as i64);
+        i.push(i64::from(self.local as u8));
+        i.push(i64::from(self.look as u8));
+    }
+
+    fn read_body(
+        r: &mut Reader<'_>,
+        _f: &mut Vec<f32>,
+        i: &mut Vec<i64>,
+    ) -> Result<(), PackedError> {
+        i.push(r.u64()? as i64);
+        i.push(r.u64()? as i64);
+        i.push(r.u64()? as i64);
+        i.push(i64::from(r.bool()? as u8));
+        i.push(i64::from(r.bool()? as u8));
+        Ok(())
+    }
+
+    fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
+        // 脏池 / 越界 offset 一律退化为 default，绝不 panic。
+        let (Some(io1), Some(io2), Some(io3), Some(io4)) = (
+            io.checked_add(1),
+            io.checked_add(2),
+            io.checked_add(3),
+            io.checked_add(4),
+        ) else {
+            return Self::default();
+        };
+        let (Some(present), Some(available), Some(source), Some(local), Some(look)) = (
+            i.get(io).copied(),
+            i.get(io1).copied(),
+            i.get(io2).copied(),
+            i.get(io3).copied(),
+            i.get(io4).copied(),
+        ) else {
+            return Self::default();
+        };
+        Self {
+            present: present as u64,
+            available: available as u64,
+            source: source as u64,
+            local: local != 0,
+            look: look != 0,
+        }
     }
 }
 
@@ -650,7 +720,7 @@ impl PackedPayload for ExtensionPayload {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::presentation::payload::{RawVoxelGroupPayload, RawVoxelPayload};
+    use crate::presentation::payload::{PresentedInputCaps, RawVoxelGroupPayload, RawVoxelPayload};
     use game_engine::presentation::packed::{PackedPayload, Reader};
     use game_engine::presentation::voxel::RAW_VOXELS;
     use game_engine::voxel::ChunkKey;
@@ -905,6 +975,63 @@ mod tests {
         assert_eq!(
             RawVoxelGroupPayload::from_pools(&[], &[0, 0, 0], 0, 99),
             RawVoxelGroupPayload::default()
+        );
+    }
+
+    /// 输入能力载荷：put_body -> read_body -> from_pools 必须与 write_pools
+    /// 的池逐槽一致；脏池 / 越界 offset 退化为 default，绝不 panic。
+    #[test]
+    fn input_caps_payload_roundtrips_and_pool_layout_matches() {
+        let payload = PresentedInputCaps {
+            present: 0b1111_1111_1111,
+            available: 0b0000_0101_0101,
+            source: 3,
+            local: true,
+            look: true,
+        };
+
+        let mut out = Vec::new();
+        payload.put_body(&mut out);
+        assert_eq!(out.len(), 8 * 3 + 2, "3 个 u64 + 2 个 bool");
+
+        let mut r = Reader::new(&out);
+        let mut f = Vec::new();
+        let mut i = Vec::new();
+        PresentedInputCaps::read_body(&mut r, &mut f, &mut i).expect("输入能力载荷体必须能解码");
+        assert!(r.u8().is_err(), "载荷体必须正好消费完，不能有尾部字节");
+        assert!(f.is_empty(), "输入能力载荷不写 f32 池");
+
+        let mut f2 = Vec::new();
+        let mut i2 = Vec::new();
+        payload.write_pools(&mut f2, &mut i2);
+        assert_eq!(f2, f, "read_body 与 write_pools 的 f32 池必须一致");
+        assert_eq!(i2, i, "read_body 与 write_pools 的 i32 池必须逐槽一致");
+        assert_eq!(i.len(), 5);
+        assert_eq!(i[0], payload.present as i64);
+        assert_eq!(i[1], payload.available as i64);
+        assert_eq!(i[2], payload.source as i64);
+        assert_eq!(i[3], 1, "local = true -> 1");
+        assert_eq!(i[4], 1, "look = true -> 1");
+
+        assert_eq!(PresentedInputCaps::from_pools(&f, &i, 0, 0), payload);
+
+        // 脏池 / 越界 offset 一律退化，绝不 panic。
+        assert_eq!(
+            PresentedInputCaps::from_pools(&[], &[], 0, 0),
+            PresentedInputCaps::default()
+        );
+        assert_eq!(
+            PresentedInputCaps::from_pools(&[], &[1, 2], 0, 0),
+            PresentedInputCaps::default()
+        );
+        assert_eq!(
+            PresentedInputCaps::from_pools(&[], &[1, 2, 3, 1, 1], 0, usize::MAX),
+            PresentedInputCaps::default()
+        );
+        // 少了 look 槽 -> default。
+        assert_eq!(
+            PresentedInputCaps::from_pools(&[], &[1, 2, 3, 1], 0, 0),
+            PresentedInputCaps::default()
         );
     }
 }

@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::identity::StableEntityId;
 
 /// 输入源标识（单人=本地玩家控制器；联机=`Client_N`）。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+///
+/// `InputSourceId(0)` 是「无控制源」哨兵（也是 `Default`）：未绑定控制的实体
+/// 上报的 `InputAvailability.source` 就是 0，表现侧据此判断「没有控制者」。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub struct InputSourceId(pub u64);
 
 /// 输入源实体。

@@ -45,12 +45,16 @@ enum Payload {
 	RAWVOXELS = 8, ## 原始体素 halo：Godot 调 gdext mesher 现算 39 bit 矩形流
 	RAWVOXELGROUPS = 9, ## 同一 LOD 的一组分块：每块 34³ halo，各一个子 VoxelMeshNode
 	CAMERA = 10,   ## 相机视角（弧度）：yaw 绕 +Y、pitch 绕 +X；由 CameraRig 消费
+	## 输入能力：present = 能力组件并集，available = 经禁用削减后的可用位，
+	## source = ControlledBy.source（0 = 无控制源），local = 是否挂 LocalPlayer。
+	## view = NONE，由 BevyInputContext 消费并翻译成通道级信号。
+	INPUTCAPS = 11,
 }
 
 ## attach / detach / despawn 命令的 payload_kinds 哨兵（packed::PAYLOAD_NONE）。
 const PAYLOAD_NONE := 0xFF
 ## 枚举条目数（Rust PayloadKind::ALL.len()），不进 enum 以免破坏契约测试。
-const PAYLOAD_COUNT := 10
+const PAYLOAD_COUNT := 11
 
 ## extension 载荷字段 tag（与 game-core payload/packed.rs 对齐）。
 const EXT_TAG_I32 := 0
@@ -153,6 +157,14 @@ const PAYLOAD_SCHEMA := {
 	Payload.CAMERA: {
 		"fields": ["yaw", "pitch"],
 		"wire": [Wire.ANGLE, Wire.ANGLE],
+		"view": View.NONE,
+	},
+	## 输入能力：i32 池 = [present, available, source, local, look]（u64 掩码按位装进
+	## i64，只用低位；local / look 用 0/1）。view = NONE，由 BevyInputContext 订阅
+	## 并翻译成 controlled_changed / capabilities_changed / look_changed / channel_changed。
+	Payload.INPUTCAPS: {
+		"fields": ["present", "available", "source", "local", "look"],
+		"wire": [Wire.I32, Wire.I32, Wire.I32, Wire.BOOL, Wire.BOOL],
 		"view": View.NONE,
 	},
 }

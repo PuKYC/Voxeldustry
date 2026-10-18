@@ -84,11 +84,17 @@ pub fn resolve_controlled_entity(
 /// 5. 原始 ∩ 可用 = `ResolvedInput`。
 ///
 /// 可用掩码由游戏侧的求解系统写入 [`InputAvailability`]。
+/// 视角是独立轴：没有 `LookChannel` 时清零 `look_*`，但保留移动 / 动作位。
 pub fn write_resolved_input(
     mut query: Query<(&RawResolved, &InputAvailability, &mut ResolvedInput)>,
 ) {
     for (raw, availability, mut resolved) in &mut query {
-        resolved.0 = raw.0.filtered(availability.mask);
+        let input = raw.0.filtered(availability.mask);
+        resolved.0 = if availability.look {
+            input
+        } else {
+            input.without_look()
+        };
     }
 }
 
@@ -179,5 +185,75 @@ pub fn ensure_input_components(
         if buffer.is_none() {
             commands.entity(entity).insert(InputBuffer::default());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::prelude::*;
+
+    use crate::input::snapshot::PlayerInput;
+    use crate::math::FixedPoint;
+
+    /// 视角门控：没有 LookChannel 时只清 look 轴，动作位仍按 mask 过滤。
+    #[test]
+    fn write_resolved_input_gates_look_by_availability() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_systems(Update, write_resolved_input);
+
+        let input = PlayerInput {
+            look_yaw: FixedPoint::from_num(1),
+            look_pitch: FixedPoint::from_num(2),
+            held: 0b1,
+            ..PlayerInput::NONE
+        };
+        let no_look = app
+            .world_mut()
+            .spawn((
+                RawResolved(input),
+                InputAvailability {
+                    mask: 0b1,
+                    look: false,
+                    ..Default::default()
+                },
+                ResolvedInput::default(),
+            ))
+            .id();
+        let with_look = app
+            .world_mut()
+            .spawn((
+                RawResolved(input),
+                InputAvailability {
+                    mask: 0b1,
+                    look: true,
+                    ..Default::default()
+                },
+                ResolvedInput::default(),
+            ))
+            .id();
+
+        app.update();
+
+        let gated = app
+            .world()
+            .entity(no_look)
+            .get::<ResolvedInput>()
+            .expect("实体必须有 ResolvedInput")
+            .0;
+        let open = app
+            .world()
+            .entity(with_look)
+            .get::<ResolvedInput>()
+            .expect("实体必须有 ResolvedInput")
+            .0;
+
+        assert_eq!(gated.look_yaw, FixedPoint::from_bits(0));
+        assert_eq!(gated.look_pitch, FixedPoint::from_bits(0));
+        assert_eq!(gated.held, 0b1, "动作位不受 look 门控影响");
+        assert_eq!(open.look_yaw, input.look_yaw);
+        assert_eq!(open.look_pitch, input.look_pitch);
+        assert_eq!(open.held, 0b1);
     }
 }

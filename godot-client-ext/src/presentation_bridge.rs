@@ -31,15 +31,47 @@ use game_core::presentation::{PresentationCommand, PresentationFrame};
 use game_core::static_data::item;
 use game_core::static_data::prototype;
 
-/// 动作表 → `Array[Dictionary]`，每项 `{ name, bit }`。
+/// 动作表 → `Array[Dictionary]`，每项 `{ name, bit, channel? }`。
 ///
 /// 按键（默认绑定 / 改键）由 Godot 侧配置，game-core 不持有物理键。
+/// `channel` 是可选键（只有归属某个输入通道的动作才有）：老脚本会忽略它。
 pub fn action_table_to_variant() -> Array<VarDictionary> {
     let mut out: Array<VarDictionary> = Array::new();
     for (name, bit) in game_core::input::action_table_snapshot() {
         let mut row = VarDictionary::new();
         row.set("name", name);
         row.set("bit", i64::from(bit));
+        if let Some(channel) = game_core::input::channel_of_action(name) {
+            row.set("channel", channel.key);
+        }
+        out.push(&row);
+    }
+    out
+}
+
+/// 输入通道表 → `Array[Dictionary]`，每项 `{ key, mask, mode, actions }`。
+///
+/// - `mask`：该通道全部动作位的并集（与 INPUTCAPS 的 present/available 同位域）；
+/// - `mode`：建议控件形态（axis2d / button / hold / toggle），仅表现层参考；
+/// - `actions`：组成该通道的动作名，供 UI 提示 / 绑定检查。
+///
+/// 查表与位掩码全部在 game-core（`input::input_channels`），这里只做机械搬运。
+pub fn input_channels_to_variant() -> Array<VarDictionary> {
+    let mut out: Array<VarDictionary> = Array::new();
+    for channel in game_core::input::input_channels() {
+        let mut row = VarDictionary::new();
+        row.set("key", channel.key);
+        row.set(
+            "mask",
+            game_core::input::mask_of_names(channel.actions.iter().copied()) as i64,
+        );
+        row.set("mode", channel.mode);
+        let actions: Vec<GString> = channel
+            .actions
+            .iter()
+            .map(|name| GString::from(*name))
+            .collect();
+        row.set("actions", &PackedStringArray::from(&actions[..]));
         out.push(&row);
     }
     out
@@ -310,6 +342,15 @@ fn payload_to_dictionary(payload: &SyncPayload) -> VarDictionary {
         SyncPayload::RawVoxelGroups(_) => {
             // 原始体素分组同样只走 GPF1 紧凑通道（Godot 侧合并 MultiMesh）；
             // Dictionary 兼容通道不支持。
+        }
+
+        SyncPayload::InputCaps(value) => {
+            // u64 没有 ToGodot，按位转 i64（掩码只用低位，语义不变）。
+            out.set("present", value.present as i64);
+            out.set("available", value.available as i64);
+            out.set("source", value.source as i64);
+            out.set("local", value.local);
+            out.set("look", value.look);
         }
 
         SyncPayload::Transform(sample) => {

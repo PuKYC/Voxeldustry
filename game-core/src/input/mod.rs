@@ -22,10 +22,12 @@ pub use actions::{
     CoreActions, ACTION_TABLE,
 };
 pub use capability::{
-    all_actions_mask, availability_mask, compute_input_availability, derive_interact_requests,
-    flight_mask, glide_mask, interact_mask, jump_mask, move_mask, rooted_mask, sprint_mask,
-    stunned_mask, tool_mask, ChannelSet, FlightChannel, GlideChannel, InteractChannel, JumpChannel,
-    MoveChannel, Rooted, SprintChannel, Stunned, ToolUseChannel,
+    all_actions_mask, availability_mask, channel_mask, channel_of_action, clear_uncontrolled_input,
+    compute_input_availability, derive_interact_requests, flight_mask, glide_mask, input_channels,
+    interact_mask, jump_mask, look_allowed, move_mask, rooted_mask, sprint_mask, stunned_mask,
+    tool_mask, ChannelSet, FlightChannel, GlideChannel, InputChannelDef, InteractChannel,
+    JumpChannel, LookChannel, MoveChannel, Rooted, SprintChannel, Stunned, ToolUseChannel,
+    INPUT_CHANNEL_TABLE,
 };
 pub(crate) use game_engine::input::{InputSet, InteractRequest, SimulationTick};
 
@@ -41,6 +43,12 @@ impl Plugin for GameInputPlugin {
         app.add_systems(
             FixedPreUpdate,
             compute_input_availability.in_set(InputSet::Availability),
+        );
+        // 失去控制的实体：清零能力 / 输入快照（只查 Without<ControlledBy>，
+        // 与 resolve_controlled_entity 的 With<ControlledBy> 不相交）。
+        app.add_systems(
+            FixedPreUpdate,
+            clear_uncontrolled_input.in_set(InputSet::Collect),
         );
         app.add_systems(
             FixedPreUpdate,

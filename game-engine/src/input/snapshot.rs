@@ -52,6 +52,18 @@ impl PlayerInput {
         self
     }
 
+    /// 清掉视角增量，保留移动 / 动作位。
+    ///
+    /// 视角是独立轴，不占动作位；没有 `LookChannel` 的实体在
+    /// `write_resolved_input` 里走这条路径，于是 `facing_system` 不会转动，
+    /// 但移动方向仍可用已有的 yaw。
+    #[inline]
+    pub fn without_look(mut self) -> Self {
+        self.look_yaw = FixedPoint::from_bits(0);
+        self.look_pitch = FixedPoint::from_bits(0);
+        self
+    }
+
     #[inline]
     pub fn is_idle(&self) -> bool {
         self.held == 0
@@ -179,5 +191,27 @@ mod tests {
         buffer.push(3, pressed);
         assert_eq!(buffer.len(), 1);
         assert_eq!(buffer.last().unwrap().1.pressed, 1);
+    }
+
+    #[test]
+    fn without_look_zeroes_only_look_axes() {
+        let input = PlayerInput {
+            move_x: FixedPoint::from_num(1),
+            move_y: FixedPoint::from_num(-1),
+            look_yaw: FixedPoint::from_num(2),
+            look_pitch: FixedPoint::from_num(3),
+            held: 0b101,
+            pressed: 0b1,
+            released: 0b10,
+        };
+        let gated = input.without_look();
+
+        assert_eq!(gated.look_yaw, FixedPoint::from_bits(0));
+        assert_eq!(gated.look_pitch, FixedPoint::from_bits(0));
+        assert_eq!(gated.move_x, input.move_x);
+        assert_eq!(gated.move_y, input.move_y);
+        assert_eq!(gated.held, input.held);
+        assert_eq!(gated.pressed, input.pressed);
+        assert_eq!(gated.released, input.released);
     }
 }
