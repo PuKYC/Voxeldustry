@@ -21,7 +21,7 @@ unsafe impl ExtensionLibrary for MyExtension {}
 
 /// 由于 bevy 关闭默认特性时 为安卓编译时仍然会自带winit 所以必须要选择后端，导致多编译一些窗口相关代码
 /// 还有这个函数
-/// fuck bevy! 
+/// fuck bevy!
 /// TODO 提交issue
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)] // edition 2021 写成 #[no_mangle]

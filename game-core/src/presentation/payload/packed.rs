@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use super::{
     ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedCamera,
-    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload,
-    MAX_EXT_FIELDS, MAX_EXT_TAGS,
+    PresentedHealth, PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload,
+    RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
 };
 
 impl PackedPayload for PresentationState {
@@ -425,14 +425,22 @@ impl PackedPayload for RawVoxelGroupPayload {
         for _ in 0..count {
             // 每条记录 6 个头部槽：x, y, z, byte_len, skirt_mask, chunk_count。
             let base = cursor;
-            let (Some(raw_x), Some(raw_y), Some(raw_z), Some(raw_len), Some(raw_mask), Some(raw_chunks)) = (
+            let (
+                Some(raw_x),
+                Some(raw_y),
+                Some(raw_z),
+                Some(raw_len),
+                Some(raw_mask),
+                Some(raw_chunks),
+            ) = (
                 i.get(base).copied(),
                 i.get(base + 1).copied(),
                 i.get(base + 2).copied(),
                 i.get(base + 3).copied(),
                 i.get(base + 4).copied(),
                 i.get(base + 5).copied(),
-            ) else {
+            )
+            else {
                 return Self::default();
             };
             let (Ok(x), Ok(y), Ok(z), Ok(byte_len), Ok(mask), Ok(chunk_count)) = (
@@ -772,19 +780,30 @@ mod tests {
         let mut chunks: BTreeMap<ChunkKey, (Vec<u8>, u8)> = BTreeMap::new();
         chunks.insert(
             ChunkKey::new(-1, 5, 2),
-            ((0..10).map(|i| ((i * 3 + 1) % 256) as u8).collect(), 0b00_1010),
+            (
+                (0..10).map(|i| ((i * 3 + 1) % 256) as u8).collect(),
+                0b00_1010,
+            ),
         );
         chunks.insert(ChunkKey::new(0, 0, 0), (Vec::new(), 0));
         chunks.insert(
             ChunkKey::new(2, -3, 4),
-            ((0..RAW_VOXELS).map(|i| (i % 251) as u8).collect(), 0b11_1111),
+            (
+                (0..RAW_VOXELS).map(|i| (i % 251) as u8).collect(),
+                0b11_1111,
+            ),
         );
         let payload = RawVoxelGroupPayload::from_chunks(1, chunks);
 
         let out = raw_group_body_bytes(&payload);
         // 版本化布局自检：lod u8 + count u32 + 每条记录 (12 + 4 + 1 + byte_len)。
-        let expected =
-            1 + 4 + payload.chunks.values().map(|(b, _)| 17 + b.len()).sum::<usize>();
+        let expected = 1
+            + 4
+            + payload
+                .chunks
+                .values()
+                .map(|(b, _)| 17 + b.len())
+                .sum::<usize>();
         assert_eq!(out.len(), expected, "载荷体字节数必须精确");
         assert_eq!(out[0], 1, "lod 必须在小端 count 之前");
         assert_eq!(u32::from_le_bytes(out[1..5].try_into().unwrap()), 3);

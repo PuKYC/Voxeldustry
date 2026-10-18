@@ -210,8 +210,7 @@ pub fn collect_surface_voxels(
                     if tree.get(interner, local).is_none() {
                         continue;
                     }
-                    let world =
-                        bevy::math::IVec3::new(key.x * c + x, key.y * c + y, key.z * c + z);
+                    let world = bevy::math::IVec3::new(key.x * c + x, key.y * c + y, key.z * c + z);
                     let exposed = [
                         bevy::math::IVec3::X,
                         bevy::math::IVec3::NEG_X,
@@ -245,7 +244,10 @@ pub fn build_voxel_collider(volume: &VoxVolume, interner: &VoxInterner<u8>) -> O
             "voxel collider skipped: invalid voxel_size={scale} surface_voxels={}",
             coords.len()
         );
-        debug_assert!(scale > 0.0, "voxel_size must be positive to build a collider");
+        debug_assert!(
+            scale > 0.0,
+            "voxel_size must be positive to build a collider"
+        );
         return None;
     }
     Some(Collider::voxels(Vector::splat(scale), &coords))
@@ -381,7 +383,9 @@ pub fn sync_voxel_collision_chunks(
                     continue;
                 }
                 let a_cell = affected.remove(&key).expect("affected key present");
-                let b_cell = affected.remove(&neighbor).expect("affected neighbor present");
+                let b_cell = affected
+                    .remove(&neighbor)
+                    .expect("affected neighbor present");
                 match (a_cell, b_cell) {
                     (Some(mut a), Some(mut b)) => {
                         let shift = bevy::math::IVec3::new(
@@ -437,11 +441,13 @@ pub fn sync_voxel_collision_chunks(
                     continue;
                 };
                 // chunks.get 返回只读 query item：Option<&mut Collider> 降为 Option<&Collider>。
-                let stored = chunks.get(entity).ok().and_then(
-                    |(_entity, _chunk, collider, _transform)| {
-                        collider.and_then(|collider| collider.shape().as_voxels().cloned())
-                    },
-                );
+                let stored =
+                    chunks
+                        .get(entity)
+                        .ok()
+                        .and_then(|(_entity, _chunk, collider, _transform)| {
+                            collider.and_then(|collider| collider.shape().as_voxels().cloned())
+                        });
                 let Some(mut neighbor_voxels) = stored else {
                     continue;
                 };
@@ -633,15 +639,20 @@ mod tests {
         let key = ChunkKey::new(0, 0, 0);
         let coords = collect_chunk_solid_voxels(&volume, interner.inner(), key);
         assert_eq!(coords.len(), 32 * 32 * 32);
-        assert_eq!(coords.first().copied(), Some(bevy::math::IVec3::new(0, 0, 0)));
+        assert_eq!(
+            coords.first().copied(),
+            Some(bevy::math::IVec3::new(0, 0, 0))
+        );
         assert_eq!(
             coords.last().copied(),
             Some(bevy::math::IVec3::new(31, 31, 31))
         );
         assert!(build_chunk_voxels(&volume, interner.inner(), key).is_some());
         // 不存在的 chunk -> 空 / None。
-        assert!(collect_chunk_solid_voxels(&volume, interner.inner(), ChunkKey::new(5, 0, 0))
-            .is_empty());
+        assert!(
+            collect_chunk_solid_voxels(&volume, interner.inner(), ChunkKey::new(5, 0, 0))
+                .is_empty()
+        );
         assert!(build_chunk_voxels(&volume, interner.inner(), ChunkKey::new(5, 0, 0)).is_none());
     }
 
@@ -662,8 +673,10 @@ mod tests {
         let volume = VoxVolume::new(FixedPoint::from_num(1));
         assert!(collect_solid_voxels(&volume, interner.inner()).is_empty());
         assert!(build_voxel_collider(&volume, interner.inner()).is_none());
-        assert!(collect_chunk_solid_voxels(&volume, interner.inner(), ChunkKey::new(0, 0, 0))
-            .is_empty());
+        assert!(
+            collect_chunk_solid_voxels(&volume, interner.inner(), ChunkKey::new(0, 0, 0))
+                .is_empty()
+        );
         assert!(build_chunk_voxels(&volume, interner.inner(), ChunkKey::new(0, 0, 0)).is_none());
     }
 

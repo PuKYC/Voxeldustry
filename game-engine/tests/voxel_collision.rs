@@ -9,8 +9,8 @@ use bevy::prelude::*;
 use bevy::time::Fixed;
 use game_engine::math::FixedPoint;
 use game_engine::voxel::{
-    Collider, RigidBody, VoxelCollider, VoxelCollisionChunk, VoxelCollisionPlugin, VoxelInterner,
-    VoxelPlugin, VoxVolume,
+    Collider, RigidBody, VoxVolume, VoxelCollider, VoxelCollisionChunk, VoxelCollisionPlugin,
+    VoxelInterner, VoxelPlugin,
 };
 use voxel::store::{ChunkKey, MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH};
 
@@ -69,7 +69,11 @@ fn per_chunk_colliders_are_derived_and_revoked_for_static_root() {
 
     run_fixed_update(&mut app);
     let chunks = chunk_entities(app.world_mut(), root);
-    assert_eq!(chunks.len(), 1, "一个实心 chunk 必须派生一个 chunk 碰撞实体");
+    assert_eq!(
+        chunks.len(),
+        1,
+        "一个实心 chunk 必须派生一个 chunk 碰撞实体"
+    );
     assert!(
         app.world().entity(root).get::<Collider>().is_none(),
         "root 自身不应直接挂 Collider"
@@ -109,7 +113,11 @@ fn per_chunk_colliders_are_derived_and_revoked_for_static_root() {
     }
     run_fixed_update(&mut app);
     let chunks = chunk_entities(app.world_mut(), root);
-    assert_eq!(chunks.len(), 2, "新增 chunk 后必须派生第二个 chunk 碰撞实体");
+    assert_eq!(
+        chunks.len(),
+        2,
+        "新增 chunk 后必须派生第二个 chunk 碰撞实体"
+    );
 
     // 移除 marker：cleanup 同帧撤销全部 chunk 实体。
     app.world_mut().entity_mut(root).remove::<VoxelCollider>();

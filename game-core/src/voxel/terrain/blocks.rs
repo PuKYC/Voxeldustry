@@ -665,15 +665,30 @@ mod tests {
         // LOD0: 区域边长 = REGION_BLOCKS = 2 块。
         assert_eq!(
             group_key(chunk_key(0, 0, 0), 0),
-            GroupKey { lod: 0, rx: 0, ry: 0, rz: 0 }
+            GroupKey {
+                lod: 0,
+                rx: 0,
+                ry: 0,
+                rz: 0
+            }
         );
         assert_eq!(
             group_key(chunk_key(1, 0, 0), 0),
-            GroupKey { lod: 0, rx: 0, ry: 0, rz: 0 }
+            GroupKey {
+                lod: 0,
+                rx: 0,
+                ry: 0,
+                rz: 0
+            }
         );
         assert_eq!(
             group_key(chunk_key(2, 0, 0), 0),
-            GroupKey { lod: 0, rx: 1, ry: 0, rz: 0 }
+            GroupKey {
+                lod: 0,
+                rx: 1,
+                ry: 0,
+                rz: 0
+            }
         );
         // 负坐标：-1/-2 -> -1，-3 -> -2（div_euclid 而非向零截断）。
         assert_eq!(group_key(chunk_key(-1, 0, 0), 0).rx, -1);

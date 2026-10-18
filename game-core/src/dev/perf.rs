@@ -304,10 +304,7 @@ mod tests {
 
         let stats = *app.world().resource::<TerrainStats>();
         assert!(stats.chunks > 0 && stats.blocks > 0);
-        assert_eq!(
-            stats.groups,
-            app.world().resource::<TerrainGroups>().len()
-        );
+        assert_eq!(stats.groups, app.world().resource::<TerrainGroups>().len());
 
         let mut frames = 0usize;
         let mut commands = 0usize;
@@ -345,8 +342,9 @@ mod tests {
         let (collider_count, chunk_count) = {
             let mut colliders = app.world_mut().query::<&game_engine::voxel::Collider>();
             let collider_count = colliders.iter(app.world()).count();
-            let mut chunk_colliders =
-                app.world_mut().query::<&game_engine::voxel::VoxelCollisionChunk>();
+            let mut chunk_colliders = app
+                .world_mut()
+                .query::<&game_engine::voxel::VoxelCollisionChunk>();
             let chunk_count = chunk_colliders.iter(app.world()).count();
             (collider_count, chunk_count)
         };
@@ -373,7 +371,10 @@ mod tests {
             "体素场景必须至少下发一次 RAWVOXELGROUPS 载荷"
         );
         #[cfg(feature = "physics")]
-        assert!(collider_count > 0, "体素地形必须派生至少一个 avian Collider");
+        assert!(
+            collider_count > 0,
+            "体素地形必须派生至少一个 avian Collider"
+        );
         #[cfg(feature = "physics")]
         assert!(
             chunk_count > 0,

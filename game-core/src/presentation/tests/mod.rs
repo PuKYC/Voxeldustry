@@ -50,7 +50,11 @@ fn vox_chunk_group_carries_skirt_masks_into_payload() {
     match component.to_presentation() {
         SyncPayload::RawVoxelGroups(payload) => {
             assert_eq!(payload.lod, 2);
-            assert_eq!(payload.chunks[&(0, 0, 0)].1, 0b10_1010, "逐块 mask 必须进入载荷");
+            assert_eq!(
+                payload.chunks[&(0, 0, 0)].1,
+                0b10_1010,
+                "逐块 mask 必须进入载荷"
+            );
             assert_eq!(payload.chunks[&(0, 0, 0)].0, vec![1, 2, 3]);
             assert_eq!(payload.chunks[&(1, 0, 0)].1, 0);
         }
@@ -83,9 +87,9 @@ fn all_payload_kinds_have_round_trippable_labels() {
                     std::collections::BTreeMap::new(),
                 ),
             ),
-            PayloadKind::Camera => SyncPayload::Camera(
-                crate::presentation::payload::PresentedCamera::default(),
-            ),
+            PayloadKind::Camera => {
+                SyncPayload::Camera(crate::presentation::payload::PresentedCamera::default())
+            }
         };
         assert_eq!(payload.kind(), kind);
         assert_eq!(payload.type_name(), kind.as_str());

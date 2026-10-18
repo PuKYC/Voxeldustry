@@ -1,7 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
-
 pub trait ByteConversion: Sized {
     type ByteArray: AsRef<[u8]> + AsMut<[u8]> + Default;
 
