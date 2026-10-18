@@ -1,0 +1,8 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://test/gameplay_test.gd" id="1_gameplay_test"]
+
+[node name="GameplayTest" type="Node3D"]
+script = ExtResource("1_gameplay_test")
+
+[node name="BevyAppManager" type="BevyAppManager" parent="."]

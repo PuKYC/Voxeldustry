@@ -148,7 +148,7 @@ impl BevyAppManager {
     /// `enable_demo = false` 时不挂 `game-core::dev::demo`（生产环境应为 `false`）。
     #[func]
     fn start_bevy_with_config(&mut self, fixed_hz: f64, runner_hz: f64, enable_demo: bool) {
-        self.start_backend(fixed_hz, runner_hz, enable_demo, None, None, false);
+        self.start_backend(fixed_hz, runner_hz, enable_demo, None, None, false, false);
     }
 
     /// 启动性能测试场景：生成 `entity_count` 个每 tick 移动的实体（取代 demo）。
@@ -158,7 +158,7 @@ impl BevyAppManager {
     #[func]
     fn start_bevy_perf_test(&mut self, fixed_hz: f64, runner_hz: f64, entity_count: i64) {
         let count = usize::try_from(entity_count).unwrap_or(1).max(1);
-        self.start_backend(fixed_hz, runner_hz, false, Some(count), None, false);
+        self.start_backend(fixed_hz, runner_hz, false, Some(count), None, false, false);
     }
 
     /// 启动体素地形 demo：挂 `TerrainConfig::default()`（radius 2 / max_lod 1）。
@@ -177,6 +177,7 @@ impl BevyAppManager {
             false,
             None,
             Some(TerrainConfig::default()),
+            false,
             false,
         );
     }
@@ -201,7 +202,15 @@ impl BevyAppManager {
             max_lod,
             ..TerrainConfig::default()
         };
-        self.start_backend(fixed_hz, runner_hz, false, None, Some(terrain), true);
+        self.start_backend(fixed_hz, runner_hz, false, None, Some(terrain), true, false);
+    }
+
+    /// 启动游戏内容测试场景：静态体素平台（可见 + 碰撞）与带碰撞的玩家。
+    ///
+    /// Godot 侧对应 `test/gameplay_test.tscn`（`BevyClient.mode = gameplay_test`）。
+    #[func]
+    fn start_bevy_gameplay_test(&mut self, fixed_hz: f64, runner_hz: f64) {
+        self.start_backend(fixed_hz, runner_hz, false, None, None, false, true);
     }
 
     #[func]
@@ -583,6 +592,7 @@ impl BevyAppManager {
         perf_entity_count: Option<usize>,
         terrain: Option<TerrainConfig>,
         terrain_perf: bool,
+        gameplay_test: bool,
     ) {
         if self.worker.is_some() {
             self.shutdown_blocking();
@@ -604,6 +614,7 @@ impl BevyAppManager {
             perf_entity_count,
             terrain,
             terrain_perf,
+            gameplay_test,
             voxel_lod: Some(self.voxel_lod.clone()),
         };
 

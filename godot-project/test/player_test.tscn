@@ -1,0 +1,33 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" uid="uid://d134wvc20hwea" path="res://bevy_client/entity/bevy_entity.gd" id="1_bevy_entity"]
+
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_player"]
+radius = 0.35
+height = 1.7
+radial_segments = 16
+rings = 8
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_body"]
+albedo_color = Color(0.24, 0.62, 1, 1)
+roughness = 0.55
+
+[sub_resource type="BoxMesh" id="BoxMesh_nose"]
+size = Vector3(0.18, 0.18, 0.42)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_nose"]
+albedo_color = Color(1, 0.78, 0.2, 1)
+roughness = 0.5
+
+[node name="PlayerTest" type="Node3D"]
+script = ExtResource("1_bevy_entity")
+
+[node name="Body" type="MeshInstance3D" parent="."]
+position = Vector3(0, 0.85, 0)
+mesh = SubResource("CapsuleMesh_player")
+surface_material_override/0 = SubResource("StandardMaterial3D_body")
+
+[node name="Nose" type="MeshInstance3D" parent="."]
+position = Vector3(0, 1.35, -0.4)
+mesh = SubResource("BoxMesh_nose")
+surface_material_override/0 = SubResource("StandardMaterial3D_nose")

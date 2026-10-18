@@ -7,9 +7,10 @@ extends Node
 
 ## 启动模式（见下方 mode 导出）：决定 autostart 调哪个扩展入口。
 enum Mode {
-	DEMO,        ## 实体演示 / 生产：start_bevy_with_config
-	VOXEL_DEMO,  ## 路径 B 体素演示：start_bevy_voxel_demo
-	VOXEL_PERF,  ## 路径 B 体素性能场景：start_bevy_voxel_perf
+	DEMO,          ## 实体演示 / 生产：start_bevy_with_config
+	VOXEL_DEMO,    ## 路径 B 体素演示：start_bevy_voxel_demo
+	VOXEL_PERF,    ## 路径 B 体素性能场景：start_bevy_voxel_perf
+	GAMEPLAY_TEST, ## 游戏内容测试场景：start_bevy_gameplay_test
 }
 
 @export var manager_path: NodePath = ^"/root/BevyAppManager"
@@ -22,7 +23,7 @@ enum Mode {
 @export_group("Mode")
 ## 启动模式：demo=实体演示；voxel_demo=路径 B 体素演示；voxel_perf=体素性能场景。
 ## 新入口带 has_method 前向兼容：扩展里没有该方法时回退到实体演示。
-@export_enum("demo", "voxel_demo", "voxel_perf") var mode: int = Mode.DEMO
+@export_enum("demo", "voxel_demo", "voxel_perf", "gameplay_test") var mode: int = Mode.DEMO
 ## voxel_perf：水平方向 mesh 块半径（块），传给 start_bevy_voxel_perf。
 @export_range(0, 16, 1) var voxel_radius_blocks: int = 2
 ## voxel_perf：最高 LOD（0..=3），传给 start_bevy_voxel_perf。
@@ -157,6 +158,12 @@ func _start_backend() -> void:
 				_mgr.start_bevy_voxel_perf(fixed_hz, runner_hz, voxel_radius_blocks, voxel_max_lod)
 			else:
 				push_warning("[BevyClient] 扩展缺少 start_bevy_voxel_perf()，回退到实体演示")
+				_start_entity_backend()
+		Mode.GAMEPLAY_TEST:
+			if _mgr.has_method("start_bevy_gameplay_test"):
+				_mgr.start_bevy_gameplay_test(fixed_hz, runner_hz)
+			else:
+				push_warning("[BevyClient] 扩展缺少 start_bevy_gameplay_test()，回退到实体演示")
 				_start_entity_backend()
 		_:
 			_start_entity_backend()

@@ -32,6 +32,8 @@ pub struct BevyBackendConfig {
     pub terrain: Option<TerrainConfig>,
     /// 体素性能场景：true 时额外挂 VoxelPerfPlugin（移动观察者压表现链路）。
     pub terrain_perf: bool,
+    /// 游戏内容测试场景：静态体素平台 + 带碰撞玩家（见 `dev::gameplay_test`）。
+    pub gameplay_test: bool,
     /// Godot -> Bevy 的 LOD 运行期句柄（observer / thresholds / max_lod）。
     /// Some 时插入 [VoxelLodHandle]，运行期流式系统读它。
     pub voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
@@ -46,6 +48,7 @@ impl Default for BevyBackendConfig {
             perf_entity_count: None,
             terrain: None,
             terrain_perf: false,
+            gameplay_test: false,
             voxel_lod: None,
         }
     }
@@ -57,6 +60,7 @@ struct CoreGameModule {
     perf_entity_count: Option<usize>,
     terrain: Option<TerrainConfig>,
     terrain_perf: bool,
+    gameplay_test: bool,
     voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
 }
 
@@ -82,7 +86,11 @@ impl GameModule<CoreSpec> for CoreGameModule {
             let config = *app.world().resource::<TerrainConfig>();
             app.add_plugins(crate::dev::perf::VoxelPerfPlugin::new(config));
         }
-        if let Some(perf_entity_count) = self.perf_entity_count {
+        if self.gameplay_test {
+            // 测试场景自带平台 / 玩家 / 相机，不再叠加 demo 或性能实体。
+            #[cfg(feature = "physics")]
+            app.add_plugins(crate::dev::gameplay_test::GameplayTestPlugin);
+        } else if let Some(perf_entity_count) = self.perf_entity_count {
             app.add_plugins(crate::dev::perf::PerfDemoPlugin {
                 entity_count: perf_entity_count,
             });
@@ -110,6 +118,7 @@ pub fn run_bevy_backend(
             perf_entity_count: config.perf_entity_count,
             terrain: config.terrain,
             terrain_perf: config.terrain_perf,
+            gameplay_test: config.gameplay_test,
             voxel_lod: config.voxel_lod,
         },
         bridge,

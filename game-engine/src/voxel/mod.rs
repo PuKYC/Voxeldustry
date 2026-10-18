@@ -40,7 +40,10 @@ mod volume;
 pub use aabb::{chunk_aabb, VoxelAabb};
 /// avian 物理类型再导出（physics feature）：game-core 无需直接依赖 avian3d。
 #[cfg(feature = "physics")]
-pub use avian3d::prelude::{Collider, RigidBody};
+pub use avian3d::prelude::{
+    Collider, ColliderOf, LinearVelocity, LockedAxes, RigidBody, ShapeCastConfig, SleepingDisabled,
+    SpatialQuery, SpatialQueryFilter,
+};
 pub use change::{apply_voxel_changes, VoxelChangeBuffer, VoxelEdit, VoxelSet};
 #[cfg(feature = "physics")]
 pub use collision::{
