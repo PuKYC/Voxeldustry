@@ -46,7 +46,7 @@ pub use self::incremental::{IncrementalMesh, SliceFaces, SliceKey, SliceRebuildR
 pub use self::lod::{voxels_per_axis, wrap_block};
 pub use self::occupancy::{
     extract_plane_dir, generate_external_occupancy_mask, generate_external_occupancy_mask_slow,
-    generate_occupancy_masks, tree_voxel_is_solid, AxisOccupancy, Dir,
+    generate_occupancy_masks, tree_voxel_is_solid, voxel_material, AxisOccupancy, Dir,
     ExternalPlane as ExternalPlaneKind, FaceNeighbor, Neighbourhood,
     OccupancyData as MeshOccupancyData, OccupancyDataBuilder, Plane,
 };

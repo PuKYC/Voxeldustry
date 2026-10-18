@@ -769,6 +769,37 @@ pub fn tree_voxel_is_solid(
     )
 }
 
+/// 读取 occupancy 网格中某个格的材料 id（0 = 空气，越界同样返回 0）。
+///
+/// 三平面掩码同时置位才算该材料；多材料同时命中时按 `materials`（材料 id 升序）
+/// 取第一个，与 greedy mesher 的材质选择保持一致。
+#[must_use]
+pub fn voxel_material(occupancy: &OccupancyData, x: usize, y: usize, z: usize) -> u8 {
+    let n = occupancy.voxels_per_axis as usize;
+    if x >= n || y >= n || z >= n {
+        return 0;
+    }
+    let plane_len = n * n;
+    let bit_x = 1u64 << x;
+    let bit_y = 1u64 << y;
+    let bit_z = 1u64 << z;
+    for (mi, (material, _)) in occupancy.materials.iter().enumerate() {
+        let Some(masks) = occupancy.per_material.get(mi) else {
+            continue;
+        };
+        if masks.len() < 3 * plane_len {
+            continue;
+        }
+        if (masks[y * n + z] & bit_x) != 0
+            && (masks[plane_len + z * n + x] & bit_y) != 0
+            && (masks[2 * plane_len + y * n + x] & bit_z) != 0
+        {
+            return *material as u8;
+        }
+    }
+    0
+}
+
 fn fill_masks_for_region<T: VoxelTrait, A: NodeAccess<T>>(
     _access: &A,
     builder: &mut OccupancyDataBuilder,

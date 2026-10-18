@@ -39,6 +39,7 @@
 //! 「哪些块、什么 LOD、怎么分组」，不改 crates/voxel 或 game-engine。
 
 pub mod blocks;
+pub mod generated;
 pub mod generation;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,7 +53,9 @@ use game_engine::presentation::voxel::{
 };
 use game_engine::presentation::RenderTransform;
 use game_engine::spatial::Size;
-use game_engine::voxel::{ChunkKey, Lod, MeshBlock, Neighbourhood, VoxVolume, VoxelInterner};
+use game_engine::voxel::{
+    ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelInterner,
+};
 
 use crate::presentation::voxel_mesh::VoxChunkGroupRaw;
 use crate::presentation::PresentedTransform;
@@ -68,6 +71,7 @@ pub use blocks::{
     nearest_block_distance_m, neighbor_origins, skirt_mask, y_band_layers, FaceNeighbor, GroupKey,
     TerrainBlock, TerrainPartition, REGION_BLOCKS, TERRAIN_MARGIN_CHUNKS,
 };
+use generated::GeneratedBlockCache;
 
 /// 地形生成参数（体素层资源）。装配方在 `add_plugins(GameVoxelPlugin)` **之前**
 /// `insert_resource` 后，[TerrainPlugin] 就会注册地形生成系统；不插入则不生成。
@@ -151,6 +155,7 @@ pub(crate) fn register_systems(app: &mut App) {
         .init_resource::<TerrainNeighborBlocks>()
         // 表现层网格机制不注册插件；WrappedBlockCache 由唯一消费者 core 侧 init。
         .init_resource::<WrappedBlockCache>()
+        .init_resource::<TerrainGeneratedBlocks>()
         .init_resource::<TerrainStats>()
         .init_resource::<VoxelLodConfig>()
         .init_resource::<VoxelLodObserver>()
@@ -213,6 +218,19 @@ struct GroupMembers {
 /// `&mut WrappedBlockCache` 不能来自同一个变量（借用冲突），所以邻块单独一份。
 #[derive(Resource, Default)]
 pub struct TerrainNeighborBlocks(pub WrappedBlockCache);
+
+/// 按 LOD 直接生成的块树缓存（LOD>0）。
+///
+/// `own` 放「正在网格化的块」，`neighbors` 放它预热过的 26 邻：两者必须分开，
+/// 否则本块的 `&mut` 与邻块的 `&` 会撞在同一份缓存上。两份缓存共享 interner
+/// 节点（hash-cons），所以重复生成同一块不会翻倍内存。
+#[derive(Resource, Default)]
+pub struct TerrainGeneratedBlocks {
+    /// 本块（组内逐块）按 LOD 生成的树。
+    pub own: GeneratedBlockCache,
+    /// 26 邻按 LOD 生成的树。
+    pub neighbors: GeneratedBlockCache,
+}
 
 /// 地形统计（demo / perf / 测试断言用；不进协议）。
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +300,28 @@ fn edge_corner_supported(plan: &[TerrainFaceNeighbor; 6], dx: i32, dy: i32, dz: 
     x_ok && y_ok && z_ok
 }
 
+/// 按 LOD 选择块的树来源并预热进对应缓存。
+///
+/// `lod == 0` 走 [WrappedBlockCache]（VoxVolume 的基础子块包装，逐位不变）；
+/// `lod > 0` 走按 LOD 直接生成的 [GeneratedBlockCache]。
+#[allow(clippy::too_many_arguments)]
+fn prime_block_tree(
+    interner: &mut VoxelInterner,
+    generator: &WorldGenerator,
+    volume: &VoxVolume,
+    wrapped: &mut WrappedBlockCache,
+    generated: &mut GeneratedBlockCache,
+    origin: ChunkKey,
+    lod: Lod,
+) {
+    let block = MeshBlock::new(origin, lod);
+    if lod.lod() == 0 {
+        wrapped.get_or_wrap(&volume.chunks, interner.inner_mut(), block);
+    } else {
+        generated.get_or_generate(interner.inner_mut(), generator, block);
+    }
+}
+
 /// Startup：生成子块 -> 逐块网格化 -> 产出 stable id 实体。
 ///
 /// 体素容器在本地构建，生成完成后作为 `VoxVolume` **组件** spawn 到地形
@@ -291,6 +331,7 @@ fn edge_corner_supported(plan: &[TerrainFaceNeighbor; 6], dx: i32, dy: i32, dz: 
 /// interner / wrapped / 邻块缓存 / 增量缓存的借用天然分离；实体 id 由
 /// `StableIdAllocator` 立即分配并登记进 `StableEntityIndex`（等价
 /// `spawn_stable` 的当帧语义）。
+///
 /// 提取一个块的原始体素 halo（34³）与跨 LOD 裙边掩码；内部无实心体素返回 None。
 ///
 /// 返回 (halo 字节, skirt_mask)：掩码由 face_neighbors 报告经 [skirt_mask] 求得，
@@ -302,10 +343,12 @@ fn edge_corner_supported(plan: &[TerrainFaceNeighbor; 6], dx: i32, dy: i32, dz: 
 fn extract_block_raw(
     block: TerrainBlock,
     volume: &VoxVolume,
+    generator: &WorldGenerator,
     _voxel_size_m: f32,
     partition: &TerrainPartition,
     interner: &mut VoxelInterner,
     wrapped: &mut WrappedBlockCache,
+    generated: &mut TerrainGeneratedBlocks,
     neighbors: &mut TerrainNeighborBlocks,
 ) -> Option<(Vec<u8>, u8)> {
     let lod = Lod::new(block.lod);
@@ -315,6 +358,11 @@ fn extract_block_raw(
     let plan = face_neighbors(&block, partition);
     // 跨 LOD 接缝裙边掩码：只有 Coarser / Finer 面置位，随 raw 一起交给消费侧。
     let skirt = skirt_mask(&plan);
+    // 树来源按 LOD 分流（godot_voxel 的做法）：
+    // - lod == 0：直接从已生成的 VoxVolume 包装（逐位不变，physics / 近景用）；
+    // - lod > 0：按自己的 LOD 直接生成（WorldGenerator::generate_block_at_lod）。
+    //   LOD 数据不折叠 LOD0，所以粗格的地表材质不会被投成地下材质、也不会下沉。
+    let lod_generated = block.lod > 0;
 
     // 预热同 LOD 的 26 邻（6 面 + 12 棱 + 8 角），随后只读取回。对角邻块让
     // halo 的棱 / 角也能被填充，从而给出真正的 3D AO；缺失 = 空气。
@@ -329,47 +377,60 @@ fn extract_block_raw(
                     mesh_block.origin.y + dy * span,
                     mesh_block.origin.z + dz * span,
                 );
-                neighbors.0.get_or_wrap(
-                    &volume.chunks,
-                    interner.inner_mut(),
-                    MeshBlock::new(neighbor, lod),
+                prime_block_tree(
+                    interner,
+                    generator,
+                    volume,
+                    &mut neighbors.0,
+                    &mut generated.neighbors,
+                    neighbor,
+                    lod,
                 );
             }
         }
     }
 
-    // 预热跨 LOD 面邻居（粗 / 细各按自己的 lod wrap；同 LOD 面上面已预热）。
+    // 预热跨 LOD 面邻居（粗 / 细各按自己的 lod 选来源；同 LOD 面上面已预热）。
     for plan_face in plan.iter() {
         match plan_face {
-            TerrainFaceNeighbor::Missing => {}
-            TerrainFaceNeighbor::Same(origin) => {
-                neighbors.0.get_or_wrap(
-                    &volume.chunks,
-                    interner.inner_mut(),
-                    MeshBlock::new(*origin, lod),
-                );
-            }
+            TerrainFaceNeighbor::Missing | TerrainFaceNeighbor::Same(_) => {}
             TerrainFaceNeighbor::Coarser { origin, .. } => {
-                neighbors.0.get_or_wrap(
-                    &volume.chunks,
-                    interner.inner_mut(),
-                    MeshBlock::new(*origin, Lod::new(block.lod + 1)),
+                prime_block_tree(
+                    interner,
+                    generator,
+                    volume,
+                    &mut neighbors.0,
+                    &mut generated.neighbors,
+                    *origin,
+                    Lod::new(block.lod + 1),
                 );
             }
             TerrainFaceNeighbor::Finer(origins) => {
                 let neighbour_lod = Lod::new(block.lod.saturating_sub(1));
                 for origin in origins.iter() {
-                    neighbors.0.get_or_wrap(
-                        &volume.chunks,
-                        interner.inner_mut(),
-                        MeshBlock::new(*origin, neighbour_lod),
+                    prime_block_tree(
+                        interner,
+                        generator,
+                        volume,
+                        &mut neighbors.0,
+                        &mut generated.neighbors,
+                        *origin,
+                        neighbour_lod,
                     );
                 }
             }
         }
     }
+    // 26 邻的树来源与块本身一致：LOD0 走包装缓存，LOD>0 走按 LOD 生成的缓存。
+    let neighborhood_tree = |origin: ChunkKey, at_lod: Lod| -> Option<&VoxTree<u8>> {
+        if at_lod.lod() == 0 {
+            neighbors.0.get(origin, at_lod)
+        } else {
+            generated.neighbors.get(origin, at_lod)
+        }
+    };
+
     let neighbourhood = {
-        let neighbor_cache = &neighbors.0;
         let mut out = Neighbourhood::none();
         for dx in -1i8..=1 {
             for dy in -1i8..=1 {
@@ -389,7 +450,7 @@ fn extract_block_raw(
                     if !edge_corner_supported(&plan, i32::from(dx), i32::from(dy), i32::from(dz)) {
                         continue;
                     }
-                    if let Some(tree) = neighbor_cache.get(neighbor, lod) {
+                    if let Some(tree) = neighborhood_tree(neighbor, lod) {
                         out.set(dx, dy, dz, tree);
                     }
                 }
@@ -400,18 +461,17 @@ fn extract_block_raw(
 
     // 把面邻居报告解析成 voxel 层描述符（借用上面已预热的树）。
     let mesh_faces = {
-        let cache = &neighbors.0;
         let mut out = [MeshFaceNeighbor::Missing; 6];
         for (face, plan_face) in plan.iter().enumerate() {
             out[face] = match plan_face {
                 TerrainFaceNeighbor::Missing => MeshFaceNeighbor::Missing,
-                TerrainFaceNeighbor::Same(origin) => match cache.get(*origin, lod) {
+                TerrainFaceNeighbor::Same(origin) => match neighborhood_tree(*origin, lod) {
                     Some(tree) => MeshFaceNeighbor::Same(tree),
                     None => MeshFaceNeighbor::Missing,
                 },
                 TerrainFaceNeighbor::Coarser { origin, offset } => {
                     let neighbour_lod = Lod::new(block.lod + 1);
-                    match cache.get(*origin, neighbour_lod) {
+                    match neighborhood_tree(*origin, neighbour_lod) {
                         Some(tree) => MeshFaceNeighbor::Coarser {
                             tree,
                             offset: *offset,
@@ -422,10 +482,10 @@ fn extract_block_raw(
                 TerrainFaceNeighbor::Finer(origins) => {
                     let neighbour_lod = Lod::new(block.lod.saturating_sub(1));
                     match (
-                        cache.get(origins[0], neighbour_lod),
-                        cache.get(origins[1], neighbour_lod),
-                        cache.get(origins[2], neighbour_lod),
-                        cache.get(origins[3], neighbour_lod),
+                        neighborhood_tree(origins[0], neighbour_lod),
+                        neighborhood_tree(origins[1], neighbour_lod),
+                        neighborhood_tree(origins[2], neighbour_lod),
+                        neighborhood_tree(origins[3], neighbour_lod),
                     ) {
                         (Some(a), Some(b), Some(c), Some(d)) => {
                             MeshFaceNeighbor::Finer([a, b, c, d])
@@ -440,7 +500,13 @@ fn extract_block_raw(
 
     // 用已 wrap 的块树 + LOD 感知面邻居 + 26 邻树提取原始体素
     //（内部 32³ + 整圈 halo）。
-    let tree = wrapped.get_or_wrap(&volume.chunks, interner.inner_mut(), mesh_block);
+    let tree = if lod_generated {
+        generated
+            .own
+            .get_or_generate(interner.inner_mut(), generator, mesh_block)
+    } else {
+        wrapped.get_or_wrap(&volume.chunks, interner.inner_mut(), mesh_block)
+    };
     let raw = extract_raw_halo_with_faces(
         tree,
         interner.inner(),
@@ -527,11 +593,20 @@ fn invalidate_group(
     blocks: &BTreeSet<ChunkKey>,
     interner: &mut VoxelInterner,
     wrapped: &mut WrappedBlockCache,
+    generated: &mut TerrainGeneratedBlocks,
     neighbors: &mut TerrainNeighborBlocks,
 ) {
     for origin in blocks {
         wrapped.invalidate_covered(interner.inner_mut(), *origin);
-        neighbors.0.invalidate_covered(interner.inner_mut(), *origin);
+        generated
+            .own
+            .invalidate_covered(interner.inner_mut(), *origin);
+        generated
+            .neighbors
+            .invalidate_covered(interner.inner_mut(), *origin);
+        neighbors
+            .0
+            .invalidate_covered(interner.inner_mut(), *origin);
     }
 }
 
@@ -545,11 +620,13 @@ fn invalidate_group(
 fn apply_group_diff(
     commands: &mut Commands,
     volume: &VoxVolume,
+    generator: &WorldGenerator,
     desired: &[TerrainBlock],
     partition: &TerrainPartition,
     voxel_size_f32: f32,
     interner: &mut VoxelInterner,
     wrapped: &mut WrappedBlockCache,
+    generated: &mut TerrainGeneratedBlocks,
     neighbors: &mut TerrainNeighborBlocks,
     groups: &mut TerrainGroups,
     members: &mut TerrainGroupMembers,
@@ -572,7 +649,7 @@ fn apply_group_diff(
             commands.entity(entity).despawn();
         }
         if let Some(old) = members.0.remove(&key) {
-            invalidate_group(&old.blocks, interner, wrapped, neighbors);
+            invalidate_group(&old.blocks, interner, wrapped, generated, neighbors);
         }
     }
 
@@ -595,9 +672,9 @@ fn apply_group_diff(
         }
         // 失效口径仍按块：旧成员 + 新成员逐个 invalidate_covered。
         if let Some(old) = members.0.get(key) {
-            invalidate_group(&old.blocks, interner, wrapped, neighbors);
+            invalidate_group(&old.blocks, interner, wrapped, generated, neighbors);
         }
-        invalidate_group(desired_blocks, interner, wrapped, neighbors);
+        invalidate_group(desired_blocks, interner, wrapped, generated, neighbors);
 
         let mut chunks: BTreeMap<ChunkKey, (Vec<u8>, u8)> = BTreeMap::new();
         for origin in desired_blocks {
@@ -608,10 +685,12 @@ fn apply_group_diff(
             if let Some((raw, mask)) = extract_block_raw(
                 block,
                 volume,
+                generator,
                 voxel_size_f32,
                 partition,
                 interner,
                 wrapped,
+                generated,
                 neighbors,
             ) {
                 chunks.insert(*origin, (raw, mask));
@@ -659,6 +738,7 @@ fn build_terrain(
     config: Res<TerrainConfig>,
     mut interner: ResMut<VoxelInterner>,
     mut wrapped: ResMut<WrappedBlockCache>,
+    mut generated: ResMut<TerrainGeneratedBlocks>,
     mut neighbors: ResMut<TerrainNeighborBlocks>,
     mut groups: ResMut<TerrainGroups>,
     mut members: ResMut<TerrainGroupMembers>,
@@ -686,11 +766,13 @@ fn build_terrain(
     apply_group_diff(
         &mut commands,
         &volume,
+        &generator,
         &planned_blocks,
         &partition,
         voxel_size_f32,
         &mut interner,
         &mut wrapped,
+        &mut generated,
         &mut neighbors,
         &mut groups,
         &mut members,
@@ -733,6 +815,7 @@ fn stream_terrain_lod(
     mut stream: ResMut<TerrainStreamState>,
     mut interner: ResMut<VoxelInterner>,
     mut wrapped: ResMut<WrappedBlockCache>,
+    mut generated: ResMut<TerrainGeneratedBlocks>,
     mut neighbors: ResMut<TerrainNeighborBlocks>,
     mut groups: ResMut<TerrainGroups>,
     mut members: ResMut<TerrainGroupMembers>,
@@ -792,14 +875,17 @@ fn stream_terrain_lod(
     let partition = TerrainPartition::new(&desired);
 
     // ── 4. 组级 diff + 重建（BTreeMap 键升序 = 确定性分配顺序）──
+    let generator = WorldGenerator::new(WorldSeed(config.seed), config.biome);
     apply_group_diff(
         &mut commands,
         volume,
+        &generator,
         &desired,
         &partition,
         voxel_size_f32,
         &mut interner,
         &mut wrapped,
+        &mut generated,
         &mut neighbors,
         &mut groups,
         &mut members,
@@ -941,14 +1027,18 @@ mod tests {
         volume.insert_chunk(block.origin, tree);
 
         let mut wrapped = WrappedBlockCache::default();
+        let mut generated = TerrainGeneratedBlocks::default();
         let mut neighbors = TerrainNeighborBlocks::default();
+        let generator = WorldGenerator::from_seed(0xC0FF_EE);
         let (raw, mask) = extract_block_raw(
             block,
             &volume,
+            &generator,
             DEFAULT_VOXEL_SIZE.to_num::<f32>(),
             &partition,
             &mut interner,
             &mut wrapped,
+            &mut generated,
             &mut neighbors,
         )
         .expect("实心块必须产出 raw halo");
@@ -1073,6 +1163,7 @@ mod tests {
         app.add_plugins(StableIdPlugin);
         app.add_plugins(crate::voxel::GameVoxelPlugin);
         app.init_resource::<WrappedBlockCache>()
+            .init_resource::<TerrainGeneratedBlocks>()
             .init_resource::<TerrainNeighborBlocks>()
             .init_resource::<TerrainGroups>()
             .init_resource::<TerrainGroupMembers>()
@@ -1267,7 +1358,10 @@ mod tests {
             })
             .collect();
         // 合成体素全实心 -> 没有空块，实体块集合应逐组等于 desired。
-        assert_eq!(have, want, "组内块集合必须等于该 GroupKey 覆盖的 desired 块");
+        assert_eq!(
+            have, want,
+            "组内块集合必须等于该 GroupKey 覆盖的 desired 块"
+        );
         assert!(!want.is_empty());
     }
 
@@ -1288,11 +1382,8 @@ mod tests {
         set_stream_observer(&mut app, [0.0, 0.0, 0.0]);
         app.update();
 
-        let before: BTreeMap<GroupKey, Entity> = app
-            .world()
-            .resource::<TerrainGroups>()
-            .iter()
-            .collect();
+        let before: BTreeMap<GroupKey, Entity> =
+            app.world().resource::<TerrainGroups>().iter().collect();
         assert!(
             before.len() >= 2,
             "测试需要至少两个组：{:?}",

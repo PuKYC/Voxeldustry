@@ -18,10 +18,11 @@
 //! FixedPoint 转 f32。确定性：所有会产字节或决定顺序的容器一律
 //! BTreeMap / 排序 Vec，绝不用 HashMap 迭代序。
 
-pub use ::voxel::mesh::{
-    extract_block, tree_voxel_is_solid, MeshBlock, Neighbourhood, RectBatch, RectInstance,
-};
 pub use ::voxel::lod_quadtree::{restricted_quadtree, QuadLeaf};
+pub use ::voxel::mesh::{
+    build_tree_occupancy, build_tree_occupancy_lod, extract_block, tree_voxel_is_solid,
+    voxel_material, FaceNeighbor, MeshBlock, Neighbourhood, RectBatch, RectInstance,
+};
 pub use ::voxel::store::*;
 
 mod aabb;
