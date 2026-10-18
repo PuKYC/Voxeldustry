@@ -210,13 +210,16 @@ impl TerrainPartition {
     }
 }
 
-/// 给定块与其划分，返回 6 个面的 LOD 感知邻居报告。
+/// 给定块与其划分，返回 6 个面的**完整 LOD 报告**（内部用）。
 ///
 /// 顺序 = [`neighbor_origins`] = `[+x, -x, +y, -y, +z, -z]`。
 /// 竖直（±y）面永远是同一 XZ 叶子的上/下 y 块（同 LOD）；水平（±x / ±z）
 /// 面按 2:1 平衡只会出现 `Same` / `Coarser` / `Finer` 三种之一。
+///
+/// 这份报告只用于「这面是否跨 LOD」（裙边掩码 / 组重建签名），
+/// **不再驱动网格剔除**：跨 LOD 面在 [face_neighbors] 里一律映射成 `Missing`。
 #[must_use]
-pub fn face_neighbors(block: &TerrainBlock, partition: &TerrainPartition) -> [FaceNeighbor; 6] {
+fn neighbour_lod_report(block: &TerrainBlock, partition: &TerrainPartition) -> [FaceNeighbor; 6] {
     let span = block_span(block.lod);
     [
         horizontal_neighbor(partition, block.origin, block.lod, span, 1, 0),
@@ -226,6 +229,35 @@ pub fn face_neighbors(block: &TerrainBlock, partition: &TerrainPartition) -> [Fa
         horizontal_neighbor(partition, block.origin, block.lod, span, 0, 1),
         horizontal_neighbor(partition, block.origin, block.lod, span, 0, -1),
     ]
+}
+
+/// 给定块与其划分，返回 6 个面的**同 LOD** 邻居报告。
+///
+/// 跨 LOD 面（`Coarser` / `Finer`）一律报 `Missing`：块只看同 LOD 邻居，
+/// 缺失按空气处理 —— 每块自己封边（godot_voxel 的块自闭合）。
+/// 这样不会出现「粗侧按 2x2 聚合剔除、细侧按粗格剔除」两侧都剔的穿透洞。
+///
+/// LOD 错位信息不外传：裙边掩码用 [`lod_mismatch_mask`]，重建签名用它 + 本报告。
+#[must_use]
+pub fn face_neighbors(block: &TerrainBlock, partition: &TerrainPartition) -> [FaceNeighbor; 6] {
+    let mut report = neighbour_lod_report(block, partition);
+    for neighbour in &mut report {
+        if matches!(
+            neighbour,
+            FaceNeighbor::Coarser { .. } | FaceNeighbor::Finer(_)
+        ) {
+            *neighbour = FaceNeighbor::Missing;
+        }
+    }
+    report
+}
+
+/// 跨 LOD 面掩码（bit `face` 对应 `[+x, -x, +y, -y, +z, -z]`）。
+///
+/// 只有 `Coarser` / `Finer` 面置位；`Same` / `Missing` 为 0。
+#[must_use]
+pub fn lod_mismatch_mask(block: &TerrainBlock, partition: &TerrainPartition) -> u8 {
+    skirt_mask(&neighbour_lod_report(block, partition))
 }
 
 /// 由面邻居报告得到跨 LOD 面掩码（bit `face` 对应 [`face_neighbors`] 顺序
@@ -892,7 +924,7 @@ mod tests {
         let mut blocks = vec![coarse];
         blocks.extend_from_slice(&fine);
         let partition = TerrainPartition::new(&blocks);
-        let neighbours = face_neighbors(&coarse, &partition);
+        let neighbours = neighbour_lod_report(&coarse, &partition);
         // -X 面（face 1）：行 = y、列 = z，行优先。
         assert_eq!(
             neighbours[1],
@@ -922,21 +954,21 @@ mod tests {
         let partition = TerrainPartition::new(&blocks);
 
         assert_eq!(
-            face_neighbors(&block(1, 0, 0, 0), &partition)[0],
+            neighbour_lod_report(&block(1, 0, 0, 0), &partition)[0],
             FaceNeighbor::Coarser {
                 origin: chunk_key(2, 0, 0),
                 offset: [0, 0],
             }
         );
         assert_eq!(
-            face_neighbors(&block(1, 0, 1, 0), &partition)[0],
+            neighbour_lod_report(&block(1, 0, 1, 0), &partition)[0],
             FaceNeighbor::Coarser {
                 origin: chunk_key(2, 0, 0),
                 offset: [0, 16],
             }
         );
         assert_eq!(
-            face_neighbors(&block(1, 1, 0, 0), &partition)[0],
+            neighbour_lod_report(&block(1, 1, 0, 0), &partition)[0],
             FaceNeighbor::Coarser {
                 origin: chunk_key(2, 0, 0),
                 offset: [16, 0],
@@ -944,7 +976,7 @@ mod tests {
         );
         // 同 XZ 叶子的 +Y 邻块是同 LOD。
         assert_eq!(
-            face_neighbors(&block(1, 0, 0, 0), &partition)[2],
+            neighbour_lod_report(&block(1, 0, 0, 0), &partition)[2],
             FaceNeighbor::Same(chunk_key(1, 1, 0))
         );
     }
@@ -955,7 +987,7 @@ mod tests {
         let blocks = lod_blocks(8, 3, VOXEL_SIZE_METERS);
         let partition = TerrainPartition::new(&blocks);
         for block in &blocks {
-            for neighbour in face_neighbors(block, &partition) {
+            for neighbour in neighbour_lod_report(block, &partition) {
                 match neighbour {
                     FaceNeighbor::Missing => {}
                     FaceNeighbor::Same(origin) => {
@@ -997,12 +1029,52 @@ mod tests {
         blocks.extend_from_slice(&fine);
         let partition = TerrainPartition::new(&blocks);
         // 粗块 -X 面是 Finer -> bit 1。
-        assert_eq!(skirt_mask(&face_neighbors(&coarse, &partition)), 1 << 1);
+        assert_eq!(
+            skirt_mask(&neighbour_lod_report(&coarse, &partition)),
+            1 << 1
+        );
         // 细块 +X 面是 Coarser -> bit 0；+Z 面是 Same -> 不置位。
         assert_eq!(
-            skirt_mask(&face_neighbors(&block(1, 0, 0, 0), &partition)),
+            skirt_mask(&neighbour_lod_report(&block(1, 0, 0, 0), &partition)),
             1 << 0
         );
+    }
+
+    /// 块自闭合：`face_neighbors` 对跨 LOD 面一律报 `Missing`（网格不再做
+    /// 跨 LOD 剔除），LOD 错位信息只经 `lod_mismatch_mask` 流出。
+    #[test]
+    fn face_neighbors_masks_cross_lod_as_missing() {
+        let coarse = block(2, 0, 0, 1);
+        let fine = [
+            block(1, 0, 0, 0),
+            block(1, 1, 0, 0),
+            block(1, 0, 1, 0),
+            block(1, 1, 1, 0),
+        ];
+        let mut blocks = vec![coarse];
+        blocks.extend_from_slice(&fine);
+        let partition = TerrainPartition::new(&blocks);
+
+        let fine_faces = face_neighbors(&block(1, 0, 0, 0), &partition);
+        assert_eq!(
+            fine_faces[0],
+            FaceNeighbor::Missing,
+            "+X 邻粗块必须报 Missing（块自闭合）"
+        );
+        assert_eq!(lod_mismatch_mask(&block(1, 0, 0, 0), &partition), 1 << 0);
+        assert_eq!(
+            fine_faces[2],
+            FaceNeighbor::Same(chunk_key(1, 1, 0)),
+            "同 LOD 面仍是 Same"
+        );
+
+        let coarse_faces = face_neighbors(&coarse, &partition);
+        assert_eq!(
+            coarse_faces[1],
+            FaceNeighbor::Missing,
+            "-X 邻细块必须报 Missing（块自闭合）"
+        );
+        assert_eq!(lod_mismatch_mask(&coarse, &partition), 1 << 1);
     }
 
     /// ±Z 面的行列轴是 (y, x)：粗邻居的切向 x 偏移必须落在 col。
@@ -1020,7 +1092,7 @@ mod tests {
         let partition = TerrainPartition::new(&blocks);
         // 粗块 -Z 面（face 5）：行 = y、列 = x，行优先。
         assert_eq!(
-            face_neighbors(&coarse, &partition)[5],
+            neighbour_lod_report(&coarse, &partition)[5],
             FaceNeighbor::Finer([
                 chunk_key(0, 0, 1),
                 chunk_key(1, 0, 1),
@@ -1030,7 +1102,7 @@ mod tests {
         );
         // 细块 (1,0,1) 的 +Z 面（face 4）：x 偏移 16 应落在 col。
         assert_eq!(
-            face_neighbors(&block(1, 0, 1, 0), &partition)[4],
+            neighbour_lod_report(&block(1, 0, 1, 0), &partition)[4],
             FaceNeighbor::Coarser {
                 origin: chunk_key(0, 0, 2),
                 offset: [0, 16],

@@ -648,14 +648,7 @@ mod tests {
     /// 独立暴力参考：直接从 34³ halo 数组按 MC 公式算某条 1x1 面的四角 AO。
     ///
     /// 刻意不调用被测 mesher 的任何函数；坐标映射独立重写一遍。
-    fn brute_face_ao(
-        blocks: &[u8],
-        plane: usize,
-        dir_pos: bool,
-        row: i32,
-        col: i32,
-        layer: i32,
-    ) -> [u8; 4] {
+    fn brute_face_ao(blocks: &[u8], plane: usize, row: i32, col: i32, layer: i32) -> [u8; 4] {
         let sample = |r: i32, c: i32| -> bool {
             let (x, y, z) = match plane {
                 0 => (layer, r, c), // YZ：行 y、列 z
@@ -712,7 +705,7 @@ mod tests {
             (2, 0, 1, 0, 0, true, 1),                         // +Z
         ];
         for (plane, dir, slice, row, col, dir_pos, layer) in cases {
-            let expected = brute_face_ao(&blocks, plane, dir_pos, row as i32, col as i32, layer);
+            let expected = brute_face_ao(&blocks, plane, row as i32, col as i32, layer);
             let word = words
                 .iter()
                 .find(|w| {
@@ -763,190 +756,6 @@ mod tests {
             }
         }
         wrap_block(&chunks, interner, MeshBlock::new(origin, Lod::new(lod)))
-    }
-
-    /// 跨 LOD 接缝剔除（requirement 4a）：lod-0 细块 +X 贴 lod-1 粗块。
-    ///
-    /// 粗块面对细邻居必须整面剔除（`Finer`），细块面对粗邻居也剔除接缝面
-    /// （`Coarser`），两侧不重复画几何。
-    #[test]
-    fn cross_lod_seam_culls_both_faces() {
-        let mut interner = new_interner();
-        let fine = solid_block(&mut interner, key(1, 0, 0), 0, 1);
-        let coarse = solid_block(&mut interner, key(2, 0, 0), 1, 2);
-        let f00 = solid_block(&mut interner, key(1, 0, 0), 0, 1);
-        let f01 = solid_block(&mut interner, key(1, 0, 1), 0, 1);
-        let f10 = solid_block(&mut interner, key(1, 1, 0), 0, 1);
-        let f11 = solid_block(&mut interner, key(1, 1, 1), 0, 1);
-
-        // 细块（lod0）+X 邻粗块（lod1）。
-        let mut fine_faces = [FaceNeighbor::Missing; 6];
-        fine_faces[0] = FaceNeighbor::Coarser {
-            tree: &coarse,
-            offset: [0, 0],
-        };
-        let fine_block = MeshBlock::new(key(1, 0, 0), Lod::new(0));
-        let fine_halo = extract_raw_halo_with_faces(
-            &fine,
-            &interner,
-            fine_block,
-            fine_faces,
-            Neighbourhood::none(),
-        );
-        let fine_words = mesh_raw_halo(0, &fine_halo);
-        assert!(
-            !fine_words.iter().any(|w| {
-                let r = unpack_rect(*w);
-                r.plane == 0 && r.dir == 0
-            }),
-            "细块 +X（plane 0 dir 0）接缝面必须被粗邻居剔除"
-        );
-        assert_eq!(fine_words.len(), 5, "细块应只剩 5 个非接缝面");
-
-        // before：面邻居缺失（修复前的行为）时接缝面被两侧各自画出来（重复几何）。
-        let fine_words_missing = mesh_raw_halo(
-            0,
-            &extract_raw_halo_with_faces(
-                &fine,
-                &interner,
-                fine_block,
-                [FaceNeighbor::Missing; 6],
-                Neighbourhood::none(),
-            ),
-        );
-        assert!(
-            fine_words_missing.iter().any(|w| {
-                let r = unpack_rect(*w);
-                r.plane == 0 && r.dir == 0
-            }),
-            "缺面邻居时 +X 接缝面会重复出现（修复前证据）"
-        );
-        assert_eq!(fine_words_missing.len(), 6, "修复前细块有 6 个面");
-
-        // 粗块（lod1）-X 邻 4 个细块（lod0）。
-        let mut coarse_faces = [FaceNeighbor::Missing; 6];
-        coarse_faces[1] = FaceNeighbor::Finer([&f00, &f01, &f10, &f11]);
-        let coarse_block = MeshBlock::new(key(2, 0, 0), Lod::new(1));
-        let coarse_halo = extract_raw_halo_with_faces(
-            &coarse,
-            &interner,
-            coarse_block,
-            coarse_faces,
-            Neighbourhood::none(),
-        );
-        let coarse_words = mesh_raw_halo(1, &coarse_halo);
-        assert!(
-            !coarse_words.iter().any(|w| {
-                let r = unpack_rect(*w);
-                r.plane == 0 && r.dir == 1
-            }),
-            "粗块 -X（plane 0 dir 1）接缝面必须被细几何剔除"
-        );
-        assert_eq!(coarse_words.len(), 5, "粗块应只剩 5 个非接缝面");
-
-        let coarse_words_missing = mesh_raw_halo(
-            1,
-            &extract_raw_halo_with_faces(
-                &coarse,
-                &interner,
-                coarse_block,
-                [FaceNeighbor::Missing; 6],
-                Neighbourhood::none(),
-            ),
-        );
-        assert!(
-            coarse_words_missing.iter().any(|w| {
-                let r = unpack_rect(*w);
-                r.plane == 0 && r.dir == 1
-            }),
-            "缺面邻居时 -X 接缝面会重复出现（修复前证据）"
-        );
-        assert_eq!(coarse_words_missing.len(), 6, "修复前粗块有 6 个面");
-    }
-
-    /// 独立暴力参考：手工构造 lod0 细块（+X 邻 lod1 粗块）的 34³ halo。
-    ///
-    /// 内部逐格采样细树；+X 面按粗格 2x2 保守聚合（粗格实心 → 覆盖的细格
-    /// 全实心）；其余面保持空气。刻意不调用被测 occupancy / external 代码。
-    fn brute_cross_lod_halo(
-        fine: &VoxTree<u8>,
-        coarse: &VoxTree<u8>,
-        interner: &VoxInterner<u8>,
-        coarse_col_offset: i32,
-    ) -> Vec<u8> {
-        let mut out = vec![0u8; RAW_VOXELS];
-        let fine_depth = fine.max_depth(Lod::new(0));
-        for z in 0..RAW_DIM as i32 {
-            for y in 0..RAW_DIM as i32 {
-                for x in 0..RAW_DIM as i32 {
-                    if tree_voxel_is_solid(fine, interner, IVec3::new(x, y, z), fine_depth) {
-                        out[raw_halo_index(x as usize + 1, y as usize + 1, z as usize + 1)] = 1;
-                    }
-                }
-            }
-        }
-        let coarse_depth = coarse.max_depth(Lod::new(1));
-        for y in 0..RAW_DIM as i32 {
-            for z in 0..RAW_DIM as i32 {
-                let coarse_row = y / 2;
-                let coarse_col = coarse_col_offset + z / 2;
-                if tree_voxel_is_solid(
-                    coarse,
-                    interner,
-                    IVec3::new(0, coarse_row, coarse_col),
-                    coarse_depth,
-                ) {
-                    out[raw_halo_index(RAW_HALO - 1, y as usize + 1, z as usize + 1)] = 1;
-                }
-            }
-        }
-        out
-    }
-
-    /// 跨 LOD 接缝 AO（requirement 4b）：生产 halo 与独立暴力参考逐字节一致，
-    /// 且接缝附近暴露面的 AO 与暴力公式逐位一致。
-    #[test]
-    fn cross_lod_seam_ao_matches_brute_force() {
-        let mut interner = new_interner();
-        // 细块 (1,0,1) lod0：+X 面是粗邻居 (2,0,0) lod1 的 z 上半区（偏移 16）。
-        let fine = single_voxel_neighbor(&mut interner, key(1, 0, 1), IVec3::new(31, 10, 10), 1);
-        let coarse = solid_block(&mut interner, key(2, 0, 0), 1, 1);
-
-        let mut fine_faces = [FaceNeighbor::Missing; 6];
-        fine_faces[0] = FaceNeighbor::Coarser {
-            tree: &coarse,
-            offset: [0, 16],
-        };
-        let fine_block = MeshBlock::new(key(1, 0, 1), Lod::new(0));
-        let halo = extract_raw_halo_with_faces(
-            &fine,
-            &interner,
-            fine_block,
-            fine_faces,
-            Neighbourhood::none(),
-        );
-
-        let reference = brute_cross_lod_halo(&fine, &coarse, &interner, 16);
-        assert_eq!(halo, reference, "跨 LOD halo 必须与暴力参考逐字节一致");
-
-        // 接缝附近暴露的 +Y 面（Voxel (31,10,10) 顶面）AO。
-        let words = mesh_raw_halo(0, &reference);
-        let word = words
-            .iter()
-            .find(|w| {
-                let r = unpack_rect(**w);
-                r.plane == 1
-                    && r.dir == 0
-                    && r.slice == 11
-                    && r.row == 10
-                    && r.col == 31
-                    && r.w == 1
-                    && r.h == 1
-            })
-            .expect("+Y 面必须存在");
-        let expected = brute_face_ao(&reference, 1, true, 10, 31, 11);
-        assert_eq!(unpack_ao(*word), expected, "跨 LOD 接缝 AO 不一致");
-        assert_ne!(expected, [3, 3, 3, 3], "测试必须真正读到粗邻居的遮挡");
     }
 
     /// 跨 LOD 裙边：只在 `skirt_mask` 置位的面出现，AO 满亮；mask=0 时与不开

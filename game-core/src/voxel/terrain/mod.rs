@@ -67,7 +67,7 @@ use crate::world::WorldSeed;
 use blocks::FaceNeighbor as TerrainFaceNeighbor;
 pub use blocks::{
     block_origin_meters, block_span, chunk_keys_to_generate, face_neighbors, group_key,
-    group_origin, lod_blocks, lod_blocks_for_observer, nearest_axis_distance_m,
+    group_origin, lod_blocks, lod_blocks_for_observer, lod_mismatch_mask, nearest_axis_distance_m,
     nearest_block_distance_m, neighbor_origins, skirt_mask, y_band_layers, FaceNeighbor, GroupKey,
     TerrainBlock, TerrainPartition, REGION_BLOCKS, TERRAIN_MARGIN_CHUNKS,
 };
@@ -207,11 +207,11 @@ struct GroupMembers {
     blocks: BTreeSet<ChunkKey>,
     /// 其中产出几何（非空）的块数。
     solid: usize,
-    /// 上次构建时每个成员块的 6 面 LOD 感知邻居报告。
+    /// 上次构建时每个成员块的「同 LOD 面邻居报告 + 跨 LOD 面掩码」。
     ///
-    /// 成员集合不变但某邻块 LOD 变化时，本块的 halo 边界采样与 `skirt_mask` 会变，
-    /// 必须据此一并触发重建（否则跨 LOD 裙边会在 LOD 环收放后残留）。
-    neighbours: BTreeMap<ChunkKey, [FaceNeighbor; 6]>,
+    /// 成员集合不变但某邻块 LOD 变化时，本块的同 LOD 邻居集合与 `skirt_mask`
+    /// 会变，必须据此一并触发重建（否则跨 LOD 裙边会在 LOD 环收放后残留）。
+    neighbours: BTreeMap<ChunkKey, ([FaceNeighbor; 6], u8)>,
 }
 
 /// 邻块包装缓存：`extract_raw_halo` 的 26 邻只读借用与它自己的
@@ -354,10 +354,11 @@ fn extract_block_raw(
     let lod = Lod::new(block.lod);
     let mesh_block = MeshBlock::new(block.origin, lod);
     let span = 1i32 << block.lod;
-    // 面邻居报告（纯原点 / LOD）：2:1 平衡保证只有同 LOD / 更粗 / 更细三种。
+    // 面邻居报告只保留同 LOD（跨 LOD 已映射成 Missing）：块只看同 LOD 邻居，
+    // 缺失按空气处理 -> 每块自己封边，不会再有「两侧都剔除」的穿透洞。
     let plan = face_neighbors(&block, partition);
-    // 跨 LOD 接缝裙边掩码：只有 Coarser / Finer 面置位，随 raw 一起交给消费侧。
-    let skirt = skirt_mask(&plan);
+    // 跨 LOD 接缝裙边掩码：错位面单独从完整 LOD 报告里取。
+    let skirt = lod_mismatch_mask(&block, partition);
     // 树来源按 LOD 分流（godot_voxel 的做法）：
     // - lod == 0：直接从已生成的 VoxVolume 包装（逐位不变，physics / 近景用）；
     // - lod > 0：按自己的 LOD 直接生成（WorldGenerator::generate_block_at_lod）。
@@ -391,36 +392,7 @@ fn extract_block_raw(
     }
 
     // 预热跨 LOD 面邻居（粗 / 细各按自己的 lod 选来源；同 LOD 面上面已预热）。
-    for plan_face in plan.iter() {
-        match plan_face {
-            TerrainFaceNeighbor::Missing | TerrainFaceNeighbor::Same(_) => {}
-            TerrainFaceNeighbor::Coarser { origin, .. } => {
-                prime_block_tree(
-                    interner,
-                    generator,
-                    volume,
-                    &mut neighbors.0,
-                    &mut generated.neighbors,
-                    *origin,
-                    Lod::new(block.lod + 1),
-                );
-            }
-            TerrainFaceNeighbor::Finer(origins) => {
-                let neighbour_lod = Lod::new(block.lod.saturating_sub(1));
-                for origin in origins.iter() {
-                    prime_block_tree(
-                        interner,
-                        generator,
-                        volume,
-                        &mut neighbors.0,
-                        &mut generated.neighbors,
-                        *origin,
-                        neighbour_lod,
-                    );
-                }
-            }
-        }
-    }
+    // 面邻居全是同 LOD（或 Missing），26 邻预热已覆盖；跨 LOD 不再预热、不再采样。
     // 26 邻的树来源与块本身一致：LOD0 走包装缓存，LOD>0 走按 LOD 生成的缓存。
     let neighborhood_tree = |origin: ChunkKey, at_lod: Lod| -> Option<&VoxTree<u8>> {
         if at_lod.lod() == 0 {
@@ -469,29 +441,10 @@ fn extract_block_raw(
                     Some(tree) => MeshFaceNeighbor::Same(tree),
                     None => MeshFaceNeighbor::Missing,
                 },
-                TerrainFaceNeighbor::Coarser { origin, offset } => {
-                    let neighbour_lod = Lod::new(block.lod + 1);
-                    match neighborhood_tree(*origin, neighbour_lod) {
-                        Some(tree) => MeshFaceNeighbor::Coarser {
-                            tree,
-                            offset: *offset,
-                        },
-                        None => MeshFaceNeighbor::Missing,
-                    }
-                }
-                TerrainFaceNeighbor::Finer(origins) => {
-                    let neighbour_lod = Lod::new(block.lod.saturating_sub(1));
-                    match (
-                        neighborhood_tree(origins[0], neighbour_lod),
-                        neighborhood_tree(origins[1], neighbour_lod),
-                        neighborhood_tree(origins[2], neighbour_lod),
-                        neighborhood_tree(origins[3], neighbour_lod),
-                    ) {
-                        (Some(a), Some(b), Some(c), Some(d)) => {
-                            MeshFaceNeighbor::Finer([a, b, c, d])
-                        }
-                        _ => MeshFaceNeighbor::Missing,
-                    }
+                // 跨 LOD 面不会出现在 face_neighbors 里（已映射成 Missing）；
+                // 兜底成 Missing，避免枚举扩张时静默漏面。
+                TerrainFaceNeighbor::Coarser { .. } | TerrainFaceNeighbor::Finer(_) => {
+                    MeshFaceNeighbor::Missing
                 }
             };
         }
@@ -575,7 +528,7 @@ fn group_neighbour_signature(
     blocks: &BTreeSet<ChunkKey>,
     lod: u8,
     partition: &TerrainPartition,
-) -> BTreeMap<ChunkKey, [FaceNeighbor; 6]> {
+) -> BTreeMap<ChunkKey, ([FaceNeighbor; 6], u8)> {
     blocks
         .iter()
         .map(|origin| {
@@ -583,7 +536,14 @@ fn group_neighbour_signature(
                 origin: *origin,
                 lod,
             };
-            (*origin, face_neighbors(&block, partition))
+            // 同 LOD 报告（剔除依据）+ 跨 LOD 面掩码（裙边依据）。
+            (
+                *origin,
+                (
+                    face_neighbors(&block, partition),
+                    lod_mismatch_mask(&block, partition),
+                ),
+            )
         })
         .collect()
 }
@@ -1016,7 +976,7 @@ mod tests {
             lod: 0,
         };
         let partition = TerrainPartition::new(&[block, coarse, same_y]);
-        let expected = skirt_mask(&face_neighbors(&block, &partition));
+        let expected = lod_mismatch_mask(&block, &partition);
         assert_eq!(expected, 1 << 0, "只有 +X 面跨 LOD");
 
         // 只放被测块自己的实心 base 子块；缺失邻块按空气处理，不影响掩码。
@@ -1047,7 +1007,7 @@ mod tests {
         assert!(raw_halo_has_solid_interior(&raw));
         assert_eq!(
             mask,
-            skirt_mask(&face_neighbors(&block, &partition)),
+            lod_mismatch_mask(&block, &partition),
             "extract_block_raw 的掩码必须与纯函数报告一致"
         );
         assert_eq!(mask, expected);
@@ -1465,11 +1425,11 @@ mod tests {
         ];
         let sig_same = group_neighbour_signature(&members, 0, &TerrainPartition::new(&same));
 
-        assert!(matches!(
-            sig_coarser[&member][0],
-            FaceNeighbor::Coarser { .. }
-        ));
-        assert!(matches!(sig_same[&member][0], FaceNeighbor::Same(_)));
+        // 跨 LOD 面在 mesh 报告里已经是 Missing，但错位掩码必须记下来。
+        assert_eq!(sig_coarser[&member].0[0], FaceNeighbor::Missing);
+        assert_eq!(sig_coarser[&member].1, 1 << 0, "跨 LOD 面必须进裙边掩码");
+        assert!(matches!(sig_same[&member].0[0], FaceNeighbor::Same(_)));
+        assert_eq!(sig_same[&member].1, 0);
         assert_ne!(sig_coarser, sig_same, "邻块 LOD 变化必须改变组重建签名");
     }
 }

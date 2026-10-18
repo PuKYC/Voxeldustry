@@ -31,8 +31,7 @@ use crate::store::{ChunkKey, Lod, MaxDepth, VoxInterner, VoxOpsConfig, VoxTree};
 
 use self::greedy::{append_skirts, extract_rects};
 use self::occupancy::{
-    build_local_block_tree, generate_external_occupancy_mask_coarser,
-    generate_external_occupancy_mask_fast, generate_external_occupancy_mask_finer,
+    build_local_block_tree, generate_external_occupancy_mask_fast,
     generate_external_occupancy_mask_generic, generate_occupancy_masks_generic, ExternalPlane,
     InternerAccess, OccupancyData,
 };
@@ -409,10 +408,10 @@ pub fn build_tree_occupancy(
 
 /// LOD-aware counterpart of [`build_tree_occupancy`].
 ///
-/// 与 `build_tree_occupancy` 相同，但六个面用 [`FaceNeighbor`] 描述：同 LOD
-/// 邻居逐格采样，粗邻居按 2x2 保守聚合，细邻居按 2x2 任一实心剔除。这样
-/// `extract_raw_halo` 在 LOD 交界处产出的 external 面掩码与 halo 自洽，粗 /
-/// 细两侧不会各自封边造成重叠。
+/// 与 `build_tree_occupancy` 相同，但六个面用 [`FaceNeighbor`] 描述。
+/// 语义上只有「同 LOD 邻居」与「没有邻居」两种：跨 LOD 面由调用方报
+/// `Missing`（按空气处理），每块自己封边 —— godot_voxel 的块自闭合做法。
+/// 因此 LOD 交界处两侧各画各的边界墙面，不会有「两侧都剔除」的穿透洞。
 #[must_use]
 pub fn build_tree_occupancy_lod(
     tree: &VoxTree<u8>,
@@ -454,34 +453,6 @@ pub fn build_tree_occupancy_lod(
                         mesh_depth,
                         plane,
                         UVec2::ZERO,
-                    );
-                }
-            }
-            FaceNeighbor::Coarser {
-                tree: neighbour,
-                offset,
-            } => {
-                let root = neighbour.get_root_id();
-                if !root.is_empty() {
-                    generate_external_occupancy_mask_coarser(
-                        &access,
-                        &mut builder,
-                        root,
-                        mesh_depth,
-                        plane,
-                        *offset,
-                    );
-                }
-            }
-            FaceNeighbor::Finer(trees) => {
-                let roots = trees.map(|neighbour| neighbour.get_root_id());
-                if roots.iter().any(|root| !root.is_empty()) {
-                    generate_external_occupancy_mask_finer(
-                        &access,
-                        &mut builder,
-                        roots,
-                        mesh_depth,
-                        plane,
                     );
                 }
             }
