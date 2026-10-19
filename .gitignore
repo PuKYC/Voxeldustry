@@ -29,6 +29,21 @@ __pycache__/
 # ───────────────────────── 本地备份（非源码） ─────────────────────────
 /.refactor-backup/
 
+# ───────────────────────── Obsidian 笔记库（vault 位于仓库根） ─────────────────────────
+# 工作区布局：开关窗口/分栏就会变动，属本机状态
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+# 本地缓存
+.obsidian/cache
+# 已删除笔记的本地回收站
+.trash/
+# 图谱视图的缩放/过滤等个人视图状态
+.obsidian/graph.json
+# 插件本地数据（常含 token / API key，切勿入库）
+.obsidian/plugins/*/data.json
+# 若希望插件/主题配置也整目录不入库，改用下面这行：
+# .obsidian/
+
 # ───────────────────────── 编辑器 / 操作系统 ─────────────────────────
 .DS_Store
 Thumbs.db
