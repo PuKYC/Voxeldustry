@@ -11,7 +11,7 @@
 | `.github/workflows/generate-android-keystore.yml` | 手动 `workflow_dispatch` | 一次性生成 Android release keystore，并（可选）自动写入 Secrets |
 | `.github/workflows/perf.yml` | 改动 `crates/**`、`game-core/**`、`game-engine/**` 的 PR / push 到 `main`，或手动触发 | 性能门禁：criterion 墙钟 A/B + gungraun 指令数 |
 
-这些工作流都跑在 `ubuntu-24.04`（Godot 4 需要 24.04），Godot 由 `chickensoft-games/setup-godot` 安装到 runner。
+runner 镜像并不统一：`lint`、`perf`、`test` 的 Linux leg、`gdext` 的 Android leg、`release` 的 Linux arm64 / Windows / Android leg 用 `ubuntu-24.04`；`gdext` 的 Linux 两腿、`godot` 导出 job 与 `release` 的 Linux x86_64 leg 用 `ubuntu-22.04`；`test` 另有 `windows-2022` 与 `macos-14`。Godot 由 `chickensoft-games/setup-godot` 安装到 runner。
 
 ## 2. 版本固定
 
@@ -53,17 +53,30 @@ debug 与 release 分目录存放，避免同名互相覆盖。`godot-project/bi
 
 ## 4. CI（.github/workflows/ci.yml）
 
-- `rust` job：
-  1. 安装 Rust `1.95`（含 rustfmt/clippy）+ cargo 缓存
-  2. `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings`（**非阻塞**，稳定后可去掉 `continue-on-error`）
-  3. `cargo test --workspace`
-  4. `bash ./build.sh`（debug）
-  5. 上传 `godot-project/bin/debug/`
-- `godot` job（依赖 rust）：
-  1. 取回 debug 动态库
-  2. 用 `chickensoft-games/setup-godot` 安装 Godot 4.7.2 + 导出模板
-  3. `godot --headless --path godot-project --import` + `--export-debug "Linux x86_64"`
-  4. 上传 `build/`
+四个 job：
+
+- `lint`（`ubuntu-24.04`）：安装 Rust `1.95` + rustfmt/clippy，跑 `cargo fmt --all --check` 与
+  `cargo clippy --workspace --all-targets -- -D warnings`。**整步 `continue-on-error: true`（非阻塞）**，
+  稳定后去掉即可。
+- `test`（矩阵：`linux-x86_64`/`ubuntu-24.04`、`windows-x86_64`/`windows-2022`、`macos-arm64`/`macos-14`）：
+  每个平台 `cargo test --workspace`。
+- `gdext`（矩阵）：
+  - `linux-x86_64`、`linux-arm64`：`ubuntu-22.04`，前者 `cargo`，后者 `cross`；
+  - `android`：`ubuntu-24.04`，`cargo-ndk` 依次编 `aarch64-linux-android` + `armv7-linux-androideabi`，
+    额外装 JDK 17 与 NDK `r28b`；
+  - 全部走 `bash ./build.sh`，产物 `godot-project/bin/debug/`，按 `gdext-debug-<name>` 上传 artifact。
+  - Windows（MinGW）/ macOS 两腿在矩阵里是**注释掉的模板**，尚未启用。
+- `godot`（`ubuntu-22.04`，`needs: gdext`，矩阵）：先合并所有 `gdext-debug-*` artifact，
+  装 Godot 4.7.2 + 导出模板，再按预设导出 debug 构建：
+
+| name | preset | 产物 |
+| --- | --- | --- |
+| `linux-x86_64` | `Linux x86_64` | `build/linux/game.x86_64` |
+| `linux-arm64` | `Linux arm64` | `build/linux/game.arm64` |
+| `android-apk` | `Android arm64` | `build/android/game.apk`（export_format 0） |
+| `android-aab` | `Android arm64` | `build/android/game.aab`（export_format 1） |
+
+Android 腿还要：装 ADB、JDK 17、Android SDK（`platform-tools`、`platforms;android-35`、`build-tools;35.0.1`、`cmake;3.10.2.4988404`、`ndk;28.1.13356709`）、建 debug keystore、写 `editor_settings-4.7.tres` 的 SDK 路径、临时 patch `export_presets.cfg` 打开 arm64-v8a + armeabi-v7a；导出用 `--install-android-build-template --export-debug`。
 
 > Godot 直接装在 runner 上（不再使用 godot-ci 容器），`godot` 命令由 action 加入 PATH；
 > 导出模板安装到 `~/.local/share/godot/export_templates/4.7.2.stable/`。
@@ -82,14 +95,15 @@ debug 与 release 分目录存放，避免同名互相覆盖。`godot-project/bi
 | `linux-x86_64` | `x86_64-unknown-linux-gnu` | `Linux x86_64` | `build/linux/game.x86_64` | 否 |
 | `linux-arm64` | `aarch64-unknown-linux-gnu`（cross） | `Linux arm64` | `build/linux/game.arm64` | 否 |
 | `windows-x86_64` | `x86_64-pc-windows-gnu`（MinGW） | `Windows Desktop x64` | `build/windows/game.exe` | 否 |
-| `android-arm64` | `aarch64-linux-android` + `armv7-linux-androideabi` | `Android arm64` | `build/android/game.apk` | **是** |
+| `android-apk` | `aarch64-linux-android` + `armv7-linux-androideabi` | `Android arm64` | `build/android/game.apk`（export_format 0） | 否 |
+| `android-aab` | 同上 | `Android arm64` | `build/android/game.aab`（export_format 1） | 否 |
 
 每个 leg 的步骤：
 
-1. 安装 Rust target（Android 额外装 NDK r25b + `cargo-ndk`，用于交叉编译扩展）
+1. 安装 Rust target（Android 额外装 NDK `r28b` + `cargo-ndk`，用于交叉编译扩展）
 2. **构建宿主动态库**（`bash ./build.sh`，Linux x86_64 debug）——Godot 编辑器导入场景时会实例化原生类 `BevyAppManager`，缺宿主库会导致导入/导出失败
 3. 构建目标平台 release 动态库
-4. Android 专属：装 JDK 17 + Android SDK（`platform-tools`、`platforms;android-36`、`build-tools;36.1.0`、`ndk;29.0.14206865`，与 Godot 4.7.2 的 `app/config.gradle` 对齐）+ debug keystore
+4. Android 专属：装 JDK 17 + Android SDK（`platform-tools`、`platforms;android-35`、`build-tools;35.0.1`、`cmake;3.10.2.4988404`、`ndk;28.1.13356709`，与 Godot 4.7.2 的 `app/config.gradle` 对齐）+ debug keystore
    → 解码 release keystore → 写签名配置 → `--install-android-build-template`
 5. 用 `godot --headless` 执行 `--import` + `--export-release "<preset>"`（Android 先 `--install-android-build-template`）
 6. 上传 `build/`
@@ -97,7 +111,8 @@ debug 与 release 分目录存放，避免同名互相覆盖。`godot-project/bi
 ### 汇总
 
 `release` job 下载全部 artifact → 每个平台打一个 zip → `softprops/action-gh-release` 发布。
-`experimental` 平台失败不会阻断其它平台发布。
+
+`continue-on-error: ${{ matrix.experimental }}`：当前所有平台（含 Android）都是 `false`，任一 leg 失败都会阻断发布；若以后新增实验平台，把它标成 `true` 即可恢复「失败不阻断」。
 
 ## 6. Android release 签名（必填 Secrets）
 
@@ -149,7 +164,7 @@ keystore/release_password="<password>"
 ```
 
 > 路径是 runner 上的**绝对路径**（CI 用 `${{ github.workspace }}/.android-keystore/release.keystore`），
-> keystore 放在仓库根的 `.android-keystore/`（已 gitignore）。缺 secret 时该 leg 会在校验处失败，但不会阻断其它平台。
+> keystore 放在仓库根的 `.android-keystore/`（已 gitignore）。缺 secret 时该 leg 会在校验处失败；Android 已转强门禁，因此会阻断发布。
 
 ## 7. 本地复现
 
@@ -176,14 +191,14 @@ python3 .github/scripts/configure_android_keystore.py
 
 ## 8. 已知注意事项 / 待办
 
-- **Android 仍是 `experimental: true`**：首次跑通后改成 `false` 变为强门禁。
+- **Android 已跑稳**：发布矩阵里两个 Android leg 已改成 `experimental: false`（强门禁），失败会阻断发布。
 - **Windows 用 MinGW（`x86_64-pc-windows-gnu`）交叉编译**。若遇到加载兼容性问题，可改为
   `runs-on: windows-latest` + `x86_64-pc-windows-msvc`（`build.sh` 已支持该 triple）。
 - **macOS 暂未纳入发布矩阵**；`.gdextension` 里保留了 macos 条目，导出预设暂缺。
 - `setup-rust-toolchain@v1` 默认 `RUSTFLAGS=-D warnings`；本仓库尚未清完 warning，因此显式设为 `rustflags: ""`，warning 门禁只保留在非阻塞的 clippy 步骤。
 - `cargo clippy` 目前 `continue-on-error`，待代码全绿后去掉。
 - Godot 版本升级时，同步修改各 workflow 的 `GODOT_VERSION` 与 `project.godot` 的 `config/features`。
-- Android 导出不再依赖 godot-ci 镜像，改为 runner 上的 `actions/setup-java`（temurin 17）+ `android-actions/setup-android`（显式安装 android-36 / build-tools 36.1.0 / NDK 29.0.14206865）+ 自建 debug keystore。
+- Android 导出不再依赖 godot-ci 镜像，改为 runner 上的 `actions/setup-java`（temurin 17）+ `android-actions/setup-android`（显式安装 android-35 / build-tools 35.0.1 / NDK 28.1.13356709）+ 自建 debug keystore。
   Godot 升级时这三个版本要跟着 `platform/android/java/app/config.gradle` 一起改。
 
 ## 9. 性能基准（.github/workflows/perf.yml）

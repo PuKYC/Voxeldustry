@@ -86,13 +86,13 @@ jobs:
               "name":"android-apk","runner":"ubuntu-24.04",
               "targets":"aarch64-linux-android armv7-linux-androideabi","cargo_cmd":"cargo",
               "preset":"Android arm64","out":"build/android/game.apk",
-              "export_format":0,"artifact":"game-android-apk","experimental":true
+              "export_format":0,"artifact":"game-android-apk","experimental":false
             },
             {
               "name":"android-aab","runner":"ubuntu-24.04",
               "targets":"aarch64-linux-android armv7-linux-androideabi","cargo_cmd":"cargo",
               "preset":"Android arm64","out":"build/android/game.aab",
-              "export_format":1,"artifact":"game-android-aab","experimental":true
+              "export_format":1,"artifact":"game-android-aab","experimental":false
             }
           ]'
 
@@ -363,7 +363,7 @@ jobs:
     # 发布条件：
     #   - tag push（v*）→ 始终发布；
     #   - workflow_dispatch → 需要 tag 非空 且 publish=true；
-    #   - 任一稳定平台 failure 时不发布（experimental 失败不算）。
+    #   - 任一平台 failure 时不发布（当前 5 个平台都是 experimental: false；以后新增实验平台标 true 可不阻断）。
     if: >-
       !cancelled()
       && needs.build.result != 'failure'
