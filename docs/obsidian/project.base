@@ -1,0 +1,11 @@
+formulas:
+  未命名: ""
+views:
+  - type: cards
+    name: 视图
+    filters:
+      and:
+        - file.inFolder("docs/项目架构")
+    order:
+      - file.basename
+    sort: []
