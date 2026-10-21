@@ -12,7 +12,8 @@ extends Camera3D
 ##   rig.bind(bevy_client)   # 要在后端发出首帧之前调用
 ##
 ## 相机模式见 CameraMode。鼠标捕获：FOLLOW_BACKEND + capture_mouse 时自动捕获，
-## Esc 释放，点击窗口重新捕获。
+## 点击窗口重新捕获。Esc / 暂停菜单 / 触屏方案由 UiRoot 统一协调：
+## UiRoot 通过 `camera_rig` 组调用 set_ui_blocked()，本脚本不再处理 ui_cancel。
 
 enum CameraMode {
 	STATIC,         ## 不接管：保持场景里摆好的相机（旧行为）
@@ -27,11 +28,17 @@ enum CameraMode {
 var _client = null
 var _entity: EntityData = null
 var _captured_by_rig := false
+## UiRoot 置位：菜单打开 / 触屏方案时为 true，期间不捕获鼠标、不消费输入。
+var _ui_blocked := false
 
 
 func _init() -> void:
 	# 晚于 BevyClient._process（默认 0）：同一帧里先收后端数据再摆相机。
 	process_priority = 100
+
+
+func _ready() -> void:
+	add_to_group("camera_rig")
 
 
 func _exit_tree() -> void:
@@ -54,6 +61,20 @@ func set_camera_mode(mode: CameraMode) -> void:
 	_apply_mode()
 
 
+## UiRoot 调用：菜单打开 / 触屏方案时屏蔽鼠标捕获。
+##
+## blocked 时释放鼠标并立即返回（Esc / 暂停菜单 / 触摸操作不应该被相机捕获）；
+## 解除时按当前模式重新应用。
+func set_ui_blocked(blocked: bool) -> void:
+	_ui_blocked = blocked
+	if blocked:
+		if _client != null:
+			_client.look_requires_mouse_capture = false
+		_release_mouse()
+		return
+	_apply_mode()
+
+
 func _process(_dt: float) -> void:
 	if camera_mode != CameraMode.FOLLOW_BACKEND or _client == null or _entity == null:
 		return
@@ -70,11 +91,15 @@ func _process(_dt: float) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	# Esc 由 UiRoot 统一处理（打开 / 关闭暂停菜单），这里不再消费 ui_cancel。
+	if _ui_blocked:
+		return
+	# 触屏方案不捕获鼠标：视角走触摸拖拽，光标保持可见。
+	if UiState.has_scheme(UiState.Scheme.TOUCH):
+		return
 	if camera_mode != CameraMode.FOLLOW_BACKEND or not capture_mouse:
 		return
-	if event.is_action_pressed("ui_cancel"):
-		_release_mouse()
-	elif event is InputEventMouseButton and (event as InputEventMouseButton).pressed \
+	if event is InputEventMouseButton and (event as InputEventMouseButton).pressed \
 			and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		_capture_mouse()
 
@@ -90,8 +115,12 @@ func _unbind() -> void:
 
 func _apply_mode() -> void:
 	var follow := camera_mode == CameraMode.FOLLOW_BACKEND
+	var touch := UiState.has_scheme(UiState.Scheme.TOUCH)
 	if _client != null:
-		_client.look_requires_mouse_capture = follow and capture_mouse
+		_client.look_requires_mouse_capture = follow and capture_mouse and not _ui_blocked and not touch
+	if _ui_blocked or touch:
+		_release_mouse()
+		return
 	if follow and capture_mouse:
 		_capture_mouse()
 	else:

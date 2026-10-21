@@ -81,6 +81,12 @@ func on_mouse_motion(relative: Vector2) -> void:
 	_look_accum += relative
 
 
+## 触屏视角 / 虚拟摇杆等 UI 层注入的视角位移（像素）。
+## 复用同一条 look_delta 通道：量化、能力过滤、暂停都在 Rust 侧，不新增链路。
+func on_look_delta(delta: Vector2) -> void:
+	_look_accum += delta
+
+
 func is_held(action: String) -> bool:
 	return _held.has(action)
 

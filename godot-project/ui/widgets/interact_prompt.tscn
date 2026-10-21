@@ -1,0 +1,28 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://ui/widgets/interact_prompt.gd" id="1_interact_prompt"]
+
+[node name="InteractPrompt" type="Control"]
+script = ExtResource("1_interact_prompt")
+custom_minimum_size = Vector2(180, 40)
+mouse_filter = 2
+widget_id = &"interact_prompt"
+tray = 1
+align = 1
+schemes = 7
+
+[node name="Prompt" type="Label" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 4
+theme_override_font_sizes/font_size = 22
+text = "Interact"
+horizontal_alignment = 1
+vertical_alignment = 1

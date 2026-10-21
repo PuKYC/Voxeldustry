@@ -98,6 +98,8 @@ var render_alpha: float = 1.0
 
 
 func _ready() -> void:
+	# 供 UiRoot 在任意场景里找到表现层组合根（不依赖固定节点路径）。
+	add_to_group("bevy_client")
 	_mgr = get_node_or_null(manager_path)
 	if _mgr == null:
 		push_error("[BevyClient] 找不到 BevyAppManager：%s" % manager_path)
@@ -257,7 +259,8 @@ func _input(event: InputEvent) -> void:
 
 
 func _process(_dt: float) -> void:
-	if enable_input:
+	# 菜单打开时不提交玩法输入：暂停期间攒的帧在 resume 后没有意义。
+	if enable_input and UiState.accepts_gameplay_input():
 		input.collect_and_submit()
 
 	var frame := _bridge.take_frame()
