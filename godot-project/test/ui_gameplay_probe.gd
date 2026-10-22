@@ -49,9 +49,16 @@ func _run() -> void:
 	ui.open_pause_menu()
 	await process_frame
 	print("PROBE menu_open=", UiState.is_menu_open(), " backend_paused=", UiState.backend_paused, " camera_blocked=", camera._ui_blocked)
+	var paused_ok: bool = UiState.is_menu_open() and UiState.backend_paused and bool(camera._ui_blocked)
 	ui.close_pause_menu()
 	await process_frame
 	print("PROBE menu_closed=", not UiState.is_menu_open(), " backend_paused=", UiState.backend_paused, " camera_blocked=", camera._ui_blocked)
+	var resumed_ok: bool = not UiState.is_menu_open() and not UiState.backend_paused and not bool(camera._ui_blocked)
+
+	if not paused_ok or not resumed_ok:
+		print("PROBE FAIL pause")
+		quit(1)
+		return
 
 	print("PROBE PASS")
 	quit(0)

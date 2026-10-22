@@ -2,9 +2,12 @@ class_name ActionButton
 extends HudWidget
 ## 动作按钮：自绘圆角矩形 + Label，不依赖原生 Button。
 ##
-## 为什么不用 Button：project.godot 里 pointing/emulate_mouse_from_touch=false，
-## 触屏时原生 Button 收不到鼠标事件；这里直接处理 InputEventScreenTouch，
-## 同时处理 InputEventMouseButton 以兼容桌面调试 / headless 测试。
+## 为什么自绘而不用原生 Button（Godot 4.7.2 实测原生 Button 也支持触摸与多指，
+## 自绘不是绕行引擎缺陷，而是三项增强）：
+## 1) 释放时机可控：通道不可用 / 隐藏 / 菜单 / 失焦时立即 release，不等 GUI 按钮状态机；
+## 2) per-index 语义显式：一个按钮只跟一根手指（InputEventScreenTouch.index），多指同按各归各的；
+## 3) 与 HudWidget 契约一致：直接复用托盘槽位、方案显隐与 scheme_overrides。
+## 因此同时处理 InputEventScreenTouch 与 InputEventMouseButton（桌面调试 / headless 测试）。
 ##
 ## 语义：按下 = Input.action_press(action)，松开 = Input.action_release(action)。
 ## toggle 模式沿用现状：按下后 TOGGLE_RELEASE_DELAY 秒自动 release，形成一次完整边沿。
