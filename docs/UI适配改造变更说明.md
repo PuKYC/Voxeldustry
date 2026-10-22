@@ -28,6 +28,7 @@ source: 本轮 UI 适配改造（P0-P5），基线 commit f77a6b3
 | P3b | 交互提示用真实绑定键位（`OS.get_keycode_string(physical_keycode)`）；触屏显示 `Tap` | 已提交 `e0123d9` |
 | P4 | 同 `group_id` 元素互斥，只激活当前 scheme 下 priority 最高者 | 已提交 `73443fc` |
 | P5 | 混合设备防抖：scheme 切换冷却、摇杆阈值、鼠标微动忽略 | 已提交 `dc28db3` |
+| P6 | 移动端入口：触屏暂停按钮、触摸滑条、debug 构建的暂停菜单 Debug 区 | 已提交 `db7dcae` |
 
 ## P0：注册表释放路径与暂停标志
 
@@ -147,25 +148,47 @@ source: 本轮 UI 适配改造（P0-P5），基线 commit f77a6b3
 
 **验证**：`tools/ui_check.sh` 通过，checks 由 77 增至 84。
 
+## P6：移动端入口（触屏暂停 / 触摸滑条 / 调试菜单）
+
+**问题**：手机没有 Esc、没有 F3、没有物理键盘。实测（本机 Godot 4.7.2 headless 探针）：
+
+- 暂停菜单只能靠 **Android 返回键**进，屏幕内没有入口；
+- 暂停菜单按钮触摸可用，但 **UI SCALE 的 `HSlider` 拖不动**（按下 / 拖动 / 抬手后 value 恒为 0.8）——原生 `HSlider` 只处理鼠标事件，`emulate_mouse_from_touch=false` 时触摸不会合成鼠标；
+- F3 调试层只在 `_unhandled_input` 判物理键，手机 / 手柄都没有入口。
+
+**改动**：
+
+| 文件 | 改动 |
+| --- | --- |
+| `godot-project/ui/widgets/pause_button.gd` + `.tscn`（新增） | 触屏暂停按钮（内置 HudWidget：`tray=TOP/END`、`schemes=TOUCH`、72×72）：自绘两条竖杠，按下 → `open_pause_menu()`；键鼠方案不显示 |
+| `godot-project/ui/widgets/touch_slider.gd`（新增） | `TouchSlider extends HSlider`：监听 `gui_input` 信号，处理 `InputEventScreenTouch` / `ScreenDrag`，按触摸 x 换算 value；鼠标 / 键盘 / 手柄行为不变（不覆写内置控件的 C++ 输入处理） |
+| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | Settings 的 HSlider 换成 TouchSlider（行高 40→64）；新增 DebugButton / DebugPanel（`Debug Overlay: ON/OFF`、`Force TOUCH: ON/OFF`、Back），仅 `OS.is_debug_build()` 或 `force_show_debug` 时显示；提示按方案变 `Tap Resume` / `Esc to resume`；新增 `debug_overlay_requested` / `debug_scheme_requested` 信号 |
+| `godot-project/ui/ui_root.gd` | 内置 HUD 注册 `pause_button.tscn`；连接暂停菜单的调试信号；抽出公开 `set_debug_overlay()`（F3 与 Debug 区共用）；打开菜单时同步 Debug 区状态 |
+| `godot-project/test/ui_smoke_test.gd` | 新增 16 项检查：暂停按钮显隐 / 触摸打开菜单；滑条触摸变大 / 拖动变小 / 写回 `UiState.ui_scale`；Debug 区可见性 / 调试层开关 / 强制方案 / `Tap Resume` 提示 / release 隐藏 |
+
+**验证**：`tools/ui_check.sh` 通过，checks 由 112 增至 128；`--gameplay` 探针 widgets 由 10 增至 11（多一个内置 PauseButton），按钮与暂停结论不变。
+
+**边界**：只解决「入口可达性」，没有新增设置项（音量 / 灵敏度 / 摇杆死区 / 按钮布局要扩 `UiState` + 存档，属于另一轮）；Debug 区不做隐藏手势，只在 debug 构建出现。
+
 ## 测试结果
 
-代码冻结后（HEAD = `7c6f1ac`，P3 收尾）实跑：
+代码冻结后（HEAD = `db7dcae`，P6）实跑：
 
 ```text
 $ GODOT_BIN=/tmp/Godot_v4.7.2-stable_linux.arm64 tools/ui_check.sh --gameplay
-[ui_smoke] checks=112 failures=0
+[ui_smoke] checks=128 failures=0
 UI_SMOKE PASS
 
-PROBE client=true widgets=10
+PROBE client=true widgets=11
 PROBE action_host=true buttons=7 tool_buttons=2 channels=7
 PROBE menu_open=true backend_paused=true camera_blocked=true
 PROBE menu_closed=true backend_paused=false camera_blocked=false
 PROBE PASS
 ```
 
-- 冒烟：**112 项检查，0 失败**，`UI_SMOKE PASS`（2026-10-22，Godot 4.7.2 headless，aarch64）。
+- 冒烟：**128 项检查，0 失败**，`UI_SMOKE PASS`（2026-10-22，Godot 4.7.2 headless，aarch64）。
 - 集成探针：**PROBE PASS**，真实通道表下 7 个动作按钮、`tool` 2 个，暂停前后 `backend_paused` / `camera_blocked` 正确。**本机 headless 跑通，不是真机验证。**
-- 逐阶段 checks 增量：43 → 51（P0）→ 57（P1）→ 72（P2）→ 77（P4）→ 84（P5）→ 112（P3 + P3b）。
+- 逐阶段 checks 增量：43 → 51（P0）→ 57（P1）→ 72（P2）→ 77（P4）→ 84（P5）→ 112（P3 + P3b）→ 128（P6）。
 
 ## 仍未被验证的风险
 
@@ -175,6 +198,7 @@ PROBE PASS
 | 真机触摸事件细节 | headless 是 stub DisplayServer（窗口 64×64、视口正方形、无真实 DPR / 安全区、`is_touchscreen_available` 恒 false），不能替代真机：真机坐标缩放 / 断点 / 安全区、`InputEventScreenTouch.canceled=true`（系统取消触摸）时是否释放动作、真实多指乱序 / 丢帧、按钮 + 摇杆 + 视角三指同时按 | 未验证（需真机） |
 | Android 真机安全区 | headless 下 `safe_insets` 恒 0，刘海 / 挖孔 / 手势条只能在真机验证 | 未验证 |
 | 混合设备防抖阈值 | scheme 切换冷却 0.5s、摇杆阈值、鼠标微动忽略都是初值 | 未验证，需真机 / 桌面触屏机调参 |
+| 移动端入口真机未验证 | 触屏暂停按钮与触摸滑条的命中 / 拖动手感、debug 包 Debug 区、Android 返回手势与系统取消触摸都未在真机验证；release 包隐藏 Debug 区也只在 headless（editor 构建恒 `is_debug_build()=true`）下间接验证 | 出 debug / release APK 各点一遍；未验证 |
 | 交互意图抽象 | 只在 [[10-Godot-UI方案]] 的「交互意图抽象」一节写设计（原独立 12 号文档已并入），未实现；元素仍然直接处理设备事件 | 未实现（非本轮范围） |
 
 ## 不在本轮范围
@@ -182,3 +206,4 @@ PROBE PASS
 - Rust 输入链路、量化、能力过滤、暂停：零改动。
 - CJK 字体与本地化：UI 文案仍为英文。
 - mod UI 加载器（manifest 驱动）：仍只有 `register_external` 入口。
+- 设置项扩容：Settings 仍只有 UI SCALE；音量 / 灵敏度 / 摇杆死区 / 按钮布局要扩 `UiState` + 存档，属于后续轮次。

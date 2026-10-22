@@ -46,12 +46,14 @@ source: "代码阅读 @ 本次 UI 适配"
 | `godot-project/ui/input/action_button_host.gd` | 动作按钮宿主：读通道表、创建 / 更新 / 显隐置灰 / 统一释放 | 本轮新增 |
 | `godot-project/ui/widgets/action_button.gd` / `.tscn` | 自绘动作按钮（可选增强，原生 Button 也支持触摸），按触摸 index 处理按下 / 抬起 / toggle | 本轮新增 |
 | `godot-project/ui/debug/hud_debug_overlay.gd` | F3 只读调试层（尺寸 / 缩放 / 安全区 / 断点 / 元素矩形 / 重叠告警） | 已实现 |
-| `godot-project/ui/widgets/` | 内置 HUD：准星、血条、交互提示 | 已实现 |
+| `godot-project/ui/widgets/` | 内置 HUD：准星、血条、交互提示、触屏暂停按钮 | 已实现 |
+| `godot-project/ui/widgets/touch_slider.gd` | 触摸可拖动的 `HSlider`（原生 HSlider 只认鼠标事件） | 本轮新增 |
+| `godot-project/ui/widgets/pause_button.gd` / `.tscn` | 触屏暂停按钮（仅 TOUCH 方案显示，落 TOP / END 托盘） | 本轮新增 |
 | `godot-project/ui/touch/touch_controls.gd` / `.tscn` | 触屏控件层：只剩左下虚拟摇杆 + 右侧视角区（动作按钮已移交 `ActionButtonHost`） | 已实现 |
 | `godot-project/ui/touch/touch_joystick.gd` | 单指虚拟摇杆，写 `move_*` 动作强度 | 已实现 |
-| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | 暂停菜单：Resume / Settings（UI 缩放滑条）/ Quit | 已实现 |
+| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | 暂停菜单：Resume / Settings（触摸滑条）/ Quit；debug 构建额外显示 Debug 区（调试层 / 强制方案） | 已实现 |
 | `godot-project/bevy_client/camera/camera_rig.gd` | 相机：`camera_rig` 组、`set_ui_blocked()`、触屏 / 菜单不捕获鼠标 | 已实现 |
-| `godot-project/test/ui_smoke_test.gd` | UI headless 冒烟（`extends SceneTree`），按 P0-P5 分阶段覆盖 | 已实现 |
+| `godot-project/test/ui_smoke_test.gd` | UI headless 冒烟（`extends SceneTree`），按 P0-P6 分阶段覆盖 | 已实现 |
 | `godot-project/test/gen_class_cache.gd` | 无编辑器时生成 `class_name` 缓存 | 已实现 |
 | `tools/ui_check.sh` | 一步跑完类名缓存 + UI 冒烟 | 已实现 |
 
@@ -517,6 +519,7 @@ scheme_overrides = {
 | --- | --- |
 | `ui_cancel`（默认含 Esc，手柄返回键视 InputMap 配置） | `UiRoot._unhandled_input` 里 toggle，并 `set_input_as_handled()` |
 | Android 返回键 | `NOTIFICATION_WM_GO_BACK_REQUEST` 同样 toggle |
+| **触屏暂停按钮**（`PauseButton`，仅 TOUCH 方案） | 点击 → `UiRoot.open_pause_menu()`；手机没有 Esc，这是屏幕内入口 |
 | 公开 API | `open_pause_menu()` / `close_pause_menu()` / `toggle_pause_menu()` |
 
 打开菜单（`open_pause_menu`）：
@@ -536,10 +539,11 @@ scheme_overrides = {
 | --- | --- |
 | Resume | 发 `resume_requested`，UiRoot 转成 `close_pause_menu()` |
 | Settings | 展开 SettingsPanel，焦点移到 UI 缩放滑条 |
-| UI SCALE | `HSlider` 0.8–1.3、步长 0.05，`ui_scale_changed` → `UiRoot.set_ui_scale()`，实时改 `content_scale_factor` |
+| UI SCALE | `TouchSlider`（`HSlider` + 触摸处理）0.8–1.3、步长 0.05，`ui_scale_changed` → `UiRoot.set_ui_scale()`，实时改 `content_scale_factor` |
 | Back | 收起 Settings，焦点回到 Settings 按钮 |
 | Quit | 直接 `get_tree().quit()`，**无二次确认** |
-| Hint | “Esc to resume” |
+| Hint | 键鼠 / 手柄 “Esc to resume”，触屏 “Tap Resume”（打开菜单时按方案刷新） |
+| Debug（仅 debug 构建） | 展开 Debug 区：`Debug Overlay: ON/OFF` 开关调试层、`Force TOUCH: ON/OFF` 强制输入方案、Back 返回 |
 
 `open()` 时焦点落在 Resume，`close()` 时释放焦点，键盘 / 手柄可以直接操作菜单。Esc 只在 UiRoot 处理，菜单自己不再消费 `ui_cancel`。
 
@@ -556,19 +560,37 @@ scheme_overrides = {
 
 `UiState` 里另有 `mouse_look_allowed()`（菜单未开且非触屏方案），供后续需要直接判断键鼠视角的代码使用。
 
+## 移动端入口（P6）
+
+手机 / 平板没有 Esc、没有 F3、也没有物理键盘，所以「进菜单」「调设置」「开调试层」三件事在触屏方案上都需要屏幕内入口：
+
+| 需求 | 入口 | 设计要点 |
+| --- | --- | --- |
+| 暂停 | `PauseButton`（TOP/END，仅 TOUCH） | 与 HUD 同属 HudWidget，复用槽位 / 安全区 / 缩放；按下调 `open_pause_menu()`。Android 返回键同时保留 |
+| 设置 | 暂停菜单 Settings 区 | `TouchSlider` 让 `HSlider` 支持 `ScreenTouch` / `ScreenDrag`；原生 HSlider 只认鼠标事件，`emulate_mouse_from_touch=false` 时触摸不会合成鼠标，所以不修就拖不动（实测确认） |
+| 调试层 | 暂停菜单 Debug 区（仅 debug 构建） | `OS.is_debug_build()` 为真才显示：调试层开关、强制 TOUCH / KBM。F3 仍是键鼠快捷入口，两者共用 `UiRoot.set_debug_overlay()` |
+
+实现约束：
+
+- `TouchSlider` 监听 `gui_input` 信号而不是覆写 `_gui_input`：内置控件的 C++ 输入处理不受 GDScript 覆写影响，信号方式能拿到触摸事件又不影响鼠标 / 键盘 / 手柄。
+- 调试入口**只在 debug 构建显示**（`force_show_debug` 仅供测试 / 手工预览），release 包不暴露；调试层本身仍是只读浮层，不参与布局、不拦输入。
+- 暂停按钮与 ActionButton 一样自绘并自己按 `event.index` 跟一根手指，按下即触发（不要求抬手）。
+- 真机仍有未验证项：真实触摸事件分发、Android 返回手势 / 系统取消触摸、触屏滑条手感（见「待办与风险」）。
+
 ## 内置 HUD 元素
 
-三个内置元素都在 `ui/widgets/`，由 `UiRoot.BUILTIN_WIDGET_PATHS` 逐个加载注册：
+四个内置元素都在 `ui/widgets/`，由 `UiRoot.BUILTIN_WIDGET_PATHS` 逐个加载注册：
 
 | 元素 | 槽位 | 尺寸 | 显示条件 / 数据源 |
 | --- | --- | --- | --- |
 | `Crosshair` | `tray=CENTER, align=CENTER` | 24×24 | `input_look_changed` → `input_context.has_look()`；`_draw()` 画四条短臂，默认隐藏 |
 | `HealthBar` | `tray=TOP, align=BEGIN, priority=20` | 260×30 | `listen_component(HEALTH)` + `controlled_entity_changed`；读 `current` / `max` 填 ProgressBar 与数值 Label |
 | `InteractPrompt` | `tray=BOTTOM, align=CENTER` | 180×40 | `listen_component(INTERACTION)`；`enabled` 且 `action != 0` 才显示；键位提示按方案生成（键鼠 `[E] Interact`（`OS.get_keycode_string(physical_keycode)`）/ 触屏 `Tap`） |
+| `PauseButton` | `tray=TOP, align=END, priority=50`，`schemes=TOUCH` | 72×72 | 无数据源；自绘暂停图标，触摸 / 鼠标按下 → `open_pause_menu()`；键鼠方案不显示 |
 
 共同约定：
 
-- 全部继承 `HudWidget`，不写坐标、不判断分辨率；`mouse_filter = IGNORE`，不拦输入。
+- 全部继承 `HudWidget`，不写坐标、不判断分辨率；只读元素 `mouse_filter = IGNORE`，`PauseButton` 是唯一可交互的内置元素（`STOP`，且只在 TOUCH 方案出现）。
 - 全部信号驱动，不轮询；没有 client（纯 UI 预览 / headless 冒烟）时保持隐藏。
 - 文案一律英文：`Interact`、`100 / 100`。原因是没有 CJK 字体资源，中文会显示方块（见风险）。
 
@@ -643,16 +665,17 @@ meta 字段：
 | P3b 交互提示 | 键鼠提示含 `Interact`、真实绑定 `[E] Interact`（键名来自 `physical_keycode`）、改键后变 `[F] Interact`；触屏提示为 `Tap` |
 | P4 同组互斥 | 同组只激活 priority 最高者，不命中当前方案的元素不参与竞争 |
 | P5 混合设备防抖 | 输入切换受冷却限制、程序化切换不受；摇杆低于阈值 / 鼠标微动不切方案；超过阈值正常切 |
+| P6 移动端入口 | 触屏暂停按钮：KBM 隐藏 / TOUCH 可见、按下打开暂停菜单；触摸滑条：按右端数值变大、拖动变小、经 `ui_scale_changed` 写回 `UiState.ui_scale`；Debug 区：debug 构建可见、开关调试层、强制 TOUCH / KBM、提示改 `Tap Resume`、release 构建入口隐藏 |
 | 暂停菜单 | Resume 信号经 UiRoot 关闭菜单、打开时隐藏触屏控件、UI 缩放滑条经 `set_ui_scale()` 生效并恢复 |
 | 真实场景集成（可选 `--gameplay`） | 加载 `gameplay_test.tscn`：UiRoot 找到 BevyClient、注册内置 HUD、实例化触屏 / 暂停 / `ActionButtonHost`、CameraRig 入组；真实通道表 → ButtonSpecs → 按钮数为 7、`tool` 两个；`open_pause_menu()` 后 `backend_paused=true` 且 `camera._ui_blocked=true`，关闭后恢复 |
 
 当前结果（2026-10-22，Godot 4.7.2 headless，aarch64）：
 
 ```text
-[ui_smoke] checks=112 failures=0
+[ui_smoke] checks=128 failures=0
 UI_SMOKE PASS
 
-PROBE client=true widgets=10
+PROBE client=true widgets=11
 PROBE action_host=true buttons=7 tool_buttons=2 channels=7
 PROBE menu_open=true backend_paused=true camera_blocked=true
 PROBE menu_closed=true backend_paused=false camera_blocked=false
@@ -661,7 +684,7 @@ PROBE PASS
 
 `--gameplay` 探针是**本机 headless** 跑通（已有 aarch64 `.so`），不是真机验证。新增检查项后以最后一次 `tools/ui_check.sh` 输出为准。
 
-动作按钮的触摸、双指同按与 toggle 边沿现在有 headless 断言（构造 `InputEventScreenTouch` 直接调 `_gui_input`）；视角区多指归属仍靠真机 / 人工验证。
+动作按钮的触摸、双指同按与 toggle 边沿现在有 headless 断言（构造 `InputEventScreenTouch` 直接调 `_gui_input`）；触屏暂停按钮与触摸滑条同样是构造 `InputEventScreenTouch` 断言；视角区多指归属、真实触摸分发与滑条手感仍靠真机 / 人工验证。
 
 逐阶段的文件清单、提交与仍未验证项见 [[UI适配改造变更说明]]。
 
@@ -677,6 +700,7 @@ PROBE PASS
 | 700 宽窗口 | compact_level=2，声明的极窄元素隐藏 |
 | Android 刘海 / 手势条 | HUD 不压安全区（**未在真机验证，见风险**） |
 | Android 真机多指 | 动作按钮 + 摇杆 + 视角三指同时按各自独立；系统取消触摸（`canceled=true`）时动作释放、不粘键（**未在真机验证**） |
+| 手机触屏入口 | 触屏暂停按钮可点、暂停菜单按钮可点、Settings 滑条可拖、debug 包里 Debug 区可用（**未在真机验证**） |
 
 ## 不做什么
 
@@ -687,6 +711,7 @@ PROBE PASS
 - 不做 UI 动画、转场、UI 音效系统；Theme 只设了默认字号与描边。
 - 不做 CJK 字体与本地化（当前 UI 文案一律英文，见风险）。
 - 不实现交互意图路由：hint / select / confirm / context 只在本节「交互意图抽象（设计，未实现）」做设计，本轮元素仍直接处理设备事件。
+- 不在 release 构建暴露调试入口：Debug 区只在 `OS.is_debug_build()` 为真时出现，也不做隐藏手势。
 
 ## 待办与风险
 
@@ -694,7 +719,8 @@ PROBE PASS
 | --- | --- | --- |
 | 无 CJK 字体资源 | 中文文案显示方块，UI 只能用英文 | 引入字体（`.ttf` 或 `SystemFont`）并挂到 `UiRoot` 的 Theme `default_font` 后再做本地化；未做 |
 | Android 真机安全区未验证 | headless 下 `safe_insets` 恒 0，`get_display_safe_area()` 在部分 ROM 上返回值不可靠 | 需要真机跑一遍刘海 / 挖孔 / 手势条；未验证 |
-| 真机触摸 / 多指未验证 | 摇杆、视角区、自绘 ActionButton 只在 headless 里用构造的 `InputEventScreenTouch` 断言过；自绘控件的真实触摸事件分发、同时三指以上、系统手势冲突、`canceled=true` 未验证 | 真机回归；必要时补集成测试 |
+| 真机触摸 / 多指未验证 | 摇杆、视角区、自绘 ActionButton / PauseButton / TouchSlider 只在 headless 里用构造的 `InputEventScreenTouch` 断言过；真实触摸事件分发、同时三指以上、系统手势冲突、`canceled=true`、滑条拖动手感未验证 | 真机回归；必要时补集成测试 |
+| 移动端入口只在 debug 构建整包验证过 | Debug 区按 `OS.is_debug_build()` 显示，headless 是 editor 构建（恒 true），release 包的实际隐藏未导包验证；触屏暂停按钮 / 触摸滑条的真机命中与手感也未验证 | 出一版 debug / release APK 各点一遍；未验证 |
 | Button 触摸与多点触控结论 | verifier 实测 Godot 4.7.2 原生 Button 支持 ScreenTouch 与多指（两指各按一个独立、同一按钮第二根手指忽略、drag 出矩形后 release 按 index 回投）；自绘 `ActionButton` 是释放时机 / per-index / HudWidget 契约的可选增强，不是绕行 | 已实证（headless / verifier）；真机细节见「真机触摸 / 多指未验证」 |
 | P4 只有规则没有界面 | `group_id` 只实现注册表互斥 + 冒烟测试，没有具体背包 / 面板界面落地 | 随实际界面一起验收 |
 | 交互意图抽象未实现 | 只有本文「交互意图抽象（设计，未实现）」一节；元素仍然直接处理设备事件 | 非本轮范围，后续期次落地 |
