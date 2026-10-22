@@ -10,7 +10,8 @@ extends SceneTree
 ## 6. P0：unregister 先 detach（不残留载荷回调 / 信号）、无 manager 不写 backend_paused；
 ## 7. P1：platform 与 scheme 分离（边距 / 缩放看 platform，不看输入方案）；
 ## 8. P2：scheme_overrides 覆盖 tray / align / priority / min_size，切回后恢复；
-## 9. P4：同组互斥（同组只激活一个 priority 最高者）。
+## 9. P4：同组互斥（同组只激活一个 priority 最高者）；
+## 10. P5：混合设备防抖（切换冷却 / 摇杆漂移阈值 / 鼠标微动阈值）。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -257,6 +258,54 @@ func _run() -> void:
 	ui.registry.refresh_scheme(UiState.Scheme.KBM)
 	await process_frame
 	_check(panel.visible and not drawer.visible, "P4：同组恢复互补方案后回到各自激活")
+
+	# P5：混合设备防抖 —— 冷却期内输入事件不夺回方案，摇杆漂移 / 鼠标微动不算换设备。
+	ui.set("scheme_switch_cooldown", 0.5)
+	ui.set("_last_scheme_switch_ms", 0)
+	ui.call("_set_scheme", UiState.Scheme.KBM)
+	ui.set("_last_scheme_switch_ms", 0)
+	var joy_event := InputEventJoypadButton.new()
+	joy_event.button_index = JOY_BUTTON_A
+	joy_event.pressed = true
+	ui.call("_input", joy_event)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.GAMEPAD, "P5：手柄按键切到 GAMEPAD")
+	var key_event := InputEventKey.new()
+	key_event.physical_keycode = KEY_E
+	key_event.pressed = true
+	ui.call("_input", key_event)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.GAMEPAD, "P5：冷却期内键鼠事件不夺回方案")
+	ui.set("scheme_switch_cooldown", 0.0)
+	ui.call("_input", key_event)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.KBM, "P5：冷却结束后键鼠事件接管")
+	var drift := InputEventJoypadMotion.new()
+	drift.axis = JOY_AXIS_LEFT_X
+	drift.axis_value = 0.05
+	ui.set("_last_scheme_switch_ms", 0)
+	ui.call("_input", drift)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.KBM, "P5：摇杆漂移（低于阈值）不切方案")
+	var push := InputEventJoypadMotion.new()
+	push.axis = JOY_AXIS_LEFT_X
+	push.axis_value = 0.9
+	ui.set("_last_scheme_switch_ms", 0)
+	ui.call("_input", push)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.GAMEPAD, "P5：超过阈值的手柄摇杆切到 GAMEPAD")
+	var micro := InputEventMouseMotion.new()
+	micro.relative = Vector2(0.5, 0.0)
+	ui.call("_input", micro)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.GAMEPAD, "P5：鼠标微动（低于阈值）不切方案")
+	var sweep := InputEventMouseMotion.new()
+	sweep.relative = Vector2(24.0, 0.0)
+	ui.call("_input", sweep)
+	await process_frame
+	_check(UiState.scheme == UiState.Scheme.KBM, "P5：正常鼠标位移切回 KBM")
+	ui.set("scheme_switch_cooldown", 0.5)
+	ui.set("_last_scheme_switch_ms", 0)
 
 	# 紧凑显隐。
 	first.compact_level = 1

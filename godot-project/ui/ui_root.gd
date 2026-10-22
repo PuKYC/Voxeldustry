@@ -44,6 +44,13 @@ const DEBUG_OVERLAY_SCRIPT := preload("res://ui/debug/hud_debug_overlay.gd")
 @export var enable_pause_menu: bool = true
 ## 仅测试用：在桌面 headless 下强制走移动端缩放公式（验证 900/1280 逻辑宽）。
 @export var debug_force_mobile: bool = false
+## 混合设备防抖：输入事件驱动的方案切换最小间隔（秒）。0 = 关闭冷却。
+## 手柄 + 键鼠同时接入时，避免两类事件互相把方案抢来抢去。
+@export var scheme_switch_cooldown: float = 0.5
+## 手柄摇杆漂移阈值：轴值绝对值低于它不算「用了手柄」。
+@export var joypad_motion_threshold: float = 0.35
+## 鼠标微动阈值（逻辑像素）：低于它的 MouseMotion 不算「用了键鼠」。
+@export var mouse_motion_threshold: float = 2.0
 
 ## 当前 BevyClient（可能为 null：纯 UI 预览 / 后端未启动）。
 var client: Node = null
@@ -65,6 +72,8 @@ var _debug_visible := false
 var _debug_t := 0.0
 var _initialized := false
 var _press_echo_guard := false
+## 上一次真正发生方案切换的时刻（毫秒，Time.get_ticks_msec）。
+var _last_scheme_switch_ms: int = 0
 
 
 func _ready() -> void:
@@ -415,21 +424,37 @@ func _input(event: InputEvent) -> void:
 	var next := 0
 	if event is InputEventScreenTouch or event is InputEventScreenDrag:
 		next = UiState.Scheme.TOUCH
-	elif event is InputEventJoypadButton or event is InputEventJoypadMotion:
+	elif event is InputEventJoypadButton:
+		next = UiState.Scheme.GAMEPAD
+	elif event is InputEventJoypadMotion:
+		# 摇杆漂移不该把方案抢成 GAMEPAD：超过阈值才算「真的在用手柄」。
+		if absf((event as InputEventJoypadMotion).axis_value) < joypad_motion_threshold:
+			return
 		next = UiState.Scheme.GAMEPAD
 	elif event is InputEventKey or event is InputEventMouseButton:
 		next = UiState.Scheme.KBM
 	elif event is InputEventMouseMotion:
-		if (event as InputEventMouseMotion).device == InputEvent.DEVICE_ID_EMULATION:
+		var motion := event as InputEventMouseMotion
+		if motion.device == InputEvent.DEVICE_ID_EMULATION:
+			return
+		# 手在触控板上微动一下不该把触屏 / 手柄方案抢走。
+		if motion.relative.length() < mouse_motion_threshold:
 			return
 		next = UiState.Scheme.KBM
 	if next != 0:
-		_set_scheme(next)
+		_set_scheme(next, true)
 
 
-func _set_scheme(next: int) -> void:
+## 写方案。from_input = true 时受切换冷却约束（混合设备防抖）；
+## 程序化设置（测试 / 外部 API）不受冷却限制。
+func _set_scheme(next: int, from_input: bool = false) -> void:
+	if from_input and scheme_switch_cooldown > 0.0:
+		var now := Time.get_ticks_msec()
+		if now - _last_scheme_switch_ms < int(scheme_switch_cooldown * 1000.0):
+			return
 	if not UiState.set_scheme(next):
 		return
+	_last_scheme_switch_ms = Time.get_ticks_msec()
 	_apply_scale()
 	_update_safe_area()
 	if touch_controls != null:
