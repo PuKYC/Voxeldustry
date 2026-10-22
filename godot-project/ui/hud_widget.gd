@@ -35,6 +35,9 @@ enum Align {
 ## tray / align / priority / min_size（Vector2）；缺省字段沿用上面的默认声明。
 ## 例：{1: {"tray": Tray.BOTTOM, "align": Align.END, "min_size": Vector2(120, 120)}}
 @export var scheme_overrides: Dictionary = {}
+## 同组互斥 id（空 = 不参与）。同组里只有命中当前方案且 priority 最高的元素会激活，
+## 用于「桌面是面板、手机是底部抽屉」这类结构不同、共用一个数据控制器的元素。
+@export var group_id: StringName = &""
 
 ## UiRoot 引用；注册时由 HudRegistry 注入。
 var ui_root: Node = null
@@ -45,6 +48,7 @@ var _base_min_size_captured := false
 var _data_visible := true
 var _scheme_visible := true
 var _compact_visible := true
+var _group_visible := true
 
 
 ## 注册时调用；子类在 _on_attach() 里连接 client 信号。
@@ -127,8 +131,16 @@ func refresh_menu() -> void:
 	_refresh_visibility()
 
 
+## 同组互斥的激活位；由注册表按「命中当前方案 + priority 最高」算出。
+func set_group_active(value: bool) -> void:
+	if _group_visible == value:
+		return
+	_group_visible = value
+	_refresh_visibility()
+
+
 func _refresh_visibility() -> void:
-	visible = _data_visible and _scheme_visible and _compact_visible and not UiState.is_menu_open()
+	visible = _data_visible and _scheme_visible and _compact_visible and _group_visible and not UiState.is_menu_open()
 
 
 ## 当前方案命中的覆盖：先找精确 key，再找位掩码相交的 key。

@@ -9,7 +9,8 @@ extends SceneTree
 ## 5. 逻辑尺寸 / 缩放 / 安全区状态字段有值；
 ## 6. P0：unregister 先 detach（不残留载荷回调 / 信号）、无 manager 不写 backend_paused；
 ## 7. P1：platform 与 scheme 分离（边距 / 缩放看 platform，不看输入方案）；
-## 8. P2：scheme_overrides 覆盖 tray / align / priority / min_size，切回后恢复。
+## 8. P2：scheme_overrides 覆盖 tray / align / priority / min_size，切回后恢复；
+## 9. P4：同组互斥（同组只激活一个 priority 最高者）。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -227,6 +228,35 @@ func _run() -> void:
 	_check(mover.get_parent() == slots.get("top_begin"), "P2：切回键鼠方案后落点恢复")
 	_check(mover.custom_minimum_size == Vector2(40.0, 20.0),
 		"P2：切回后最小尺寸恢复默认（实际 %s）" % str(mover.custom_minimum_size))
+
+	# P4：同组互斥 —— 同组多个元素同时命中当前方案时只激活 priority 最高的一个。
+	var panel := HudWidget.new()
+	panel.name = "GroupPanel"
+	panel.widget_id = &"smoke_group_panel"
+	panel.group_id = &"smoke_inventory"
+	panel.schemes = UiState.Scheme.KBM
+	panel.priority = 10
+	panel.custom_minimum_size = Vector2(40.0, 20.0)
+	var drawer := HudWidget.new()
+	drawer.name = "GroupDrawer"
+	drawer.widget_id = &"smoke_group_drawer"
+	drawer.group_id = &"smoke_inventory"
+	drawer.schemes = UiState.Scheme.TOUCH
+	drawer.priority = 20
+	drawer.custom_minimum_size = Vector2(40.0, 20.0)
+	_check(ui.registry.register(panel), "P4：同组面板元素注册成功")
+	_check(ui.registry.register(drawer), "P4：同组抽屉元素注册成功")
+	ui.call("_set_scheme", UiState.Scheme.KBM)
+	await process_frame
+	_check(panel.visible and not drawer.visible, "P4：键鼠方案只激活同组里命中的那个")
+	drawer.schemes = UiState.Scheme.KBM | UiState.Scheme.TOUCH
+	ui.registry.refresh_scheme(UiState.Scheme.KBM)
+	await process_frame
+	_check(drawer.visible and not panel.visible, "P4：同组同时命中时只激活 priority 最高者")
+	drawer.schemes = UiState.Scheme.TOUCH
+	ui.registry.refresh_scheme(UiState.Scheme.KBM)
+	await process_frame
+	_check(panel.visible and not drawer.visible, "P4：同组恢复互补方案后回到各自激活")
 
 	# 紧凑显隐。
 	first.compact_level = 1

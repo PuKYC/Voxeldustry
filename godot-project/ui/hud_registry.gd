@@ -46,6 +46,7 @@ func register(widget: HudWidget) -> bool:
 	widget.refresh_scheme(UiState.scheme)
 	widget.apply_compact(UiState.compact_level)
 	widget.refresh_menu()
+	_apply_groups(UiState.scheme)
 	return true
 
 
@@ -120,6 +121,7 @@ func unregister(id: StringName) -> bool:
 	_by_id.erase(id)
 	_widgets.erase(widget)
 	_detach_widget(widget)
+	_apply_groups(UiState.scheme)
 	return true
 
 
@@ -141,6 +143,7 @@ func refresh_scheme(current: int) -> void:
 		relocate(widget, current)
 	for widget in _widgets:
 		widget.refresh_scheme(current)
+	_apply_groups(current)
 
 
 ## 按当前方案重排一个元素：落点槽位变了就搬槽位，没变则按新 priority 重新插入。
@@ -169,6 +172,25 @@ func refresh_compact(level: int) -> void:
 func refresh_menu() -> void:
 	for widget in _widgets:
 		widget.refresh_menu()
+
+
+## 同组互斥：每个 group_id 只让「命中当前方案 + priority 最高」的那个元素激活。
+## 不命中方案的元素本来就被 schemes 隐藏，这里不参与竞争。
+func _apply_groups(current: int) -> void:
+	if _widgets.is_empty():
+		return
+	var best: Dictionary[StringName, HudWidget] = {}
+	for widget in _widgets:
+		if widget.group_id == &"" or (widget.schemes & current) == 0:
+			continue
+		var chosen: HudWidget = best.get(widget.group_id, null)
+		if chosen == null or widget.effective_priority(current) > chosen.effective_priority(current):
+			best[widget.group_id] = widget
+	for widget in _widgets:
+		if widget.group_id == &"":
+			widget.set_group_active(true)
+		else:
+			widget.set_group_active(best.get(widget.group_id, null) == widget)
 
 
 func widgets() -> Array[HudWidget]:
