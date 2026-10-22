@@ -28,6 +28,14 @@ func _on_attach() -> void:
 	_refresh_from_context()
 
 
+func _on_detach() -> void:
+	# 先断 client 信号，再让注册表 queue_free，避免残留回调打到已释放实例。
+	if _client != null and _client.has_signal("input_look_changed"):
+		if _client.is_connected(&"input_look_changed", _on_input_look_changed):
+			_client.disconnect(&"input_look_changed", _on_input_look_changed)
+	_client = null
+
+
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_RESIZED:
 		queue_redraw()

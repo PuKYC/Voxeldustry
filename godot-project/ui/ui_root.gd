@@ -86,7 +86,8 @@ func _ready() -> void:
 
 
 func _process(delta: float) -> void:
-	# 尺寸变化后的第一帧再读一次视口：content_scale_factor 生效是延迟的。
+	# 这里只负责按 0.25s 节流 F3 调试层刷新；
+	# 尺寸变化后「延迟一帧再读视口」的逻辑在 _schedule_metrics() / _refresh_metrics()。
 	if not _initialized:
 		return
 	if debug_overlay == null or not _debug_visible:
@@ -491,10 +492,12 @@ func toggle_pause_menu() -> void:
 
 
 func _set_backend_paused(paused: bool) -> void:
-	UiState.backend_paused = paused
+	# 后端没起来（纯 UI 预览 / headless 冒烟）时不要写 backend_paused：
+	# 否则调试层会显示一个根本没发出去的暂停。
 	var manager := _get_manager()
 	if manager == null:
 		return
+	UiState.backend_paused = paused
 	if paused:
 		if manager.has_method("pause_bevy"):
 			manager.pause_bevy()

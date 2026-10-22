@@ -75,10 +75,18 @@ func register_external(scene: PackedScene, meta: Dictionary) -> HudWidget:
 		widget.compact_level = int(meta["compact_level"])
 	if meta.has("mouse_filter"):
 		widget.mouse_filter = int(meta["mouse_filter"])
+	# 入树前先量一次：custom_minimum_size / 子节点尺寸大多能直接得出，
+	# 尽早拒绝，省掉「先 attach 再 detach」的回滚成本。
+	var pre_size := widget.get_combined_minimum_size()
+	if pre_size.x > MAX_WIDGET_WIDTH or pre_size.y > MAX_WIDGET_HEIGHT:
+		push_warning("[HudRegistry] mod UI 尺寸超限：%s (%.0f x %.0f)" % [widget.widget_id, pre_size.x, pre_size.y])
+		widget.queue_free()
+		return null
 	if not register(widget):
 		widget.queue_free()
 		return null
-	# 进树之后才拿得到组合最小尺寸；超限直接拒绝，避免 mod 挤爆 HUD。
+	# 进树后再量一次：容器与子节点的最小尺寸此时才最终确定。
+	# 超限走 unregister（它会先 detach 再 queue_free），不留 client 回调。
 	var min_size := widget.get_combined_minimum_size()
 	if min_size.x > MAX_WIDGET_WIDTH or min_size.y > MAX_WIDGET_HEIGHT:
 		push_warning("[HudRegistry] mod UI 尺寸超限：%s (%.0f x %.0f)" % [widget.widget_id, min_size.x, min_size.y])
@@ -93,9 +101,20 @@ func unregister(id: StringName) -> bool:
 		return false
 	_by_id.erase(id)
 	_widgets.erase(widget)
-	if is_instance_valid(widget):
-		widget.queue_free()
+	_detach_widget(widget)
 	return true
+
+
+## 移除元素：detach 先断回调，再离开容器并 queue_free。
+## 只 queue_free 不会断开 listen_component / 信号连接，被拒的 mod 元素会留下回调。
+func _detach_widget(widget: HudWidget) -> void:
+	if not is_instance_valid(widget):
+		return
+	widget.detach()
+	var parent := widget.get_parent()
+	if parent != null:
+		parent.remove_child(widget)
+	widget.queue_free()
 
 
 func refresh_scheme(current: int) -> void:

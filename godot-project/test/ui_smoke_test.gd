@@ -6,7 +6,8 @@ extends SceneTree
 ## 2. HudWidget 注册 / 排序 / 方案显隐 / 紧凑显隐；
 ## 3. 菜单打开时 HUD 隐藏、关闭后恢复；
 ## 4. register_external（mod 路径）能通过 PackedScene 注册；
-## 5. 逻辑尺寸 / 缩放 / 安全区状态字段有值。
+## 5. 逻辑尺寸 / 缩放 / 安全区状态字段有值；
+## 6. P0：unregister 先 detach（不残留载荷回调 / 信号）、无 manager 不写 backend_paused。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -175,6 +176,15 @@ func _run() -> void:
 	await process_frame
 	_check(is_equal_approx(UiState.ui_scale, 1.0), "UI 缩放：恢复 1.0")
 
+	# P0：没有 manager（headless 无后端）时不能把 backend_paused 置 true。
+	# 冒烟场景 root 下没有 BevyAppManager，open_pause_menu 会走 manager == null 分支。
+	UiState.backend_paused = false
+	ui.open_pause_menu()
+	await process_frame
+	_check(not UiState.backend_paused, "P0：无 manager 时不写 backend_paused")
+	ui.close_pause_menu()
+	await process_frame
+
 	# mod 路径：运行时 PackedScene + meta。
 	var mod_widget := HudWidget.new()
 	mod_widget.name = "ModWidget"
@@ -201,12 +211,78 @@ func _run() -> void:
 	var huge_scene := PackedScene.new()
 	huge_scene.pack(huge)
 	_check(ui.register_external(huge_scene, {"id": "smoke_huge"}) == null, "mod 路径：超尺寸被拒绝")
+	_check(ui.registry.get_widget(&"smoke_huge") == null, "mod 路径：超尺寸元素未留在注册表")
+
+	# P0：unregister 必须先 detach —— 否则被拒 / 被卸载的 mod 元素会在 client 上留下回调。
+	var stub := _StubClient.new()
+	stub.name = "StubClient"
+	root.add_child(stub)
+	ui.client = stub
+	var probe := _ProbeWidget.new()
+	probe.name = "ProbeWidget"
+	probe.widget_id = &"smoke_probe"
+	probe.custom_minimum_size = Vector2(32.0, 32.0)
+	_check(ui.registry.register(probe), "P0：可断回调的探针元素注册成功")
+	_check(stub.listen_count == 1, "P0：attach 时订阅了载荷回调（实际 %d）" % stub.listen_count)
+	_check(stub.controlled_entity_changed.get_connections().size() == 1, "P0：attach 时连了受控实体信号")
+	_check(ui.registry.unregister(&"smoke_probe"), "P0：unregister 成功")
+	_check(stub.listen_count == 0, "P0：unregister 后载荷回调已取消（实际 %d）" % stub.listen_count)
+	_check(stub.controlled_entity_changed.get_connections().size() == 0, "P0：unregister 后信号已断开")
+	ui.client = null
 
 	# 安全区字段：桌面为 0，移动端由 DisplayServer 提供（headless 为 0）。
 	_check(UiState.safe_insets == Vector4.ZERO, "桌面安全区内缩为 0")
 	_check(UiState.compact_level >= 0 and UiState.compact_level <= 2, "断点等级合法")
 
 	_finish()
+
+
+## P0 测试替身：只记录 listen / unlisten，不真正派发载荷。
+class _StubClient:
+	extends Node
+
+	signal controlled_entity_changed(entity)
+
+	var listen_count := 0
+
+
+	func listen_component(_kind: int, _cb: Callable) -> void:
+		listen_count += 1
+
+
+	func unlisten_component(_kind: int, _cb: Callable) -> void:
+		listen_count = maxi(0, listen_count - 1)
+
+
+## P0 测试替身：attach 时挂回调、detach 时摘掉（模拟 HealthBar 的订阅习惯）。
+class _ProbeWidget:
+	extends HudWidget
+
+	var _client = null
+	var _cb: Callable
+
+
+	func _on_attach() -> void:
+		_client = ui_root.get_client()
+		if _client == null:
+			return
+		_cb = _on_entity_changed
+		_client.listen_component(BevyEnums.Payload.HEALTH, _cb)
+		_client.connect(&"controlled_entity_changed", _on_entity_changed)
+
+
+	func _on_detach() -> void:
+		if _client == null:
+			return
+		if _client.has_method("unlisten_component"):
+			_client.unlisten_component(BevyEnums.Payload.HEALTH, _cb)
+		if _client.is_connected(&"controlled_entity_changed", _on_entity_changed):
+			_client.disconnect(&"controlled_entity_changed", _on_entity_changed)
+		_client = null
+
+
+	func _on_entity_changed(_e) -> void:
+		pass
 
 
 func _check(condition: bool, message: String) -> void:

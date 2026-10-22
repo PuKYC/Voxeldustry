@@ -242,6 +242,13 @@ func listen_component(kind: int, callable: Callable) -> void:
 		dispatcher.listen(kind, callable)
 
 
+## 取消 listen_component 的订阅：mod UI 被拒 / 卸载时不能把回调留在 dispatcher 里，
+## 否则后续载荷会打到已经 queue_free 的实例上。
+func unlisten_component(kind: int, callable: Callable) -> void:
+	if dispatcher != null:
+		dispatcher.unlisten(kind, callable)
+
+
 ## 输入通道表：Array[{ key, mask, mode, actions }]（定义在 game-core）。
 ## 扩展未编译进 get_input_channels() 时返回空表并告警。
 func input_channels() -> Array:

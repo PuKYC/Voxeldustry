@@ -46,6 +46,18 @@ func listen(kind: int, callable: Callable) -> void:
 	_listeners[kind].append(callable)
 
 
+## 取消订阅；只移除第一个匹配的 callable（重复 listen 同一回调时要多次 unlisten）。
+func unlisten(kind: int, callable: Callable) -> void:
+	if not _listeners.has(kind):
+		return
+	var cbs: Array = _listeners[kind]
+	var index := cbs.find(callable)
+	if index >= 0:
+		cbs.remove_at(index)
+	if cbs.is_empty():
+		_listeners.erase(kind)
+
+
 func apply(f: Dictionary) -> void:
 	var n: int = f["command_count"]
 	var tick: int = f["tick"]
@@ -123,7 +135,8 @@ func _mark(id: int) -> void:
 func _notify_listeners(kind: int, e: EntityData) -> void:
 	if _listeners.is_empty():
 		return
-	var cbs: Array = _listeners.get(kind, [])
+	# 遍历副本：回调里可能 unlisten（元素被移除），直接迭代会被边删边遍历跳过。
+	var cbs: Array = (_listeners.get(kind, []) as Array).duplicate()
 	for cb: Callable in cbs:
 		cb.call(e)
 

@@ -31,6 +31,18 @@ func _on_attach() -> void:
 		_client.connect(&"controlled_entity_changed", _on_controlled_entity_changed)
 
 
+func _on_detach() -> void:
+	if _client == null:
+		return
+	if _client.has_method("unlisten_component"):
+		_client.unlisten_component(BevyEnums.Payload.INTERACTION, _on_interaction_changed)
+	if _client.has_signal("controlled_entity_changed"):
+		if _client.is_connected(&"controlled_entity_changed", _on_controlled_entity_changed):
+			_client.disconnect(&"controlled_entity_changed", _on_controlled_entity_changed)
+	_client = null
+	_entity = null
+
+
 ## INTERACTION 载荷 ADD / UPDATE：enabled 且 action != 0 才显示。
 func _on_interaction_changed(e: EntityData) -> void:
 	if e == null:

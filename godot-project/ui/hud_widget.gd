@@ -33,6 +33,7 @@ enum Align {
 
 ## UiRoot 引用；注册时由 HudRegistry 注入。
 var ui_root: Node = null
+var _attached := false
 var _data_visible := true
 var _scheme_visible := true
 var _compact_visible := true
@@ -41,8 +42,19 @@ var _compact_visible := true
 ## 注册时调用；子类在 _on_attach() 里连接 client 信号。
 func attach(root: Node) -> void:
 	ui_root = root
+	_attached = true
 	_refresh_visibility()
 	_on_attach()
+
+
+## 注册表移除元素前调用：先断回调再 queue_free（幂等）。
+## 子类在 _on_detach() 里断开自己在 _on_attach() 里连的 client 信号 / 载荷订阅。
+func detach() -> void:
+	if not _attached:
+		return
+	_attached = false
+	_on_detach()
+	ui_root = null
 
 
 ## 由注册表在输入方案变化时调用。
@@ -79,6 +91,11 @@ func _refresh_visibility() -> void:
 # ── 子类可覆盖 ──────────────────────────────────────────
 
 func _on_attach() -> void:
+	pass
+
+
+## detach() 时调用：断开 _on_attach() 里连的回调（不负责隐藏 / 释放动作）。
+func _on_detach() -> void:
 	pass
 
 

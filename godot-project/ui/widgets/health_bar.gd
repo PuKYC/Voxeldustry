@@ -31,6 +31,19 @@ func _on_attach() -> void:
 	_sync_from_context()
 
 
+func _on_detach() -> void:
+	# detach 的唯一目的：把 attach 时挂上去的回调全部摘掉。
+	if _client == null:
+		return
+	if _client.has_method("unlisten_component"):
+		_client.unlisten_component(BevyEnums.Payload.HEALTH, _on_health_changed)
+	if _client.has_signal("controlled_entity_changed"):
+		if _client.is_connected(&"controlled_entity_changed", _on_controlled_entity_changed):
+			_client.disconnect(&"controlled_entity_changed", _on_controlled_entity_changed)
+	_client = null
+	_entity = null
+
+
 ## HEALTH 载荷 ADD / UPDATE：任何实体都会到达，只认当前受控实体。
 ## 受控实体未知时先接受（注册早于 controlled_entity_changed 的窗口期）。
 func _on_health_changed(e: EntityData) -> void:
