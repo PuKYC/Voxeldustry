@@ -286,6 +286,31 @@ pub fn mesh_raw_halo(lod: u8, blocks: &[u8]) -> Vec<u64> {
 /// 边界格，覆盖位图全部命中 -> 本函数通常不产出额外几何；保留为正确性安全网。
 #[must_use]
 pub fn mesh_raw_halo_with_skirts(lod: u8, blocks: &[u8], skirt_mask: u8) -> Vec<u64> {
+    mesh_raw_halo_with_skirts_and_face_materials(lod, blocks, skirt_mask, &identity_face_material)
+}
+
+fn identity_face_material(block: u8, _face: u8) -> u8 {
+    block
+}
+
+/// 与 [`mesh_raw_halo_with_skirts`] 几何逐位相同，但把每个矩形的
+/// `material`（构建时 = 方块 id）重映射成真实材质 id（= 渲染侧 Texture2DArray
+/// 的 layer 索引）。
+///
+/// 映射签名 `map(block_id, face) -> material_id`，其中
+/// `face = plane * 2 + dir`，顺序 `[+x, -x, +y, -y, +z, -z]`（与
+/// ExternalPlane 一致）。机制层不依赖 game-core 的材质表：映射由调用方注入
+/// （生产路径注入 `static_data::voxel::face_material`，测试用闭包）。
+///
+/// per-face 材质**不增加矩形数量**：贪心只在同 plane / dir 内合并，不同朝向
+/// 的面本来就不会合到一起。
+#[must_use]
+pub fn mesh_raw_halo_with_skirts_and_face_materials(
+    lod: u8,
+    blocks: &[u8],
+    skirt_mask: u8,
+    face_material: &dyn Fn(u8, u8) -> u8,
+) -> Vec<u64> {
     debug_assert!(lod <= MAX_LOD, "lod exceeds MAX_LOD");
     let Some(occupancy) = raw_halo_occupancy(blocks) else {
         return Vec::new();
@@ -293,12 +318,13 @@ pub fn mesh_raw_halo_with_skirts(lod: u8, blocks: &[u8], skirt_mask: u8) -> Vec<
     // 原点只影响 RectBatch.origin（单 batch 排序键的前 3 项为常量），
     // 取规范原点 0 即可保证输出与直接 mesher 逐位一致。
     let block = MeshBlock::new(ChunkKey::new(0, 0, 0), Lod::new(0));
-    pack_rect_batch_with_ao(&mesh_occupancy_with_ao_and_skirts(
-        &occupancy,
-        block.origin,
-        block.lod,
-        skirt_mask,
-    ))
+    let mut batch =
+        mesh_occupancy_with_ao_and_skirts(&occupancy, block.origin, block.lod, skirt_mask);
+    for rect in batch.rects.iter_mut() {
+        let face = rect.plane.saturating_mul(2).saturating_add(rect.dir);
+        rect.material = face_material(rect.material, face);
+    }
+    pack_rect_batch_with_ao(&batch)
 }
 
 /// 从 34³ halo 缓冲构造 [`OccupancyData`]（内部 32³ + 6 external + padded halo）。
@@ -888,5 +914,33 @@ mod tests {
             mesh_raw_halo(0, &halo),
             "面外全空时主 mesher 已封边，裙边不得增加几何"
         );
+    }
+
+    /// 面材质重映射只改 material 字段，几何逐位不变；恒等映射必须等于旧输出。
+    #[test]
+    fn face_material_remap_only_touches_material_field() {
+        let mut blocks = vec![0u8; RAW_VOXELS];
+        blocks[raw_halo_index(1, 1, 1)] = 5;
+        let plain = mesh_raw_halo_with_skirts(0, &blocks, 0);
+        assert_eq!(plain.len(), 6, "单个体素 = 6 个面");
+
+        let identity = mesh_raw_halo_with_skirts_and_face_materials(0, &blocks, 0, &|b, _| b);
+        assert_eq!(identity, plain, "恒等映射必须与旧输出逐位相同");
+
+        let mapped =
+            mesh_raw_halo_with_skirts_and_face_materials(0, &blocks, 0, &|_block, face| 100 + face);
+        assert_eq!(mapped.len(), plain.len(), "重映射不得增减矩形");
+        let mut faces = [false; 6];
+        for word in &mapped {
+            let rect = unpack_rect(*word);
+            let face = rect.plane * 2 + rect.dir;
+            assert_eq!(
+                rect.material,
+                100 + face,
+                "material 必须是 map(block, face)"
+            );
+            faces[face as usize] = true;
+        }
+        assert_eq!(faces, [true; 6], "六个朝向都要被映射到");
     }
 }

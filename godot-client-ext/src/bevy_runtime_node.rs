@@ -397,8 +397,11 @@ impl BevyAppManager {
         presentation_bridge::events_to_array(&events)
     }
 
-    /// 体素调色板表（路径 B GPU 渲染启动时拉一次）：
-    /// `{ voxel_size, palette(256×RGBA8 字节), material_count }`。
+    /// 体素渲染数据表（路径 B GPU 渲染启动时拉一次）：
+    /// `{ voxel_size, block_names(256 项，下标 == block id，未知 id 为空串) }`。
+    /// 外观（颜色 / PBR / 纹理）与 block→面材质绑定都由 Godot 侧资源接管，
+    /// Rust 只给 block id→名字；具体布局见
+    /// `presentation_bridge::voxel_table_to_variant`。
     #[func]
     fn get_voxel_table(&self) -> VarDictionary {
         presentation_bridge::voxel_table_to_variant()
@@ -410,6 +413,12 @@ impl BevyAppManager {
     /// skirt_mask 是 6 bit 跨 LOD 接缝裙边掩码（ExternalPlane 顺序；0 = 无裙边）；
     /// Godot 侧 VoxelMeshNode.lod_skirts_enabled=false 时固定传 0，行为退回
     /// 普通 mesh_raw_halo。
+    ///
+    /// face_material_map 由 Godot 的 VoxelMaterialLibrary.build_face_material_map()
+    /// 生成：索引 = block*6 + face（face = plane*2+dir，顺序 [+x, -x, +y, -y, +z, -z]），
+    /// 值 = 该面要写的材质 id；Rust 不持有任何材质表，只机械重映射。
+    /// **空 map（或长度 != 256*6）= identity 降级**：矩形 material 保持 block id。
+    ///
     /// mesher 输出 Vec<u64>，而 u64 没有 ToGodot，这里逐元素按位转 i64
     /// 交给 PackedInt64Array（每个 u64 一个矩形，保留完整 64 位，绝不截断成 32 位）。
     #[func]
@@ -418,11 +427,17 @@ impl BevyAppManager {
         lod: i64,
         blocks: PackedByteArray,
         skirt_mask: i64,
+        face_material_map: PackedByteArray,
     ) -> PackedInt64Array {
         let bytes = blocks.to_vec();
         let mask = (skirt_mask & 0x3F) as u8;
-        let words =
-            game_core::presentation::mesh_raw_halo_with_skirts(lod.clamp(0, 3) as u8, &bytes, mask);
+        let material_map = face_material_map.to_vec();
+        let words = game_core::presentation::voxel_mesh::mesh_raw_halo_for_render(
+            lod.clamp(0, 3) as u8,
+            &bytes,
+            mask,
+            &material_map,
+        );
         let signed: Vec<i64> = words.iter().map(|w| *w as i64).collect();
         PackedInt64Array::from(&signed[..])
     }

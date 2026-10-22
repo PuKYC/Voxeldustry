@@ -39,6 +39,9 @@ enum Mode {
 ## 路径 B：跨 LOD 接缝裙边总开关（默认开启）。关闭时按 mask=0 网格化。
 @export var voxel_lod_skirts: bool = true
 
+## 路径 B：体素材质库（外观真相源，Godot 资源）。留空 = 加载下面的默认路径。
+@export var voxel_material_library: VoxelMaterialLibrary = null
+
 @export_group("Runtime")
 @export var autostart: bool = true
 @export var fixed_hz: float = 60.0
@@ -60,6 +63,9 @@ enum Mode {
 @export var vfx_library: Dictionary = {}
 ## mod 语义覆盖：domain -> { id: name }。
 @export var semantic_overrides: Dictionary = {}
+
+## 路径 B：默认体素材质库（VoxelMaterialLibrary 资源）。
+const DEFAULT_MATERIAL_LIBRARY_PATH := "res://bevy_client/voxel_material/voxel_material_library.tres"
 
 signal entity_added(entity: EntityData)
 signal entity_state_changed(entity: EntityData)
@@ -191,25 +197,54 @@ func _start_entity_backend() -> void:
 		_mgr.start_bevy_with_config(fixed_hz, runner_hz, enable_demo)
 
 
-## 路径 B：拉一次体素调色板 / 体素边长，写入 VoxelMeshNode 的共享静态量。
-## 查表在 game-core（get_voxel_table），这里只做字节 -> ImageTexture 的搬运。
+## 路径 B：拉一次体素绑定契约（voxel_size + block_names），加载 Godot 材质库并
+## 构建共享 GPU 数据。外观完全由 Godot 资源接管，Rust 只提供方块名做对账。
 func _apply_voxel_table() -> void:
 	if not _mgr.has_method("get_voxel_table"):
+		push_warning("[BevyClient] 扩展缺少 get_voxel_table()，跳过体素表装配")
 		return
 	var table: Variant = _mgr.get_voxel_table()
 	if not (table is Dictionary) or (table as Dictionary).is_empty():
+		push_warning("[BevyClient] get_voxel_table() 返回空表，跳过体素表装配")
 		return
-	VoxelMeshNode.voxel_size = float(table.get("voxel_size", VoxelMeshNode.voxel_size))
+	var t := table as Dictionary
+	VoxelMeshNode.voxel_size = float(t.get("voxel_size", VoxelMeshNode.voxel_size))
 	# RAWVOXELS 载荷的 mesher 来自 gdext 扩展：交给 VoxelMeshNode 现算矩形流。
 	# 扩展没有该方法时保持 mesh_fn 无效，set_raw_voxel_view 会告警后跳过。
 	if _mgr.has_method("mesh_voxel_halo"):
 		VoxelMeshNode.mesh_fn = Callable(_mgr, "mesh_voxel_halo")
-	var bytes: PackedByteArray = table.get("palette", PackedByteArray())
-	if bytes.size() != 256 * 4:
-		push_warning("[BevyClient] 体素调色板字节数异常：%d" % bytes.size())
+
+	# Godot 是外观与 block→面材质绑定的真相源；Rust 只导出方块名用于对账。
+	# 新旧扩展握手：V2 的 get_voxel_table 才有 block_names；旧扩展仍在旧契约上，
+	# 其 mesher 只有 3 参，按 4 参调用会逐块报错、体素直接不渲染。
+	var block_names: PackedStringArray = t.get("block_names", PackedStringArray())
+	VoxelMeshNode.mesh_supports_face_map = t.has("block_names")
+	if not VoxelMeshNode.mesh_supports_face_map:
+		push_warning("[BevyClient] 扩展是旧版（get_voxel_table 无 block_names）：材质绑定沿用旧扩展逻辑，face_material_map 不启用")
+	elif block_names.is_empty():
+		push_warning("[BevyClient] block_names 为空：face_material_map 走 identity 降级")
+	var library := _resolve_material_library()
+	if library == null:
+		push_error("[BevyClient] 体素材质库加载失败：%s" % DEFAULT_MATERIAL_LIBRARY_PATH)
 		return
-	var image := Image.create_from_data(256, 1, false, Image.FORMAT_RGBA8, bytes)
-	VoxelMeshNode.palette_texture = ImageTexture.create_from_image(image)
+	if VoxelMeshNode.mesh_supports_face_map:
+		for problem in library.validate_block_binding(block_names):
+			if problem.begins_with("ERROR"):
+				push_error("[BevyClient] 材质绑定：%s" % problem)
+			else:
+				push_warning("[BevyClient] 材质绑定：%s" % problem)
+		VoxelMeshNode.set_face_material_map(library.build_face_material_map(block_names))
+	if not VoxelMeshNode.apply_material_library(library):
+		push_error("[BevyClient] 体素材质库构建失败（检查 bake 产物）：%s" % library.describe())
+
+
+## 解析材质库：优先场景里配置的资源，否则加载默认 .tres。
+func _resolve_material_library() -> VoxelMaterialLibrary:
+	if voxel_material_library != null:
+		return voxel_material_library
+	if ResourceLoader.exists(DEFAULT_MATERIAL_LIBRARY_PATH):
+		return load(DEFAULT_MATERIAL_LIBRARY_PATH) as VoxelMaterialLibrary
+	return null
 
 
 ## 运行期 LOD：覆写观察者位置（米）。后端未启动 / 扩展缺方法时静默跳过。

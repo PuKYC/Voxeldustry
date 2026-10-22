@@ -20,9 +20,19 @@ const WORD_BYTES := 8
 ## 每行最多多少个矩形（RD 纹理宽度上限远大于此）。
 const TEX_WIDTH := 1024
 
-## 全局共享：调色板纹理（256 x 1 RGBA8，方块 id -> 线性 RGBA）与体素边长。
-## BevyClient 启动时从 get_voxel_table() 拉一次并写入。
-static var palette_texture: Texture2D = null
+## 全局共享的材质 GPU 数据（数组 + 参数 LUT + 层数）。
+## 唯一来源是 Godot 资源库 VoxelMaterialLibrary（外观真相源在 Godot），
+## BevyClient 启动时 load 一次，经 apply_material_library() 构建后写进所有节点。
+static var material_arrays: VoxelMaterialArrays = null
+## 每次 apply_material_library 成功后 +1；节点只在版本变化时写 uniform。
+static var material_version: int = 0
+## block→面材质表（256*6 字节，Godot 侧 VoxelMaterialLibrary 生成），
+## 每次 mesh_fn 调用时传给 gdext mesher；空表 = Rust 侧 identity 降级。
+static var face_material_map: PackedByteArray = PackedByteArray()
+## 材质层数（= Texture2DArray depth），仅用于 shader 越界夹取。
+static var layer_count: int = 0
+## 是否存在自发光材质：false 时着色器跳过 emissive_array 采样（省片元带宽）。
+static var has_emissive: bool = false
 static var voxel_size: float = 0.45
 ## AO 总强度（静态全局）：1.0 = 当前观感（默认开启），0.0 = 完全关闭。
 static var ao_strength: float = 1.0
@@ -38,6 +48,9 @@ static var lod_skirts_enabled: bool = true
 ## RAWVOXELS：由 BevyClient 装配的 gdext mesher 桥（manager.mesh_voxel_halo）。
 ## 无效时 set_raw_voxel_view 只告警，不做网格化。
 static var mesh_fn: Callable = Callable()
+## 扩展是否支持 mesh_voxel_halo 的第 4 参（face_material_map）。
+## BevyClient 用 get_voxel_table() 是否含 block_names 判断新旧扩展；旧扩展按 3 参调用。
+static var mesh_supports_face_map: bool = true
 ## 调试：为 true 时读回第一块纹理自检（会触发 GPU 同步，仅调试用）。
 static var debug_self_check: bool = false
 
@@ -56,6 +69,11 @@ var _has_mesh := false
 ## 已写入材质的 AO 参数缓存；只在变化时写 shader，热路径不重复写。
 var _ao_strength := -1.0
 var _ao_power := -1.0
+## 已写入材质的 GPU 数据版本（= VoxelMeshNode.material_version）。
+## 只在版本变化时写数组 / LUT / layer_count 等 uniform。
+var _applied_material_version: int = -1
+## 材质未就绪的告警只打一次，避免每块每帧刷屏。
+var _warned_missing_materials: bool = false
 ## LOD 淡入状态：切换到新 LOD 时从"全 discard"渐变到"全显示"。
 var _fade_active := false
 var _fade_elapsed := 0.0
@@ -121,6 +139,38 @@ static func set_lod_skirts_enabled(enabled: bool) -> void:
 	lod_skirts_enabled = enabled
 
 
+## 从 Godot 资源库构建共享材质 GPU 数据（Texture2DArray ×3~4 + 参数 LUT）。
+##
+## 外观真相源是 VoxelMaterialLibrary（VoxelMaterial + bake 产物 tiles），
+## 这里只做「构建 + 发布静态量」：成功 material_version += 1，失败 push_error
+## 并保留上一版数组（不破坏正在渲染的节点）。
+static func apply_material_library(library: VoxelMaterialLibrary) -> bool:
+	if library == null:
+		push_error("[VoxelMeshNode] apply_material_library: library 为 null")
+		return false
+	var arrays := library.build_arrays()
+	if arrays == null or not arrays.is_ready():
+		push_error("[VoxelMeshNode] 材质库构建失败：%s" % library.describe())
+		return false
+	material_arrays = arrays
+	layer_count = arrays.layer_count
+	has_emissive = arrays.has_emissive
+	material_version += 1
+	return true
+
+
+## 设置 block→面材质表（256*6 字节，索引 block*6+face），传给 gdext mesher。
+## 空表 = Rust 侧 identity 降级（block id 当材质 id），只用于诊断。
+static func set_face_material_map(map: PackedByteArray) -> void:
+	if map.size() != 256 * 6:
+		push_warning("[VoxelMeshNode] face_material_map 长度 %d，期望 %d；mesher 将 identity 降级" % [
+			map.size(), 256 * 6,
+		])
+		face_material_map = PackedByteArray()
+		return
+	face_material_map = map
+
+
 # ───────────────────────── ViewLayer 钩子 ─────────────────────────
 
 ## 内部矩形上传 helper：lod + 39 bit 矩形流（u64 原样，绝不截断成 32 位）。
@@ -146,8 +196,7 @@ func set_mesh_view(lod: int, words: PackedInt64Array) -> void:
 	_material.set_shader_parameter("voxel_size", voxel_size)
 	_material.set_shader_parameter("block_lod", lod)
 	_apply_ao()
-	if palette_texture != null:
-		_material.set_shader_parameter("palette", palette_texture)
+	_apply_materials()
 	_material.set_shader_parameter("block_origin", global_position)
 	_apply_lod_fade(0.0)
 
@@ -173,7 +222,14 @@ func set_raw_voxel_view(lod: int, blocks: PackedByteArray, skirt_mask: int) -> v
 		push_warning("[VoxelMeshNode] mesh_fn 未设置，无法网格化 RAWVOXELS halo")
 		return
 	var effective_mask := skirt_mask if lod_skirts_enabled else 0
-	var words: PackedInt64Array = mesh_fn.call(lod, blocks, effective_mask)
+	# 第 4 个参数是 Godot 侧维护的 block→面材质表（256*6）；空表时 Rust 侧 identity 降级。
+	# 旧扩展（mesh_voxel_halo 只有 3 参）按 has_method 无法区分，用 BevyClient 探测的
+	# mesh_supports_face_map 决定，避免逐块报 “Invalid call”。
+	var words: PackedInt64Array
+	if mesh_supports_face_map:
+		words = mesh_fn.call(lod, blocks, effective_mask, face_material_map)
+	else:
+		words = mesh_fn.call(lod, blocks, effective_mask)
 	set_mesh_view(lod, words)
 
 
@@ -194,11 +250,38 @@ func _apply_ao() -> void:
 		_ao_power = ao_power
 
 
+## 把共享材质 GPU 数据（3~4 张数组 + 参数 LUT）同步到本节点材质：
+## 只在 material_version 变化时写 uniform，其余帧只做一次整数比较（热路径不写）。
+func _apply_materials() -> void:
+	if _material == null or _applied_material_version == material_version:
+		return
+
+	var ready := material_arrays != null and material_arrays.is_ready()
+	_material.set_shader_parameter("use_material_layers", ready)
+
+	if ready:
+		_material.set_shader_parameter("albedo_array", material_arrays.albedo)
+		_material.set_shader_parameter("normal_array", material_arrays.normal)
+		_material.set_shader_parameter("orm_array", material_arrays.orm)
+		_material.set_shader_parameter("pbr_params", material_arrays.params)
+		_material.set_shader_parameter("layer_count", material_arrays.layer_count)
+		_material.set_shader_parameter("has_emissive", material_arrays.has_emissive)
+		if material_arrays.has_emissive and material_arrays.emissive != null:
+			_material.set_shader_parameter("emissive_array", material_arrays.emissive)
+	elif not _warned_missing_materials:
+		_warned_missing_materials = true
+		push_warning("[VoxelMeshNode] 材质库未就绪，体素用中性灰兜底（检查 VoxelMaterialLibrary 加载 / bake）")
+
+	_applied_material_version = material_version
+
+
 func _process(delta: float) -> void:
 	# 静态块的 Transform 不常变，但 ViewLayer 可能在本帧任何时刻改写位置。
 	if _has_mesh and _material != null:
 		_material.set_shader_parameter("block_origin", global_position)
 		_apply_ao()
+		# 材质数据可能在节点物化之后才装配完：这里只做整数版本比较，未变化时零写入。
+		_apply_materials()
 		_apply_lod_fade(delta)
 
 

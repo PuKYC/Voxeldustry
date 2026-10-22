@@ -1,0 +1,14 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_eg10j"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/grass_side.res" id="2_5pm38"]
+
+[resource]
+script = ExtResource("1_eg10j")
+material_key = "grass_side"
+display_name = "Grass Side"
+tiles = ExtResource("2_5pm38")
+albedo_color = Color(0.43137255, 0.30588236, 0.19607843, 1)
+albedo_pattern = 4
+pattern_secondary_color = Color(0.3372549, 0.5803922, 0.24313726, 1)
+emission_energy = 0.0

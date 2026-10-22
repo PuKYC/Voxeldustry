@@ -41,6 +41,10 @@ func _setup_light() -> void:
 	light.shadow_enabled = true
 	add_child(light)
 
+	# 引擎 lit 光照必须有环境光；方向光由本函数创建，环境走统一的 VoxelEnv
+	# （幂等，只加一次 WorldEnvironment）。
+	VoxelEnv.ensure(self)
+
 
 func _setup_client() -> void:
 	_client = BEVY_CLIENT_SCENE.instantiate()

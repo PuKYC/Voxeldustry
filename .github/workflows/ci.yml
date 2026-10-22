@@ -387,6 +387,25 @@ jobs:
           echo "import exit=$? (ignored)"
           exit 0
 
+      # 体素材质管线冒烟：生成 class_name 缓存（无编辑器环境必需）后跑库构建断言。
+      # 这条是阻塞门禁：bake 产物 / LUT / block 绑定 / 数组构建任一坏掉都会红。
+      - name: Voxel material pipeline check (headless)
+        timeout-minutes: 10
+        run: |
+          godot --headless --path godot-project --script res://test/gen_class_cache.gd
+          godot --headless --path godot-project --script res://test/voxel_material_check.gd
+          godot --headless --path godot-project --script res://test/voxel_shader_check.gd
+          # 端到端：Godot 资源库 -> face_material_map -> gdext mesher -> 逐面材质 id
+          godot --headless --path godot-project --script res://test/voxel_binding_check.gd
+
+      # 作者改了 defs 却没重跑 bake 时，CI 通过这里发现（tiles/*.res 会与参数不一致）。
+      - name: Voxel material assets are up to date
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          godot --headless --path godot-project --script res://tools/bake_voxel_materials.gd
+          git diff --exit-code --stat -- godot-project/bevy_client/voxel_material
+
       - name: Export debug build (${{ matrix.name }})
         timeout-minutes: 30
         shell: bash

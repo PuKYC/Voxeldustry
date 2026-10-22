@@ -1,0 +1,13 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_edup5"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/snow.res" id="2_qsbfd"]
+
+[resource]
+script = ExtResource("1_edup5")
+material_key = "snow"
+display_name = "Snow"
+tiles = ExtResource("2_qsbfd")
+albedo_color = Color(0.9254902, 0.9411765, 0.9647059, 1)
+roughness = 0.7843137254901961
+emission_energy = 0.0

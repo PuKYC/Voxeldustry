@@ -1,0 +1,13 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_7i6ar"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/sand.res" id="2_26lru"]
+
+[resource]
+script = ExtResource("1_7i6ar")
+material_key = "sand"
+display_name = "Sand"
+tiles = ExtResource("2_26lru")
+albedo_color = Color(0.8392157, 0.7764706, 0.54901963, 1)
+albedo_pattern = 1
+emission_energy = 0.0

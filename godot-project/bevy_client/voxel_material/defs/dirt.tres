@@ -1,0 +1,13 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_h80cj"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/dirt.res" id="2_6tr53"]
+
+[resource]
+script = ExtResource("1_h80cj")
+material_key = "dirt"
+display_name = "Dirt"
+tiles = ExtResource("2_6tr53")
+albedo_color = Color(0.43137255, 0.30588236, 0.19607843, 1)
+albedo_pattern = 1
+emission_energy = 0.0

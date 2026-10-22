@@ -3,6 +3,14 @@
 [ext_resource type="Script" uid="uid://7eb2h2p8fsor" path="res://test/voxel_perf.gd" id="1_perf"]
 [ext_resource type="PackedScene" uid="uid://n2wwv7h51fv5" path="res://bevy_client/bevy_client.tscn" id="2_client"]
 
+[sub_resource type="Environment" id="Environment_voxel"]
+background_mode = 1
+background_color = Color(0.45, 0.55, 0.68, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.55, 0.68, 0.88, 1)
+ambient_light_sky_contribution = 0.0
+ambient_light_energy = 0.5
+
 [node name="VoxelPerf" type="Node3D" unique_id=664238732]
 script = ExtResource("1_perf")
 radius_blocks = 6
@@ -18,6 +26,9 @@ fov = 60.0
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1933954458]
 transform = Transform3D(0.866025, 0, 0.5, 0.383022, 0.642788, -0.663414, -0.321394, 0.766044, 0.55667, 0, 0, 0)
 shadow_enabled = true
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_voxel")
 
 [node name="BevyClient" parent="." unique_id=401283957 instance=ExtResource("2_client")]
 manager_path = NodePath("../BevyAppManager")

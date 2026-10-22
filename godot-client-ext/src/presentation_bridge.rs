@@ -192,32 +192,57 @@ pub fn semantic_tables_to_variant(registry: &semantics::SemanticRegistry) -> Var
     out
 }
 
-/// 体素调色板表（路径 B GPU 渲染启动时拉一次）。
-///
-/// 返回 `{ voxel_size, palette, material_count }`：
-/// - `voxel_size`：单个体素边长（米，f32）；
-/// - `palette`：256 × RGBA8 字节，按**方块 id** 索引（与 RectInstance.material 一致），
-///   未知 id 为品红；颜色直接取 static_data::voxel::MATERIAL_TABLE 的线性 RGBA8 原值，
-///   渲染侧不再做任何换算（边界铁律：查表在 game-core，搬运在 godot-client-ext）。
-pub fn voxel_table_to_variant() -> VarDictionary {
-    use game_core::static_data::voxel::{
-        block_def, material_def, MATERIAL_TABLE, VOXEL_SIZE_METERS,
-    };
+/// `get_voxel_table` 导出契约的键名（实现与单测共用，防止两边漂移）。
+const VOXEL_TABLE_KEYS: [&str; 2] = ["voxel_size", "block_names"];
 
-    let mut palette = vec![0u8; 256 * 4];
-    for (index, px) in palette.chunks_exact_mut(4).enumerate() {
-        let color = block_def(index as u8)
-            .and_then(|block| material_def(block.material))
-            .map(|material| material.color)
-            .unwrap_or([255, 0, 255, 255]);
-        px.copy_from_slice(&color);
-    }
+/// 体素渲染数据表（路径 B GPU 渲染启动时拉一次）。
+///
+/// **返回且仅返回**两项：
+/// - `voxel_size`：单个体素边长（米，f32）；
+/// - `block_names`：`PackedStringArray`，长度 256，下标 == block id，
+///   值 = 方块名（未使用的 id 为空串）。Godot 侧按名字绑定方块外观资源；
+///   材质 / 面材质绑定完全由 Godot 的 VoxelMaterialLibrary 负责，Rust 不感知。
+///
+/// 边界铁律：方块 id / 名字表在 game-core（static_data::voxel），本文件只做
+/// 机械搬运；**外观与材质都不在 Rust**。
+pub fn voxel_table_to_variant() -> VarDictionary {
+    let data = voxel_table_data();
+    let [key_voxel_size, key_block_names] = VOXEL_TABLE_KEYS;
+
+    let names: Vec<GString> = data
+        .block_names
+        .iter()
+        .map(|name| GString::from(name.as_str()))
+        .collect();
 
     let mut out = VarDictionary::new();
-    out.set("voxel_size", VOXEL_SIZE_METERS as f32);
-    out.set("palette", &PackedByteArray::from(&palette[..]));
-    out.set("material_count", MATERIAL_TABLE.len() as i64);
+    out.set(key_voxel_size, data.voxel_size);
+    out.set(key_block_names, &PackedStringArray::from(&names[..]));
     out
+}
+
+/// `voxel_table_to_variant` 与 Godot 类型无关的纯数据装配。
+///
+/// 单独拆出来只为**脱离引擎**做单元测试（godot-rust 的 `Dictionary` /
+/// `PackedByteArray` 在单元测试里不能构造：没有 Godot 引擎会 panic）。
+/// 装配逻辑仍然只是搬运 game-core 的表与字节，不含业务判断。
+struct VoxelTableData {
+    voxel_size: f32,
+    block_names: Vec<String>,
+}
+
+fn voxel_table_data() -> VoxelTableData {
+    use game_core::static_data::voxel::{block_name, VOXEL_SIZE_METERS};
+
+    // block id -> 名字；未使用的 id 导出空串（Godot 侧按空名跳过）。
+    let block_names: Vec<String> = (0..=u8::MAX)
+        .map(|id| block_name(id).map_or_else(String::new, String::from))
+        .collect();
+
+    VoxelTableData {
+        voxel_size: VOXEL_SIZE_METERS as f32,
+        block_names,
+    }
 }
 
 /// `PackedStringArray` → `Vec<String>`（Godot → Rust 的第一段搬运）。
@@ -547,6 +572,49 @@ pub fn packed_frame_to_dictionary(data: &PackedByteArray) -> VarDictionary {
         Err(error) => {
             godot_warn!("[presentation_bridge] 打包帧解析失败：{error}");
             VarDictionary::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{voxel_table_data, VOXEL_TABLE_KEYS};
+
+    /// 导出契约的纯数据面：键集合恰为两项、block_names 长度 256、名字契约。
+    ///
+    /// 这里不构造任何 Godot 类型：godot-rust 的 Dictionary / PackedByteArray
+    /// 在没有引擎的单元测试里会 panic，Variant 搬运由 cargo check 保证；
+    /// 但键名与数据布局都在本测试里锁死。
+    #[test]
+    fn voxel_table_data_matches_contract() {
+        assert_eq!(
+            VOXEL_TABLE_KEYS,
+            ["voxel_size", "block_names"],
+            "导出键集合固定为两项"
+        );
+
+        let data = voxel_table_data();
+        assert!((data.voxel_size - 0.45).abs() < 1e-6, "voxel_size = 0.45 m");
+        assert_eq!(
+            data.block_names.len(),
+            256,
+            "block_names 必须覆盖 256 个 id"
+        );
+
+        // 0..7 的方块名是跨 Rust/Godot 的硬契约（顺序 == block id）。
+        let expected = [
+            "air", "stone", "dirt", "grass", "sand", "snow", "wood", "leaf",
+        ];
+        for (id, want) in expected.iter().enumerate() {
+            assert_eq!(
+                data.block_names[id], *want,
+                "block_names[{id}] 名字契约错误"
+            );
+        }
+
+        // 未使用的 block id 导出空串（Godot 侧按空名跳过/回退）。
+        for id in [8usize, 42, 200, 255] {
+            assert_eq!(data.block_names[id], "", "未知 block id {id} 应为空串");
         }
     }
 }

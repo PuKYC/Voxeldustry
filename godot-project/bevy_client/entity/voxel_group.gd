@@ -23,7 +23,7 @@ var _children: Dictionary = {}
 
 ## 呈现一组原始体素 halo：逐个 chunk 复用 / 新建子 VoxelMeshNode，放在该块的
 ## 绝对世界原点，再调用 VoxelMeshNode 现成的 set_raw_voxel_view —— mesher 调用、
-## 纹理上传、block_origin / palette / AO / lod_fade 全部由它负责，这里不重复。
+## 纹理上传、block_origin / PBR Texture2DArray / AO / lod_fade 全部由它负责，这里不重复。
 ## chunks 元素 shape：{ x, y, z, skirt_mask: int, blocks: PackedByteArray }（BTreeMap 升序）。
 func set_raw_voxel_group_view(lod: int, chunks: Array) -> void:
 	var seen: Dictionary = {}

@@ -1,0 +1,14 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_ebkm6"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/wood.res" id="2_24viv"]
+
+[resource]
+script = ExtResource("1_ebkm6")
+material_key = "wood"
+display_name = "Wood"
+tiles = ExtResource("2_24viv")
+albedo_color = Color(0.47843137, 0.34509805, 0.20392157, 1)
+albedo_pattern = 2
+roughness = 0.9019607843137256
+emission_energy = 0.0

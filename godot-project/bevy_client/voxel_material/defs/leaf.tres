@@ -1,0 +1,13 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_7rs2u"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/leaf.res" id="2_daeq7"]
+
+[resource]
+script = ExtResource("1_7rs2u")
+material_key = "leaf"
+display_name = "Leaf"
+tiles = ExtResource("2_daeq7")
+albedo_color = Color(0.2509804, 0.47843137, 0.21176471, 1)
+albedo_pattern = 5
+emission_energy = 0.0

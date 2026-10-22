@@ -1,0 +1,14 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_odpmm"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/stone.res" id="2_yv56i"]
+
+[resource]
+script = ExtResource("1_odpmm")
+material_key = "stone"
+display_name = "Stone"
+tiles = ExtResource("2_yv56i")
+albedo_color = Color(0.47843137, 0.47843137, 0.49411765, 1)
+albedo_pattern = 1
+roughness = 0.8627450980392157
+emission_energy = 0.0

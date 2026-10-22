@@ -22,6 +22,8 @@ var _frames: int = 0
 
 
 func _ready() -> void:
+	# 引擎 lit 光照必须有环境光；方向光在 tscn 里已有，这里只补 WorldEnvironment。
+	VoxelEnv.ensure(self)
 	if aim_camera_on_ready:
 		_aim_camera()
 

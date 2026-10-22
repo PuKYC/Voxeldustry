@@ -1,7 +1,11 @@
 //! 体素世界静态数据。
 //!
-//! **游戏数值不是引擎常量**：体素边长、方块调色板、材质表、生物群系表、
+//! **游戏数值不是引擎常量**：体素边长、方块 id/名字表、生物群系表、
 //! LOD 距离阈值全部落在本模块，由 crate::voxel / crate::world 消费。
+//!
+//! **材质概念完全不在 Rust**：颜色 / PBR / 纹理以及 block -> 面材质绑定
+//! 全部由 Godot 侧资源与 VoxelMaterialLibrary 接管；Rust 只保留 block id、
+//! 方块名契约与几何。
 //!
 //! 依赖方向：本模块只依赖 game_engine；**不依赖 presentation / godot**。
 //! Game 数值一律以 FixedPoint（I40F24）或整数表达，避免 f32 进入逻辑层。
@@ -21,86 +25,25 @@ pub const SNOW_BLOCK: u8 = 5;
 pub const WOOD_BLOCK: u8 = 6;
 pub const LEAF_BLOCK: u8 = 7;
 
-// ── 材质表 ────────────────────────────────────────────────────────────────
+// ── 面序（与 ExternalPlane / RectInstance 一致）────────────────────────────
 
-/// 材质 id（渲染侧查表；逻辑层只传递整数）。
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct MaterialId(pub u8);
+/// 面索引个数：顺序 `[+x, -x, +y, -y, +z, -z]`（face = plane * 2 + dir）。
+///
+/// 与 `voxel::mesh::ExternalPlane`、`RectInstance` 的 `plane * 2 + dir` 以及
+/// 着色器的 `orientation` 完全一致；Godot 侧 build_face_material_map() 的索引
+/// 也按此顺序（Rust 不认识材质，只保留几何面序契约）。
+pub const FACE_COUNT: usize = 6;
 
-/// 材质定义。color 是线性 RGBA8，仅作静态数据；逻辑层不参与混合。
-#[derive(Clone, Copy, Debug)]
-pub struct MaterialDef {
-    pub id: MaterialId,
-    pub name: &'static str,
-    pub color: [u8; 4],
-    /// 0 = 镜面，255 = 完全粗糙（渲染侧启发式）。
-    pub roughness: u8,
-}
+// ── 方块表：u8 方块 id -> 名字 / 是否实心 ─────────────────────────────────
 
-pub const MATERIAL_TABLE: &[MaterialDef] = &[
-    MaterialDef {
-        id: MaterialId(0),
-        name: "stone",
-        color: [122, 122, 126, 255],
-        roughness: 220,
-    },
-    MaterialDef {
-        id: MaterialId(1),
-        name: "dirt",
-        color: [110, 78, 50, 255],
-        roughness: 255,
-    },
-    MaterialDef {
-        id: MaterialId(2),
-        name: "grass",
-        color: [86, 148, 62, 255],
-        roughness: 255,
-    },
-    MaterialDef {
-        id: MaterialId(3),
-        name: "sand",
-        color: [214, 198, 140, 255],
-        roughness: 255,
-    },
-    MaterialDef {
-        id: MaterialId(4),
-        name: "snow",
-        color: [236, 240, 246, 255],
-        roughness: 200,
-    },
-    MaterialDef {
-        id: MaterialId(5),
-        name: "wood",
-        color: [122, 88, 52, 255],
-        roughness: 230,
-    },
-    MaterialDef {
-        id: MaterialId(6),
-        name: "leaf",
-        color: [64, 122, 54, 255],
-        roughness: 255,
-    },
-    MaterialDef {
-        id: MaterialId(7),
-        name: "air",
-        color: [0, 0, 0, 0],
-        roughness: 255,
-    },
-];
-
-/// 按 id 查材质（线性扫描；表 < 16 项，确定性且无 HashMap 顺序依赖）。
-pub fn material_def(id: MaterialId) -> Option<&'static MaterialDef> {
-    MATERIAL_TABLE.iter().find(|m| m.id == id)
-}
-
-// ── 方块调色板表：u8 方块 id -> 材质 / 视觉数据 ───────────────────────────
-
-/// 方块定义（u8 调色板条目）。
+/// 方块定义（u8 方块 id 条目）。
+///
+/// **不含任何外观 / 材质字段**：材质绑定由 Godot 侧负责，Rust 只导出
+/// id -> name 契约供对账（[`block_name`]）。
 #[derive(Clone, Copy, Debug)]
 pub struct BlockDef {
     pub id: u8,
     pub name: &'static str,
-    pub material: MaterialId,
     /// 是否阻挡 / 可站立；空气为 false。
     pub solid: bool,
 }
@@ -109,59 +52,60 @@ pub const BLOCK_TABLE: &[BlockDef] = &[
     BlockDef {
         id: AIR_BLOCK,
         name: "air",
-        material: MaterialId(7),
         solid: false,
     },
     BlockDef {
         id: STONE_BLOCK,
         name: "stone",
-        material: MaterialId(0),
         solid: true,
     },
     BlockDef {
         id: DIRT_BLOCK,
         name: "dirt",
-        material: MaterialId(1),
         solid: true,
     },
     BlockDef {
+        // 草方块的六面外观差异由 Godot 侧 face material map 决定，Rust 不感知。
         id: GRASS_BLOCK,
         name: "grass",
-        material: MaterialId(2),
         solid: true,
     },
     BlockDef {
         id: SAND_BLOCK,
         name: "sand",
-        material: MaterialId(3),
         solid: true,
     },
     BlockDef {
         id: SNOW_BLOCK,
         name: "snow",
-        material: MaterialId(4),
         solid: true,
     },
     BlockDef {
         id: WOOD_BLOCK,
         name: "wood",
-        material: MaterialId(5),
         solid: true,
     },
     BlockDef {
         id: LEAF_BLOCK,
         name: "leaf",
-        material: MaterialId(6),
         solid: true,
     },
 ];
 
-/// 按 u8 方块 id 查调色板条目。
+/// 按 u8 方块 id 查表项。
+#[must_use]
 pub fn block_def(id: u8) -> Option<&'static BlockDef> {
     BLOCK_TABLE.iter().find(|b| b.id == id)
 }
 
+/// 按 u8 方块 id 查名字（导出对账 / 调试用）；未知 id 返回 `None`。
+#[must_use]
+pub fn block_name(id: u8) -> Option<&'static str> {
+    block_def(id).map(|block| block.name)
+}
+
 /// 方块是否实心（未知 id 视为空气）。
+#[must_use]
 pub fn is_solid_block(id: u8) -> bool {
     block_def(id).is_some_and(|b| b.solid)
 }
@@ -280,10 +224,6 @@ impl WorldTables {
         block_def(id)
     }
 
-    pub fn material(&self, id: MaterialId) -> Option<&'static MaterialDef> {
-        material_def(id)
-    }
-
     pub fn biome(&self, id: BiomeId) -> Option<&'static BiomeDef> {
         biome_def(id)
     }
@@ -311,7 +251,6 @@ mod tests {
     fn world_tables_delegate_to_static_tables() {
         let tables = WorldTables;
         assert!(tables.block(STONE_BLOCK).is_some());
-        assert!(tables.material(MaterialId(0)).is_some());
         assert!(tables.biome(DEFAULT_BIOME).is_some());
         assert!(tables.block_is_solid(STONE_BLOCK));
         assert!(!tables.block_is_solid(AIR_BLOCK));
@@ -319,22 +258,40 @@ mod tests {
         assert_eq!(tables.lod_thresholds().len(), 3);
     }
 
+    /// block id 唯一，且 0..7 的名字是导出契约；未知 id 返回 None。
     #[test]
-    fn block_ids_unique_and_materials_exist() {
+    fn block_ids_unique_and_names_exported() {
         let mut ids: Vec<u8> = BLOCK_TABLE.iter().map(|b| b.id).collect();
         ids.sort_unstable();
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len(), "方块 id 必须唯一");
 
-        for block in BLOCK_TABLE {
-            assert!(
-                material_def(block.material).is_some(),
-                "方块 {} 引用了不存在的材质 {:?}",
-                block.name,
-                block.material
-            );
+        let expected = [
+            (AIR_BLOCK, "air"),
+            (STONE_BLOCK, "stone"),
+            (DIRT_BLOCK, "dirt"),
+            (GRASS_BLOCK, "grass"),
+            (SAND_BLOCK, "sand"),
+            (SNOW_BLOCK, "snow"),
+            (WOOD_BLOCK, "wood"),
+            (LEAF_BLOCK, "leaf"),
+        ];
+        for (id, name) in expected {
+            assert_eq!(block_name(id), Some(name), "block {id} 的名字契约");
         }
+        assert_eq!(block_name(8), None, "未知 block id 返回 None");
+        assert_eq!(block_name(255), None);
+
+        let mut names: Vec<&str> = BLOCK_TABLE.iter().map(|b| b.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "方块名必须唯一（Godot 资源按名字绑定）"
+        );
     }
 
     #[test]

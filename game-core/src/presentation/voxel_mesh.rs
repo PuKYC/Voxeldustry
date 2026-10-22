@@ -30,6 +30,8 @@ use std::collections::BTreeMap;
 use bevy::prelude::*;
 use game_engine::voxel::{ChunkKey, RectInstance};
 
+use crate::static_data::voxel::FACE_COUNT;
+
 /// 一个 mesh 块（32³ 基础跨度）的原始体素缓冲（内部 32³ + halo 层，共 34³）。
 ///
 /// 值 = 方块 id（`static_data::voxel::BLOCK_TABLE` 的 id），0 = 空气。
@@ -112,11 +114,51 @@ pub fn rect_scale_meters(voxel_size_m: f32, lod: u8) -> f32 {
     voxel_size_m * (1u32 << u32::from(lod)) as f32
 }
 
+/// Godot 侧 `VoxelMaterialLibrary.build_face_material_map()` 产出的映射表长度：
+/// 256 个 block × 6 个面（face = plane*2+dir，顺序 `[+x, -x, +y, -y, +z, -z]`）。
+pub const FACE_MATERIAL_MAP_LEN: usize = 256 * FACE_COUNT;
+
+/// 渲染入口：34³ raw halo -> 39 bit 矩形流，并按 Godot 提供的 block→面材质
+/// 映射重映射每个矩形的 `material` 字段。
+///
+/// `face_material_map` 由 Godot 的 `VoxelMaterialLibrary.build_face_material_map()`
+/// 生成，索引 `block * FACE_COUNT + face`，值就是矩形要写的材质 id。Rust 侧
+/// 不持有任何材质表，只做机械重映射。
+///
+/// **降级路径**：长度不等于 [`FACE_MATERIAL_MAP_LEN`]（例如空 map 表示 Godot
+/// 未提供绑定时）退化为 identity —— 矩形 material 保持 block id，不 panic。
+#[must_use]
+pub fn mesh_raw_halo_for_render(
+    lod: u8,
+    blocks: &[u8],
+    skirt_mask: u8,
+    face_material_map: &[u8],
+) -> Vec<u64> {
+    if face_material_map.len() != FACE_MATERIAL_MAP_LEN {
+        return game_engine::presentation::voxel::mesh_raw_halo_with_skirts(
+            lod, blocks, skirt_mask,
+        );
+    }
+
+    game_engine::presentation::voxel::mesh_raw_halo_with_skirts_and_face_materials(
+        lod,
+        blocks,
+        skirt_mask,
+        &|block, face| {
+            // 正常 mesher 的 face 一定在 0..5；这里防御性夹取，避免 map 越界。
+            let face = usize::from(face).min(FACE_COUNT - 1);
+            face_material_map[usize::from(block) * FACE_COUNT + face]
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
-    use game_engine::presentation::voxel::{pack_rect, pack_rect_with_ao, unpack_ao, unpack_rect};
+    use game_engine::presentation::voxel::{
+        pack_rect, pack_rect_with_ao, raw_halo_index, unpack_ao, unpack_rect, RAW_VOXELS,
+    };
 
     fn rect(
         plane: u8,
@@ -253,5 +295,84 @@ mod tests {
         // 消费端按 UV 角取 AO：每个角只读自己的 2 bit。
         assert_eq!(unpack_ao(word)[ao_corner_index(0, 0) as usize], 3);
         assert_eq!(unpack_ao(word)[ao_corner_index(1, 1) as usize], 0);
+    }
+
+    /// 渲染入口必须按 Godot 提供的 face material map 逐面重映射 material 字段。
+    #[test]
+    fn render_mesher_applies_face_material_map() {
+        use crate::static_data::voxel::{GRASS_BLOCK, STONE_BLOCK};
+
+        // 合成 map：默认 identity（每面 = block id）；草方块六面映射成 10..15。
+        let mut map = vec![0u8; FACE_MATERIAL_MAP_LEN];
+        for block in 0..=255usize {
+            for face in 0..FACE_COUNT {
+                map[block * FACE_COUNT + face] = block as u8;
+            }
+        }
+        for face in 0..FACE_COUNT {
+            map[usize::from(GRASS_BLOCK) * FACE_COUNT + face] = 10 + face as u8;
+        }
+
+        let mut blocks = vec![0u8; RAW_VOXELS];
+        // halo 内部坐标 (1,1,1) = 块局部 (0,0,0)。
+        blocks[raw_halo_index(1, 1, 1)] = GRASS_BLOCK;
+        let words = mesh_raw_halo_for_render(0, &blocks, 0, &map);
+        assert_eq!(words.len(), 6, "单个体素 = 6 个面");
+
+        let mut seen = [false; 6];
+        for word in &words {
+            let r = unpack_rect(*word);
+            let face = usize::from(r.plane) * 2 + usize::from(r.dir);
+            assert!(!seen[face], "每个朝向只应有一个 1x1 面");
+            seen[face] = true;
+            assert_eq!(
+                r.material,
+                10 + face as u8,
+                "face {face} 必须取 map[block*6+face]"
+            );
+        }
+        assert!(seen.iter().all(|hit| *hit));
+
+        // 非草方块：map 为 identity，material 保持 block id。
+        let mut stone = vec![0u8; RAW_VOXELS];
+        stone[raw_halo_index(1, 1, 1)] = STONE_BLOCK;
+        let words = mesh_raw_halo_for_render(0, &stone, 0, &map);
+        assert!(words
+            .iter()
+            .all(|w| unpack_rect(*w).material == STONE_BLOCK));
+
+        // 空气块不得产生几何。
+        assert!(mesh_raw_halo_for_render(0, &vec![0u8; RAW_VOXELS], 0, &map).is_empty());
+    }
+
+    /// 未提供绑定（空 map / 长度错误）时 identity 降级：material 保持 block id，
+    /// 几何不变且不 panic。
+    #[test]
+    fn render_mesher_identity_without_face_material_map() {
+        use crate::static_data::voxel::{GRASS_BLOCK, STONE_BLOCK};
+
+        let mut blocks = vec![0u8; RAW_VOXELS];
+        blocks[raw_halo_index(1, 1, 1)] = GRASS_BLOCK;
+
+        for map in [
+            Vec::new(),
+            vec![0u8; 10],
+            vec![0u8; FACE_MATERIAL_MAP_LEN * 2],
+        ] {
+            let words = mesh_raw_halo_for_render(0, &blocks, 0, &map);
+            assert_eq!(words.len(), 6, "identity 降级不改变几何");
+            assert!(
+                words
+                    .iter()
+                    .all(|w| unpack_rect(*w).material == GRASS_BLOCK),
+                "identity 降级时 material 必须保持 block id"
+            );
+        }
+
+        let mut stone = vec![0u8; RAW_VOXELS];
+        stone[raw_halo_index(1, 1, 1)] = STONE_BLOCK;
+        assert!(mesh_raw_halo_for_render(0, &stone, 0, &[])
+            .iter()
+            .all(|w| unpack_rect(*w).material == STONE_BLOCK));
     }
 }

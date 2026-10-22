@@ -53,6 +53,10 @@ func _setup_camera_and_light() -> void:
 	light.shadow_enabled = true
 	add_child(light)
 
+	# 引擎 lit 光照必须有环境光（否则背光面全黑）；背景 / 环境配置统一在
+	# VoxelEnv，幂等：场景里已有 WorldEnvironment 时直接复用。
+	VoxelEnv.ensure(self)
+
 
 var _dbg_t := 0.0
 

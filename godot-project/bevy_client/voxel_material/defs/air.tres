@@ -1,0 +1,13 @@
+[gd_resource type="Resource" script_class="VoxelMaterial" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="1_s3sgc"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/tiles/air.res" id="2_1skdl"]
+
+[resource]
+script = ExtResource("1_s3sgc")
+material_key = "air"
+display_name = "Air"
+tiles = ExtResource("2_1skdl")
+albedo_color = Color(0, 0, 0, 0)
+normal_from_albedo = false
+emission_energy = 0.0

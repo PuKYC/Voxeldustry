@@ -1,0 +1,59 @@
+[gd_resource type="Resource" script_class="VoxelMaterialLibrary" format=3]
+
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_block_material.gd" id="1_2efpy"]
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material.gd" id="2_fm7a5"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/stone.tres" id="3_a43xo"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/dirt.tres" id="4_jw22t"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/grass_top.tres" id="5_gq8qs"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/sand.tres" id="6_ipnxm"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/snow.tres" id="7_2b05u"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/wood.tres" id="8_cb8br"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/leaf.tres" id="9_hy6kr"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/air.tres" id="10_tbcye"]
+[ext_resource type="Resource" path="res://bevy_client/voxel_material/defs/grass_side.tres" id="11_y0int"]
+[ext_resource type="Script" path="res://bevy_client/voxel_material/voxel_material_library.gd" id="12_nlmlp"]
+
+[sub_resource type="Resource" id="Resource_altaf"]
+script = ExtResource("1_2efpy")
+block_key = "air"
+faces = PackedInt32Array(7, 7, 7, 7, 7, 7)
+
+[sub_resource type="Resource" id="Resource_5ddkt"]
+script = ExtResource("1_2efpy")
+block_key = "stone"
+faces = PackedInt32Array(0, 0, 0, 0, 0, 0)
+
+[sub_resource type="Resource" id="Resource_2evyp"]
+script = ExtResource("1_2efpy")
+block_key = "dirt"
+faces = PackedInt32Array(1, 1, 1, 1, 1, 1)
+
+[sub_resource type="Resource" id="Resource_dqs3j"]
+script = ExtResource("1_2efpy")
+block_key = "grass"
+faces = PackedInt32Array(8, 8, 2, 1, 8, 8)
+
+[sub_resource type="Resource" id="Resource_cblix"]
+script = ExtResource("1_2efpy")
+block_key = "sand"
+faces = PackedInt32Array(3, 3, 3, 3, 3, 3)
+
+[sub_resource type="Resource" id="Resource_3wo41"]
+script = ExtResource("1_2efpy")
+block_key = "snow"
+faces = PackedInt32Array(4, 4, 4, 4, 4, 4)
+
+[sub_resource type="Resource" id="Resource_2cpxf"]
+script = ExtResource("1_2efpy")
+block_key = "wood"
+faces = PackedInt32Array(5, 5, 5, 5, 5, 5)
+
+[sub_resource type="Resource" id="Resource_yy3q2"]
+script = ExtResource("1_2efpy")
+block_key = "leaf"
+faces = PackedInt32Array(6, 6, 6, 6, 6, 6)
+
+[resource]
+script = ExtResource("12_nlmlp")
+materials = Array[ExtResource("2_fm7a5")]([ExtResource("3_a43xo"), ExtResource("4_jw22t"), ExtResource("5_gq8qs"), ExtResource("6_ipnxm"), ExtResource("7_2b05u"), ExtResource("8_cb8br"), ExtResource("9_hy6kr"), ExtResource("10_tbcye"), ExtResource("11_y0int")])
+blocks = Array[ExtResource("1_2efpy")]([SubResource("Resource_altaf"), SubResource("Resource_5ddkt"), SubResource("Resource_2evyp"), SubResource("Resource_dqs3j"), SubResource("Resource_cblix"), SubResource("Resource_3wo41"), SubResource("Resource_2cpxf"), SubResource("Resource_yy3q2")])
