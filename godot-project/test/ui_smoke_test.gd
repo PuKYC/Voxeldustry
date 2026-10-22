@@ -11,7 +11,10 @@ extends SceneTree
 ## 7. P1：platform 与 scheme 分离（边距 / 缩放看 platform，不看输入方案）；
 ## 8. P2：scheme_overrides 覆盖 tray / align / priority / min_size，切回后恢复；
 ## 9. P4：同组互斥（同组只激活一个 priority 最高者）；
-## 10. P5：混合设备防抖（切换冷却 / 摇杆漂移阈值 / 鼠标微动阈值）。
+## 10. P5：混合设备防抖（切换冷却 / 摇杆漂移阈值 / 鼠标微动阈值）；
+## 11. P3：ButtonSpecs 规格生成（tool 双按钮 / 缺规格兜底）、ActionButton 多点触摸
+##     按下释放、通道 unavailable 立即释放、菜单 / 切方案隐藏；
+## 12. P3b：交互提示用真实绑定（触屏显示 Tap）。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -306,6 +309,153 @@ func _run() -> void:
 	_check(UiState.scheme == UiState.Scheme.KBM, "P5：正常鼠标位移切回 KBM")
 	ui.set("scheme_switch_cooldown", 0.5)
 	ui.set("_last_scheme_switch_ms", 0)
+
+	# P3：动作按钮映射移到 Godot —— ButtonSpecs 生成规格，ActionButtonHost 建按钮，
+	# ActionButton 自己按下 / 松开（多点触控按 index 各自独立）。
+	_check(ui.action_host != null, "P3：UiRoot 已创建 ActionButtonHost")
+	if ui.action_host != null:
+		var host: ActionButtonHost = ui.action_host
+		_check(host.buttons().is_empty(), "P3：无 BevyClient 时按钮数为 0（实际 %d）" % host.buttons().size())
+		# 规格表与 Rust 动作名保持一致（防 ACTION_TABLE 漂移）。
+		_check(ButtonSpecs.specs_for_channel("tool").size() == 2, "P3：tool 通道有两条规格")
+		var flight_specs := ButtonSpecs.specs_for_channel("flight")
+		_check(not flight_specs.is_empty()
+				and String((flight_specs[0] as Dictionary).get("action", "")) == "flight_toggle",
+			"P3：flight 动作名与 Rust 表一致（flight_toggle）")
+		for action in ["jump", "primary_tool", "secondary_tool", "turbo_action"]:
+			if not InputMap.has_action(action):
+				InputMap.add_action(action)
+		host.apply_channels([
+			{"key": "move", "mode": "axis2d", "actions": ["move_forward"]},
+			{"key": "jump", "mode": "button", "actions": ["jump"]},
+			{"key": "tool", "mode": "hold", "actions": ["primary_tool", "secondary_tool"]},
+			{"key": "turbo", "mode": "toggle", "actions": ["turbo_action"]},
+		])
+		await process_frame
+		# 期望 4 个：jump 1 + tool 2 + turbo 兜底 1；move 是 axis2d 不出按钮。
+		_check(host.buttons().size() == 4,
+			"P3：tool 生成两个、无规格通道走兜底、axis2d 不出按钮（实际 %d）" % host.buttons().size())
+		var by_id := {}
+		for button: ActionButton in host.buttons():
+			by_id[button.widget_id] = button
+		_check(by_id.has(&"btn_primary") and by_id.has(&"btn_secondary"), "P3：tool 通道两个按钮 id 正确")
+		_check(by_id.has(&"btn_turbo"), "P3：缺规格通道用兜底规格（btn_turbo）")
+		ui.call("_set_scheme", UiState.Scheme.TOUCH)
+		await process_frame
+		var jump_button: ActionButton = by_id.get(&"btn_jump", null)
+		var turbo_button: ActionButton = by_id.get(&"btn_turbo", null)
+		_check(jump_button != null and jump_button.visible, "P3：触屏方案下动作按钮可见")
+
+		var touch_a := InputEventScreenTouch.new()
+		touch_a.index = 0
+		touch_a.pressed = true
+		touch_a.position = jump_button.size * 0.5
+		jump_button._gui_input(touch_a)
+		_check(Input.is_action_pressed("jump"), "P3：按钮按下注入动作")
+		var touch_b := InputEventScreenTouch.new()
+		touch_b.index = 1
+		touch_b.pressed = true
+		touch_b.position = turbo_button.size * 0.5
+		turbo_button._gui_input(touch_b)
+		_check(Input.is_action_pressed("jump") and Input.is_action_pressed("turbo_action"),
+			"P3：两根手指同时按住两个按钮都生效")
+		var touch_up := InputEventScreenTouch.new()
+		touch_up.index = 0
+		touch_up.pressed = false
+		jump_button._gui_input(touch_up)
+		_check(not Input.is_action_pressed("jump"), "P3：松开按钮释放动作")
+		_check(Input.is_action_pressed("turbo_action"), "P3：松开一根手指不影响另一个按钮")
+		# toggle：按住 turbo 后 0.1s 自动释放，形成一次完整边沿。
+		await create_timer(0.25).timeout
+		_check(not Input.is_action_pressed("turbo_action"), "P3：toggle 模式自动释放动作")
+
+		# available=false：立即释放该动作并隐藏？（present 管显隐，available 管置灰）
+		host.set_channel_state("jump", true, true)
+		var touch_c := InputEventScreenTouch.new()
+		touch_c.index = 2
+		touch_c.pressed = true
+		touch_c.position = jump_button.size * 0.5
+		jump_button._gui_input(touch_c)
+		_check(Input.is_action_pressed("jump"), "P3：重新按下按钮")
+		host.set_channel_state("jump", true, false)
+		_check(not Input.is_action_pressed("jump"), "P3：通道不可用时立即释放动作")
+		host.set_channel_state("jump", false, true)
+		_check(not jump_button.visible, "P3：通道 present=false 时按钮隐藏")
+		host.set_channel_state("jump", true, true)
+		await process_frame
+		_check(jump_button.visible, "P3：通道恢复后按钮重新可见")
+
+		# 菜单打开 / 方案切走时释放全部动作并隐藏按钮。
+		host.release_all()
+		ui.open_pause_menu()
+		await process_frame
+		_check(not jump_button.visible, "P3：菜单打开时动作按钮隐藏")
+		ui.close_pause_menu()
+		await process_frame
+		ui.call("_set_scheme", UiState.Scheme.KBM)
+		await process_frame
+		_check(not jump_button.visible, "P3：切回键鼠方案后动作按钮隐藏")
+		host.release_all()
+		for action in ["jump", "primary_tool", "secondary_tool", "turbo_action"]:
+			if InputMap.has_action(action):
+				Input.action_release(action)
+
+		# 规格字段原样落到 HudWidget（P2 集成：ActionButton 不自带覆盖逻辑）。
+		var spec_button := ActionButton.new()
+		spec_button.configure(ButtonSpecs.normalize_spec({
+			"id": "btn_probe",
+			"label": "Probe",
+			"action": "jump",
+			"tray": HudWidget.Tray.BOTTOM,
+			"align": HudWidget.Align.BEGIN,
+			"priority": 7,
+			"schemes": UiState.Scheme.TOUCH | UiState.Scheme.KBM,
+			"scheme_overrides": {UiState.Scheme.TOUCH: {"tray": HudWidget.Tray.TOP}},
+		}, {"key": "jump", "mode": "button", "actions": ["jump"]}))
+		_check(spec_button.tray == HudWidget.Tray.BOTTOM and spec_button.priority == 7
+				and spec_button.schemes == (UiState.Scheme.TOUCH | UiState.Scheme.KBM)
+				and spec_button.scheme_overrides.has(UiState.Scheme.TOUCH),
+			"P3：规格字段原样落到 HudWidget")
+		spec_button.free()
+
+		# 无 client 时 refresh() 要安全：清空按钮而不是报错。
+		host.refresh()
+		await process_frame
+		_check(host.buttons().is_empty(), "P3：无 client 时 refresh() 安全清空按钮")
+		host.destroy()
+		await process_frame
+		_check(ui.registry.get_widget(&"btn_jump") == null, "P3：destroy 后按钮已从注册表移除")
+
+	# P3b：交互提示用真实绑定（触屏固定 Tap）。
+	var prompt = ui.registry.get_widget(&"interact_prompt")
+	_check(prompt != null, "P3b：交互提示元素已注册")
+	if prompt != null:
+		var prompt_label: Label = prompt.get_node_or_null("Prompt")
+		_check(prompt_label != null, "P3b：交互提示有 Prompt Label")
+		if prompt_label != null:
+			ui.call("_set_scheme", UiState.Scheme.KBM)
+			await process_frame
+			_check(prompt_label.text.contains("Interact"), "P3b：键鼠方案提示含 Interact（实际 \"%s\"）" % prompt_label.text)
+			# 真实绑定：注册 E 后提示变 "[E] Interact"，改键成 F 后跟着变。
+			if not InputMap.has_action("interact"):
+				InputMap.add_action("interact")
+			var key_e := InputEventKey.new()
+			key_e.physical_keycode = KEY_E
+			InputMap.action_add_event("interact", key_e)
+			prompt.call("_refresh_prompt")
+			_check(prompt_label.text == "[E] Interact", "P3b：提示跟随 InputMap 绑定（实际 \"%s\"）" % prompt_label.text)
+			InputMap.action_erase_event("interact", key_e)
+			var key_f := InputEventKey.new()
+			key_f.physical_keycode = KEY_F
+			InputMap.action_add_event("interact", key_f)
+			prompt.call("_refresh_prompt")
+			_check(prompt_label.text == "[F] Interact", "P3b：改键后提示跟着变（实际 \"%s\"）" % prompt_label.text)
+			InputMap.action_erase_event("interact", key_f)
+			ui.call("_set_scheme", UiState.Scheme.TOUCH)
+			await process_frame
+			_check(prompt_label.text == "Tap", "P3b：触屏方案提示为 Tap（实际 \"%s\"）" % prompt_label.text)
+			ui.call("_set_scheme", UiState.Scheme.KBM)
+			await process_frame
 
 	# 紧凑显隐。
 	first.compact_level = 1

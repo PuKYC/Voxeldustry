@@ -55,6 +55,7 @@ const DEBUG_OVERLAY_SCRIPT := preload("res://ui/debug/hud_debug_overlay.gd")
 ## 当前 BevyClient（可能为 null：纯 UI 预览 / 后端未启动）。
 var client: Node = null
 var registry := HudRegistry.new()
+var action_host: ActionButtonHost = null
 var pause_menu: Control = null
 var touch_controls: Control = null
 var debug_overlay: Control = null
@@ -88,6 +89,7 @@ func _ready() -> void:
 	_update_safe_area()
 	_instantiate_optional()
 	_register_builtin_widgets()
+	_setup_action_buttons()
 	_connect_viewport()
 	_set_camera_blocked(UiState.is_menu_open() or UiState.has_scheme(UiState.Scheme.TOUCH))
 	_initialized = true
@@ -247,6 +249,26 @@ func _load_scene_instance(path: String) -> Node:
 		push_warning("[UiRoot] 无法加载场景：%s" % path)
 		return null
 	return (resource as PackedScene).instantiate()
+
+
+## 动作按钮宿主：把通道表映射成 HudWidget 注册进托盘。
+## 原来的按钮逻辑在触屏层里（自己算坐标 + 安全区），现在复用槽位与 SafeArea。
+func _setup_action_buttons() -> void:
+	if not enable_touch_controls:
+		return
+	action_host = ActionButtonHost.new()
+	action_host.name = "ActionButtonHost"
+	add_child(action_host)
+	action_host.setup(self, registry)
+	# UiRoot._ready 可能早于 BevyClient.bind：客户端能力位变化时补一次刷新。
+	if client != null and client.has_signal("input_capabilities_changed"):
+		if not client.input_capabilities_changed.is_connected(_on_input_capabilities_changed):
+			client.input_capabilities_changed.connect(_on_input_capabilities_changed)
+
+
+func _on_input_capabilities_changed(_present: int, _available: int) -> void:
+	if action_host != null:
+		action_host.refresh()
 
 
 func _register_builtin_widgets() -> void:
@@ -579,6 +601,13 @@ func _toggle_debug_overlay() -> void:
 	if debug_overlay != null:
 		debug_overlay.visible = _debug_visible
 		debug_overlay.refresh()
+
+
+func _exit_tree() -> void:
+	# 退出场景时按钮宿主先拆：释放按下中的动作，并从注册表移除。
+	if action_host != null:
+		action_host.destroy()
+		action_host = null
 
 
 ## 供 mod / 外部代码注册 UI（见 HudRegistry.register_external）。

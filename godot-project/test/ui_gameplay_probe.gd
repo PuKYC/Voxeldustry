@@ -23,6 +23,21 @@ func _run() -> void:
 		return
 	var client = ui.client
 	print("PROBE client=", client != null, " widgets=", ui.registry.widgets().size())
+
+	# P3：真实通道表 -> ButtonSpecs -> ActionButtonHost 的端到端检查。
+	var host = ui.action_host
+	var button_count: int = 0 if host == null else host.buttons().size()
+	var tool_buttons := 0
+	if host != null:
+		for button in host.buttons():
+			if button.channel_key() == "tool":
+				tool_buttons += 1
+	print("PROBE action_host=", host != null, " buttons=", button_count,
+		" tool_buttons=", tool_buttons, " channels=", 0 if host == null else host.channel_table().size())
+	if host == null or button_count <= 0 or tool_buttons != 2:
+		print("PROBE FAIL action buttons")
+		quit(1)
+		return
 	print("PROBE touch=", ui.touch_controls != null, " pause=", ui.pause_menu != null)
 	var camera = get_first_node_in_group("camera_rig")
 	print("PROBE camera=", camera != null)
