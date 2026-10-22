@@ -21,7 +21,7 @@ source: "代码阅读 @ commit 67d5a1f"
 | --- | --- |
 | `item` | 物品定义、分类、子类、标签索引、堆叠 |
 | `prototype` | 对象原型表 |
-| `voxel` | 方块 id 调色板、材质表、生物群系、体素边长、LOD 距离阈值、`WorldTables` |
+| `voxel` | 方块 id 与名字、生物群系、体素边长、LOD 距离阈值、`WorldTables`（材质外观不在这里） |
 
 规则：
 
@@ -29,7 +29,7 @@ source: "代码阅读 @ commit 67d5a1f"
 - 数值一律用 `FixedPoint` 或整数表达，避免 f32 进入逻辑层。
 - 表现层只消费只读快照：`godot-client-ext` 把表搬给 GDScript 的 `StaticTables`。
 
-体素世界的关键常量：方块 id 0 到 7 依次是空气、石、土、草、沙、雪、木、叶；材质表给渲染侧查表，逻辑层只传整数。
+体素世界的关键常量：方块 id 0 到 7 依次是空气、石、土、草、沙、雪、木、叶；Rust 只导出 `block_names` 给 Godot 对账，材质外观与 block→面绑定都在 Godot 侧（见 [[06-体素世界与材质]]）。
 
 ## 稳定身份
 
@@ -79,7 +79,10 @@ source: "代码阅读 @ commit 67d5a1f"
 
 | 想改什么 | 改哪里 |
 | --- | --- |
-| 方块颜色与粗糙度 | `static_data/voxel.rs` 的 `MATERIAL_TABLE` |
+| 材质外观（颜色 / 粗糙度 / 金属度 / 自发光 / 图案） | `godot-project/bevy_client/voxel_material/defs/*.tres`（VoxelMaterial），改完跑 `godot-project/tools/bake_voxel_materials.gd` 重新烘焙 |
+| block → 六个面的材质绑定 | `godot-project/bevy_client/voxel_material/voxel_material_library.tres` 的 `blocks`（VoxelBlockMaterial） |
+| 材质瓦片像素 | `godot-project/bevy_client/voxel_material/tiles/*.res`（bake 产物）；美术源图放 `godot-project/art/voxel_materials/`（该目录带 `.gdignore`，不导入、不进导出包，只做 bake 输入） |
+| 新增材质 | 加 `godot-project/bevy_client/voxel_material/defs/<key>.tres`，追加到库的 `materials`，再重跑 bake（layer 顺序即材质 id） |
 | 物品定义 | `static_data/item` |
 | LOD 距离阈值 | `static_data/voxel.rs` 的 `LOD_DISTANCE_THRESHOLDS` |
 | 表现语义名 | 运行期 `SemanticRegistry` 或 GDScript 的 `semantic_overrides` |
