@@ -7,7 +7,8 @@ extends SceneTree
 ## 3. 菜单打开时 HUD 隐藏、关闭后恢复；
 ## 4. register_external（mod 路径）能通过 PackedScene 注册；
 ## 5. 逻辑尺寸 / 缩放 / 安全区状态字段有值；
-## 6. P0：unregister 先 detach（不残留载荷回调 / 信号）、无 manager 不写 backend_paused。
+## 6. P0：unregister 先 detach（不残留载荷回调 / 信号）、无 manager 不写 backend_paused；
+## 7. P1：platform 与 scheme 分离（边距 / 缩放看 platform，不看输入方案）。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -62,6 +63,31 @@ func _run() -> void:
 	await process_frame
 	_check(is_equal_approx(UiState.logical_width, 1920.0), "桌面：逻辑宽度回到 1920（实际 %.0f）" % UiState.logical_width)
 	_check(UiState.compact_level == 0, "桌面：断点回到正常（实际 %d）" % UiState.compact_level)
+
+	# P1：platform 与 scheme 分离 —— 边距 / 缩放看 platform，不看 scheme。
+	_check(UiState.platform == UiState.Platform.DESKTOP, "P1：桌面 platform = DESKTOP（实际 %d）" % UiState.platform)
+	ui.call("_set_scheme", UiState.Scheme.TOUCH)
+	await process_frame
+	_check(UiState.platform == UiState.Platform.DESKTOP, "P1：切触屏方案不改变 platform")
+	_check(_safe_margin(ui) == int(UiRoot.EDGE_PAD), "P1：桌面切触屏方案后边距仍为 EDGE_PAD（实际 %d）" % _safe_margin(ui))
+	ui.set("debug_force_mobile", true)
+	ui.call("_apply_scale")
+	ui.call("_schedule_metrics")
+	await process_frame
+	await process_frame
+	await process_frame
+	_check(UiState.platform == UiState.Platform.PHONE, "P1：debug_force_mobile 视为 PHONE（实际 %d）" % UiState.platform)
+	_check(_safe_margin(ui) == int(UiRoot.TOUCH_PAD), "P1：PHONE 边距为 TOUCH_PAD（实际 %d）" % _safe_margin(ui))
+	ui.set("debug_force_mobile", false)
+	ui.call("_apply_scale")
+	ui.call("_schedule_metrics")
+	await process_frame
+	await process_frame
+	await process_frame
+	_check(UiState.platform == UiState.Platform.DESKTOP, "P1：关闭 debug_force_mobile 回到 DESKTOP（实际 %d）" % UiState.platform)
+	ui.call("_set_scheme", UiState.Scheme.KBM)
+	await process_frame
+
 	var slots: Dictionary = ui.get("_slots")
 	_check(slots.size() == 9, "托盘槽位数量 = 9（实际 %d）" % slots.size())
 	# 已落地的内置 HUD（widgets 子代理交付）应被 UiRoot 自动注册。
@@ -283,6 +309,14 @@ class _ProbeWidget:
 
 	func _on_entity_changed(_e) -> void:
 		pass
+
+
+## SafeArea 的基础边距（不含安全区 inset；headless 下 inset 恒 0）。
+func _safe_margin(ui: CanvasLayer) -> int:
+	var safe: MarginContainer = ui.get("_safe")
+	if safe == null:
+		return -1
+	return safe.get_theme_constant("margin_left")
 
 
 func _check(condition: bool, message: String) -> void:

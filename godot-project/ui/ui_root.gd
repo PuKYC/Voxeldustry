@@ -274,7 +274,21 @@ func _detect_initial_scheme() -> void:
 		UiState.set_scheme(UiState.Scheme.KBM)
 
 
+## 设备类别只看静态特征（是否移动端 / 屏幕对角线），不看输入事件。
+## debug_force_mobile 视为 PHONE：它模拟的是手机缩放公式。
+func _update_platform() -> void:
+	if debug_force_mobile:
+		UiState.platform = UiState.Platform.PHONE
+	elif not _is_mobile():
+		UiState.platform = UiState.Platform.DESKTOP
+	elif is_equal_approx(_mobile_target_width(), TABLET_TARGET_WIDTH):
+		UiState.platform = UiState.Platform.TABLET
+	else:
+		UiState.platform = UiState.Platform.PHONE
+
+
 func _apply_scale() -> void:
+	_update_platform()
 	_base_factor = _compute_base_scale()
 	var factor := _base_factor * _user_scale
 	factor = clampf(factor, 0.5, 8.0)
@@ -336,7 +350,8 @@ func _update_safe_area() -> void:
 	UiState.safe_insets = insets
 	if _safe == null:
 		return
-	var pad := TOUCH_PAD if UiState.has_scheme(UiState.Scheme.TOUCH) else EDGE_PAD
+	# 边距看平台不看方案：平板接键盘时界面不该因为 scheme 抖动而跳变。
+	var pad := TOUCH_PAD if UiState.platform != UiState.Platform.DESKTOP else EDGE_PAD
 	_safe.add_theme_constant_override("margin_left", int(round(pad + insets.x)))
 	_safe.add_theme_constant_override("margin_top", int(round(pad + insets.y)))
 	_safe.add_theme_constant_override("margin_right", int(round(pad + insets.z)))

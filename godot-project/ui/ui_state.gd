@@ -15,6 +15,17 @@ enum Scheme {
 
 const ALL_SCHEMES := Scheme.TOUCH | Scheme.KBM | Scheme.GAMEPAD
 
+## 静态设备类别：决定缩放目标、安全区与基础边距。
+## 与动态的 scheme（输入方案）分开：平板接键盘时 scheme 变 KBM，platform 仍是 TABLET，
+## 边距与缩放不该跟着输入事件抖动。
+enum Platform {
+	DESKTOP,
+	PHONE,
+	TABLET,
+}
+
+## 当前设备类别（静态，由 UiRoot 在启动 / 缩放重算时写入）。
+static var platform: int = Platform.DESKTOP
 ## 当前输入方案（位掩码）。
 static var scheme: int = Scheme.KBM
 ## 菜单栈深度：> 0 表示有菜单打开（游戏暂停、不捕获鼠标、HUD 隐藏）。
@@ -63,6 +74,7 @@ static func set_menu_open(open: bool) -> void:
 
 
 static func reset() -> void:
+	platform = Platform.DESKTOP
 	scheme = Scheme.KBM
 	menu_depth = 0
 	backend_paused = false
