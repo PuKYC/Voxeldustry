@@ -443,6 +443,72 @@ scheme_overrides = {
 
 **仍需真机验证**（headless 是 stub DisplayServer：窗口 64×64、视口正方形、无真实 DPR / 安全区、`is_touchscreen_available` 恒 false，不能替代真机）：真机坐标缩放 / 断点 / 安全区；`InputEventScreenTouch.canceled=true`（系统取消触摸）时是否释放动作；真实多指乱序 / 丢帧；按钮 + 摇杆 + 视角三指同时按。
 
+## 交互意图抽象（设计，未实现）
+
+一句话：把「鼠标悬停 / 长按 / 手柄焦点」这类设备差异收进方案层，元素只声明并响应意图 **hint / select / confirm / context**，不判断设备。本节是设计说明，**本轮不实现**；已落地的 `scheme` / `scheme_overrides` / `ButtonSpecs` 见本文对应章节。
+
+### 问题
+
+元素现在能声明「在哪些方案下可见」（`schemes` 位掩码）和「在不同方案下怎么摆」（`scheme_overrides`），但**交互仍绑定具体事件**：
+
+- 桌面：鼠标悬停高亮、左键确认、右键上下文；
+- 触屏：没有悬停，用按下 / 长按 / 抬手；
+- 手柄：没有指针，用焦点移动 + 确认键。
+
+如果每个元素自己判 `UiState.scheme`、自己监听 `InputEventMouse` / `InputEventScreenTouch`，就会出现 N 份设备分支，和「元素不判断设备」的边界冲突，mod 也没法复用交互元素。
+
+### 意图模型
+
+四个意图，语义与触发方式解耦：
+
+| 意图 | 含义 | 桌面（KBM） | 触屏（TOUCH） | 手柄（GAMEPAD） |
+| --- | --- | --- | --- | --- |
+| `hint` | 用户「看向 / 指向」某元素，元素可展示可操作性 | 鼠标悬停 | 手指按下（落在元素上） | 焦点移入 |
+| `select` | 明确选中目标（可以无副作用） | 左键按下 | 手指按下 | 焦点移入后确认前 |
+| `confirm` | 执行主动作 | 左键释放 / Enter | 抬手（短按） | 确认键（A） |
+| `context` | 执行次要 / 上下文动作 | 右键 | 长按 | 上下文键（X） |
+
+触发方式是**方案层配置**，不是元素逻辑：长按多少毫秒、按下是否先发 `select`、抬手是否要求仍在元素内，都由方案表决定；元素只看到意图。
+
+### 元素契约
+
+元素只实现意图回调（伪代码，未落地）：`on_intent(intent, payload) -> bool`（返回 true 表示消费），或拆成 `_on_hint() / _on_select() / _on_confirm() / _on_context()`。约束：
+
+- 回调里只改自身视觉、只发游戏语义请求（例如 `Input.action_press`）；
+- 不读 `UiState.scheme`、不判断 `InputEvent` 子类、不写坐标；
+- 不消费的意图返回 false，由路由层继续路由或丢弃。
+
+### 与 scheme / scheme_overrides 的关系
+
+| 层 | 管什么 | 索引 | 现状 |
+| --- | --- | --- | --- |
+| `scheme`（位掩码 1/2/4） | 当前输入方案、可见性（`schemes`） | 位与 | 已实现 |
+| `scheme_overrides` | 同一元素在不同方案下的**放置**：tray / align / priority / min_size | scheme 值 | 已实现 |
+| 意图路由（本节） | 同一元素在不同方案下**如何被触发** | scheme 值 | 未实现 |
+
+边界：
+
+- `scheme_overrides` 是布局维度，意图抽象是交互维度；`scheme_overrides` 不会让元素知道该监听什么事件。
+- `platform`（DESKTOP / PHONE / TABLET）不参与意图映射：它只决定缩放、安全区与基础边距。平板接键盘时 platform 仍是 TABLET、scheme 变成 KBM，意图按 scheme 表走。
+- 意图不新增输入链路：最终仍落到 InputMap 动作 / `look_delta` / Rust 命令，Rust 侧零改动。
+
+### 迁移路径
+
+1. **现状（P3 已落地）**：`ActionButton` 是自绘 `HudWidget` 子类，自己按 `InputEventScreenTouch.index` 处理触摸；`ActionButtonHost` 负责通道 → 按钮的生命周期、显隐与释放。这不是因为「原生 Button 不支持触摸」——4.7.2 上原生 Button 支持触摸与多指，自绘是为了释放时机、per-index 语义与 HudWidget 契约一致。
+2. **抽路由**：把触摸 / 鼠标 / 焦点统一翻译成意图，元素实现意图回调。`ActionButton` 是第一个消费者（触摸按下 = `select`，抬手 = `confirm`，长按 = `context`）。
+3. **P3b 是 hint 的轻量版**：交互提示元素只声明「要一个提示」，文案由方案给——键鼠取 InputMap 第一个键鼠事件（键盘 `OS.get_keycode_string(physical_keycode)`，鼠标 `as_text()`），触屏显示 `Tap`。提示元素不判断设备。
+4. **手柄**：接焦点导航后，`focus_entered` / `focus_exited` 映射 `hint` / `select`，`ui_accept` 映射 `confirm`。
+5. **mod API**：意图路由稳定后再公开，避免 mod 绑死设备事件；当前 mod UI 的鼠标过滤仍走 Godot 原生 `mouse_filter`。
+
+### 未解决问题
+
+- 焦点导航与意图模型如何合流（Godot focus 自带 select 语义，是否复用）。
+- 长按阈值、按下后滑动容差（算取消还是算 context）没有定值。
+- 意图消费与冒泡：上层已消费的意图是否阻止下层；菜单打开时意图如何短路。
+- 多点触控同时命中多个元素时的意图排序：P3 已实测「两指各按一个按钮互不影响、同一按钮第二根手指被忽略」，但意图层的多指优先级、真实多指乱序 / 丢帧仍未定义。
+- 触屏按下即 `select` 时，是否先给 `hint`（避免视觉闪动）。
+- 提示文案的来源与本地化（当前无 CJK 字体，文案只能英文）。
+
 ## 暂停与输入互斥
 
 入口：
@@ -620,7 +686,7 @@ PROBE PASS
 - 不在 HudWidget 子类里写坐标、分辨率判断、安全区计算。
 - 不做 UI 动画、转场、UI 音效系统；Theme 只设了默认字号与描边。
 - 不做 CJK 字体与本地化（当前 UI 文案一律英文，见风险）。
-- 不实现交互意图路由：hint / select / confirm / context 只在 [[12-交互意图抽象设计]] 设计页，本轮元素仍直接处理设备事件。
+- 不实现交互意图路由：hint / select / confirm / context 只在本节「交互意图抽象（设计，未实现）」做设计，本轮元素仍直接处理设备事件。
 
 ## 待办与风险
 
@@ -631,7 +697,7 @@ PROBE PASS
 | 真机触摸 / 多指未验证 | 摇杆、视角区、自绘 ActionButton 只在 headless 里用构造的 `InputEventScreenTouch` 断言过；自绘控件的真实触摸事件分发、同时三指以上、系统手势冲突、`canceled=true` 未验证 | 真机回归；必要时补集成测试 |
 | Button 触摸与多点触控结论 | verifier 实测 Godot 4.7.2 原生 Button 支持 ScreenTouch 与多指（两指各按一个独立、同一按钮第二根手指忽略、drag 出矩形后 release 按 index 回投）；自绘 `ActionButton` 是释放时机 / per-index / HudWidget 契约的可选增强，不是绕行 | 已实证（headless / verifier）；真机细节见「真机触摸 / 多指未验证」 |
 | P4 只有规则没有界面 | `group_id` 只实现注册表互斥 + 冒烟测试，没有具体背包 / 面板界面落地 | 随实际界面一起验收 |
-| 交互意图抽象未实现 | 只有 [[12-交互意图抽象设计]] 设计页；元素仍然直接处理设备事件 | 非本轮范围，后续期次落地 |
+| 交互意图抽象未实现 | 只有本文「交互意图抽象（设计，未实现）」一节；元素仍然直接处理设备事件 | 非本轮范围，后续期次落地 |
 | 移动端 renderer 未定 | `project.godot` 仍是 Forward Plus；移动端要不要切 mobile renderer 没定 | 与 UI 适配解耦，但影响安卓帧率；待性能测试 |
 | mod UI 加载器未做 | 只有 `register_external` API，没有 manifest 驱动的发现 / 排序 / 卸载 | 随 Mod M6 一起设计；见 [[08-静态数据与Mod体系]] |
 | 手柄只做到方案检测 | 暂停菜单内部有 `grab_focus` 可键盘 / 手柄操作，但局内 HUD 与交互没有焦点链、也没有按键提示 | 需要局内焦点导航与手柄提示；未做 |
