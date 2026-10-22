@@ -8,7 +8,8 @@ extends SceneTree
 ## 4. register_external（mod 路径）能通过 PackedScene 注册；
 ## 5. 逻辑尺寸 / 缩放 / 安全区状态字段有值；
 ## 6. P0：unregister 先 detach（不残留载荷回调 / 信号）、无 manager 不写 backend_paused；
-## 7. P1：platform 与 scheme 分离（边距 / 缩放看 platform，不看输入方案）。
+## 7. P1：platform 与 scheme 分离（边距 / 缩放看 platform，不看输入方案）；
+## 8. P2：scheme_overrides 覆盖 tray / align / priority / min_size，切回后恢复。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -164,6 +165,69 @@ func _run() -> void:
 	_check(second.visible, "输入方案切换：全方案元素保持可见")
 	ui.call("_set_scheme", UiState.Scheme.KBM)
 
+	# P2：按方案覆盖 tray / align / priority / min_size。
+	# 默认落 TOP+BEGIN，TOUCH 下覆盖成 BOTTOM+END 且最小尺寸变大。
+	var mover := HudWidget.new()
+	mover.name = "MoverWidget"
+	mover.widget_id = &"smoke_mover"
+	mover.tray = HudWidget.Tray.TOP
+	mover.align = HudWidget.Align.BEGIN
+	mover.custom_minimum_size = Vector2(40.0, 20.0)
+	mover.scheme_overrides = {
+		UiState.Scheme.TOUCH: {
+			"tray": HudWidget.Tray.BOTTOM,
+			"align": HudWidget.Align.END,
+			"min_size": Vector2(120.0, 48.0),
+		},
+	}
+	_check(ui.registry.register(mover), "P2：带 scheme_overrides 的元素注册成功")
+	await process_frame
+	_check(mover.get_parent() == slots.get("top_begin"), "P2：默认方案落在 top_begin")
+	_check(mover.custom_minimum_size == Vector2(40.0, 20.0), "P2：默认方案最小尺寸为默认值")
+
+	var mover2 := HudWidget.new()
+	mover2.name = "MoverWidget2"
+	mover2.widget_id = &"smoke_mover2"
+	mover2.tray = HudWidget.Tray.TOP
+	mover2.align = HudWidget.Align.BEGIN
+	mover2.priority = 1
+	mover2.custom_minimum_size = Vector2(40.0, 20.0)
+	mover2.scheme_overrides = {
+		UiState.Scheme.TOUCH: {
+			"tray": HudWidget.Tray.BOTTOM,
+			"align": HudWidget.Align.END,
+			"priority": 30,
+		},
+	}
+	_check(ui.registry.register(mover2), "P2：第二个带覆盖的元素注册成功")
+	ui.call("_set_scheme", UiState.Scheme.TOUCH)
+	await process_frame
+	_check(mover.get_parent() == slots.get("bottom_end"), "P2：TOUCH 方案覆盖后搬到 bottom_end")
+	_check(mover.custom_minimum_size == Vector2(120.0, 48.0),
+		"P2：TOUCH 方案最小尺寸被覆盖（实际 %s）" % str(mover.custom_minimum_size))
+	var bottom_end: Control = slots.get("bottom_end")
+	_check(bottom_end != null and bottom_end.get_child_count() >= 2
+			and bottom_end.get_child(bottom_end.get_child_count() - 1) == mover2,
+		"P2：覆盖后同槽仍按 priority 排序（大者贴 END 边）")
+
+	# 覆盖后的元素仍然参与紧凑 / 菜单的显隐。
+	mover.compact_level = 1
+	mover.apply_compact(1)
+	_check(not mover.visible, "P2：覆盖后的元素仍响应紧凑等级")
+	mover.apply_compact(0)
+	mover.compact_level = 0
+	ui.open_pause_menu()
+	await process_frame
+	_check(not mover.visible, "P2：覆盖后的元素仍响应菜单隐藏")
+	ui.close_pause_menu()
+	await process_frame
+
+	ui.call("_set_scheme", UiState.Scheme.KBM)
+	await process_frame
+	_check(mover.get_parent() == slots.get("top_begin"), "P2：切回键鼠方案后落点恢复")
+	_check(mover.custom_minimum_size == Vector2(40.0, 20.0),
+		"P2：切回后最小尺寸恢复默认（实际 %s）" % str(mover.custom_minimum_size))
+
 	# 紧凑显隐。
 	first.compact_level = 1
 	first.apply_compact(1)
@@ -238,6 +302,41 @@ func _run() -> void:
 	huge_scene.pack(huge)
 	_check(ui.register_external(huge_scene, {"id": "smoke_huge"}) == null, "mod 路径：超尺寸被拒绝")
 	_check(ui.registry.get_widget(&"smoke_huge") == null, "mod 路径：超尺寸元素未留在注册表")
+
+	# P2：mod meta 支持 scheme_overrides，且 640x480 上限对所有方案的 min_size 都生效。
+	var meta_scene := HudWidget.new()
+	meta_scene.name = "ModMetaWidget"
+	meta_scene.custom_minimum_size = Vector2(32.0, 32.0)
+	var packed_meta := PackedScene.new()
+	packed_meta.pack(meta_scene)
+	var meta_widget: HudWidget = ui.register_external(packed_meta, {
+		"id": "smoke_mod_meta",
+		"scheme_overrides": {
+			UiState.Scheme.TOUCH: {
+				"tray": HudWidget.Tray.BOTTOM,
+				"align": HudWidget.Align.BEGIN,
+				"min_size": Vector2(48.0, 48.0),
+			},
+		},
+	})
+	_check(meta_widget != null, "P2：mod meta 可传 scheme_overrides")
+	if meta_widget != null:
+		_check(meta_widget.scheme_overrides.has(UiState.Scheme.TOUCH), "P2：mod meta 的覆盖已写入元素")
+		ui.call("_set_scheme", UiState.Scheme.TOUCH)
+		await process_frame
+		_check(meta_widget.get_parent() == slots.get("bottom_begin"), "P2：mod 元素按覆盖落到 bottom_begin")
+		ui.call("_set_scheme", UiState.Scheme.KBM)
+		await process_frame
+
+	var wide_scene := HudWidget.new()
+	wide_scene.name = "ModWideWidget"
+	wide_scene.custom_minimum_size = Vector2(32.0, 32.0)
+	var packed_wide := PackedScene.new()
+	packed_wide.pack(wide_scene)
+	_check(ui.register_external(packed_wide, {
+		"id": "smoke_mod_wide",
+		"scheme_overrides": {UiState.Scheme.TOUCH: {"min_size": Vector2(2000.0, 40.0)}},
+	}) == null, "P2：mod 只在 TOUCH 方案超尺寸也被拒绝")
 
 	# P0：unregister 必须先 detach —— 否则被拒 / 被卸载的 mod 元素会在 client 上留下回调。
 	var stub := _StubClient.new()

@@ -31,9 +31,17 @@ enum Align {
 ## 紧凑等级达到该值时隐藏（0 = 永不因紧凑隐藏）。
 @export var compact_level: int = 0
 
+## 按方案覆盖位置与尺寸。key 为 UiState.Scheme 的值（1 / 2 / 4），value 可含
+## tray / align / priority / min_size（Vector2）；缺省字段沿用上面的默认声明。
+## 例：{1: {"tray": Tray.BOTTOM, "align": Align.END, "min_size": Vector2(120, 120)}}
+@export var scheme_overrides: Dictionary = {}
+
 ## UiRoot 引用；注册时由 HudRegistry 注入。
 var ui_root: Node = null
 var _attached := false
+## 默认最小尺寸（首次注册 / 首次生效时记下），方案覆盖切回时用它恢复。
+var _base_min_size: Vector2 = Vector2.ZERO
+var _base_min_size_captured := false
 var _data_visible := true
 var _scheme_visible := true
 var _compact_visible := true
@@ -57,9 +65,44 @@ func detach() -> void:
 	ui_root = null
 
 
+## 按当前方案解析后的落点 / 次序 / 尺寸（注册表用它们排布与排序）。
+func effective_tray(current: int) -> int:
+	return int(_override_for(current).get("tray", tray))
+
+
+func effective_align(current: int) -> int:
+	return int(_override_for(current).get("align", align))
+
+
+func effective_priority(current: int) -> int:
+	return int(_override_for(current).get("priority", priority))
+
+
+## 当前方案下的最小尺寸：有覆盖用覆盖值，否则用默认值。
+func effective_min_size(current: int) -> Vector2:
+	_capture_base_min_size()
+	var override := _override_for(current)
+	if not override.has("min_size"):
+		return _base_min_size
+	return _to_size(override["min_size"])
+
+
+## 所有方案会用到的最小尺寸（mod 尺寸上限检查要对每个方案都生效）。
+func all_min_sizes() -> Array[Vector2]:
+	_capture_base_min_size()
+	var result: Array[Vector2] = [_base_min_size]
+	for key: Variant in scheme_overrides.keys():
+		var override: Variant = scheme_overrides[key]
+		if override is Dictionary and (override as Dictionary).has("min_size"):
+			result.append(_to_size((override as Dictionary)["min_size"]))
+	return result
+
+
 ## 由注册表在输入方案变化时调用。
 func refresh_scheme(current: int) -> void:
+	_capture_base_min_size()
 	_scheme_visible = (schemes & current) != 0
+	custom_minimum_size = effective_min_size(current)
 	_refresh_visibility()
 	_on_scheme_changed(current)
 
@@ -86,6 +129,38 @@ func refresh_menu() -> void:
 
 func _refresh_visibility() -> void:
 	visible = _data_visible and _scheme_visible and _compact_visible and not UiState.is_menu_open()
+
+
+## 当前方案命中的覆盖：先找精确 key，再找位掩码相交的 key。
+func _override_for(current: int) -> Dictionary:
+	if scheme_overrides.is_empty():
+		return {}
+	var exact: Variant = scheme_overrides.get(current, null)
+	if exact is Dictionary:
+		return exact
+	for key: Variant in scheme_overrides.keys():
+		var override: Variant = scheme_overrides[key]
+		if override is Dictionary and (int(key) & current) != 0:
+			return override
+	return {}
+
+
+## 首次生效前记下默认最小尺寸：不能放 _ready()，子类覆写 _ready() 时会被跳过。
+func _capture_base_min_size() -> void:
+	if _base_min_size_captured:
+		return
+	_base_min_size = custom_minimum_size
+	_base_min_size_captured = true
+
+
+func _to_size(raw: Variant) -> Vector2:
+	if raw is Vector2:
+		return raw
+	if raw is Vector2i:
+		return Vector2(raw)
+	if raw is Array and (raw as Array).size() == 2:
+		return Vector2(float(raw[0]), float(raw[1]))
+	return _base_min_size
 
 
 # ── 子类可覆盖 ──────────────────────────────────────────

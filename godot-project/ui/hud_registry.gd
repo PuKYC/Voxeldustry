@@ -34,14 +34,14 @@ func register(widget: HudWidget) -> bool:
 	if _by_id.has(id):
 		push_warning("[HudRegistry] HUD 元素 id 重复：%s" % id)
 		return false
-	var slot := _slot_for(widget.tray, widget.align)
+	var slot := _slot_for(widget.effective_tray(UiState.scheme), widget.effective_align(UiState.scheme))
 	if slot == null:
-		push_warning("[HudRegistry] 未知托盘：%s" % widget.tray)
+		push_warning("[HudRegistry] 未知托盘：%s" % widget.effective_tray(UiState.scheme))
 		return false
 	widget.widget_id = id
 	_by_id[id] = widget
 	_widgets.append(widget)
-	_insert(slot, widget)
+	_insert(slot, widget, UiState.scheme)
 	widget.attach(_ui_root)
 	widget.refresh_scheme(UiState.scheme)
 	widget.apply_compact(UiState.compact_level)
@@ -75,10 +75,16 @@ func register_external(scene: PackedScene, meta: Dictionary) -> HudWidget:
 		widget.compact_level = int(meta["compact_level"])
 	if meta.has("mouse_filter"):
 		widget.mouse_filter = int(meta["mouse_filter"])
+	if meta.has("scheme_overrides"):
+		var overrides: Variant = meta["scheme_overrides"]
+		if overrides is Dictionary:
+			widget.scheme_overrides = overrides
+		else:
+			push_warning("[HudRegistry] scheme_overrides 必须是 Dictionary：%s" % widget.widget_id)
 	# 入树前先量一次：custom_minimum_size / 子节点尺寸大多能直接得出，
 	# 尽早拒绝，省掉「先 attach 再 detach」的回滚成本。
-	var pre_size := widget.get_combined_minimum_size()
-	if pre_size.x > MAX_WIDGET_WIDTH or pre_size.y > MAX_WIDGET_HEIGHT:
+	var pre_size := _oversized(widget)
+	if pre_size != Vector2.ZERO:
 		push_warning("[HudRegistry] mod UI 尺寸超限：%s (%.0f x %.0f)" % [widget.widget_id, pre_size.x, pre_size.y])
 		widget.queue_free()
 		return null
@@ -87,12 +93,24 @@ func register_external(scene: PackedScene, meta: Dictionary) -> HudWidget:
 		return null
 	# 进树后再量一次：容器与子节点的最小尺寸此时才最终确定。
 	# 超限走 unregister（它会先 detach 再 queue_free），不留 client 回调。
-	var min_size := widget.get_combined_minimum_size()
-	if min_size.x > MAX_WIDGET_WIDTH or min_size.y > MAX_WIDGET_HEIGHT:
+	var min_size := _oversized(widget)
+	if min_size != Vector2.ZERO:
 		push_warning("[HudRegistry] mod UI 尺寸超限：%s (%.0f x %.0f)" % [widget.widget_id, min_size.x, min_size.y])
 		unregister(widget.widget_id)
 		return null
 	return widget
+
+
+## 超过尺寸上限时返回实际尺寸，否则返回 Vector2.ZERO。
+## 对每个方案声明的 min_size 都检查：只在 TOUCH 下超限的 mod 元素也要被拒。
+func _oversized(widget: HudWidget) -> Vector2:
+	var worst := widget.get_combined_minimum_size()
+	for size: Vector2 in widget.all_min_sizes():
+		worst.x = maxf(worst.x, size.x)
+		worst.y = maxf(worst.y, size.y)
+	if worst.x > MAX_WIDGET_WIDTH or worst.y > MAX_WIDGET_HEIGHT:
+		return worst
+	return Vector2.ZERO
 
 
 func unregister(id: StringName) -> bool:
@@ -118,8 +136,29 @@ func _detach_widget(widget: HudWidget) -> void:
 
 
 func refresh_scheme(current: int) -> void:
+	# 先按新方案重排（tray / align / priority），再广播给元素自己（尺寸 / 文案 / 显隐）。
+	for widget in _widgets.duplicate():
+		relocate(widget, current)
 	for widget in _widgets:
 		widget.refresh_scheme(current)
+
+
+## 按当前方案重排一个元素：落点槽位变了就搬槽位，没变则按新 priority 重新插入。
+## 返回 true 表示父容器确实变了。
+func relocate(widget: HudWidget, current: int) -> bool:
+	if not is_instance_valid(widget) or not _widgets.has(widget):
+		return false
+	var tray := widget.effective_tray(current)
+	var slot := _slot_for(tray, widget.effective_align(current))
+	if slot == null:
+		push_warning("[HudRegistry] 未知托盘：%s" % tray)
+		return false
+	var parent := widget.get_parent()
+	var changed := parent != slot
+	if parent != null:
+		parent.remove_child(widget)
+	_insert(slot, widget, current)
+	return changed
 
 
 func refresh_compact(level: int) -> void:
@@ -167,21 +206,23 @@ func _slot_for(tray: int, align: int) -> Control:
 			return _slots.get("mid_center", null)
 
 
-func _insert(slot: Control, widget: HudWidget) -> void:
+func _insert(slot: Control, widget: HudWidget, current: int) -> void:
 	var box := slot as BoxContainer
 	if box == null:
 		slot.add_child(widget)
 		return
+	var priority := widget.effective_priority(current)
+	var align := widget.effective_align(current)
 	var index := box.get_child_count()
 	for i in range(box.get_child_count()):
 		var other := box.get_child(i) as HudWidget
 		if other == null:
 			continue
 		var before := false
-		if widget.align == HudWidget.Align.BEGIN:
-			before = widget.priority > other.priority
+		if align == HudWidget.Align.BEGIN:
+			before = priority > other.effective_priority(current)
 		else:
-			before = widget.priority < other.priority
+			before = priority < other.effective_priority(current)
 		if before:
 			index = i
 			break
