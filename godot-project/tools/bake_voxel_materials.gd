@@ -3,7 +3,8 @@ extends SceneTree
 ##
 ## 做的事（docs/项目架构/06-体素世界与材质.md「烘焙管线」）：
 ## 1. 确保 res://bevy_client/voxel_material/defs/<key>.tres（9 个默认 VoxelMaterial）存在；
-## 2. 对每个材质跑 VoxelTileBaker.build()，保存 res://bevy_client/voxel_material/tiles/<key>.res；
+## 2. 对**库里每个材质**（9 个默认 + 作者追加的自定义材质）跑 VoxelTileBaker.build()，
+##    保存 res://bevy_client/voxel_material/tiles/<key>.res；
 ## 3. 把 tiles 赋回材质并保存 defs，最后保存库（materials 按 id 顺序 + blocks 内嵌）。
 ##
 ## 运行：
@@ -45,46 +46,38 @@ func _run() -> int:
 	var specs := _default_material_specs()
 	var materials: Array[VoxelMaterial] = []
 	var keys: Array[String] = []
-	for i in specs.size():
-		var spec: Dictionary = specs[i]
+	var created_keys := {}
+	for spec in specs:
 		var key: String = spec["key"]
 		keys.append(key)
 		var def_path := DEF_DIR.path_join(key + ".tres")
 		var material := _load_material(def_path)
-		var created := material == null
-		if created:
+		if material == null:
 			material = _make_default_material(spec)
+			created_keys[key] = true
 		# 作者参数以磁盘上的 defs 为准（幂等 / 可手工调参）；新建时用默认值。
 		if material.material_key.is_empty():
 			material.material_key = key
 		if material.display_name.is_empty():
 			material.display_name = String(spec["display_name"])
-
-		var tiles := VoxelTileBaker.build(material, size)
-		var tile_path := TILE_DIR.path_join(key + ".res")
-		var old_md5 := FileAccess.get_md5(tile_path) if FileAccess.file_exists(tile_path) else ""
-		if not _save(tiles, tile_path):
-			return 1
-		tiles.take_over_path(tile_path)
-		var new_md5 := FileAccess.get_md5(tile_path)
-		var state := "NEW" if old_md5.is_empty() else ("IDEMPOTENT" if old_md5 == new_md5 else "CHANGED")
-		print("[bake] material %d %-10s %s tiles=%dx%d md5=%s %s" % [
-			i, key, "created" if created else "loaded", size, size, new_md5, state,
-		])
-		material.tiles = tiles
-		if not _save(material, def_path):
-			return 1
-		if material.resource_path != def_path:
-			material.take_over_path(def_path)
 		materials.append(material)
 
-	# 保留已有库里的额外材质（未来“新增材质 = 加 .tres 并追加”不会被默认 bake 清掉）。
+	# 库里已有的额外材质（新增材质 = 复制 .tres 改 key 后追加到 materials）保留在默认层之后，
+	# 并且和默认材质一样重烤 tiles——否则自定义材质会永远停在旧参数 / 没有 bake 产物。
 	if FileAccess.file_exists(LIB_PATH):
 		var old_library := _load_material_library(LIB_PATH)
 		if old_library != null:
 			for material in old_library.materials:
-				if material != null and not keys.has(material.material_key):
-					materials.append(material)
+				if material == null or material.material_key.is_empty():
+					continue
+				if keys.has(material.material_key):
+					continue
+				keys.append(material.material_key)
+				materials.append(material)
+
+	for i in materials.size():
+		if not _bake_material(materials[i], size, i, created_keys.has(materials[i].material_key)):
+			return 1
 
 	library.materials = materials
 	library.blocks = _build_default_blocks(library)
@@ -109,6 +102,31 @@ func _run() -> int:
 	])
 	print("[bake] defs=%s tiles=%s" % [DEF_DIR, TILE_DIR])
 	return 0 if _failures == 0 else 1
+
+
+## 烤一个材质的 tiles 并回写它的 def；返回 false 表示失败。
+func _bake_material(material: VoxelMaterial, size: int, index: int, created: bool) -> bool:
+	var key := material.material_key
+	var def_path := material.resource_path
+	if def_path.is_empty() or not def_path.begins_with("res://"):
+		def_path = DEF_DIR.path_join(key + ".tres")
+	var tiles := VoxelTileBaker.build(material, size)
+	var tile_path := TILE_DIR.path_join(key + ".res")
+	var old_md5 := FileAccess.get_md5(tile_path) if FileAccess.file_exists(tile_path) else ""
+	if not _save(tiles, tile_path):
+		return false
+	tiles.take_over_path(tile_path)
+	var new_md5 := FileAccess.get_md5(tile_path)
+	var state := "NEW" if old_md5.is_empty() else ("IDEMPOTENT" if old_md5 == new_md5 else "CHANGED")
+	print("[bake] material %d %-10s %s tiles=%dx%d md5=%s %s" % [
+		index, key, "created" if created else "loaded", size, size, new_md5, state,
+	])
+	material.tiles = tiles
+	if not _save(material, def_path):
+		return false
+	if material.resource_path != def_path:
+		material.take_over_path(def_path)
+	return true
 
 
 # ───────────────────────── 默认材质 / 方块 ─────────────────────────
