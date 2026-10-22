@@ -14,7 +14,8 @@ extends SceneTree
 ## 10. P5：混合设备防抖（切换冷却 / 摇杆漂移阈值 / 鼠标微动阈值）；
 ## 11. P3：ButtonSpecs 规格生成（tool 双按钮 / 缺规格兜底）、ActionButton 多点触摸
 ##     按下释放、通道 unavailable 立即释放、菜单 / 切方案隐藏；
-## 12. P3b：交互提示用真实绑定（触屏显示 Tap）。
+## 12. P3b：交互提示用真实绑定（触屏显示 Tap）；
+## 13. P6：移动端入口 —— 触屏暂停按钮、触摸可拖动滑条、debug 构建的暂停菜单 Debug 区。
 ##
 ## 运行：
 ##   /tmp/Godot_v4.7.2-stable_linux.arm64 --headless --path godot-project \
@@ -158,8 +159,18 @@ func _run() -> void:
 	_check(ui.registry.register(second), "内置路径：第二个元素注册成功")
 	await process_frame
 	var top_end: Control = slots.get("top_end")
-	var order_ok := top_end != null and top_end.get_child_count() >= 2 \
-		and top_end.get_child(top_end.get_child_count() - 1) == second
+	var order_ok := false
+	if top_end != null:
+		var first_index := -1
+		var second_index := -1
+		for i in range(top_end.get_child_count()):
+			var child := top_end.get_child(i)
+			if child == first:
+				first_index = i
+			elif child == second:
+				second_index = i
+		# 槽里还有内置元素（例如触屏暂停按钮），这里只断言两者的相对顺序。
+		order_ok = first_index >= 0 and second_index > first_index
 	_check(order_ok, "priority 排序：大优先级靠屏幕边缘")
 
 	# 方案显隐：仅键鼠的元素切到触屏后隐藏。
@@ -587,6 +598,95 @@ func _run() -> void:
 	# 安全区字段：桌面为 0，移动端由 DisplayServer 提供（headless 为 0）。
 	_check(UiState.safe_insets == Vector4.ZERO, "桌面安全区内缩为 0")
 	_check(UiState.compact_level >= 0 and UiState.compact_level <= 2, "断点等级合法")
+
+	# P6-A：触屏暂停按钮 —— 手机没有 Esc / F3，靠这个按钮进暂停菜单。
+	var pause_button = ui.registry.get_widget(&"pause_button")
+	_check(pause_button != null, "P6：触屏暂停按钮已注册")
+	if pause_button != null:
+		ui.call("_set_scheme", UiState.Scheme.KBM)
+		await process_frame
+		_check(not pause_button.visible, "P6：键鼠方案下暂停按钮隐藏")
+		ui.call("_set_scheme", UiState.Scheme.TOUCH)
+		await process_frame
+		_check(pause_button.visible, "P6：触屏方案下暂停按钮可见")
+		var tap := InputEventScreenTouch.new()
+		tap.index = 3
+		tap.pressed = true
+		pause_button._gui_input(tap)
+		await process_frame
+		_check(UiState.is_menu_open(), "P6：点暂停按钮打开暂停菜单")
+		ui.close_pause_menu()
+		await process_frame
+		ui.call("_set_scheme", UiState.Scheme.KBM)
+		await process_frame
+
+	# P6-B：原生 HSlider 只认鼠标事件，触屏滑条必须自己处理 ScreenTouch / ScreenDrag。
+	ui.open_pause_menu()
+	await process_frame
+	ui.pause_menu.call("_on_settings_pressed")
+	await process_frame
+	await process_frame
+	var scale_slider: HSlider = ui.pause_menu.get_node("%ScaleSlider")
+	var slider_touch := InputEventScreenTouch.new()
+	slider_touch.index = 4
+	slider_touch.pressed = true
+	slider_touch.position = Vector2(scale_slider.size.x * 0.9, scale_slider.size.y * 0.5)
+	scale_slider.emit_signal("gui_input", slider_touch)
+	await process_frame
+	_check(scale_slider.value > 1.15, "P6：触摸按下滑条右端后数值变大（实际 %.2f）" % scale_slider.value)
+	var slider_drag := InputEventScreenDrag.new()
+	slider_drag.index = 4
+	slider_drag.position = Vector2(scale_slider.size.x * 0.05, scale_slider.size.y * 0.5)
+	slider_drag.relative = slider_drag.position - slider_touch.position
+	scale_slider.emit_signal("gui_input", slider_drag)
+	await process_frame
+	_check(scale_slider.value < 0.9, "P6：触摸拖动后数值变小（实际 %.2f）" % scale_slider.value)
+	var slider_release := InputEventScreenTouch.new()
+	slider_release.index = 4
+	slider_release.pressed = false
+	slider_release.position = slider_drag.position
+	scale_slider.emit_signal("gui_input", slider_release)
+	await process_frame
+	_check(is_equal_approx(UiState.ui_scale, scale_slider.value),
+		"P6：滑条触摸经 ui_scale_changed 写回 UiState（ui_scale=%.2f）" % UiState.ui_scale)
+
+	# P6-C：debug 构建的暂停菜单 Debug 区 —— F3 的移动端 / 手柄替代入口。
+	var pause_menu = ui.pause_menu
+	pause_menu.set("force_show_debug", true)
+	pause_menu.call("apply_debug_visibility")
+	await process_frame
+	var debug_button: Button = pause_menu.get_node("%DebugButton")
+	_check(debug_button.visible, "P6：debug 构建显示调试入口")
+	debug_button.pressed.emit()
+	await process_frame
+	_check(pause_menu.get_node("%DebugPanel").visible, "P6：打开 Debug 面板")
+	var overlay_button: Button = pause_menu.get_node("%DebugOverlayButton")
+	var force_touch_button: Button = pause_menu.get_node("%ForceTouchButton")
+	overlay_button.pressed.emit()
+	await process_frame
+	_check(ui.debug_overlay.visible, "P6：Debug 区可打开调试层")
+	_check(overlay_button.text.contains("ON"), "P6：调试层按钮文案同步（实际 %s）" % overlay_button.text)
+	overlay_button.pressed.emit()
+	await process_frame
+	_check(not ui.debug_overlay.visible, "P6：再次点击关闭调试层")
+	force_touch_button.pressed.emit()
+	await process_frame
+	_check(UiState.has_scheme(UiState.Scheme.TOUCH), "P6：Debug 区可强制触屏方案")
+	var hint: Label = pause_menu.get_node("%Hint")
+	_check(hint.text == "Tap Resume", "P6：触屏方案下暂停提示改 Tap（实际 %s）" % hint.text)
+	force_touch_button.pressed.emit()
+	await process_frame
+	_check(UiState.has_scheme(UiState.Scheme.KBM), "P6：再次点击回到键鼠方案")
+	pause_menu.set("force_show_debug", false)
+	pause_menu.call("apply_debug_visibility")
+	await process_frame
+	_check(debug_button.visible == OS.is_debug_build(),
+		"P6：release 构建不显示调试入口（当前 debug=%s）" % str(OS.is_debug_build()))
+	ui.close_pause_menu()
+	await process_frame
+	ui.set_debug_overlay(false)
+	ui.set_ui_scale(1.0)
+	await process_frame
 
 	_finish()
 

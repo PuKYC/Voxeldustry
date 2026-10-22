@@ -1,0 +1,15 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://ui/widgets/pause_button.gd" id="1_pause_button"]
+
+[node name="PauseButton" type="Control"]
+custom_minimum_size = Vector2(72, 72)
+layout_mode = 3
+mouse_filter = 0
+focus_mode = 0
+script = ExtResource("1_pause_button")
+widget_id = &"pause_button"
+tray = 0
+align = 2
+priority = 50
+schemes = 1

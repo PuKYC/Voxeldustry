@@ -33,6 +33,7 @@ const BUILTIN_WIDGET_PATHS: Array[String] = [
 	"res://ui/widgets/crosshair.tscn",
 	"res://ui/widgets/health_bar.tscn",
 	"res://ui/widgets/interact_prompt.tscn",
+	"res://ui/widgets/pause_button.tscn",
 ]
 const TOUCH_CONTROLS_SCENE := "res://ui/touch/touch_controls.tscn"
 const PAUSE_MENU_SCENE := "res://ui/screens/pause_menu.tscn"
@@ -233,6 +234,10 @@ func _instantiate_optional() -> void:
 				pause_menu.resume_requested.connect(close_pause_menu)
 			if pause_menu.has_signal("ui_scale_changed"):
 				pause_menu.ui_scale_changed.connect(_on_ui_scale_changed)
+			if pause_menu.has_signal("debug_overlay_requested"):
+				pause_menu.debug_overlay_requested.connect(_on_debug_overlay_requested)
+			if pause_menu.has_signal("debug_scheme_requested"):
+				pause_menu.debug_scheme_requested.connect(_on_debug_scheme_requested)
 
 	debug_overlay = DEBUG_OVERLAY_SCRIPT.new()
 	debug_overlay.name = "HudDebugOverlay"
@@ -525,6 +530,8 @@ func open_pause_menu() -> void:
 	registry.refresh_menu()
 	if pause_menu != null:
 		pause_menu.visible = true
+		if pause_menu.has_method("set_debug_overlay_state"):
+			pause_menu.set_debug_overlay_state(_debug_visible)
 		if pause_menu.has_method("open"):
 			pause_menu.open()
 	menu_changed.emit(true)
@@ -596,11 +603,25 @@ func _on_ui_scale_changed(value: float) -> void:
 
 # ───────────────────────── 调试层 ─────────────────────────
 
-func _toggle_debug_overlay() -> void:
-	_debug_visible = not _debug_visible
+## 调试层开关：F3（键鼠）与暂停菜单 Debug 区（移动端 / 手柄）共用同一个入口。
+func set_debug_overlay(value: bool) -> void:
+	_debug_visible = value
 	if debug_overlay != null:
-		debug_overlay.visible = _debug_visible
-		debug_overlay.refresh()
+		debug_overlay.visible = value
+		if value:
+			debug_overlay.refresh()
+
+
+func _toggle_debug_overlay() -> void:
+	set_debug_overlay(not _debug_visible)
+
+
+func _on_debug_overlay_requested(enabled: bool) -> void:
+	set_debug_overlay(enabled)
+
+
+func _on_debug_scheme_requested(scheme: int) -> void:
+	_set_scheme(scheme)
 
 
 func _exit_tree() -> void:
