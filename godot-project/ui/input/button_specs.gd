@@ -1,28 +1,26 @@
 class_name ButtonSpecs
 extends RefCounted
-## 动作通道 -> 按钮规格表（Godot 侧）。
+## 动作通道 -> 按钮规格表（Godot 侧）的兼容数据层。
 ##
-## 数据源：BevyInputContext.channels() 返回的 Array[{ key, mask, mode, actions }]
-## （通道表由 Rust 提供）。Rust 只描述「有哪些动作通道」，一个通道显示几个按钮、
-## 按钮文案、放在哪个托盘，全部由这里决定，改 UI 不需要改 Rust。
+## 注意：动作簇（ActionCluster / InputBindings）已改为「一个簇一个 HudWidget」的
+## 语义槽位模型，按下述 ButtonSpecs 不再参与触屏布局。本文件保留给：
+## 1) 旧测试 / 外部工具读取「通道 -> 按钮语义」；
+## 2) mod 或临时 UI 仍想按通道拉一条规格时的轻量兜底。
+## 新代码请优先用 InputBindings（槽位 / 文案 / 提示的唯一真相源）。
 ##
-## 规格只声明语义（tray / align / priority / schemes），不写坐标：
-## 布局交给托盘容器 + SafeArea。
-##
-## 本次约定（不要改）：动作按钮默认放右下角（tray = RIGHT, align = END），
-## priority = 0，并且只在触屏方案显示（schemes = UiState.Scheme.TOUCH）。
+## 数据源：BevyInputContext.channels() 返回的 Array[{ key, mask, mode, actions }]。
+## Rust 侧语义动作：attack / break_block / place_block（tool 通道已整体移除）。
 
-## 有显式规格的通道。tool 通道有两个动作（主工具 / 副工具），所以对应两个按钮。
+## 有显式规格的通道。一个通道可以映射多个按钮（例如未来自定义 HUD 拆键）。
 const BY_CHANNEL: Dictionary = {
-	"jump":     [{ "id": "btn_jump", "label": "Jump", "action": "jump" }],
-	"tool":     [
-		{ "id": "btn_primary", "label": "Use", "action": "primary_tool" },
-		{ "id": "btn_secondary", "label": "Alt", "action": "secondary_tool" },
-	],
-	"glide":    [{ "id": "btn_glide", "label": "Glide", "action": "glide" }],
-	"flight":   [{ "id": "btn_flight", "label": "Fly", "action": "flight_toggle" }],
-	"interact": [{ "id": "btn_interact", "label": "Interact", "action": "interact" }],
-	"sprint":   [{ "id": "btn_sprint", "label": "Sprint", "action": "sprint" }],
+	"jump":        [{ "id": "btn_jump", "label": "Jump", "action": "jump" }],
+	"glide":       [{ "id": "btn_glide", "label": "Glide", "action": "glide" }],
+	"flight":      [{ "id": "btn_flight", "label": "Fly", "action": "flight_toggle" }],
+	"interact":    [{ "id": "btn_interact", "label": "Interact", "action": "interact" }],
+	"sprint":      [{ "id": "btn_sprint", "label": "Sprint", "action": "sprint" }],
+	"attack":      [{ "id": "btn_attack", "label": "Attack", "action": "attack" }],
+	"break_block": [{ "id": "btn_break_block", "label": "Break", "action": "break_block" }],
+	"place_block": [{ "id": "btn_place_block", "label": "Place", "action": "place_block" }],
 }
 
 ## action -> 规格 的反查表（预留：供后续「按动作名找按钮」用，本轮不填）。
@@ -90,7 +88,7 @@ static func label_for(key: String) -> String:
 ## 补齐归一化字段：id / label / action / mode / channel / tray / align /
 ## priority / schemes / scheme_overrides 缺一不可。
 ## 规格里的可选字段优先（mode / tray / align / priority / schemes /
-## scheme_overrides 都可以逐条覆盖），缺省托盘约定见文件头。
+## scheme_overrides 都可以逐条覆盖），缺省托盘约定见 InputBindings。
 static func normalize_spec(spec: Dictionary, channel: Dictionary) -> Dictionary:
 	var key := String(channel.get("key", ""))
 	var actions: Array = channel.get("actions", [])
@@ -113,9 +111,9 @@ static func normalize_spec(spec: Dictionary, channel: Dictionary) -> Dictionary:
 		"action": action,
 		"mode": String(spec.get("mode", channel.get("mode", ""))),
 		"channel": key,
-		"tray": int(spec.get("tray", HudWidget.Tray.RIGHT)),
+		"tray": int(spec.get("tray", HudWidget.Tray.BOTTOM)),
 		"align": int(spec.get("align", HudWidget.Align.END)),
-		"priority": int(spec.get("priority", 0)),
+		"priority": int(spec.get("priority", 10)),
 		"schemes": int(spec.get("schemes", UiState.Scheme.TOUCH)),
 		"scheme_overrides": override_dict,
 	}

@@ -7,6 +7,11 @@
 //! **跨边界契约**：Godot 侧只认 [`ActionDef::name`]（与 Godot `InputMap` 同名）；
 //! 名字 → 通道位的映射在此编译期固定，存档 / 协议 / 回滚 / 玩法逻辑
 //! 一律看不到物理按键 —— 这就是「改键不影响逻辑」。
+//!
+//! **交互三动作互相独立**：`attack` / `break_block` / `place_block` 是三个
+//! 语义动作、各占独立通道位（不再有聚合的 `tool` 通道，也没有
+//! `primary_tool` / `secondary_tool`）：能力 / 禁用状态可以分别门控，
+//! 玩法逻辑也就能分别解释意图。
 
 pub use game_engine::input::actions::{
     ActionDef, ActionId, ActionMap, ChannelMask, MAX_INPUT_CHANNELS,
@@ -32,12 +37,14 @@ pub const ACTION_TABLE: &[ActionDef] = &[
     action!("glide", 6, 5),
     action!("flight_toggle", 7, 6),
     action!("interact", 8, 7),
-    action!("primary_tool", 9, 8),
-    action!("secondary_tool", 10, 9),
+    // 三个交互动作各占独立通道位：攻击 / 破坏方块 / 放置方块。
+    action!("attack", 9, 8),
+    action!("break_block", 10, 9),
     action!("sprint", 11, 10),
     action!("crouch", 12, 11),
     action!("reload", 13, 12),
     action!("drop_item", 14, 13),
+    action!("place_block", 15, 14),
     // 1000~9999 留给 mod / 插件；10000+ 用字符串哈希。
 ];
 
@@ -115,5 +122,27 @@ mod tests {
         assert_eq!(mask, 1 << 4);
         assert_eq!(name_of_bit(4), Some("jump"));
         assert_eq!(action_of_bit(4), Some(ActionId(5)));
+    }
+
+    /// 三个交互动作是独立语义：各自的 id / 通道位不得复用，
+    /// 旧的聚合 `tool` 与 `primary_tool` / `secondary_tool` 必须已移除。
+    #[test]
+    fn combat_actions_are_independent_semantics() {
+        assert_eq!(channel_bit_of("attack"), Some(8));
+        assert_eq!(channel_bit_of("break_block"), Some(9));
+        assert_eq!(channel_bit_of("place_block"), Some(14));
+        assert_eq!(action_of_bit(8), Some(ActionId(9)));
+        assert_eq!(action_of_bit(9), Some(ActionId(10)));
+        assert_eq!(action_of_bit(14), Some(ActionId(15)));
+
+        for removed in ["tool", "primary_tool", "secondary_tool"] {
+            assert!(
+                channel_bit_of(removed).is_none(),
+                "{removed} 必须已从 ACTION_TABLE 移除"
+            );
+        }
+
+        // jump 的通道位是玩法 / 测试依赖的契约（bit 4），不要顺手改掉。
+        assert_eq!(channel_bit_of("jump"), Some(4));
     }
 }

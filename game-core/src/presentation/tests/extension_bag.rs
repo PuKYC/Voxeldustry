@@ -801,6 +801,7 @@ fn registration_order_does_not_change_frame_bytes() {
                 InteractionHint {
                     action: crate::input::actions::ActionId(2),
                     enabled: true,
+                    target: 1,
                 },
                 ExtensionBag::default(),
             ))

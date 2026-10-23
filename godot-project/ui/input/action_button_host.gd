@@ -1,19 +1,21 @@
 class_name ActionButtonHost
 extends Node
-## 动作按钮宿主：把 BevyInputContext 的通道表映射成 ActionButton 并注册进 HudRegistry。
+## 动作按钮宿主：把 BevyInputContext 的通道表 + 交互目标，映射成触屏动作簇
+## （ActionCluster）与键鼠 / 手柄提示（ActionHints），各注册为一个 HudWidget。
 ##
 ## 数据流（真实链路）：
 ##   ui_root.client -> client.input_context (BevyInputContext)
-##   - channels() 拉通道表（channel 由 Rust 提供）；
+##   - channels() 拉通道表（通道由 Rust 提供）；
 ##   - has_channel(key) / is_channel_available(key) 初始化 present / available；
-##   - channel_changed(key, present, available) 增量刷新。
-## 映射规则在 ButtonSpecs：tool 通道两个按钮，没有显式规格的通道走 fallback_spec。
+##   - channel_changed(key, present, available) 增量刷新；
+##   - interaction_target_changed(target, enabled) / interaction_target() 取交互目标。
+## 槽位解析在 InputBindings：CONTEXT 布局主按钮在 attack / break_block 之间按目标切换。
 ##
-## 不写坐标：按钮只声明 tray / align / priority / schemes，布局交给托盘 + SafeArea。
-## 无 client（headless 冒烟 / 纯 UI 预览）时按钮数为 0，不报错。
+## 无 client（headless 冒烟 / 纯 UI 预览）时不报错，按钮数为 0。
 ##
-## 测试注入缝：apply_channels / set_channel_state / buttons / channel_table /
-## destroy / release_all（ui_smoke_test 用这些不依赖 BevyClient）。
+## 测试注入缝：apply_channels / set_channel_state / set_interaction_target / buttons /
+## channel_table / refresh / refresh_settings / release_all / destroy
+## （ui_smoke_test 用这些，不依赖 BevyClient）。
 
 var _ui_root = null
 var _registry: HudRegistry = null
@@ -21,15 +23,23 @@ var _client = null
 var _input_context = null
 var _channels: Array = []
 ## key -> [present, available]；与 _channels 同步维护。
-var _channel_states: Dictionary[String, Array] = {}
-var _buttons: Array[ActionButton] = []
+var _channel_states: Dictionary = {}
+## 交互上下文：{"target_kind": int, "interact_enabled": bool}。
+var _context: Dictionary = {
+	"target_kind": InputBindings.TARGET_NONE,
+	"interact_enabled": false,
+}
+## 触屏动作簇 / 键鼠手柄提示。
+var _cluster: ActionCluster = null
+var _hints: ActionHints = null
 
 
-## 绑定 UiRoot 与注册表，并尝试接上真实 client。
+## 绑定 UiRoot 与注册表，创建并注册动作簇 / 提示，然后尝试接上真实 client。
 func setup(ui_root: Node, registry: HudRegistry) -> void:
 	_ui_root = ui_root
 	_registry = registry
 	_connect_ui_root()
+	_build_widgets()
 	_bind_client()
 	_reload_channels()
 
@@ -40,18 +50,19 @@ func setup(ui_root: Node, registry: HudRegistry) -> void:
 func refresh() -> void:
 	_bind_client()
 	_reload_channels()
+	refresh_settings()
 
 
-## 测试 / 外部注入：直接设通道表并重建按钮。
-## 无 input_context 时按「present = available = true」建按钮；
-## 行里显式给 present / available 时以行为准（方便构造异常态）。
+## 测试 / 外部注入：直接设通道表并重建槽位。
+## 行里显式给 present / available 时以行为准（方便构造异常态）；
+## 有 input_context 时以真实能力位为准。
 func apply_channels(rows: Array) -> void:
-	_channels = rows.duplicate()
+	_channels = rows.duplicate(true)
 	_channel_states.clear()
-	for row in _channels:
-		if not (row is Dictionary):
+	for raw in _channels:
+		if not (raw is Dictionary):
 			continue
-		var channel: Dictionary = row
+		var channel: Dictionary = raw
 		var key := String(channel.get("key", ""))
 		if key.is_empty():
 			continue
@@ -67,43 +78,119 @@ func apply_channels(rows: Array) -> void:
 			if _input_context.has_method("is_channel_available"):
 				available = bool(_input_context.is_channel_available(key))
 		_channel_states[key] = [present, available]
-	_rebuild()
+	_refresh()
 
 
 ## 测试 / 外部注入：单通道状态变化（真实链路走 channel_changed 信号）。
 func set_channel_state(key: String, present: bool, available: bool) -> void:
 	_channel_states[key] = [present, available]
-	for button in _buttons:
-		if button != null and is_instance_valid(button) and button.channel_key() == key:
-			button.set_channel_state(present, available)
+	_refresh()
 
 
+## 测试 / 外部注入：交互目标类型与可用性（真实链路走 interaction_target_changed）。
+func set_interaction_target(target_kind: int, enabled: bool) -> void:
+	_context["target_kind"] = target_kind
+	_context["interact_enabled"] = enabled
+	_refresh()
+
+
+func interaction_context() -> Dictionary:
+	return _context.duplicate()
+
+
+## 从 UiState 重新读取按钮缩放 / 透明度 / 左手模式并重排。
+func refresh_settings() -> void:
+	if _cluster != null:
+		_cluster.refresh_settings()
+	_refresh()
+
+
+## 当前显示的按钮（触屏方案下可见的）。
 func buttons() -> Array:
-	return _buttons.duplicate()
+	if _cluster == null:
+		return []
+	return _cluster.buttons()
 
 
 func channel_table() -> Array:
-	return _channels.duplicate()
+	return _channels.duplicate(true)
+
+
+func cluster() -> ActionCluster:
+	return _cluster
+
+
+func hints() -> ActionHints:
+	return _hints
 
 
 ## 释放所有按钮的按下状态（菜单 / 方案切走 / 失焦 / 退出时调用）。
 func release_all() -> void:
-	for button in _buttons:
-		if button != null and is_instance_valid(button):
-			button.release()
+	if _cluster != null:
+		_cluster.release_all()
 
 
-## 拆除：释放动作、断信号、从注册表移除按钮。
-## 不释放自身节点（宿主挂在 UiRoot 下，随它一起释放；测试里 destroy 后还能读状态）。
+## 拆除：释放动作、断信号、从注册表移除动作簇与提示。
+## 不释放自身节点（宿主挂在 UiRoot 下，随它一起释放）。
 func destroy() -> void:
 	release_all()
 	_disconnect_all()
-	_free_buttons()
+	_destroy_widget(_cluster)
+	_destroy_widget(_hints)
+	_cluster = null
+	_hints = null
 	_channels.clear()
 	_channel_states.clear()
+	_context = {
+		"target_kind": InputBindings.TARGET_NONE,
+		"interact_enabled": false,
+	}
 
 
 # ───────────────────────── 构建 ─────────────────────────
+
+func _build_widgets() -> void:
+	if _cluster != null:
+		return
+	_cluster = ActionCluster.new()
+	_cluster.name = "ActionCluster"
+	_mount_widget(_cluster)
+	_hints = ActionHints.new()
+	_hints.name = "ActionHints"
+	_mount_widget(_hints)
+
+
+## 优先走 HudRegistry；没有注册表 / 注册失败时直接挂到 UiRoot 下，按钮仍可用。
+func _mount_widget(widget: HudWidget) -> void:
+	if widget == null:
+		return
+	if _registry != null and is_instance_valid(_registry):
+		if _registry.register(widget):
+			return
+	if _ui_root != null and is_instance_valid(_ui_root):
+		_ui_root.add_child(widget)
+		widget.attach(_ui_root)
+	elif not widget.is_inside_tree():
+		add_child(widget)
+	if _ui_root != null and is_instance_valid(_ui_root):
+		widget.attach(_ui_root)
+	widget.refresh_scheme(UiState.scheme)
+	widget.apply_compact(UiState.compact_level)
+	widget.refresh_menu()
+
+
+func _destroy_widget(widget: HudWidget) -> void:
+	if widget == null or not is_instance_valid(widget):
+		return
+	var removed := false
+	if _registry != null and is_instance_valid(_registry):
+		if _registry.get_widget(widget.widget_id) == widget:
+			removed = _registry.unregister(widget.widget_id)
+	if not removed:
+		if widget.get_parent() != null:
+			widget.get_parent().remove_child(widget)
+		widget.queue_free()
+
 
 func _reload_channels() -> void:
 	var rows: Array = []
@@ -112,55 +199,16 @@ func _reload_channels() -> void:
 	apply_channels(rows)
 
 
-func _rebuild() -> void:
-	_free_buttons()
-	for row in _channels:
-		if not (row is Dictionary):
-			continue
-		var channel: Dictionary = row
-		var key := String(channel.get("key", ""))
-		var mode := String(channel.get("mode", ""))
-		var actions: Array = channel.get("actions", [])
-		# axis2d 是摇杆负责的移动轴，不出按钮；空 key / 空 actions 也不出。
-		if key.is_empty() or mode == "axis2d" or actions.is_empty():
-			continue
-		var raw_specs := ButtonSpecs.specs_for_channel(key)
-		if raw_specs.is_empty():
-			raw_specs = [ButtonSpecs.fallback_spec(channel)]
-		for raw in raw_specs:
-			if raw is Dictionary:
-				_create_button(ButtonSpecs.normalize_spec(raw, channel))
+# ───────────────────────── 刷新 ─────────────────────────
 
-
-func _create_button(spec: Dictionary) -> void:
-	var button := ActionButton.new()
-	button.configure(spec)
-	if _registry != null and is_instance_valid(_registry):
-		if not _registry.register(button):
-			button.free()
-			return
-	else:
-		add_child(button)
-	var key := String(spec.get("channel", ""))
-	var state: Array = _channel_states.get(key, [true, true])
-	button.set_channel_state(bool(state[0]), bool(state[1]))
-	_buttons.append(button)
-
-
-func _free_buttons() -> void:
-	for button in _buttons:
-		if button == null or not is_instance_valid(button):
-			continue
-		var removed := false
-		if _registry != null and is_instance_valid(_registry):
-			var id: StringName = button.widget_id
-			if _registry.get_widget(id) == button:
-				removed = _registry.unregister(id)
-		if not removed:
-			if button.get_parent() != null:
-				button.get_parent().remove_child(button)
-			button.queue_free()
-	_buttons.clear()
+func _refresh() -> void:
+	if _cluster == null:
+		return
+	var layout := InputBindings.ui_layout()
+	var entries := InputBindings.resolve_touch(layout, _channels, _channel_states, _context)
+	_cluster.apply_slots(entries)
+	if _hints != null:
+		_hints.set_hint(InputBindings.hint_text(UiState.scheme, _channels, _channel_states, _context))
 
 
 # ───────────────────────── 真实链路 ─────────────────────────
@@ -191,8 +239,27 @@ func _bind_client() -> void:
 	if context == null or not context.has_signal("channel_changed"):
 		return
 	_input_context = context
-	if not context.channel_changed.is_connected(_on_channel_changed):
-		context.channel_changed.connect(_on_channel_changed)
+	context.channel_changed.connect(_on_channel_changed)
+	if context.has_signal("interaction_target_changed"):
+		context.interaction_target_changed.connect(_on_interaction_target_changed)
+	_sync_context_from_input()
+
+
+## 把 context 当前的交互目标同步进 _context（去抖：只在变化时刷新）。
+func _sync_context_from_input() -> void:
+	if _input_context == null:
+		return
+	var target := InputBindings.TARGET_NONE
+	var enabled := false
+	if _input_context.has_method("interaction_target"):
+		target = int(_input_context.interaction_target())
+	if _input_context.has_method("interaction_enabled"):
+		enabled = bool(_input_context.interaction_enabled())
+	if int(_context.get("target_kind", 0)) == target and bool(_context.get("interact_enabled", false)) == enabled:
+		return
+	_context["target_kind"] = target
+	_context["interact_enabled"] = enabled
+	_refresh()
 
 
 func _disconnect_input_context() -> void:
@@ -200,6 +267,9 @@ func _disconnect_input_context() -> void:
 		if _input_context.has_signal("channel_changed"):
 			if _input_context.channel_changed.is_connected(_on_channel_changed):
 				_input_context.channel_changed.disconnect(_on_channel_changed)
+		if _input_context.has_signal("interaction_target_changed"):
+			if _input_context.interaction_target_changed.is_connected(_on_interaction_target_changed):
+				_input_context.interaction_target_changed.disconnect(_on_interaction_target_changed)
 	_input_context = null
 
 
@@ -229,14 +299,17 @@ func _connect_ui_root() -> void:
 
 func _on_channel_changed(key: String, present: bool, available: bool) -> void:
 	# 未知 key 说明本宿主的通道表还是旧的 / 空的（client bind 晚于 UiRoot._ready），
-	# 立刻重新拉表重建按钮；不能直接 return，否则按钮永远补不回来。
+	# 立刻重新拉表重建槽位；不能直接 return，否则按钮永远补不回来。
 	if not _channel_states.has(key):
 		_reload_channels()
-		# 拉表后该 key 若已出现，补上这次边沿。
 		if _channel_states.has(key):
 			set_channel_state(key, present, available)
 		return
 	set_channel_state(key, present, available)
+
+
+func _on_interaction_target_changed(target: int, enabled: bool) -> void:
+	set_interaction_target(target, enabled)
 
 
 func _on_menu_changed(open: bool) -> void:
@@ -247,6 +320,7 @@ func _on_menu_changed(open: bool) -> void:
 func _on_scheme_changed(current: int) -> void:
 	if (current & UiState.Scheme.TOUCH) == 0:
 		release_all()
+	refresh_settings()
 
 
 func _notification(what: int) -> void:

@@ -73,6 +73,7 @@ fn all_payload_kinds_have_round_trippable_labels() {
             PayloadKind::Interaction => SyncPayload::Interaction(InteractionHint {
                 action: crate::input::actions::ActionId(0),
                 enabled: false,
+                target: 0,
             }),
             PayloadKind::Extension => {
                 SyncPayload::Extension(crate::presentation::payload::ExtensionPayload::default())

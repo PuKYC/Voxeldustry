@@ -412,6 +412,9 @@ fn payload_to_dictionary(payload: &SyncPayload) -> VarDictionary {
         SyncPayload::Interaction(value) => {
             out.set("action", i64::from(value.action.0));
             out.set("enabled", value.enabled);
+            // 目标类型：0 = 无、1 = 实体、2 = 方块（见 game-core 的
+            // INTERACTION_TARGET_* 常量）。
+            out.set("target", i64::from(value.target));
         }
         SyncPayload::Extension(value) => {
             // 兼容通道：整袋字段 → Array[{ key, tag, value }]；tag 与 GPF1 线格式一致

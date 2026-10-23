@@ -47,6 +47,7 @@ func register(widget: HudWidget) -> bool:
 	widget.apply_compact(UiState.compact_level)
 	widget.refresh_menu()
 	_apply_groups(UiState.scheme)
+	_mark_slots_dirty()
 	return true
 
 
@@ -122,6 +123,7 @@ func unregister(id: StringName) -> bool:
 	_widgets.erase(widget)
 	_detach_widget(widget)
 	_apply_groups(UiState.scheme)
+	_mark_slots_dirty()
 	return true
 
 
@@ -144,6 +146,7 @@ func refresh_scheme(current: int) -> void:
 	for widget in _widgets:
 		widget.refresh_scheme(current)
 	_apply_groups(current)
+	_mark_slots_dirty()
 
 
 ## 按当前方案重排一个元素：落点槽位变了就搬槽位，没变则按新 priority 重新插入。
@@ -161,17 +164,20 @@ func relocate(widget: HudWidget, current: int) -> bool:
 	if parent != null:
 		parent.remove_child(widget)
 	_insert(slot, widget, current)
+	_mark_slots_dirty()
 	return changed
 
 
 func refresh_compact(level: int) -> void:
 	for widget in _widgets:
 		widget.apply_compact(level)
+	_mark_slots_dirty()
 
 
 func refresh_menu() -> void:
 	for widget in _widgets:
 		widget.refresh_menu()
+	_mark_slots_dirty()
 
 
 ## 同组互斥：每个 group_id 只让「命中当前方案 + priority 最高」的那个元素激活。
@@ -228,16 +234,15 @@ func _slot_for(tray: int, align: int) -> Control:
 			return _slots.get("mid_center", null)
 
 
+## 把元素插进槽位：槽位是任意 Control 都行（HudSlot / 旧 BoxContainer / 裸 Control），
+## 按 priority 规则算出插入 index，add_child 后再 move_child。
+## 排序规则与原实现一致：BEGIN 槽 priority 越大越靠前，CENTER / END 槽相反。
 func _insert(slot: Control, widget: HudWidget, current: int) -> void:
-	var box := slot as BoxContainer
-	if box == null:
-		slot.add_child(widget)
-		return
 	var priority := widget.effective_priority(current)
 	var align := widget.effective_align(current)
-	var index := box.get_child_count()
-	for i in range(box.get_child_count()):
-		var other := box.get_child(i) as HudWidget
+	var index := slot.get_child_count()
+	for i in range(slot.get_child_count()):
+		var other := slot.get_child(i) as HudWidget
 		if other == null:
 			continue
 		var before := false
@@ -248,6 +253,13 @@ func _insert(slot: Control, widget: HudWidget, current: int) -> void:
 		if before:
 			index = i
 			break
-	box.add_child(widget)
-	if index < box.get_child_count() - 1:
-		box.move_child(widget, index)
+	slot.add_child(widget)
+	if index < slot.get_child_count() - 1:
+		slot.move_child(widget, index)
+
+
+## 槽位是 HudSlot 时通知它重排（非 HudSlot 槽位跳过，保持向后兼容）。
+func _mark_slots_dirty() -> void:
+	for value in _slots.values():
+		if value is HudSlot:
+			(value as HudSlot).mark_dirty()

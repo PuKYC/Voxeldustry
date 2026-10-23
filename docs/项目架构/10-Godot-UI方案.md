@@ -14,14 +14,14 @@ source: "代码阅读 @ 本次 UI 适配"
 
 # Godot UI 方案
 
-一句话：**一套 UI 树 + platform / scheme / compact_level 三量分离 + 三条托盘行（top / mid / bottom）+ 左右两个竖列 + 中央 + 九个槽位 + HudWidget 契约（含 scheme_overrides），不做布局求解器。** 桌面、手机、平板、手柄共用同一棵树：platform 决定缩放目标 / 安全区 / 基础边距，scheme 决定显隐与重排，compact_level 决定隐藏哪些元素；触屏动作按钮走 ButtonSpecs 映射 + 自绘 ActionButton，触屏只是往 InputMap 里注入动作，不改 Rust 输入链路。
+一句话：**一套 UI 树 + platform / scheme / compact_level 三量分离 + 九个 HudSlot 区域层（铺满 SafeArea、互相叠放）+ 触控区域避让层 + HudWidget 契约（含 scheme_overrides），不做布局求解器。** 桌面、手机、平板、手柄共用同一棵树：platform 决定缩放目标 / 安全区 / 基础边距，scheme 决定显隐与重排，compact_level 决定隐藏哪些元素。输入侧分三层：物理输入 → Godot 绑定层（InputBindings，直连 / 按目标上下文解析）→ Rust 语义动作（attack / break_block / place_block / jump / interact / ...）。触屏动作簇是一个 HudWidget（ActionCluster，落 bottom_end），内部按弧线排按钮；键鼠 / 手柄不出按钮，只出键位提示，并在提交前按上下文重映射。Rust 只认语义动作与能力位（present / available），不认键位。
 
 ## 目标与边界
 
 | 目标 | 做法 |
 | --- | --- |
 | 一套 UI 适配桌面 / 手机 / 平板 / 手柄 | 单 UI 树 + 输入方案位掩码显隐，不维护两套界面 |
-| 分辨率与刘海屏自适应 | 托盘容器 + 断点 + 移动端目标逻辑宽度 + 安全区内缩 |
+| 分辨率与刘海屏自适应 | HudSlot 区域层 + 断点 + 移动端目标逻辑宽度 + 安全区内缩 + 触控区域避让 |
 | 元素不写坐标 | HudWidget 只声明 tray / align / priority / schemes / compact_level，可按方案覆盖（scheme_overrides）与同组互斥（group_id） |
 | mod UI 免费获得适配 | `register_external(scene, meta)` 注册进同一套槽位 |
 | 触屏不新增输入链路 | 摇杆写 `Input.action_press`，视角走 `BevyInput.on_look_delta` |
@@ -38,20 +38,25 @@ source: "代码阅读 @ 本次 UI 适配"
 
 | 路径 | 作用 | 状态 |
 | --- | --- | --- |
-| `godot-project/ui/ui_root.gd` / `ui_root.tscn` | UI 根（CanvasLayer），构建托盘树、安全区、缩放、断点、platform / scheme 检测与防抖、菜单 / 暂停、F3 调试层；创建 `ActionButtonHost` 并在客户端能力位变化时补刷新 | 已实现 |
-| `godot-project/ui/ui_state.gd` | UI 全局静态状态，无 Autoload | 已实现 |
+| `godot-project/ui/ui_root.gd` / `ui_root.tscn` | UI 根（CanvasLayer）：9 个 HudSlot 区域层、安全区、缩放、断点、platform / scheme 检测与防抖、触控区域避让层、菜单 / 暂停、期 3 设置接线、F3 调试层 | 已实现 |
+| `godot-project/ui/hud_slot.gd` | 自绘区域层容器：最小尺寸只取 reserve、主轴对齐 / 自动换行、inset 避让、边缘预留带 | 本轮新增 |
+| `godot-project/ui/touch_regions.gd` | 触控区域登记表：摇杆 / 动作簇 / 视角区的矩形与槽位 inset 汇总 | 本轮新增 |
+| `godot-project/ui/ui_state.gd` | UI 全局静态状态，无 Autoload；期 3 设置字段 + `load_settings` / `save_settings`（user://ui_settings.cfg） | 已实现 |
 | `godot-project/ui/hud_widget.gd` | HudWidget 契约基类（Control）；`scheme_overrides` 按方案覆盖 tray / align / priority / min_size | 已实现 |
-| `godot-project/ui/hud_registry.gd` | 托盘槽位注册表 + priority 排序 + `relocate()` 按方案重排 + 同组互斥 + mod 注册校验 | 已实现 |
-| `godot-project/ui/input/button_specs.gd` | 通道 → 动作按钮规格映射表（`BY_CHANNEL` / 预留 `BY_ACTION` / `fallback_spec`） | 本轮新增 |
-| `godot-project/ui/input/action_button_host.gd` | 动作按钮宿主：读通道表、创建 / 更新 / 显隐置灰 / 统一释放 | 本轮新增 |
-| `godot-project/ui/widgets/action_button.gd` / `.tscn` | 自绘动作按钮（可选增强，原生 Button 也支持触摸），按触摸 index 处理按下 / 抬起 / toggle | 本轮新增 |
+| `godot-project/ui/hud_registry.gd` | 槽位注册表 + priority 排序（不再依赖 BoxContainer）+ `relocate()` + 同组互斥 + mod 注册校验 | 已实现 |
+| `godot-project/ui/input/input_bindings.gd` | 输入绑定层（纯 static）：槽位 → 语义动作、上下文解析、预设、键位提示、KBM 提交前重映射 | 本轮新增 |
+| `godot-project/ui/input/action_cluster.gd` | 触屏动作簇（HudWidget，`bottom_end`）：主按钮 + 弧形副按钮、物理尺寸、透明度、左手镜像、避让登记 | 本轮新增 |
+| `godot-project/ui/input/action_button_host.gd` | 动作簇宿主：读语义通道表 / 能力位 / INTERACTION 目标，刷新动作簇与键鼠提示，统一释放 | 本轮新增 |
+| `godot-project/ui/input/button_specs.gd` | 旧通道 → 按钮映射表，已废弃（保留空壳避免旧脚本解析失败） | 已废弃 |
+| `godot-project/ui/widgets/action_button.gd` | 自绘动作按钮（`Control`，由 ActionCluster 管理），按触摸 index 产生按下 / 释放 | 本轮重写 |
+| `godot-project/ui/widgets/action_hints.gd` | 键鼠 / 手柄动作提示（仅 KBM / GAMEPAD 显示） | 本轮新增 |
 | `godot-project/ui/debug/hud_debug_overlay.gd` | F3 只读调试层（尺寸 / 缩放 / 安全区 / 断点 / 元素矩形 / 重叠告警） | 已实现 |
 | `godot-project/ui/widgets/` | 内置 HUD：准星、血条、交互提示、触屏暂停按钮 | 已实现 |
-| `godot-project/ui/widgets/touch_slider.gd` | 触摸可拖动的 `HSlider`（原生 HSlider 只认鼠标事件） | 本轮新增 |
-| `godot-project/ui/widgets/pause_button.gd` / `.tscn` | 触屏暂停按钮（仅 TOUCH 方案显示，落 TOP / END 托盘） | 本轮新增 |
-| `godot-project/ui/touch/touch_controls.gd` / `.tscn` | 触屏控件层：只剩左下虚拟摇杆 + 右侧视角区（动作按钮已移交 `ActionButtonHost`） | 已实现 |
-| `godot-project/ui/touch/touch_joystick.gd` | 单指虚拟摇杆，写 `move_*` 动作强度 | 已实现 |
-| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | 暂停菜单：Resume / Settings（触摸滑条）/ Quit；debug 构建额外显示 Debug 区（调试层 / 强制方案） | 已实现 |
+| `godot-project/ui/widgets/touch_slider.gd` | 触摸可拖动的 `HSlider`（原生 HSlider 只认鼠标事件） | 已实现 |
+| `godot-project/ui/widgets/pause_button.gd` / `.tscn` | 触屏暂停按钮（仅 TOUCH 方案显示，落 TOP / END 槽位） | 已实现 |
+| `godot-project/ui/touch/touch_controls.gd` / `.tscn` | 触屏控件层：虚拟摇杆 + 视角区 + 浮动摇杆区；左手镜像、避让登记 | 已实现 |
+| `godot-project/ui/touch/touch_joystick.gd` | 单指虚拟摇杆，写 `move_*` 动作强度；推到边缘自动 `sprint` | 已实现 |
+| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | 暂停菜单：Resume / Settings（UI 缩放 + 期 3 设置区）/ Quit；debug 构建额外显示 Debug 区 | 已实现 |
 | `godot-project/bevy_client/camera/camera_rig.gd` | 相机：`camera_rig` 组、`set_ui_blocked()`、触屏 / 菜单不捕获鼠标 | 已实现 |
 | `godot-project/test/ui_smoke_test.gd` | UI headless 冒烟（`extends SceneTree`），按 P0-P6 分阶段覆盖 | 已实现 |
 | `godot-project/test/gen_class_cache.gd` | 无编辑器时生成 `class_name` 缓存 | 已实现 |
@@ -59,30 +64,60 @@ source: "代码阅读 @ 本次 UI 适配"
 
 `UiRoot` 的场景文件只挂脚本，整棵布局树在 `_build_layout()` 里用代码构建，避免场景文件与适配逻辑两头维护。
 
-可选子场景按“存在才加载”处理（`ResourceLoader.exists`）：触屏控件、暂停菜单、内置 HUD 场景缺失时 UiRoot 照常启动，只是少对应部件。这让 UI 骨架与具体控件可以分开落地。`ActionButtonHost` 不是场景：`enable_touch_controls` 为真时由 UiRoot 在代码里创建，无 client 时按钮数为 0。
+可选子场景按“存在才加载”处理（`ResourceLoader.exists`）：触屏控件、暂停菜单、内置 HUD 场景缺失时 UiRoot 照常启动，只是少对应部件。这让 UI 骨架与具体控件可以分开落地。`ActionButtonHost` 不是场景：`enable_touch_controls` 为真时由 UiRoot 在代码里创建，它再创建 `ActionCluster`（触屏）与 `ActionHints`（键鼠 / 手柄）；无 client 时按钮数为 0。
 
 ## 布局树
 
 ```text
 UiRoot (CanvasLayer, layer=10, PROCESS_MODE_ALWAYS)
 └ UiTree (Control, 全屏, MOUSE_FILTER_IGNORE, 内置 Theme)
-  └ SafeArea (MarginContainer)        ← 安全区 + 边距只在这里加
-    └ Trays (VBoxContainer)
-      ├ TopTray (HBox)
-      │  ├ TopBegin   (HBox, ALIGNMENT_BEGIN)
-      │  ├ TopCenter  (HBox, ALIGNMENT_CENTER)
-      │  └ TopEnd     (HBox, ALIGNMENT_END)
-      ├ MidTray (HBox, 垂直 EXPAND_FILL)
-      │  ├ MidBegin  (VBox)             ← 左竖列
-      │  ├ MidCenter (CenterContainer)  ← 中央，吃掉剩余宽度
-      │  └ MidEnd    (VBox)             ← 右竖列
-      └ BottomTray (HBox)
-         ├ BottomBegin / BottomCenter / BottomEnd
+  └ SafeArea (MarginContainer)          ← 安全区 + 边距只在这里加
+    ├ TopBegin (HudSlot, TOP/BEGIN)     ┐
+    ├ TopCenter (HudSlot, TOP/CENTER)   │ 9 个区域层全部铺满 SafeArea，
+    ├ TopEnd (HudSlot, TOP/END)         │ 互相叠放、各自只对一个边缘负责。
+    ├ MidBegin (HudSlot, LEFT/CENTER)   │ 最小尺寸只取 reserve，
+    ├ MidCenter (HudSlot, CENTER)       │ 不取子元素之和。
+    ├ MidEnd (HudSlot, RIGHT/CENTER)    │
+    ├ BottomBegin (HudSlot, BOTTOM/BEGIN)│
+    ├ BottomCenter (HudSlot, BOTTOM/CENTER, reserve 72 = 快捷栏预留带)
+    └ BottomEnd (HudSlot, BOTTOM/END)   ┘
 ```
 
-九个槽位全是容器：top / bottom 的六个是 `HBoxContainer`，`mid_begin` / `mid_end` 是 `VBoxContainer`，`mid_center` 是 `CenterContainer`。元素加进去由容器重排。所有托盘与槽位默认 `MOUSE_FILTER_IGNORE`，不拦输入，真正可交互的控件自己打开鼠标过滤。
+布局规则从「托盘行 + 竖列」改成「9 个独立叠放的区域层」：
 
-动作按钮是普通 HudWidget（默认 `tray=RIGHT` / `align=END`），进 `mid_end` 右竖列、按注册顺序纵排（槽内整体垂直居中）；它们与内置 HUD 共用 `SafeArea` 和缩放，不再由触屏控件层手算坐标。
+| 问题（旧布局） | 新布局 |
+| --- | --- |
+| 槽位是 HBox / VBox，最小尺寸 = 子元素之和；元素一多就把 MidTray 撑出屏幕 | HudSlot 最小尺寸只取 reserve；子元素再多也只在自己的内容区里换行 / 夹取，不改变槽位尺寸 |
+| 子元素少 / 隐藏时槽位塌成 0，上下托盘高度变化推动中间区域，准星漂移 | 每个槽位都铺满 SafeArea，彼此不共享高度；mid_center 恒等于安全区中心 |
+| 元素增减导致其它元素位移 | 跨槽位完全独立；同槽位内的重排只影响该槽位 |
+
+九个槽位全部 `MOUSE_FILTER_IGNORE`，不拦输入，真正可交互的控件自己打开鼠标过滤。
+
+### HudSlot 行为
+
+- 主轴：top / bottom 水平，mid 垂直；主轴放不下自动换行 / 换列（`wrap`），交叉轴由 `edge` 决定（TOP 贴顶、BOTTOM 贴底、LEFT 贴左、RIGHT 贴右、CENTER 居中）。
+- 主轴对齐 `align`：BEGIN 从头排、END 贴端、CENTER 整体居中；换行 / 换列朝远离该边缘的方向展开。
+- `inset: Vector4` 给槽位划避让区；`reserve: Vector2` 是边缘预留带（bottom_center 的 72 就是快捷栏占位，现在没有元素也保留）。
+- 隐藏的子元素不占位、不参与排布（可见性变化会触发 deferred 重排）。
+- 子元素请求尺寸取 `get_combined_minimum_size()` 并夹到内容区；若引擎最小尺寸拒绝缩小，记录 `debug_warnings`，只把分配 footprint 夹进内容区，保证后续元素不被它推出去。调试层与测试都按 footprint 判定越界 / 重叠。
+- 槽位直接设置子元素 `position/size`，因此子元素必须保持默认 anchors。
+
+### 避让层（TouchRegionRegistry）
+
+触控区域不在 SafeArea 里，必须向区域层登记自己占用的矩形：
+
+```text
+VirtualJoystick / JoystickZone ─┐
+ActionCluster ────────────────┼─→ UiRoot.update_touch_region(name, rect, reserves)
+LookArea（只登记不避让）──────┘        └→ TouchRegionRegistry.slot_insets()
+                                          └→ HudSlot.set_inset()
+```
+
+- `reserves` 形如 `{"bottom_begin": Vector4(left, top, right, bottom)}`，单位是设计单位；同一槽位每边取 max。
+- 摇杆：右手登记 `bottom_begin` 左避让（宽度 + 边距），左手登记 `bottom_end` 右避让；浮动摇杆未激活时释放登记。
+- 动作簇：登记自身矩形（`reserves` 为空，仅用于重叠诊断；簇自身就在槽位里，不能再给自己避让）。
+- 视角区：只登记矩形不避让——HUD 在它上层且按钮先吃触摸。
+- 平板触屏额外把底部槽位往里收（`TABLET_EXTRA_EDGE`），让动作簇离边缘更远。
 
 ## 托盘与槽位契约
 
@@ -99,20 +134,22 @@ UiRoot (CanvasLayer, layer=10, PROCESS_MODE_ALWAYS)
 | --- | --- | --- |
 | TOP | BEGIN / CENTER / END | `top_begin` / `top_center` / `top_end` |
 | BOTTOM | BEGIN / CENTER / END | `bottom_begin` / `bottom_center` / `bottom_end` |
-| LEFT | 忽略（只有一列） | `mid_begin` |
-| RIGHT | 忽略（只有一列） | `mid_end` |
+| LEFT | 忽略 | `mid_begin` |
+| RIGHT | 忽略 | `mid_end` |
 | CENTER | 忽略 | `mid_center` |
 
-LEFT / RIGHT 各只有一列，Align 不改变落点，只影响同槽内的排序。
+LEFT / RIGHT 的 Align 不改变落点，只影响同槽内的排序。
 
-槽内排序按当前方案的 `effective_priority()`：`BEGIN` 槽里 priority 越大越靠屏幕边缘（`top_begin` 越靠左、`bottom_begin` 越靠左）；其余槽相反，priority 越大越靠近 `END` 边。冒烟测试用两个 TOP+END 元素验证了“大优先级贴右边缘”。
+槽内顺序由 `HudRegistry._insert` 在插入时按 `effective_priority()` 算 index（任意 Control 槽位都适用，不再要求 BoxContainer）：BEGIN 槽里 priority 越大越靠屏幕边缘，其余槽相反。
 
 注册规则（`HudRegistry.register`）：
 
 1. `widget_id` 为空时退回节点名；为空且无节点名直接拒绝。
 2. 重复 id 拒绝，不静默覆盖。
 3. `tray` 取 `CENTER` 或未知值时都落 `mid_center`；只有注册表还没 `setup()`（槽位不存在）时才因取不到槽位而拒绝。
-4. 插入槽位后调 `attach(ui_root)`，再按当前方案 `relocate()`（槽位 / 排序 / min_size）并重算同组激活，最后广播 `scheme` / `compact_level` / 菜单状态。`refresh_scheme()` 同样先重排再通知元素。
+4. 插入槽位后调 `attach(ui_root)`，再按当前方案 `relocate()`（槽位 / 排序 / min_size）并重算同组激活，最后广播 `scheme` / `compact_level` / 菜单状态；随后对 HudSlot 调 `mark_dirty()`。`refresh_scheme()` / `refresh_compact()` / `refresh_menu()` 同样在末尾重排。
+
+**角色 → 区域映射**（本期只落状态条与动作按钮）：血条键鼠 / 手柄落 `bottom_begin`、触屏用 `scheme_overrides` 落 `top_begin`；暂停按钮仅触屏、落 `top_end`；动作簇仅触屏、落 `bottom_end`（左手模式改 `bottom_begin`）。
 
 元素不写任何坐标；要新位置就声明 tray + align，要次序就调 priority。
 
@@ -174,7 +211,7 @@ LEFT / RIGHT 各只有一列，Align 不改变落点，只影响同槽内的排�
 2. `px_per_unit = win_size.x / UiState.logical_width`，把像素换算回设计单位。
 3. 四边内缩 `insets = (left, top, right, bottom)`，各夹到 `>= 0`，写 `UiState.safe_insets`。
 4. 应用方式只有一处：`SafeArea` 这个 `MarginContainer` 的四边 margin = 基础边距 + 对应 inset。
-5. 触屏控件挂在 `SafeArea` 之外（贴屏幕物理边缘），所以它的 layout 自己读 `UiState.safe_insets` 避让：摇杆避开左 / 下 insets（视角区仍占满右侧整高，它是拖拽区、不承载按钮）。动作按钮已改为 HudWidget 进托盘槽位，安全区由 `SafeArea` 统一处理，不再由触屏层手算。安全区更新后 UiRoot 调 `touch_controls.refresh_layout()` 重排一次；移动端 insets 要延迟一帧才准，所以重排不能省。
+5. 触屏控件挂在 `SafeArea` 之外（贴屏幕物理边缘），所以它的 layout 自己读 `UiState.safe_insets` 避让：摇杆避开左 / 下 insets（视角区是拖拽区、不承载按钮）。触控区域再通过 `update_touch_region()` 向避让层登记矩形，给 `bottom_begin` / `bottom_end` 设置 inset；动作簇作为 HudWidget 进 `bottom_end`，安全区由 `SafeArea` 统一处理。安全区更新后 UiRoot 调 `touch_controls.refresh_layout()` 重排一次；移动端 insets 要延迟一帧才准，所以重排不能省。
 
 基础边距看 `platform`：非 `DESKTOP`（手机 / 平板）`TOUCH_PAD = 16`，`DESKTOP` `EDGE_PAD = 24`（设计单位）。桌面恒 `safe_insets = 0`。
 
@@ -275,6 +312,11 @@ scheme_overrides = {
 | `safe_insets` | Vector4 | 0 | 安全区内缩，设计单位 (left, top, right, bottom) |
 | `logical_width` / `logical_height` | float | 1920×1080 | 逻辑可用尺寸（设计单位） |
 | `compact_level` | int | 0 | 0 正常 / 1 紧凑 / 2 极窄 |
+| `action_layout` | int | CONTEXT | 操作布局预设：CONTEXT（精简）/ SPLIT（分开） |
+| `button_scale` | float | 1.0 | 动作按钮大小系数 0.8–1.3 |
+| `button_opacity` | float | 0.75 | 动作按钮空闲透明度 0.35–1.0 |
+| `left_handed` | bool | false | 左手模式：动作簇 / 摇杆 / 视角区镜像 |
+| `joystick_mode` | int | FIXED | 摇杆模式：FIXED / FLOATING（左半屏按下处浮起） |
 
 写方只有 UiRoot（`platform` 在 `_apply_scale()` 开头写，`scheme` 在方案检测 / 切换时写）；读方是 HUD 元素、CameraRig、BevyClient。辅助方法：
 
@@ -285,7 +327,9 @@ scheme_overrides = {
 | `is_menu_open()` / `set_menu_open(b)` | 菜单深度 |
 | `accepts_gameplay_input()` | `menu_depth == 0`，BevyClient 每帧据此决定是否提交输入 |
 | `mouse_look_allowed()` | 菜单未开且非触屏方案 |
-| `reset()` | 全部归默认（测试 / 退出场景用） |
+| `physical_units(mm)` / `action_button_units(role)` | 毫米 → 设计单位（DPI / content_scale_factor 换算，带下限与回退） |
+| `load_settings()` / `save_settings()` | 读写 `user://ui_settings.cfg`（`SETTINGS_VERSION=1`） |
+| `reset()` | 全部归默认（测试 / 退出场景用；不删设置文件） |
 
 ## 输入方案检测
 
@@ -328,122 +372,108 @@ scheme_overrides = {
 
 ## 触屏输入映射
 
-触屏不新增输入链路，只把触摸翻译成现有的 InputMap 动作与视角位移。控件层在 `ui/touch/`，由 UiRoot 实例化到 UiTree 最底层（放在 HUD 之下，不挡血条与提示），父链反查 UiRoot 并监听 `scheme_changed` / `menu_changed`。**控件层只剩摇杆 + 视角区**：动作按钮已交给独立的 `ActionButtonHost` / `ActionButton`（见下一节）。
+触屏不新增 Rust 输入链路：摇杆 / 动作簇把触摸翻译成已有的语义动作，视角走 `BevyInput.on_look_delta`，Rust 侧仍是同一条 held / pressed / released + move + look 链路。
 
-### 控件布局
+```text
+InputEventScreenTouch / ScreenDrag
+  → 触屏控件层（ui/touch/）
+     ├ 摇杆：Input.action_press("move_*", strength) / release；推到边缘自动 sprint
+     └ 视角区：ScreenDrag.relative → BevyInput.on_look_delta()
+  → 动作簇（ActionCluster + ActionButton）
+     绑定层解析出的语义动作 → Input.action_press / action_release
+  → BevyInput.collect_and_submit()：held / pressed / released + get_vector + look_delta
+  → submit_input_frame() → InputStaging → 量化 / 能力过滤 / 事件派生（Rust 不变）
+```
 
-| 部件 | 位置 / 尺寸 | 行为 |
+| 触摸控件 | Godot 落点 | Rust 落点 |
 | --- | --- | --- |
-| 虚拟摇杆 `VirtualJoystick`（`touch_joystick.gd`） | 左下角，底圈半径 140 设计单位 | 只跟踪落在摇杆上的第一根手指（按 `event.index` 匹配）；死区 0.15 + 死区外线性重映射在控件内完成 |
-| 视角区 `LookArea` | 右侧 55% 宽度、整屏高 | 记录从视角区按下的手指 index 集合，拖动按 index 归属 |
-| 动作按钮 `ActionButtonHost` + `ActionButton` | 默认 `tray=RIGHT` / `align=END`，单按钮最小 96×96 | 按 ButtonSpecs 生成，缺规格的通道走兜底；一个通道可以有多个按钮（`tool` 两个） |
-
-控件只在 TOUCH 方案且菜单关闭时可见；隐藏、切走方案、打开菜单、窗口失焦、退出树时触屏层 `_release_all()` 只复位摇杆与视角手势，动作按钮由 `ActionButtonHost` 在同样时机 `release_all()`，避免“手指抬起事件丢失”造成粘键。
-
-### 映射链路
-
-| 触摸控件 | 写入口 | 落点 |
-| --- | --- | --- |
-| 虚拟摇杆 | 按归一化方向拆成 4 个 `move_*` 动作的强度，`Input.action_press(action, strength)` / `action_release(action)` | `BevyInput.collect_and_submit()` 的 `Input.get_vector` 与 `is_action_pressed` 原样读到 |
-| 视角区 | `ScreenDrag.relative × look_sensitivity` → `apply_look_delta()` → `BevyInput.on_look_delta(delta)` | 与鼠标位移同一条 `look_delta` 通道 → `quantize_look` / LookChannel |
-| 动作按钮 | 按 ButtonSpecs 的 `spec.action` 写 `Input.action_press` / `action_release`；`toggle` 模式点按后 0.1s 自动 release，形成一次完整边沿 | 与键盘、手柄走同一套 `held / pressed / released` |
-
-动作按钮的生成方式：**按 ButtonSpecs 生成，缺规格的通道走兜底**。`ActionButtonHost` 从 `BevyInputContext.channels()` 拉通道表，跳过 `mode == "axis2d"`（移动归摇杆），每个通道查 `ButtonSpecs.BY_CHANNEL`；查不到规格就用 `fallback_spec`（`key` + `actions[0]`）兜底，不再让控件层自己维护「通道 → 按钮」的隐式映射。`channel_changed` 里用 `present` 控制显隐、`available` 控制置灰，并在不可用时立即释放该动作。按钮文案来自规格的 `label`，缺省退回 `key.replace("_", " ").capitalize()`。
+| 虚拟摇杆 | `move_forward/back/left/right` 动作强度；边缘额外 `sprint` | `get_vector` 合成移动轴 → `quantize_axis`；sprint 走通道位 |
+| 视角区 | `ScreenDrag.relative × look_sensitivity` → `on_look_delta` | 与鼠标同一个 `look_delta` → `quantize_look`，不占动作位 |
+| 动作簇 | 绑定层解析出的 `attack / break_block / place_block / jump / interact / glide / flight_toggle` | 进 held / pressed / released，与键盘手柄一致 |
 
 关键约定：
 
-- 暂停闸：视角区先查 `UiState.accepts_gameplay_input()`，菜单期间不注入视角。
-- 摇杆只对 `InputMap.has_action()` 的动作注入，动作名来自 BevyInput 从 game-core 注册的动作表。
-- 多指：摇杆只跟第一根手指并按 index 匹配；视角区用 `Dictionary[index]` 记录；动作按钮由 `ActionButton` 自己按 `InputEventScreenTouch.index` 归属。verifier 已实测（4.7.2）：两指各按一个按钮互不影响、同一按钮第二根手指被忽略；真实多指乱序 / 丢帧与「按钮 + 摇杆 + 视角」三指同按仍需真机验证。
-- `emulate_mouse_from_touch=false`，且采集层忽略 `DEVICE_ID_EMULATION` 的合成鼠标事件。
-- `on_look_delta` 是 UI 注入视角的正式入口；`touch_controls.gd` 仍保留 `on_mouse_motion` 兜底（前向兼容），两条入口都只往同一个 `_look_accum` 里加。
+- `emulate_mouse_from_touch=false`；采集层忽略 `DEVICE_ID_EMULATION` 的合成鼠标事件。
+- 多指按 `event.index` 路由：摇杆只跟第一根手指，视角区用 index 集合，ActionButton 每个按钮跟一根手指；动作簇在 HUD 上层（触摸控件层被 `move_child(..., 0)` 压到最底），按钮先吃触摸，其余滑动才落到视角区。
+- 隐藏 / 切走触屏方案 / 打开菜单 / 失焦 / 退出场景树时统一释放：触屏层复位摇杆与视角手势，`ActionButtonHost.release_all()` 释放按钮动作。
+- 摇杆 / 动作簇 / 视角区在布局变化时向 `UiRoot.update_touch_region()` 登记矩形（见「避让层」）。
 
-这条设计的收益：Rust 侧零改动，暂停、能力过滤、量化、历史全部复用；代价是触屏输入必须落在已注册的 InputMap 动作上，没有“触屏专用动作”。
+## 输入绑定层与动作簇
 
-## 动作按钮：ButtonSpecs / ActionButtonHost / ActionButton
+### 三层分工
 
-本轮把动作按钮拆成三层：**映射表 / 宿主 / 控件**。自绘 `ActionButton` 是**可选增强，不是对引擎能力的绕行**——Godot 4.7.2 上原生 `Button` 本身就支持触摸与多指（详见下面「触摸实现方式」）。拆三层的直接收益是：映射从控件层挪成数据表、一个通道可以出多个按钮（`tool` 通道的 `primary_tool` / `secondary_tool`）、释放时机与 per-index 语义由自己掌握。
+```text
+物理输入（键盘 / 触屏 / 手柄）
+  → Godot InputBindings（绑定层，可配置）
+      物理槽位 → 语义动作（直连 / 上下文解析）
+  → Rust 语义动作 + 能力（present / available，确定性不变）
+  → INPUTCAPS 回传
+  → UI 按钮 / 键位提示 / 显隐（全部由语义能力生成）
+```
 
-| 层 | 文件 | 职责 |
+Rust 只认语义动作与能力，不知道键位；绑定解析在提交前完成，预测回滚与 `InputBuffer` 重演不受影响。
+
+### 语义动作表（Rust）
+
+| 动作 | 通道 | 能力组件 | 说明 |
+| --- | --- | --- | --- |
+| `attack` | `attack` | `AttackChannel` | 攻击 / 主操作 |
+| `break_block` | `break_block` | `BreakBlockChannel` | 破坏方块 |
+| `place_block` | `place_block` | `PlaceBlockChannel` | 放置方块 |
+| `jump` / `glide` / `flight_toggle` / `interact` / `sprint` | 同名 | 同名 Channel | 已是语义命名 |
+
+`tool` 通道与 `primary_tool` / `secondary_tool` 已删除。眩晕（`Stunned`）削减 move / jump / attack / break_block / place_block 的 `available`，但 `present` 不变，因此按钮只置灰、不消失、不位移；interact 不受眩晕影响。动作位布局随动作表变化（attack bit8、break_block bit9、place_block bit14），`INPUTCAPS` 字段 `present` / `available` 形状不变，只是位域内容变了。
+
+`INTERACTION` 载荷新增 `target: u8`（0=none / 1=entity / 2=block），供绑定层在 context 预设下决定主操作解析成 attack 还是 break_block。
+
+### InputBindings：槽位 → 语义动作
+
+一个物理槽位有两种绑定：
+
+- **直连**：槽位 → 一个语义动作（split 预设：attack / break_block / place_block 各一个按钮）。
+- **上下文**：槽位 → 有序候选列表，取第一个 present 且 available 的动作；都不可用时取第一个 present 的并置灰（不位移）。context 主槽位候选 `[attack, break_block]`，target=block 时反转为 `[break_block, attack]`。
+
+| 预设 | 触屏右下角 | 键鼠 / 手柄 |
 | --- | --- | --- |
-| 映射表 | `ui/input/button_specs.gd`（`ButtonSpecs`） | 通道 / 动作 → 按钮规格，纯数据 |
-| 宿主 | `ui/input/action_button_host.gd`（`ActionButtonHost`） | 读通道表、创建 / 更新 / 销毁按钮、显隐置灰、统一释放 |
-| 控件 | `ui/widgets/action_button.gd` / `.tscn`（`ActionButton`） | 自绘按钮，按触摸 index 产生 press / release |
+| 精简 Context（默认） | 主按钮（attack / break_block 上下文）、副按钮（place_block）、跳跃；Interact 仅在有可交互目标时出现 | 无按钮；左键主、右键副、中键 break，提交前按 target 重映射 |
+| 分开 Split | attack、break_block、place_block、跳跃各一个按钮 | 三个动作各绑一个键，不做上下文重映射 |
 
-### ButtonSpecs
+槽位显隐规则：任一候选动作的通道 `present` 才显示；全无则隐藏；Interact 额外要求 `INTERACTION.enabled`。按钮文案取当前解析出的动作，目标变化时跟着变。`glide` / `flight` 仅在能力 present 时占位；sprint 不再出按钮，由摇杆推到边缘自动触发。
 
-映射表放在 **Godot** 侧（game-core 的通道表只给 key / mask / mode / actions，不含按钮布局与文案）：
+键鼠 / 手柄提示（`ActionHints`）由 `InputBindings.hint_text()` 从 InputMap 真实绑定生成（例：`[LMB] Attack  [RMB] Place  [Space] Jump`），触屏返回空串、整行隐藏。
 
-- `BY_CHANNEL`：通道 key → 规格数组。一个通道可以给多个按钮（`tool` 给 `primary_tool` / `secondary_tool` 两个）。
-- `BY_ACTION`：预留按动作名查规格，当前为空。
-- `fallback_spec`：通道查不到规格时兜底，用 `key` 与 `actions[0]` 生成一个按钮。
+### ActionCluster：触屏右下角动作簇
 
-当前 6 个显式通道（共 7 个按钮）：
+`ActionCluster` 是**一个** `HudWidget`（`widget_id=action_cluster`、`tray=BOTTOM`、`align=END`、`priority=10`、`schemes=TOUCH`），内部管理 `ActionButton` 子控件（按钮不再单独注册进 HudRegistry）。
 
-| 通道 | 按钮 | action |
-| --- | --- | --- |
-| `jump` | Jump | `jump` |
-| `tool` | Use / Alt | `primary_tool` / `secondary_tool` |
-| `glide` | Glide | `glide` |
-| `flight` | Fly | `flight_toggle` |
-| `interact` | Interact | `interact` |
-| `sprint` | Sprint | `sprint` |
-| 缺规格通道（mod / 新通道） | 兜底按钮 | `actions[0]` |
+- **位置**：只落右下角；右上角只有暂停按钮；右侧中部留空给拇指滑动视角。
+- **主按钮最大**：主按钮（primary / 左手时的首个锚点）约 10 mm，其余约 9 mm，跳跃 9.5 mm；由 `DisplayServer.screen_get_dpi()` 换算 → 设计单位（除以 `content_scale_factor`），并乘期 3 的按钮大小设置。平板 ×1.1。
+- **弧形**：主按钮钉在簇的右下角（左手为左下角），其余按钮按 `[180°, 215°, 250°, 285°, 320°]` 极坐标绕主按钮展开。因为簇在 `bottom_end` 是 END / BOTTOM 对齐，簇向右下固定：Interact 等动态按钮出现时簇向左 / 上长大，**主按钮位置不跳**。
+- **常驻上限 3–4 个**：context 3 个（主 / 副 / 跳）+ 条件 Interact；split 4 个。glide / flight 只在能力 present 时占位；其余不出现。
+- **触摸优先级**：按钮 `mouse_filter=STOP`，吃掉落在自己矩形内的触摸；其余滑动走下层视角区。
+- **透明度**：空闲 alpha = 期 3 的按钮透明度（默认 0.75），按下变亮。
+- **左手模式**：`align=BEGIN` + 内部水平镜像；摇杆镜像到右下，视角区镜像到左侧。
+- **避让**：按自身 global rect 调 `update_touch_region("action_cluster", ...)`（reserves 为空），供调试层做重叠告警；动态显隐 / resized 时更新。
 
-规格字段归一化：
+`ActionButton` 是自绘 `Control`：按下 `Input.action_press(action)`、抬起 `action_release`，toggle 模式点按后 0.1s 自动释放；不可用 / 隐藏 / 失焦 / 退出树都会立即 release（防粘键）。一个按钮只跟一根手指。
 
-| 字段 | 说明 | 缺省 |
-| --- | --- | --- |
-| `id` | 按钮唯一 id（HudWidget.widget_id） | 由通道 + action 拼 |
-| `label` | 英文文案 | `key.replace("_", " ").capitalize()` |
-| `action` | 要注入的 InputMap 动作 | 通道的 `actions[0]` |
-| `mode` | `button` / `hold` / `toggle` | 通道的 mode |
-| `channel` | 来源通道 key | 通道 key |
-| `tray` / `align` / `priority` | 放置（作为 HudWidget 注册） | `RIGHT` / `END` / 0 |
-| `schemes` | 显隐位掩码 | `TOUCH` |
-| `scheme_overrides` | 按方案覆盖位置 | 空 |
+### 期 3 设置（落盘）
 
-改按钮布局 / 文案只改这张表，不动控件与 Rust；代价是 game-core 通道表变化时 Godot 侧要同步更新。
+`UiState` 新增 5 个字段并持久化到 `user://ui_settings.cfg`（`ConfigFile`，section `ui`，`SETTINGS_VERSION=1`）：
 
-### ActionButtonHost
+| 设置 | 字段 | 取值 | 生效点 |
+| --- | --- | --- | --- |
+| 操作布局 | `action_layout` | CONTEXT / SPLIT | 绑定层重解析 → 动作簇按钮数量 / 文案 |
+| 按钮大小 | `button_scale` | 0.8–1.3 | 动作簇按钮边长 |
+| 按钮透明度 | `button_opacity` | 0.35–1.0 | ActionButton 空闲 alpha |
+| 左手模式 | `left_handed` | bool | 动作簇镜像 / 摇杆与视角区镜像 |
+| 摇杆模式 | `joystick_mode` | FIXED / FLOATING | 固定摇杆 vs 左半屏按下处浮起 |
 
-`ActionButtonHost` 是普通 `Node`，不继承 HudWidget；它把每个按钮作为 HudWidget 注册进注册表，从而免费获得托盘、方案显隐、`scheme_overrides`、安全区与缩放适配。
+暂停菜单 Settings 区新增对应控件（运行期创建，插在 Back 前），交互只发信号；`UiRoot` 统一写 `UiState` + `save_settings()`，再调 `action_host.refresh_settings()` / `touch_controls.refresh_settings()` 立即生效。`UiRoot.load_persisted_settings` 仅供测试关闭读取。
 
-- `setup(ui_root, registry)` 绑定 UI 根与注册表；
-- 从 `client.input_context.channels()` 拉通道表，跳过 `axis2d`（移动归摇杆）；
-- 订阅 `channel_changed(key, present, available)`：`present` 控制显隐，`available` 控制置灰，不可用时立即释放该动作；
-- **晚到补偿**：`refresh()` 重新绑 client 并重拉通道表，覆盖「client 晚于 `UiRoot._ready`」「`input_context` 晚于 client 绑定」「`channels()` 晚于 context 就绪」三种时序；UiRoot 在 client 的 `input_capabilities_changed` 时调用它；
-- `channel_changed` 收到当前表里没有的 key 时不丢弃，而是重拉一次通道表并补上这次边沿（否则晚绑定时按钮永远补不回来）；
-- 测试注入缝：`apply_channels(rows)` / `set_channel_state(key, present, available)`，headless 冒烟不依赖真实后端；
-- 菜单打开、切走 TOUCH 方案、窗口失焦、退出树时统一 `release_all()`，避免手指抬起事件丢失造成粘键；
-- `destroy()` 释放动作、断信号、把按钮从注册表移除（宿主节点本身随 UiRoot 释放，`destroy()` 不 free 自己）。
+### 快捷栏预留（本期不实现）
 
-### ActionButton
-
-`ActionButton` 是自绘 `HudWidget`（`Control` 子类，不是原生 `Button`；场景文件 `action_button.tscn` 只挂脚本）：
-
-- 自己处理 `InputEventScreenTouch`，按 `index` 归属手指，按下写 `Input.action_press(spec.action)`，抬起写 `action_release`；
-- `toggle` 模式点按后 0.1s 自动 release，形成一次完整边沿；
-- 不可用 / 隐藏 / 退树时确保释放对应动作；
-- 视觉自己画，不依赖主题的 Button 样式。
-
-**触摸实现方式**：`project.godot` 设了 `pointing/emulate_mouse_from_touch=false`，触摸事件直接进 GUI；按钮 `mouse_filter=STOP`，只吃落在自己矩形内的触摸。`ActionButton` 在 `_gui_input()` 里处理 `InputEventScreenTouch`（同时处理 `InputEventMouseButton` 兼容桌面调试 / headless），一个按钮只跟踪一根手指、按 `index` 匹配。
-
-**关于原生 Button（verifier 实测，Godot 4.7.2）**：
-
-- `InputEventScreenTouch` 会直接触发原生 `Button` 的 `button_down` / `pressed` / `button_up`，不是鼠标模拟——`BaseButton` 原生处理 ScreenTouch，`Viewport` 按 touch index 维护 `gui.touch_focus`；
-- 两根手指分别按两个 Button，各自 down / up 独立；同一 Button 上的第二根手指被忽略（只认第一根）；手指拖出控件矩形后 release 仍按 index 回投到原控件；
-- 运行时改 `ProjectSettings` 的 `emulate_mouse_from_touch` 无效（引擎启动时读一次）；只有 `Input.emulate_mouse_from_touch` 在 `Input.parse_input_event` 路径才产生合成鼠标。本项目 `emulate=false` 无需改，也不影响原生 Button 与自绘 Control。
-
-**既然原生 Button 支持触摸，为什么还自绘**（三条理由，不是「Button 做不到」）：
-
-1. **释放时机可控**：通道不可用 / 元素隐藏 / 菜单打开 / 窗口失焦时立即 release，不等 GUI 的按钮状态机；
-2. **per-index 语义显式**：一个按钮只跟一根手指，多指同按时各按钮独立、互不串扰；
-3. **与 HudWidget 契约一致**：直接复用 tray / align / priority / schemes / scheme_overrides 与注册表，不引入第二套宿主。
-
-结论：自绘是可选增强，不是对引擎能力的绕行；4.7.2 上原生 Button 也支持触摸与多指。
-
-**仍需真机验证**（headless 是 stub DisplayServer：窗口 64×64、视口正方形、无真实 DPR / 安全区、`is_touchscreen_available` 恒 false，不能替代真机）：真机坐标缩放 / 断点 / 安全区；`InputEventScreenTouch.canceled=true`（系统取消触摸）时是否释放动作；真实多指乱序 / 丢帧；按钮 + 摇杆 + 视角三指同时按。
+`bottom_center` 槽位 `reserve=(0,72)`：现在没有快捷栏元素也保留这条底部带，其它元素不会挤进去。动作簇总宽度受常驻上限约束，中间留给未来的快捷栏。期 4 再实现快捷栏本体。
 
 ## 交互意图抽象（设计，未实现）
 
@@ -496,7 +526,7 @@ scheme_overrides = {
 
 ### 迁移路径
 
-1. **现状（P3 已落地）**：`ActionButton` 是自绘 `HudWidget` 子类，自己按 `InputEventScreenTouch.index` 处理触摸；`ActionButtonHost` 负责通道 → 按钮的生命周期、显隐与释放。这不是因为「原生 Button 不支持触摸」——4.7.2 上原生 Button 支持触摸与多指，自绘是为了释放时机、per-index 语义与 HudWidget 契约一致。
+1. **现状（绑定层已落地）**：`ActionButton` 是自绘 `Control`（由 `ActionCluster` 管理，不再单独注册），自己按 `InputEventScreenTouch.index` 处理触摸；`ActionButtonHost` + `InputBindings` 负责语义动作解析、上下文显隐与释放。这不是因为「原生 Button 不支持触摸」——4.7.2 上原生 Button 支持触摸与多指，自绘是为了释放时机、per-index 语义与动作簇契约一致。
 2. **抽路由**：把触摸 / 鼠标 / 焦点统一翻译成意图，元素实现意图回调。`ActionButton` 是第一个消费者（触摸按下 = `select`，抬手 = `confirm`，长按 = `context`）。
 3. **P3b 是 hint 的轻量版**：交互提示元素只声明「要一个提示」，文案由方案给——键鼠取 InputMap 第一个键鼠事件（键盘 `OS.get_keycode_string(physical_keycode)`，鼠标 `as_text()`），触屏显示 `Tap`。提示元素不判断设备。
 4. **手柄**：接焦点导航后，`focus_entered` / `focus_exited` 映射 `hint` / `select`，`ui_accept` 映射 `confirm`。
@@ -540,6 +570,7 @@ scheme_overrides = {
 | Resume | 发 `resume_requested`，UiRoot 转成 `close_pause_menu()` |
 | Settings | 展开 SettingsPanel，焦点移到 UI 缩放滑条 |
 | UI SCALE | `TouchSlider`（`HSlider` + 触摸处理）0.8–1.3、步长 0.05，`ui_scale_changed` → `UiRoot.set_ui_scale()`，实时改 `content_scale_factor` |
+| 期 3 设置 | 操作布局（Context/Split）、按钮大小（0.8–1.3）、按钮透明度（0.35–1.0）、左手模式、摇杆模式；运行期创建在 Back 之前，只发信号，由 UiRoot 写 `UiState` + `save_settings()` 并立即生效 |
 | Back | 收起 Settings，焦点回到 Settings 按钮 |
 | Quit | 直接 `get_tree().quit()`，**无二次确认** |
 | Hint | 键鼠 / 手柄 “Esc to resume”，触屏 “Tap Resume”（打开菜单时按方案刷新） |
@@ -584,7 +615,9 @@ scheme_overrides = {
 | 元素 | 槽位 | 尺寸 | 显示条件 / 数据源 |
 | --- | --- | --- | --- |
 | `Crosshair` | `tray=CENTER, align=CENTER` | 24×24 | `input_look_changed` → `input_context.has_look()`；`_draw()` 画四条短臂，默认隐藏 |
-| `HealthBar` | `tray=TOP, align=BEGIN, priority=20` | 260×30 | `listen_component(HEALTH)` + `controlled_entity_changed`；读 `current` / `max` 填 ProgressBar 与数值 Label |
+| `HealthBar` | 默认 `tray=BOTTOM, align=BEGIN, priority=20`；TOUCH 覆盖为 `TOP/BEGIN` | 260×30 | `listen_component(HEALTH)` + `controlled_entity_changed`；读 `current` / `max` 填 ProgressBar 与数值 Label |
+| `ActionHints` | `tray=BOTTOM, align=BEGIN, priority=10`，`schemes=KBM|GAMEPAD` | 文本行 | 由 `ActionButtonHost` 创建；`InputBindings.hint_text()` 从 InputMap 生成键位提示，空串隐藏 |
+| `ActionCluster` | `tray=BOTTOM, align=END, priority=10`，`schemes=TOUCH` | 动态 | 由 `ActionButtonHost` 创建；语义动作解析 + 弧形按钮 + 避让登记 |
 | `InteractPrompt` | `tray=BOTTOM, align=CENTER` | 180×40 | `listen_component(INTERACTION)`；`enabled` 且 `action != 0` 才显示；键位提示按方案生成（键鼠 `[E] Interact`（`OS.get_keycode_string(physical_keycode)`）/ 触屏 `Tap`） |
 | `PauseButton` | `tray=TOP, align=END, priority=50`，`schemes=TOUCH` | 72×72 | 无数据源；自绘暂停图标，触摸 / 鼠标按下 → `open_pause_menu()`；键鼠方案不显示 |
 
@@ -649,94 +682,75 @@ meta 字段：
 
 自动化（headless，无编辑器）：
 
-| 项 | 覆盖 |
+| 脚本 | 覆盖 |
 | --- | --- |
-| `tools/ui_check.sh` | 生成类名缓存 + `.godot/extension_list.cfg`，再跑 `test/ui_smoke_test.gd`，失败非零退出 |
-| UiRoot 加载 | `ui_root.tscn` 可实例化，9 个槽位齐全，内置 HUD 自动注册 |
-| 注册与排序 | 内置注册、priority 排序、重复 id 拒绝 |
-| 方案 / 紧凑 / 菜单 | 三种显隐条件与菜单开关后恢复 |
-| mod 路径 | `register_external` 正例、重复 id 与超尺寸反例 |
-| 尺寸与缩放 | 桌面 / `debug_force_mobile` 模拟移动端两种情况下逻辑宽度（1920 / 900）与断点等级 |
-| 触屏控件 | 实例化、触屏方案可见、摇杆上推注入 `move_forward` 且 `Input.get_vector` 读到前进、`reset()` 释放动作、模拟 `safe_insets=(12,0,20,48)` 时摇杆避开左 / 下安全区 |
-| P0 释放路径 | 无 manager 不写 `backend_paused`；`unregister` 后载荷回调与信号成对断开；超尺寸 mod 元素不留注册表 |
-| P1 platform | 桌面 / 切触屏方案后 platform 不变；`debug_force_mobile` → PHONE 且边距为 `TOUCH_PAD`；关闭后回 DESKTOP |
-| P2 方案覆盖 | 覆盖 tray / align / priority 后重排；`min_size` 覆盖与切回恢复；mod meta 的 `scheme_overrides`；每方案尺寸上限 |
-| P3 动作按钮 | `tool` 生成两个按钮、缺规格通道走兜底、`axis2d` 不出按钮；模拟两指同时按住两个按钮各自生效、松开互不影响；`toggle` 自动释放；通道不可用时立即释放；菜单 / 切方案后隐藏 |
-| P3b 交互提示 | 键鼠提示含 `Interact`、真实绑定 `[E] Interact`（键名来自 `physical_keycode`）、改键后变 `[F] Interact`；触屏提示为 `Tap` |
-| P4 同组互斥 | 同组只激活 priority 最高者，不命中当前方案的元素不参与竞争 |
-| P5 混合设备防抖 | 输入切换受冷却限制、程序化切换不受；摇杆低于阈值 / 鼠标微动不切方案；超过阈值正常切 |
-| P6 移动端入口 | 触屏暂停按钮：KBM 隐藏 / TOUCH 可见、按下打开暂停菜单；触摸滑条：按右端数值变大、拖动变小、经 `ui_scale_changed` 写回 `UiState.ui_scale`；Debug 区：debug 构建可见、开关调试层、强制 TOUCH / KBM、提示改 `Tap Resume`、release 构建入口隐藏 |
-| 暂停菜单 | Resume 信号经 UiRoot 关闭菜单、打开时隐藏触屏控件、UI 缩放滑条经 `set_ui_scale()` 生效并恢复 |
-| 真实场景集成（可选 `--gameplay`） | 加载 `gameplay_test.tscn`：UiRoot 找到 BevyClient、注册内置 HUD、实例化触屏 / 暂停 / `ActionButtonHost`、CameraRig 入组；真实通道表 → ButtonSpecs → 按钮数为 7、`tool` 两个；`open_pause_menu()` 后 `backend_paused=true` 且 `camera._ui_blocked=true`，关闭后恢复 |
+| `tools/ui_check.sh` | 生成类名缓存 + `.godot/extension_list.cfg`，依次跑下面 4 个脚本，任一失败非零退出；`--gameplay` 追加真实场景探针 |
+| `test/ui_smoke_test.gd` | 9 个 HudSlot 槽位 / 准星居中 / 隐藏元素不位移 / 内置 HUD / 方案与紧凑 / 菜单 / mod 路径 / 触屏控件 / 期 3 设置接线 / 动作簇与绑定层（context 3 按钮、target 切换、Interact 条件出现、split 4 按钮、置灰不位移、左手） |
+| `test/ui_layout_test.gd` | SubViewport 844×390 / 1280×800 / 1920×1080：footprint 不越界、mid_center 居中、换行换列、reserve 72、inset 避让、隐藏不变、TouchRegionRegistry |
+| `test/input_bindings_test.gd` | 绑定层 context / split 解析、target 切换、interact 显隐、stun 置灰、动作簇弧形 / 锚点稳定 / 左手镜像、ActionButton 多点触控与释放、键位提示 |
+| `test/ui_settings_test.gd` | 单位换算、落盘恢复、坏文件回默认、暂停菜单 5 类设置控件与信号、左手镜像、浮动摇杆、血条角色映射、sprint 边沿 |
 
-当前结果（2026-10-22，Godot 4.7.2 headless，aarch64）：
+当前结果（2026-10-23，Godot 4.7.2 headless，aarch64）：
 
 ```text
-[ui_smoke] checks=128 failures=0
-UI_SMOKE PASS
-
-PROBE client=true widgets=11
-PROBE action_host=true buttons=7 tool_buttons=2 channels=7
-PROBE menu_open=true backend_paused=true camera_blocked=true
-PROBE menu_closed=true backend_paused=false camera_blocked=false
-PROBE PASS
+[ui_smoke] checks=146 failures=0            UI_SMOKE PASS
+[ui_layout] checks=41 failures=0            UI_LAYOUT PASS
+[input_bindings] checks=114 failures=0      INPUT_BINDINGS PASS
+[ui_settings] checks=122 failures=0         UI_SETTINGS PASS
 ```
 
-`--gameplay` 探针是**本机 headless** 跑通（已有 aarch64 `.so`），不是真机验证。新增检查项后以最后一次 `tools/ui_check.sh` 输出为准。
+布局验收口径（与方案 §9 对齐）：
 
-动作按钮的触摸、双指同按与 toggle 边沿现在有 headless 断言（构造 `InputEventScreenTouch` 直接调 `_gui_input`）；触屏暂停按钮与触摸滑条同样是构造 `InputEventScreenTouch` 断言；视角区多指归属、真实触摸分发与滑条手感仍靠真机 / 人工验证。
-
-逐阶段的文件清单、提交与仍未验证项见 [[UI适配改造变更说明]]。
+- 没有元素 footprint 超出屏幕 / 安全区（多视口 headless + SubViewport）。
+- 准星中心 == 安全区中心（误差 < 0.01）。
+- 隐藏任一元素后，其它槽位元素位置不变（同槽位内按可见元素重排，见「HudSlot 行为」）。
+- 动作簇 / 摇杆 / 暂停按钮 / 快捷栏预留带互不重叠。
+- 真机复测仍是必须项：headless 的 DPI / 安全区 / 触摸分发都是 stub。
 
 人工矩阵（每条都要过一遍）：
 
 | 环境 | 期望 |
 | --- | --- |
-| 1280×720 键鼠 | 正常断点，HUD 贴边不越界 |
-| 1920×1080 键鼠 | 正常断点，槽位留白一致 |
-| 手柄 | 方案切到 GAMEPAD，触屏控件消失 |
-| 手机横屏（逻辑宽 900，orientation=landscape） | compact_level=1，触屏控件可见，安全区内缩生效 |
-| 平板（逻辑宽 1280） | 断点 0，元素不会被拉得过宽 |
-| 700 宽窗口 | compact_level=2，声明的极窄元素隐藏 |
-| Android 刘海 / 手势条 | HUD 不压安全区（**未在真机验证，见风险**） |
-| Android 真机多指 | 动作按钮 + 摇杆 + 视角三指同时按各自独立；系统取消触摸（`canceled=true`）时动作释放、不粘键（**未在真机验证**） |
-| 手机触屏入口 | 触屏暂停按钮可点、暂停菜单按钮可点、Settings 滑条可拖、debug 包里 Debug 区可用（**未在真机验证**） |
+| 1280×720 / 1920×1080 键鼠 | 断点正常，HUD 贴边不越界，键位提示可见、动作簇不可见 |
+| 手机横屏（逻辑宽 ~900） | compact_level=1，触屏动作簇右下、摇杆左下、暂停右上、准星居中 |
+| 平板（逻辑宽 ~1280，触屏） | 断点 0，动作簇离边缘更远、按钮略大 |
+| Android 刘海 / 手势条 | HUD 不压安全区（**未真机验证**） |
+| Android 真机多指 | 按钮 + 摇杆 + 视角三指同按各自独立；系统取消触摸（`canceled=true`）释放动作（**未真机验证**） |
+| 左手模式 / 浮动摇杆 / 按钮大小 / 透明度 | 切换后立即生效，重启保持（**手感未真机验证**） |
 
 ## 不做什么
 
-- 不做布局求解器 / flex / 约束求解；容器 + 槽位就是全部布局能力。
+- 不做布局求解器 / flex / 约束求解；HudSlot + 槽位就是全部布局能力。
 - 不做 desktop 与 mobile 两套 UI 树。
-- 不在 Rust 侧区分触屏输入源；触屏只是 InputMap 的另一个动作来源。
+- 不在 Rust 侧区分触屏输入源；触屏只是语义动作的另一个来源。
 - 不在 HudWidget 子类里写坐标、分辨率判断、安全区计算。
-- 不做 UI 动画、转场、UI 音效系统；Theme 只设了默认字号与描边。
-- 不做 CJK 字体与本地化（当前 UI 文案一律英文，见风险）。
-- 不实现交互意图路由：hint / select / confirm / context 只在本节「交互意图抽象（设计，未实现）」做设计，本轮元素仍直接处理设备事件。
-- 不在 release 构建暴露调试入口：Debug 区只在 `OS.is_debug_build()` 为真时出现，也不做隐藏手势。
+- 不做 UI 动画、转场、UI 音效系统。
+- 不做 CJK 字体与本地化（UI 文案一律英文）。
+- 不实现交互意图路由：hint / select / confirm / context 仍只是设计。
+- 期 4 快捷栏、期 5 拖动自定义布局不在本轮；只保留 `bottom_center` 的 72 预留带。
+- 不在 release 构建暴露调试入口。
 
 ## 待办与风险
 
 | 项 | 影响 | 处理 |
 | --- | --- | --- |
-| 无 CJK 字体资源 | 中文文案显示方块，UI 只能用英文 | 引入字体（`.ttf` 或 `SystemFont`）并挂到 `UiRoot` 的 Theme `default_font` 后再做本地化；未做 |
-| Android 真机安全区未验证 | headless 下 `safe_insets` 恒 0，`get_display_safe_area()` 在部分 ROM 上返回值不可靠 | 需要真机跑一遍刘海 / 挖孔 / 手势条；未验证 |
-| 真机触摸 / 多指未验证 | 摇杆、视角区、自绘 ActionButton / PauseButton / TouchSlider 只在 headless 里用构造的 `InputEventScreenTouch` 断言过；真实触摸事件分发、同时三指以上、系统手势冲突、`canceled=true`、滑条拖动手感未验证 | 真机回归；必要时补集成测试 |
-| 移动端入口只在 debug 构建整包验证过 | Debug 区按 `OS.is_debug_build()` 显示，headless 是 editor 构建（恒 true），release 包的实际隐藏未导包验证；触屏暂停按钮 / 触摸滑条的真机命中与手感也未验证 | 出一版 debug / release APK 各点一遍；未验证 |
-| Button 触摸与多点触控结论 | verifier 实测 Godot 4.7.2 原生 Button 支持 ScreenTouch 与多指（两指各按一个独立、同一按钮第二根手指忽略、drag 出矩形后 release 按 index 回投）；自绘 `ActionButton` 是释放时机 / per-index / HudWidget 契约的可选增强，不是绕行 | 已实证（headless / verifier）；真机细节见「真机触摸 / 多指未验证」 |
-| P4 只有规则没有界面 | `group_id` 只实现注册表互斥 + 冒烟测试，没有具体背包 / 面板界面落地 | 随实际界面一起验收 |
-| 交互意图抽象未实现 | 只有本文「交互意图抽象（设计，未实现）」一节；元素仍然直接处理设备事件 | 非本轮范围，后续期次落地 |
-| 移动端 renderer 未定 | `project.godot` 仍是 Forward Plus；移动端要不要切 mobile renderer 没定 | 与 UI 适配解耦，但影响安卓帧率；待性能测试 |
-| mod UI 加载器未做 | 只有 `register_external` API，没有 manifest 驱动的发现 / 排序 / 卸载 | 随 Mod M6 一起设计；见 [[08-静态数据与Mod体系]] |
-| 手柄只做到方案检测 | 暂停菜单内部有 `grab_focus` 可键盘 / 手柄操作，但局内 HUD 与交互没有焦点链、也没有按键提示 | 需要局内焦点导航与手柄提示；未做 |
-| 触屏手感未调 | 摇杆死区 0.15、底圈半径 140、按钮 96×96、视角灵敏度 1.0 都是初值 | 真机调参；未做 |
-| 暂停菜单 Quit 无确认 | 误触直接 `get_tree().quit()` | 加二次确认或主菜单流程；未做 |
-| 方案状态是单值覆盖 | `scheme` 是位掩码但当前只记一个来源，手柄 + 键鼠同时接入会互相覆盖 | P5 已加切换冷却与幅度阈值做防抖，但仍是「最近事件获胜」，没有多源合并；未做 |
-
-已解除 / 已接受（2026-10-22）：
-
-- **交互提示缺 ActionId 反查已解决（P3b）**：键鼠提示改为从 InputMap 该动作绑定的第一个键鼠事件取键名（键盘 `OS.get_keycode_string(physical_keycode)`、鼠标 `as_text()`），触屏显示 `Tap`；不再硬编码「按 E」。一个动作多绑定时只展示第一个键鼠事件。
+| 无 CJK 字体资源 | 中文文案显示方块，UI 只能用英文 | 引入字体并挂 Theme 后再本地化；未做 |
+| 真机安全区 / DPI 未验证 | headless 的 `safe_insets` / `screen_get_dpi` 是 stub，物理尺寸用回退 160 dpi | 真机回归；`physical_units` 已有下限与回退 |
+| 真机触摸 / 多指未验证 | 摇杆、动作簇、暂停按钮、浮动摇杆只在 headless 用构造事件断言 | 真机回归 |
+| 动作簇弧形手感未调 | 角度 / 半径 / 9–10 mm 都是初值 | 真机调参 |
+| 同槽位隐藏元素会重排 | 隐藏子元素不占位，同槽位其余元素会前移（跨槽位不受影响） | 若产品要求严格不位移，可改为「隐藏也占位」；当前按「跨槽位不变」验收 |
+| 单元素超尺寸被夹 | Godot 的 `size` 会被最小尺寸钳住，只能夹分配 footprint | `debug_warnings` 记录；跨槽位不受影响 |
+| 攻击 / 破坏 / 放置玩法未实现 | 语义动作与能力已通，但 Rust 侧没有消费系统；Interact 目标类型也依赖玩法产出 | 玩法落地后接 `ResolvedInput` 位与 `InteractionHint.target` |
+| 键鼠上下文重映射 | CONTEXT 预设下 attack 按 target 改报 break_block；玩法验证后可能调整 | 随玩法实测 |
+| 移动端 renderer 未定 | 仍是 Forward Plus | 与 UI 解耦，待性能测试 |
+| mod UI 加载器未做 | 只有 `register_external` API | 随 Mod M6 |
+| 手柄只做到方案检测 | 局内 HUD 无焦点链；动作提示可用但未做手柄图标 | 后续 |
+| 暂停菜单 Quit 无确认 | 误触直接退出 | 后续 |
+| 方案状态是单值覆盖 | 多设备同时输入仍是最近事件获胜（P5 已防抖） | 后续 |
 
 ## 维护约定
 
 - 架构变化时改对应笔记，并在 [[11-当前状态与风险]] 更新状态表。
-- 新增输入通道 / 按钮规格时，同步改 `ButtonSpecs` 与本笔记的「动作按钮」一节。
-- 改 `scheme` / `platform` / `compact_level` 的语义时，同步改「三量分离」与测试矩阵。
+- 新增语义动作时同步改：`game-core/src/input/actions.rs` 的 `ACTION_TABLE` → `capability.rs` 的通道 / 能力组件 → `InputBindings` 的槽位配置 / 文案；不再单独维护 ButtonSpecs。
+- 改 `scheme` / `platform` / `compact_level` / `action_layout` 的语义时，同步改「三量分离」「输入绑定层与动作簇」与测试矩阵。
+- 调 HudSlot 布局规则时，必须同步跑 `ui_layout_test.gd`（多视口）。

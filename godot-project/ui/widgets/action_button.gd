@@ -1,25 +1,23 @@
 class_name ActionButton
-extends HudWidget
+extends Control
 ## 动作按钮：自绘圆角矩形 + Label，不依赖原生 Button。
 ##
-## 为什么自绘而不用原生 Button（Godot 4.7.2 实测原生 Button 也支持触摸与多指，
-## 自绘不是绕行引擎缺陷，而是三项增强）：
-## 1) 释放时机可控：通道不可用 / 隐藏 / 菜单 / 失焦时立即 release，不等 GUI 按钮状态机；
-## 2) per-index 语义显式：一个按钮只跟一根手指（InputEventScreenTouch.index），多指同按各归各的；
-## 3) 与 HudWidget 契约一致：直接复用托盘槽位、方案显隐与 scheme_overrides。
-## 因此同时处理 InputEventScreenTouch 与 InputEventMouseButton（桌面调试 / headless 测试）。
+## 由 ActionCluster 统一创建、排布、显隐与回收（按钮不再继承 HudWidget、不再
+## 注册进 HudRegistry —— 一个动作簇只占一个 HUD 槽位）。本类只负责：
+## 1) 一根手指 = 一次按下：按 InputEventScreenTouch.index 匹配，多指各自独立；
+## 2) 按下注入 Input.action_press(action)、抬起 Input.action_release(action)；
+## 3) 释放时机可控：不可用 / 隐藏 / 失焦 / 退出树都会立即 release（防粘键）；
+## 4) toggle 模式保留 0.1s 自动释放，形成一次完整边沿。
 ##
-## 语义：按下 = Input.action_press(action)，松开 = Input.action_release(action)。
-## toggle 模式沿用现状：按下后 TOGGLE_RELEASE_DELAY 秒自动 release，形成一次完整边沿。
-##
-## 防粘键：隐藏 / 方案切走（由父级 release_all 兜底）/ 窗口失焦 / 退出树 /
-## 注册表 detach 都会 release()。一个按钮只跟踪一根手指（按 event.index 匹配）。
+## 尺寸 / 透明度由簇通过 apply_size() / set_opacity() 下发；available=false 时
+## 置灰并立即释放，但控件矩形不变（避免布局跳动）。
 
-## 按钮边长（设计单位）。触屏目标尺寸，不随分辨率写死坐标。
-const BUTTON_SIZE := 96.0
 ## toggle 模式点按后保持按下的时长（秒），之后 release 形成一次完整边沿。
 const TOGGLE_RELEASE_DELAY := 0.1
-const FONT_SIZE := 22
+const FONT_RATIO := 0.22
+const FONT_MIN := 12
+const FONT_MAX := 40
+const MIN_SIZE := 44.0
 const CORNER_RADIUS := 16
 const BORDER_WIDTH := 2
 
@@ -30,14 +28,15 @@ const COLOR_BORDER := Color(1.0, 1.0, 1.0, 0.55)
 const COLOR_BORDER_DISABLED := Color(1.0, 1.0, 1.0, 0.18)
 const COLOR_TEXT_DISABLED := Color(1.0, 1.0, 1.0, 0.40)
 
-## 通道 key（BevyInputContext 的通道名，例如 "tool"）。
-var _channel_key := ""
-## 要注入的 InputMap 动作名（例如 "primary_tool"）。
+## 稳定 id（"btn_" + role），测试 / 调试友好。
+var widget_id: StringName = &""
+## 要注入的 InputMap 动作名（例如 "attack"）。
 var _action := ""
 ## 通道模式：hold / toggle / button ...
 var _mode := ""
-## 通道状态：present 控制显隐，available 控制置灰 + 立即释放。
+## 当前通道是否 present（显隐由簇决定，这里只用于隐藏时 release）。
 var _present := true
+## 通道状态：available 控制置灰 + 立即释放。
 var _available := true
 ## 当前是否处于「按下」状态（toggle 自动释放后变回 false）。
 var _pressed := false
@@ -45,15 +44,19 @@ var _pressed := false
 var _touch_index := -1
 ## 每次 press 自增；toggle 定时器只释放自己那一次按下。
 var _press_generation := 0
+## 当前边长（像素）与不透明度。
+var _size_px := 0.0
+var _opacity := 0.75
+
 var _label: Label = null
 var _label_text := ""
 var _box: StyleBoxFlat = null
 
 
 func _init() -> void:
-	custom_minimum_size = Vector2(BUTTON_SIZE, BUTTON_SIZE)
 	focus_mode = Control.FOCUS_NONE
 	mouse_filter = Control.MOUSE_FILTER_STOP
+	custom_minimum_size = Vector2(MIN_SIZE, MIN_SIZE)
 
 
 func _ready() -> void:
@@ -63,8 +66,9 @@ func _ready() -> void:
 	_refresh_visual()
 
 
-## 应用一条归一化规格（ButtonSpecs.normalize_spec 的产物）。
-## 注册表 / UiRoot 不实现方案覆盖逻辑，这里只把字段原样交给 HudWidget。
+# ───────────────────────── 配置（簇 / 测试共用） ─────────────────────────
+
+## 兼容旧测试入口：字典里取 id / label / action / mode，其余字段忽略。
 func configure(spec: Dictionary) -> void:
 	if spec.is_empty():
 		return
@@ -72,48 +76,101 @@ func configure(spec: Dictionary) -> void:
 	if not id.is_empty():
 		widget_id = StringName(id)
 		name = id
-	_channel_key = String(spec.get("channel", ""))
-	_action = String(spec.get("action", ""))
-	_mode = String(spec.get("mode", ""))
-	_label_text = String(spec.get("label", ""))
-	tray = int(spec.get("tray", HudWidget.Tray.RIGHT)) as HudWidget.Tray
-	align = int(spec.get("align", HudWidget.Align.END)) as HudWidget.Align
-	priority = int(spec.get("priority", 0))
-	schemes = int(spec.get("schemes", UiState.Scheme.TOUCH))
-	var overrides: Variant = spec.get("scheme_overrides", {})
-	if overrides is Dictionary:
-		scheme_overrides = (overrides as Dictionary).duplicate()
-	_apply_label()
-	_refresh_visual()
+	set_action(String(spec.get("action", "")))
+	set_label(String(spec.get("label", "")))
+	set_mode(String(spec.get("mode", "")))
 
 
-func channel_key() -> String:
-	return _channel_key
+func set_action(action: String) -> void:
+	if _action == action:
+		return
+	if _pressed:
+		release()
+	_action = action
 
 
 func action_name() -> String:
 	return _action
 
 
+func set_label(text: String) -> void:
+	_label_text = text
+	_apply_label()
+
+
+func label_text() -> String:
+	return _label_text
+
+
+## 兼容别名：与 Label 语义一致。
+func text() -> String:
+	return _label_text
+
+
+func set_mode(mode: String) -> void:
+	_mode = mode
+
+
 func mode() -> String:
 	return _mode
+
+
+## 通道状态变化：present=false 隐藏；available=false 置灰并立刻释放（不粘键）。
+func set_channel_state(present: bool, available: bool) -> void:
+	_present = present
+	_available = available
+	if not present or not available:
+		release()
+	visible = present
+	_refresh_visual()
+
+
+func set_available(value: bool) -> void:
+	_available = value
+	if not value:
+		release()
+	_refresh_visual()
+
+
+func available() -> bool:
+	return _available
+
+
+func is_available() -> bool:
+	return _available
 
 
 func is_holding() -> bool:
 	return _pressed
 
 
-## 通道状态变化：present -> 显隐；not available -> 置灰并立刻释放（不粘键）。
-func set_channel_state(present: bool, available: bool) -> void:
-	_present = present
-	_available = available
-	if not available:
-		release()
-	set_data_visible(present)
+func size_px() -> float:
+	return _size_px
+
+
+## 应用按钮边长（像素）：同步控件最小尺寸 / 实际尺寸 / 字号。
+func apply_size(px: float) -> void:
+	var side := maxf(px, MIN_SIZE)
+	_size_px = side
+	custom_minimum_size = Vector2(side, side)
+	size = custom_minimum_size
+	if _label != null:
+		var font_size := int(clampf(side * FONT_RATIO, float(FONT_MIN), float(FONT_MAX)))
+		_label.add_theme_font_size_override("font_size", font_size)
+	queue_redraw()
+
+
+## 不透明度：空闲 alpha = opacity，按下时变亮（alpha 更高）。
+func set_opacity(value: float) -> void:
+	_opacity = clampf(value, 0.05, 1.0)
 	_refresh_visual()
 
 
-## 立刻松手并释放动作（隐藏 / 菜单 / 失焦 / 退出 / 方案切走 / detach 时调用）。
+func opacity() -> float:
+	return _opacity
+
+
+## 立刻松手并释放动作（隐藏 / 菜单 / 失焦 / 退出 / 方案切走 / 回收时调用）。
 func release() -> void:
 	_touch_index = -1
 	if not _pressed:
@@ -156,11 +213,11 @@ func _gui_input(event: InputEvent) -> void:
 
 
 func _press() -> void:
-	if _pressed:
+	if _pressed or not _present or not _available:
 		return
 	_pressed = true
 	_press_generation += 1
-	if InputMap.has_action(_action):
+	if not _action.is_empty() and InputMap.has_action(_action):
 		Input.action_press(_action)
 	if _mode == "toggle":
 		_schedule_toggle_release(_press_generation)
@@ -198,16 +255,6 @@ func _release_action() -> void:
 
 # ───────────────────────── 生命周期 / 防粘键 ─────────────────────────
 
-func _on_scheme_changed(current: int) -> void:
-	# 方案切走（不含本元素的 schemes）时立刻释放；隐藏也会触发 visibility 通知。
-	if (schemes & current) == 0:
-		release()
-
-
-func _on_detach() -> void:
-	release()
-
-
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_VISIBILITY_CHANGED and not is_visible_in_tree():
 		release()
@@ -232,25 +279,22 @@ func _ensure_style() -> void:
 func _ensure_label() -> void:
 	if _label != null and is_instance_valid(_label):
 		return
-	_label = get_node_or_null("Label") as Label
-	if _label != null:
-		return
 	_label = Label.new()
 	_label.name = "Label"
 	_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_label.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_label.add_theme_font_size_override("font_size", FONT_SIZE)
+	_label.add_theme_font_size_override("font_size", int(FONT_MIN))
 	_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.9))
 	_label.add_theme_constant_override("outline_size", 4)
 	add_child(_label)
 
 
 func _apply_label() -> void:
-	if _label == null:
-		return
-	_label.text = _label_text
+	_ensure_label()
+	if _label != null:
+		_label.text = _label_text
 
 
 func _refresh_visual() -> void:
@@ -259,6 +303,10 @@ func _refresh_visual() -> void:
 		_box.border_color = COLOR_BORDER_DISABLED if not _available else COLOR_BORDER
 	if _label != null:
 		_label.modulate = COLOR_TEXT_DISABLED if not _available else Color.WHITE
+	var alpha := _opacity
+	if _pressed:
+		alpha = minf(1.0, _opacity + 0.2)
+	modulate = Color(1.0, 1.0, 1.0, alpha)
 	queue_redraw()
 
 
@@ -266,4 +314,3 @@ func _draw() -> void:
 	if _box == null:
 		return
 	draw_style_box(_box, Rect2(Vector2.ZERO, size))
-

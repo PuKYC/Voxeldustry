@@ -12,7 +12,7 @@ extends SceneTree
 ## 8. P2：scheme_overrides 覆盖 tray / align / priority / min_size，切回后恢复；
 ## 9. P4：同组互斥（同组只激活一个 priority 最高者）；
 ## 10. P5：混合设备防抖（切换冷却 / 摇杆漂移阈值 / 鼠标微动阈值）；
-## 11. P3：ButtonSpecs 规格生成（tool 双按钮 / 缺规格兜底）、ActionButton 多点触摸
+## 11. P3：ButtonSpecs 规格生成（attack/break_block/place_block / 缺规格兜底）、ActionButton 多点触摸
 ##     按下释放、通道 unavailable 立即释放、菜单 / 切方案隐藏；
 ## 12. P3b：交互提示用真实绑定（触屏显示 Tap）；
 ## 13. P6：移动端入口 —— 触屏暂停按钮、触摸可拖动滑条、debug 构建的暂停菜单 Debug 区。
@@ -45,6 +45,8 @@ func _run() -> void:
 		return
 
 	var ui: CanvasLayer = scene.instantiate()
+	# 冒烟测试不读 user://ui_settings.cfg，保证默认预设可复现。
+	ui.set("load_persisted_settings", false)
 	root.add_child(ui)
 	await process_frame
 	await process_frame
@@ -105,6 +107,60 @@ func _run() -> void:
 	_check(ui.registry.get_widget(&"crosshair") != null, "内置 HUD：crosshair 已注册")
 	_check(ui.registry.get_widget(&"health_bar") != null, "内置 HUD：health_bar 已注册")
 	_check(ui.registry.get_widget(&"interact_prompt") != null, "内置 HUD：interact_prompt 已注册")
+
+	# HudSlot 区域层：9 个槽位都是自绘容器，最小尺寸只取 reserve。
+	var all_hud_slots := true
+	for key: String in slots:
+		if not (slots[key] is HudSlot):
+			all_hud_slots = false
+	_check(all_hud_slots, "HudSlot：9 个槽位全部是自绘区域层")
+	var quickbar_slot := slots.get("bottom_center") as HudSlot
+	_check(quickbar_slot != null and is_equal_approx(quickbar_slot.reserve.y, HudSlot.QUICKBAR_RESERVE),
+		"HudSlot：bottom_center 预留快捷栏高度")
+	# 准星恒在安全区正中（不随上下槽位内容变化）。
+	var crosshair: HudWidget = ui.registry.get_widget(&"crosshair")
+	var safe_rect: Rect2 = ui.get("_safe").get_global_rect()
+	if crosshair != null:
+		# 准星默认隐藏（等 LookChannel）：显式显示一次再量中心。
+		crosshair.set_data_visible(true)
+		await process_frame
+		await process_frame
+		var cross_center: Vector2 = crosshair.get_global_rect().get_center()
+		_check(cross_center.distance_to(safe_rect.get_center()) < 0.01,
+			"布局：准星中心 = 安全区中心（误差 %.3f）" % cross_center.distance_to(safe_rect.get_center()))
+		_check(crosshair.visible, "布局：准星在数据可见时显示")
+		crosshair.set_data_visible(false)
+		await process_frame
+	# 隐藏一个槽内元素后，其它槽位元素位置不变。
+	var before_positions := {}
+	for widget: HudWidget in ui.registry.widgets():
+		before_positions[widget.widget_id] = widget.get_global_rect()
+	var prompt_widget: HudWidget = ui.registry.get_widget(&"interact_prompt")
+	if prompt_widget != null:
+		prompt_widget.set_data_visible(true)
+		await process_frame
+		prompt_widget.set_data_visible(false)
+		await process_frame
+	var stable := true
+	for widget: HudWidget in ui.registry.widgets():
+		if widget.widget_id == &"interact_prompt" or not before_positions.has(widget.widget_id):
+			continue
+		var old_rect: Rect2 = before_positions[widget.widget_id]
+		if not widget.get_global_rect().is_equal_approx(old_rect):
+			stable = false
+			print("[ui_smoke] moved: %s %s -> %s" % [widget.widget_id, old_rect, widget.get_global_rect()])
+	_check(stable, "布局：隐藏元素后其它元素位置不变")
+	# 角色映射：血条键鼠左下、触屏左上。
+	var health_widget: HudWidget = ui.registry.get_widget(&"health_bar")
+	if health_widget != null:
+		ui.call("_set_scheme", UiState.Scheme.KBM)
+		await process_frame
+		_check(health_widget.get_parent() == slots.get("bottom_begin"), "角色映射：血条键鼠落左下")
+		ui.call("_set_scheme", UiState.Scheme.TOUCH)
+		await process_frame
+		_check(health_widget.get_parent() == slots.get("top_begin"), "角色映射：血条触屏落左上")
+		ui.call("_set_scheme", UiState.Scheme.KBM)
+		await process_frame
 
 	# 触屏控件 / 暂停菜单：存在即由 UiRoot 实例化。
 	_check(ui.touch_controls != null, "触屏控件已实例化")
@@ -321,121 +377,151 @@ func _run() -> void:
 	ui.set("scheme_switch_cooldown", 0.5)
 	ui.set("_last_scheme_switch_ms", 0)
 
-	# P3：动作按钮映射移到 Godot —— ButtonSpecs 生成规格，ActionButtonHost 建按钮，
-	# ActionButton 自己按下 / 松开（多点触控按 index 各自独立）。
+	# P3：输入绑定层 → 动作簇。语义动作 attack / break_block / place_block，
+	# context（精简）与 split（分开）两种预设，context 下主按钮按目标类型解析。
 	_check(ui.action_host != null, "P3：UiRoot 已创建 ActionButtonHost")
 	if ui.action_host != null:
 		var host: ActionButtonHost = ui.action_host
 		_check(host.buttons().is_empty(), "P3：无 BevyClient 时按钮数为 0（实际 %d）" % host.buttons().size())
-		# 规格表与 Rust 动作名保持一致（防 ACTION_TABLE 漂移）。
-		_check(ButtonSpecs.specs_for_channel("tool").size() == 2, "P3：tool 通道有两条规格")
-		var flight_specs := ButtonSpecs.specs_for_channel("flight")
-		_check(not flight_specs.is_empty()
-				and String((flight_specs[0] as Dictionary).get("action", "")) == "flight_toggle",
-			"P3：flight 动作名与 Rust 表一致（flight_toggle）")
-		for action in ["jump", "primary_tool", "secondary_tool", "turbo_action"]:
+		_check(host.cluster() != null, "P3：动作簇已创建")
+		_check(ui.registry.get_widget(&"action_cluster") != null, "P3：动作簇以 HudWidget 注册")
+		_check(ui.registry.get_widget(&"action_hints") != null, "P3：键鼠提示以 HudWidget 注册")
+		for action in ["attack", "break_block", "place_block", "jump", "interact"]:
 			if not InputMap.has_action(action):
 				InputMap.add_action(action)
+		if InputMap.action_get_events("attack").is_empty():
+			var mouse_left := InputEventMouseButton.new()
+			mouse_left.button_index = MOUSE_BUTTON_LEFT
+			InputMap.action_add_event("attack", mouse_left)
+		UiState.action_layout = UiState.ActionLayout.CONTEXT
 		host.apply_channels([
 			{"key": "move", "mode": "axis2d", "actions": ["move_forward"]},
+			{"key": "attack", "mode": "button", "actions": ["attack"]},
+			{"key": "break_block", "mode": "button", "actions": ["break_block"]},
+			{"key": "place_block", "mode": "button", "actions": ["place_block"]},
 			{"key": "jump", "mode": "button", "actions": ["jump"]},
-			{"key": "tool", "mode": "hold", "actions": ["primary_tool", "secondary_tool"]},
-			{"key": "turbo", "mode": "toggle", "actions": ["turbo_action"]},
+			{"key": "interact", "mode": "button", "actions": ["interact"]},
 		])
-		await process_frame
-		# 期望 4 个：jump 1 + tool 2 + turbo 兜底 1；move 是 axis2d 不出按钮。
-		_check(host.buttons().size() == 4,
-			"P3：tool 生成两个、无规格通道走兜底、axis2d 不出按钮（实际 %d）" % host.buttons().size())
-		var by_id := {}
-		for button: ActionButton in host.buttons():
-			by_id[button.widget_id] = button
-		_check(by_id.has(&"btn_primary") and by_id.has(&"btn_secondary"), "P3：tool 通道两个按钮 id 正确")
-		_check(by_id.has(&"btn_turbo"), "P3：缺规格通道用兜底规格（btn_turbo）")
 		ui.call("_set_scheme", UiState.Scheme.TOUCH)
 		await process_frame
-		var jump_button: ActionButton = by_id.get(&"btn_jump", null)
-		var turbo_button: ActionButton = by_id.get(&"btn_turbo", null)
-		_check(jump_button != null and jump_button.visible, "P3：触屏方案下动作按钮可见")
-
+		await process_frame
+		# context：主 + 副(place) + 跳跃 = 3 个常驻按钮；axis2d 不出按钮。
+		_check(host.buttons().size() == 3,
+			"P3：context 预设常驻 3 个按钮（实际 %d）" % host.buttons().size())
+		var primary: ActionButton = host.cluster().button_for("primary")
+		_check(primary != null and primary.visible and primary.action_name() == "attack",
+			"P3：context 主按钮解析为 attack")
+		_check(primary != null and primary.label_text() == "Attack",
+			"P3：主按钮文案 Attack（实际 %s）" % ("" if primary == null else primary.label_text()))
+		# 主按钮钉在簇右下（右手）。
+		var cluster_rect: Rect2 = host.cluster().get_global_rect()
+		var primary_rect: Rect2 = primary.get_global_rect()
+		_check(primary_rect.end.x <= cluster_rect.end.x + 0.5 and primary_rect.end.y <= cluster_rect.end.y + 0.5
+				and primary_rect.position.x > cluster_rect.position.x + cluster_rect.size.x * 0.25,
+			"P3：主按钮在动作簇右下角")
+		# 目标类型切换 → 主按钮改解析 break_block，位置不变。
+		var primary_before: Rect2 = primary.get_global_rect()
+		host.set_interaction_target(InputBindings.TARGET_BLOCK, false)
+		await process_frame
+		await process_frame
+		_check(primary.action_name() == "break_block" and primary.label_text() == "Break",
+			"P3：target=BLOCK 时主按钮改解析 break_block")
+		_check(primary.get_global_rect().position.distance_to(primary_before.position) < 0.5,
+			"P3：上下文切换不移动主按钮")
+		host.set_interaction_target(InputBindings.TARGET_NONE, false)
+		await process_frame
+		# Interact 仅在有可交互目标时出现，且不推动主按钮。
+		var primary_before_interact: Rect2 = primary.get_global_rect()
+		host.set_interaction_target(InputBindings.TARGET_ENTITY, true)
+		await process_frame
+		await process_frame
+		var interact_button: ActionButton = host.cluster().button_for("interact")
+		_check(interact_button != null and interact_button.visible, "P3：有可交互目标时出现 Interact 按钮")
+		_check(primary.get_global_rect().position.distance_to(primary_before_interact.position) < 0.5,
+			"P3：Interact 出现后主按钮位置不变")
+		host.set_interaction_target(InputBindings.TARGET_NONE, false)
+		await process_frame
+		# 触摸：两指各按一个按钮，互不影响。
+		var jump_button: ActionButton = host.cluster().button_for("jump")
+		_check(jump_button != null and jump_button.visible, "P3：跳跃按钮可见")
 		var touch_a := InputEventScreenTouch.new()
 		touch_a.index = 0
 		touch_a.pressed = true
-		touch_a.position = jump_button.size * 0.5
-		jump_button._gui_input(touch_a)
-		_check(Input.is_action_pressed("jump"), "P3：按钮按下注入动作")
+		touch_a.position = primary.size * 0.5
+		primary._gui_input(touch_a)
+		_check(Input.is_action_pressed("attack"), "P3：主按钮按下注入 attack")
 		var touch_b := InputEventScreenTouch.new()
 		touch_b.index = 1
 		touch_b.pressed = true
-		touch_b.position = turbo_button.size * 0.5
-		turbo_button._gui_input(touch_b)
-		_check(Input.is_action_pressed("jump") and Input.is_action_pressed("turbo_action"),
+		touch_b.position = jump_button.size * 0.5
+		jump_button._gui_input(touch_b)
+		_check(Input.is_action_pressed("attack") and Input.is_action_pressed("jump"),
 			"P3：两根手指同时按住两个按钮都生效")
-		var touch_up := InputEventScreenTouch.new()
-		touch_up.index = 0
-		touch_up.pressed = false
-		jump_button._gui_input(touch_up)
+		var touch_up_a := InputEventScreenTouch.new()
+		touch_up_a.index = 0
+		touch_up_a.pressed = false
+		primary._gui_input(touch_up_a)
+		_check(not Input.is_action_pressed("attack") and Input.is_action_pressed("jump"),
+			"P3：松开一根手指不影响另一个按钮")
+		var touch_up_b := InputEventScreenTouch.new()
+		touch_up_b.index = 1
+		touch_up_b.pressed = false
+		jump_button._gui_input(touch_up_b)
 		_check(not Input.is_action_pressed("jump"), "P3：松开按钮释放动作")
-		_check(Input.is_action_pressed("turbo_action"), "P3：松开一根手指不影响另一个按钮")
-		# toggle：按住 turbo 后 0.1s 自动释放，形成一次完整边沿。
-		await create_timer(0.25).timeout
-		_check(not Input.is_action_pressed("turbo_action"), "P3：toggle 模式自动释放动作")
-
-		# available=false：立即释放该动作并隐藏？（present 管显隐，available 管置灰）
-		host.set_channel_state("jump", true, true)
-		var touch_c := InputEventScreenTouch.new()
-		touch_c.index = 2
-		touch_c.pressed = true
-		touch_c.position = jump_button.size * 0.5
-		jump_button._gui_input(touch_c)
-		_check(Input.is_action_pressed("jump"), "P3：重新按下按钮")
-		host.set_channel_state("jump", true, false)
-		_check(not Input.is_action_pressed("jump"), "P3：通道不可用时立即释放动作")
-		host.set_channel_state("jump", false, true)
-		_check(not jump_button.visible, "P3：通道 present=false 时按钮隐藏")
-		host.set_channel_state("jump", true, true)
+		# 眩晕：主/备动作都 available=false → 置灰且不位移。
+		var grey_before: Rect2 = primary.get_global_rect()
+		host.set_channel_state("attack", true, false)
+		host.set_channel_state("break_block", true, false)
 		await process_frame
-		_check(jump_button.visible, "P3：通道恢复后按钮重新可见")
-
-		# 菜单打开 / 方案切走时释放全部动作并隐藏按钮。
+		_check(not primary.available(), "P3：可用性全 false 时主按钮置灰")
+		_check(primary.get_global_rect().position.distance_to(grey_before.position) < 0.5,
+			"P3：置灰不移动按钮")
+		host.set_channel_state("attack", true, true)
+		host.set_channel_state("break_block", true, true)
+		await process_frame
+		_check(primary.available(), "P3：能力恢复后按钮可用")
+		# split 预设：attack / break / place / jump 各一个按钮。
+		UiState.action_layout = UiState.ActionLayout.SPLIT
+		host.refresh_settings()
+		await process_frame
+		await process_frame
+		_check(host.buttons().size() == 4,
+			"P3：split 预设 4 个常驻按钮（实际 %d）" % host.buttons().size())
+		UiState.action_layout = UiState.ActionLayout.CONTEXT
+		host.refresh_settings()
+		await process_frame
+		# 菜单打开 / 切走触屏时隐藏并释放。
 		host.release_all()
 		ui.open_pause_menu()
 		await process_frame
-		_check(not jump_button.visible, "P3：菜单打开时动作按钮隐藏")
+		_check(not primary.is_visible_in_tree(), "P3：菜单打开时动作簇隐藏")
 		ui.close_pause_menu()
 		await process_frame
 		ui.call("_set_scheme", UiState.Scheme.KBM)
 		await process_frame
-		_check(not jump_button.visible, "P3：切回键鼠方案后动作按钮隐藏")
+		_check(not primary.is_visible_in_tree(), "P3：切回键鼠方案后动作簇隐藏")
+		# 键鼠提示来自 InputMap 真实绑定。
+		var hints: ActionHints = host.hints()
+		_check(hints != null and hints.hint_text().contains("Attack"),
+			"P3：键鼠提示含 [LMB] Attack（实际 \"%s\"）" % ("" if hints == null else hints.hint_text()))
 		host.release_all()
-		for action in ["jump", "primary_tool", "secondary_tool", "turbo_action"]:
+		for action in ["attack", "break_block", "place_block", "jump", "interact"]:
 			if InputMap.has_action(action):
 				Input.action_release(action)
-
-		# 规格字段原样落到 HudWidget（P2 集成：ActionButton 不自带覆盖逻辑）。
-		var spec_button := ActionButton.new()
-		spec_button.configure(ButtonSpecs.normalize_spec({
-			"id": "btn_probe",
-			"label": "Probe",
-			"action": "jump",
-			"tray": HudWidget.Tray.BOTTOM,
-			"align": HudWidget.Align.BEGIN,
-			"priority": 7,
-			"schemes": UiState.Scheme.TOUCH | UiState.Scheme.KBM,
-			"scheme_overrides": {UiState.Scheme.TOUCH: {"tray": HudWidget.Tray.TOP}},
-		}, {"key": "jump", "mode": "button", "actions": ["jump"]}))
-		_check(spec_button.tray == HudWidget.Tray.BOTTOM and spec_button.priority == 7
-				and spec_button.schemes == (UiState.Scheme.TOUCH | UiState.Scheme.KBM)
-				and spec_button.scheme_overrides.has(UiState.Scheme.TOUCH),
-			"P3：规格字段原样落到 HudWidget")
-		spec_button.free()
-
-		# 无 client 时 refresh() 要安全：清空按钮而不是报错。
-		host.refresh()
+		# 设置接线：左手模式 → 簇改落 bottom_begin 并镜像。
+		UiState.left_handed = true
+		host.refresh_settings()
 		await process_frame
-		_check(host.buttons().is_empty(), "P3：无 client 时 refresh() 安全清空按钮")
+		_check(host.cluster().left_handed() and host.cluster().align == HudWidget.Align.BEGIN,
+			"P3：左手模式簇落 bottom_begin 并镜像")
+		UiState.left_handed = false
+		host.refresh_settings()
+		await process_frame
+		# destroy 清理注册项。
 		host.destroy()
 		await process_frame
-		_check(ui.registry.get_widget(&"btn_jump") == null, "P3：destroy 后按钮已从注册表移除")
+		_check(ui.registry.get_widget(&"action_cluster") == null and ui.registry.get_widget(&"action_hints") == null,
+			"P3：destroy 后动作簇/提示已从注册表移除")
 
 	# P3b：交互提示用真实绑定（触屏固定 Tap）。
 	var prompt = ui.registry.get_widget(&"interact_prompt")
@@ -687,6 +773,32 @@ func _run() -> void:
 	ui.set_debug_overlay(false)
 	ui.set_ui_scale(1.0)
 	await process_frame
+
+	# 期 3：暂停菜单设置信号 → UiState 立即生效（落盘细节由 ui_settings_test 覆盖）。
+	UiState.reset()
+	ui.open_pause_menu()
+	await process_frame
+	ui.pause_menu.action_layout_changed.emit(UiState.ActionLayout.SPLIT)
+	await process_frame
+	_check(UiState.action_layout == UiState.ActionLayout.SPLIT, "期3：操作布局预设写入 UiState")
+	ui.pause_menu.button_scale_changed.emit(1.2)
+	await process_frame
+	_check(is_equal_approx(UiState.button_scale, 1.2), "期3：按钮大小写入 UiState")
+	ui.pause_menu.button_opacity_changed.emit(0.5)
+	await process_frame
+	_check(is_equal_approx(UiState.button_opacity, 0.5), "期3：按钮透明度写入 UiState")
+	ui.pause_menu.left_handed_changed.emit(true)
+	await process_frame
+	_check(UiState.left_handed, "期3：左手模式写入 UiState")
+	ui.pause_menu.joystick_mode_changed.emit(UiState.JoystickMode.FLOATING)
+	await process_frame
+	_check(UiState.joystick_mode == UiState.JoystickMode.FLOATING, "期3：摇杆模式写入 UiState")
+	_check(FileAccess.file_exists(UiState.settings_path()), "期3：设置已落盘到 user://ui_settings.cfg")
+	ui.close_pause_menu()
+	await process_frame
+	# 恢复默认并落盘，避免污染后续测试。
+	UiState.reset()
+	UiState.save_settings()
 
 	_finish()
 

@@ -65,6 +65,7 @@ fn sample_frame() -> PresentationFrame {
             payload: SyncPayload::Interaction(InteractionHint {
                 action: crate::input::actions::ActionId(8),
                 enabled: true,
+                target: 1,
             }),
         },
         // 扩展载荷：两条相邻命令，覆盖非零 i32 offset / count / Tags 槽布局。
@@ -544,6 +545,7 @@ fn sample_payload(kind: PayloadKind) -> SyncPayload {
         PayloadKind::Interaction => SyncPayload::Interaction(InteractionHint {
             action: ActionId(3),
             enabled: true,
+            target: 2,
         }),
         PayloadKind::Extension => SyncPayload::Extension(
             ExtensionPayload::from_fields(vec![

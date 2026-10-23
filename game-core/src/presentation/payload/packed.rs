@@ -245,15 +245,21 @@ impl PackedPayload for PresentedInputCaps {
     }
 }
 
+// ── 交互提示：action u32 / enabled u8(bool) / target u32 ──
+//
+// 载荷体顺序：action(u32 LE)、enabled(u8)、target(u32 LE)。
+// SoA 池：i32 池依次 [action, enabled, target]（与 read_body 逐槽一致）。
 impl PackedPayload for InteractionHint {
     fn put_body(&self, out: &mut Vec<u8>) {
         put_u32(out, self.action.0);
         put_bool(out, self.enabled);
+        put_u32(out, u32::from(self.target));
     }
 
     fn write_pools(&self, _f: &mut Vec<f32>, i: &mut Vec<i64>) {
         i.push(i64::from(self.action.0));
         i.push(i64::from(self.enabled as u8));
+        i.push(i64::from(self.target));
     }
 
     fn read_body(
@@ -263,6 +269,7 @@ impl PackedPayload for InteractionHint {
     ) -> Result<(), PackedError> {
         i.push(i64::from(r.u32()?));
         i.push(i64::from(r.bool()? as u8));
+        i.push(i64::from(r.u32()?));
         Ok(())
     }
 
@@ -270,6 +277,7 @@ impl PackedPayload for InteractionHint {
         InteractionHint {
             action: ActionId(i[io] as u32),
             enabled: i[io + 1] != 0,
+            target: i[io + 2] as u8,
         }
     }
 }

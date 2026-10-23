@@ -39,8 +39,16 @@ simple_channel!(
     FlightChannel
 );
 simple_channel!(
-    /// 可使用工具。
-    ToolUseChannel
+    /// 可攻击（`attack`）。
+    AttackChannel
+);
+simple_channel!(
+    /// 可破坏方块（`break_block`）。
+    BreakBlockChannel
+);
+simple_channel!(
+    /// 可放置方块（`place_block`）。
+    PlaceBlockChannel
 );
 simple_channel!(
     /// 可冲刺。
@@ -69,7 +77,7 @@ impl Default for InteractChannel {
 }
 
 simple_channel!(
-    /// 眩晕：禁用移动 / 跳跃 / 工具。
+    /// 眩晕：禁用移动 / 跳跃 / 攻击 / 破坏方块 / 放置方块（交互不受影响）。
     Stunned
 );
 simple_channel!(
@@ -87,7 +95,12 @@ pub const JUMP_ACTIONS: &[&str] = &["jump"];
 pub const GLIDE_ACTIONS: &[&str] = &["glide"];
 pub const FLIGHT_ACTIONS: &[&str] = &["flight_toggle"];
 pub const INTERACT_ACTIONS: &[&str] = &["interact"];
-pub const TOOL_ACTIONS: &[&str] = &["primary_tool", "secondary_tool"];
+/// 攻击是独立语义动作（旧 `tool` 聚合通道已整体移除）。
+pub const ATTACK_ACTIONS: &[&str] = &["attack"];
+/// 破坏方块是独立语义动作。
+pub const BREAK_BLOCK_ACTIONS: &[&str] = &["break_block"];
+/// 放置方块是独立语义动作。
+pub const PLACE_BLOCK_ACTIONS: &[&str] = &["place_block"];
 pub const SPRINT_ACTIONS: &[&str] = &["sprint"];
 
 fn mask_of(actions: &[&str]) -> u64 {
@@ -109,16 +122,24 @@ pub fn flight_mask() -> u64 {
 pub fn interact_mask() -> u64 {
     mask_of(INTERACT_ACTIONS)
 }
-pub fn tool_mask() -> u64 {
-    mask_of(TOOL_ACTIONS)
+pub fn attack_mask() -> u64 {
+    mask_of(ATTACK_ACTIONS)
+}
+pub fn break_block_mask() -> u64 {
+    mask_of(BREAK_BLOCK_ACTIONS)
+}
+pub fn place_block_mask() -> u64 {
+    mask_of(PLACE_BLOCK_ACTIONS)
 }
 pub fn sprint_mask() -> u64 {
     mask_of(SPRINT_ACTIONS)
 }
 
-/// 眩晕削减的通道。
+/// 眩晕削减的通道：移动 / 跳跃 / 攻击 / 破坏 / 放置。
+///
+/// 交互（`interact`）不受眩晕影响。
 pub fn stunned_mask() -> u64 {
-    move_mask() | jump_mask() | tool_mask()
+    move_mask() | jump_mask() | attack_mask() | break_block_mask() | place_block_mask()
 }
 
 /// 定身削减的通道。
@@ -180,8 +201,18 @@ pub const INPUT_CHANNEL_TABLE: &[InputChannelDef] = &[
         mode: "button",
     },
     InputChannelDef {
-        key: "tool",
-        actions: TOOL_ACTIONS,
+        key: "attack",
+        actions: ATTACK_ACTIONS,
+        mode: "button",
+    },
+    InputChannelDef {
+        key: "break_block",
+        actions: BREAK_BLOCK_ACTIONS,
+        mode: "button",
+    },
+    InputChannelDef {
+        key: "place_block",
+        actions: PLACE_BLOCK_ACTIONS,
         mode: "button",
     },
     InputChannelDef {
@@ -215,7 +246,9 @@ pub struct ChannelSet {
     pub can_glide: bool,
     pub can_fly: bool,
     pub can_interact: bool,
-    pub can_use_tool: bool,
+    pub can_attack: bool,
+    pub can_break_block: bool,
+    pub can_place_block: bool,
     pub can_sprint: bool,
     /// 视角轴（`LookChannel`）；不参与动作位掩码，单独走 `InputAvailability.look`。
     pub can_look: bool,
@@ -245,8 +278,14 @@ pub fn channel_mask(set: ChannelSet) -> u64 {
     if set.can_interact {
         mask |= interact_mask();
     }
-    if set.can_use_tool {
-        mask |= tool_mask();
+    if set.can_attack {
+        mask |= attack_mask();
+    }
+    if set.can_break_block {
+        mask |= break_block_mask();
+    }
+    if set.can_place_block {
+        mask |= place_block_mask();
     }
     if set.can_sprint {
         mask |= sprint_mask();
@@ -278,19 +317,25 @@ pub fn availability_mask(set: ChannelSet, disabled: u64, stunned: bool, rooted: 
 }
 
 /// 每 tick 重算可用通道（插进引擎的 `InputSet::Availability`）。
+///
+/// 注意：Bevy 的 Query 元组上限是 15 个元素。三个交互通道各自独立查询后
+/// 正好 15 项，因此 `&ControlledBy` 拆成独立的只读查询（本系统只从中取
+/// `source`），主查询仍以 `With<ControlledBy>` 过滤，语义不变。
 #[allow(clippy::type_complexity)]
 pub fn compute_input_availability(
+    controlled_query: Query<(Entity, &ControlledBy)>,
     mut query: Query<
         (
             &mut InputAvailability,
-            &ControlledBy,
             Option<&LocalPlayer>,
             Option<&MoveChannel>,
             Option<&JumpChannel>,
             Option<&GlideChannel>,
             Option<&FlightChannel>,
             Option<&InteractChannel>,
-            Option<&ToolUseChannel>,
+            Option<&AttackChannel>,
+            Option<&BreakBlockChannel>,
+            Option<&PlaceBlockChannel>,
             Option<&SprintChannel>,
             Option<&LookChannel>,
             Option<&InputDisabled>,
@@ -300,30 +345,36 @@ pub fn compute_input_availability(
         With<ControlledBy>,
     >,
 ) {
-    for (
-        mut availability,
-        controlled,
-        local_player,
-        can_move,
-        can_jump,
-        can_glide,
-        can_fly,
-        can_interact,
-        can_use_tool,
-        can_sprint,
-        can_look,
-        disabled,
-        stunned,
-        rooted,
-    ) in &mut query
-    {
+    for (entity, controlled) in &controlled_query {
+        let Ok((
+            mut availability,
+            local_player,
+            can_move,
+            can_jump,
+            can_glide,
+            can_fly,
+            can_interact,
+            can_attack,
+            can_break_block,
+            can_place_block,
+            can_sprint,
+            can_look,
+            disabled,
+            stunned,
+            rooted,
+        )) = query.get_mut(entity)
+        else {
+            continue;
+        };
         let set = ChannelSet {
             can_move: can_move.is_some(),
             can_jump: can_jump.is_some(),
             can_glide: can_glide.is_some(),
             can_fly: can_fly.is_some(),
             can_interact: can_interact.is_some(),
-            can_use_tool: can_use_tool.is_some(),
+            can_attack: can_attack.is_some(),
+            can_break_block: can_break_block.is_some(),
+            can_place_block: can_place_block.is_some(),
             can_sprint: can_sprint.is_some(),
             can_look: can_look.is_some(),
         };
@@ -459,11 +510,13 @@ mod tests {
     }
 
     #[test]
-    fn stunning_removes_move_jump_tool_but_keeps_interact() {
+    fn stunning_removes_move_jump_combat_but_keeps_interact() {
         let set = ChannelSet {
             can_move: true,
             can_jump: true,
-            can_use_tool: true,
+            can_attack: true,
+            can_break_block: true,
+            can_place_block: true,
             can_interact: true,
             ..ChannelSet::default()
         };
@@ -471,7 +524,9 @@ mod tests {
 
         assert_eq!(mask & move_mask(), 0);
         assert_eq!(mask & jump_mask(), 0);
-        assert_eq!(mask & tool_mask(), 0);
+        assert_eq!(mask & attack_mask(), 0);
+        assert_eq!(mask & break_block_mask(), 0);
+        assert_eq!(mask & place_block_mask(), 0);
         assert_ne!(mask & interact_mask(), 0, "眩晕不应该禁用交互");
     }
 
@@ -562,7 +617,9 @@ mod tests {
         let set = ChannelSet {
             can_move: true,
             can_jump: true,
-            can_use_tool: true,
+            can_attack: true,
+            can_break_block: true,
+            can_place_block: true,
             can_interact: true,
             ..ChannelSet::default()
         };
@@ -571,16 +628,112 @@ mod tests {
 
         assert_ne!(present & move_mask(), 0);
         assert_ne!(present & jump_mask(), 0);
-        assert_ne!(present & tool_mask(), 0);
+        assert_ne!(present & attack_mask(), 0);
+        assert_ne!(present & break_block_mask(), 0);
+        assert_ne!(present & place_block_mask(), 0);
         assert_eq!(available & move_mask(), 0);
         assert_eq!(available & jump_mask(), 0);
-        assert_eq!(available & tool_mask(), 0);
+        assert_eq!(available & attack_mask(), 0);
+        assert_eq!(available & break_block_mask(), 0);
+        assert_eq!(available & place_block_mask(), 0);
         assert_ne!(available & interact_mask(), 0, "眩晕不应该禁用交互");
         assert_eq!(
             present,
             channel_mask(set),
             "禁用状态不得改变 present（能力组件并集）"
         );
+    }
+
+    /// 旧的聚合 `tool` 通道与 `primary_tool` / `secondary_tool` 已整体移除：
+    /// 动作表里不得再存在这些名字（否则能力 / 存档语义会悄悄漂移）。
+    #[test]
+    fn action_table_has_no_tool_aggregates() {
+        for removed in ["tool", "primary_tool", "secondary_tool"] {
+            assert!(
+                CoreActions::lookup(removed).is_none(),
+                "ACTION_TABLE 里不得再存在 {removed}"
+            );
+            assert!(actions::channel_bit_of(removed).is_none());
+            assert!(channel_of_action(removed).is_none());
+        }
+    }
+
+    /// attack / break_block / place_block 是三个独立通道：位不同、掩码不相交，
+    /// 且各自只含一个动作。
+    #[test]
+    fn combat_actions_occupy_distinct_channels() {
+        let cases = [
+            ("attack", attack_mask(), ATTACK_ACTIONS, 8u32),
+            ("break_block", break_block_mask(), BREAK_BLOCK_ACTIONS, 9),
+            ("place_block", place_block_mask(), PLACE_BLOCK_ACTIONS, 14),
+        ];
+        for (name, mask, action_names, bit) in cases {
+            assert_eq!(mask.count_ones(), 1, "{name} 必须只占一个通道位");
+            assert_eq!(mask, actions::mask_of_name(name).unwrap());
+            assert_eq!(action_names.len(), 1);
+            assert_eq!(action_names[0], name);
+            assert_eq!(actions::channel_bit_of(name), Some(bit));
+            let channel = channel_of_action(name).expect("动作必须挂在通道表上");
+            assert_eq!(channel.key, name);
+            assert_eq!(channel.mode, "button");
+            assert_eq!(channel.actions, action_names);
+        }
+        assert_eq!(attack_mask() & break_block_mask(), 0);
+        assert_eq!(attack_mask() & place_block_mask(), 0);
+        assert_eq!(break_block_mask() & place_block_mask(), 0);
+    }
+
+    /// 眩晕同时削减三个动作的 available，但 present 保持能力声明不变。
+    #[test]
+    fn stunning_trims_all_combat_actions_but_keeps_present() {
+        let set = ChannelSet {
+            can_attack: true,
+            can_break_block: true,
+            can_place_block: true,
+            ..ChannelSet::default()
+        };
+        let present = channel_mask(set);
+        let available = availability_mask(set, 0, true, false);
+
+        for mask in [attack_mask(), break_block_mask(), place_block_mask()] {
+            assert_ne!(present & mask, 0, "present 必须保留能力位");
+            assert_eq!(available & mask, 0, "available 必须被眩晕削减");
+        }
+        assert_eq!(present, channel_mask(set));
+    }
+
+    /// 交互不受眩晕削减（交互由 InteractChannel 单独门控）。
+    #[test]
+    fn interact_survives_stunned() {
+        let set = ChannelSet {
+            can_interact: true,
+            ..ChannelSet::default()
+        };
+        let available = availability_mask(set, 0, true, false);
+        assert_ne!(available & interact_mask(), 0);
+        assert_eq!(stunned_mask() & interact_mask(), 0);
+        assert_eq!(stunned_mask() & sprint_mask(), 0, "眩晕不影响冲刺能力位");
+    }
+
+    /// 通道表里的每个动作都能在 ACTION_TABLE 查到，且通道位合法。
+    #[test]
+    fn every_channel_action_exists_in_action_table_with_valid_bit() {
+        let mut keys: Vec<&str> = INPUT_CHANNEL_TABLE.iter().map(|c| c.key).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "通道 key 必须唯一");
+
+        for channel in INPUT_CHANNEL_TABLE {
+            assert!(!channel.actions.is_empty(), "{} 通道不得为空", channel.key);
+            for action in channel.actions {
+                let def = CoreActions::lookup(action).unwrap_or_else(|| {
+                    panic!("通道 {} 的动作 {action} 不在 ACTION_TABLE", channel.key)
+                });
+                assert!(def.channel_bit < actions::MAX_INPUT_CHANNELS);
+                assert_eq!(channel_of_action(action).map(|c| c.key), Some(channel.key));
+            }
+        }
     }
 
     /// 视角是独立轴：不占动作位，也不被眩晕 / 定身削减。

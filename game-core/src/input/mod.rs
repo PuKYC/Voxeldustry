@@ -22,12 +22,13 @@ pub use actions::{
     CoreActions, ACTION_TABLE,
 };
 pub use capability::{
-    all_actions_mask, availability_mask, channel_mask, channel_of_action, clear_uncontrolled_input,
-    compute_input_availability, derive_interact_requests, flight_mask, glide_mask, input_channels,
-    interact_mask, jump_mask, look_allowed, move_mask, rooted_mask, sprint_mask, stunned_mask,
-    tool_mask, ChannelSet, FlightChannel, GlideChannel, InputChannelDef, InteractChannel,
-    JumpChannel, LookChannel, MoveChannel, Rooted, SprintChannel, Stunned, ToolUseChannel,
-    INPUT_CHANNEL_TABLE,
+    all_actions_mask, attack_mask, availability_mask, break_block_mask, channel_mask,
+    channel_of_action, clear_uncontrolled_input, compute_input_availability,
+    derive_interact_requests, flight_mask, glide_mask, input_channels, interact_mask, jump_mask,
+    look_allowed, move_mask, place_block_mask, rooted_mask, sprint_mask, stunned_mask,
+    AttackChannel, BreakBlockChannel, ChannelSet, FlightChannel, GlideChannel, InputChannelDef,
+    InteractChannel, JumpChannel, LookChannel, MoveChannel, PlaceBlockChannel, Rooted,
+    SprintChannel, Stunned, INPUT_CHANNEL_TABLE,
 };
 pub(crate) use game_engine::input::{InputSet, InteractRequest, SimulationTick};
 

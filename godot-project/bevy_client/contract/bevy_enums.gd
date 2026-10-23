@@ -118,9 +118,11 @@ const PAYLOAD_SCHEMA := {
 		"wire": [Wire.BOOL],
 		"view": View.VISIBLE,
 	},
+	## 交互提示：i32 池 = [action, enabled, target]；target 0=none / 1=entity / 2=block
+	## （与 Rust 的 INTERACTION_TARGET_* 一致），供绑定层按上下文解析主操作。
 	Payload.INTERACTION: {
-		"fields": ["action", "enabled"],
-		"wire": [Wire.I32, Wire.BOOL],
+		"fields": ["action", "enabled", "target"],
+		"wire": [Wire.I32, Wire.BOOL, Wire.I32],
 		"view": View.NONE,
 	},
 	Payload.EXT: {

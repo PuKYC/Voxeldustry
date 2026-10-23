@@ -18,6 +18,9 @@ signal capabilities_changed(present: int, available: int)
 ## 视角轴（LookChannel）开关；视角不占动作位，所以单独一个信号。
 signal look_changed(available: bool)
 signal channel_changed(key: String, present: bool, available: bool)
+## 当前受控实体的交互目标类型 / 是否可用（INTERACTION 载荷）。
+## target 取值见 game-core 的 INTERACTION_TARGET_*：0 = 无、1 = 实体、2 = 方块。
+signal interaction_target_changed(target: int, enabled: bool)
 
 ## 发起订阅的 BevyClient（不标注 Node：它承载的是脚本方法，避免静态分析误判）。
 var _client = null
@@ -34,6 +37,9 @@ var _channels: Array = []
 var _mask_by_key: Dictionary[String, int] = {}
 ## key -> [present, available] 上一次状态（channel_changed 的边沿去抖）。
 var _channel_state: Dictionary[String, Array] = {}
+## 交互目标类型 / 是否可用（来自 INTERACTION 载荷，只跟踪当前受控实体）。
+var _interaction_target: int = 0
+var _interaction_enabled: bool = false
 
 
 ## 绑定客户端：拉一次通道表，订阅 INPUTCAPS 与实体移除。
@@ -56,6 +62,8 @@ func bind(client) -> void:
 
 	if _client.has_method("listen_component"):
 		_client.listen_component(BevyEnums.Payload.INPUTCAPS, _on_caps_changed)
+		# 交互目标：同一受控实体的 INTERACTION 载荷变化（提示 / 主按钮语义用）。
+		_client.listen_component(BevyEnums.Payload.INTERACTION, _on_interaction_changed)
 	if _client.has_signal("entity_removed"):
 		_client.entity_removed.connect(_on_entity_removed)
 
@@ -93,6 +101,21 @@ func has_channel(key: String) -> bool:
 func is_channel_available(key: String) -> bool:
 	var mask: int = _mask_by_key.get(key, 0)
 	return mask != 0 and (_available & mask) == mask
+
+
+## 当前受控实体的交互目标类型（INTERACTION_TARGET_*，0 = 无）。
+func interaction_target() -> int:
+	return _interaction_target
+
+
+## 当前受控实体的交互是否可用。
+func interaction_enabled() -> bool:
+	return _interaction_enabled
+
+
+## 通道级状态快照：key -> [present, available]（键鼠提交前重映射 / 提示解析用）。
+func channel_states() -> Dictionary:
+	return _channel_state.duplicate(true)
 
 
 ## 视角轴是否开放。视角不在 channels() 里（它不占动作位），UI 单独判断。
@@ -135,6 +158,8 @@ func _on_caps_changed(e: EntityData) -> void:
 		capabilities_changed.emit(present, available)
 		look_changed.emit(look)
 		_emit_channel_changes(present, available)
+		# 交互目标同理：读到新实体当前值（载荷不一定重发），变化时发一次信号。
+		_read_interaction(e)
 		return
 
 	if present == _present and available == _available and look == _look:
@@ -176,6 +201,35 @@ func _emit_channel_changes(present: int, available: int) -> void:
 		channel_changed.emit(key, channel_present, channel_available)
 
 
+## INTERACTION 载荷变化：只关心当前受控实体（其它实体的提示不参与本地输入语义）。
+func _on_interaction_changed(e: EntityData) -> void:
+	if e == null or e != _entity:
+		return
+	_read_interaction(e)
+
+
+## 从实体读当前 InteractionHint（{action, enabled, target}），去抖后发信号。
+func _read_interaction(e: EntityData) -> void:
+	var target := 0
+	var enabled := false
+	if e != null:
+		var hint: Variant = e.get_component(BevyEnums.Payload.INTERACTION)
+		if hint is Dictionary:
+			var data: Dictionary = hint as Dictionary
+			target = int(data.get("target", 0))
+			enabled = bool(data.get("enabled", false))
+	_set_interaction(target, enabled)
+
+
+## 写交互目标状态；只有真正变化时才发信号（实体切换 / 清零时不抖动）。
+func _set_interaction(target: int, enabled: bool) -> void:
+	if target == _interaction_target and enabled == _interaction_enabled:
+		return
+	_interaction_target = target
+	_interaction_enabled = enabled
+	interaction_target_changed.emit(target, enabled)
+
+
 func _on_entity_removed(e: EntityData, _reason: int) -> void:
 	if e == _entity:
 		_clear()
@@ -195,6 +249,7 @@ func _clear() -> void:
 		capabilities_changed.emit(0, 0)
 	if had_look:
 		look_changed.emit(false)
+	_set_interaction(0, false)
 	# 通道全部回落到「无」；即使位图本来就是 0，也要复位通道状态
 	#（后端重启后复用同一 context 时不残留陈旧边沿）。
 	for row: Dictionary in _channels:

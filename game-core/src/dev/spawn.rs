@@ -8,7 +8,10 @@
 /// 生成一个「本地玩家 + 输入源」装配，返回 `(Entity, StableEntityId)`。
 ///
 /// - 第一批：身份 / 空间 / 表现基础组件（`spawn_stable`，当帧建立稳定 ID 映射）；
-/// - 第二批：输入能力通道 + 快照缓冲 + 表现插值端点 + `$extra`；
+/// - 第一次 insert：基础输入通道（move / jump / interact）+ 快照缓冲 +
+///   表现插值端点 + `$extra`；
+/// - 第二次 insert：三个交互通道（attack / break_block / place_block）+
+///   SprintChannel + LookChannel（攒在一起避开 Bundle 15 元素上限）；
 /// - 随后补一个 `InputSource` 指向玩家，并再保险一次稳定 ID 索引。
 ///
 /// `extra` 放场景特有组件；当前调用方都传空元组 `()`。
@@ -38,7 +41,6 @@ macro_rules! spawn_local_player {
             crate::input::capability::MoveChannel,
             crate::input::capability::JumpChannel,
             crate::input::capability::InteractChannel::default(),
-            crate::input::capability::ToolUseChannel,
             crate::input::snapshot::RawResolved::default(),
             crate::input::snapshot::ResolvedInput::default(),
             crate::input::capability::InputAvailability::default(),
@@ -53,11 +55,17 @@ macro_rules! spawn_local_player {
             $($extra,)*
         ));
 
-        // Bevy Bundle 元组上限 15：LookChannel 单独 insert，避免 gameplay_test
-        // 的 4 个 extra 把元组顶到 16（编译期 Bundle 约束会报错）。
-        $world
-            .entity_mut(entity)
-            .insert(crate::input::capability::LookChannel);
+        // Bevy Bundle 元组上限 15：三个交互通道（attack / break_block /
+        // place_block）+ SprintChannel + LookChannel 一起放第二次 insert，
+        // 避免 gameplay_test 的 4 个 extra 把第一批元组顶到 16（编译期
+        // Bundle 约束会报错）。第一批因此固定 10 项 + `$extra`。
+        $world.entity_mut(entity).insert((
+            crate::input::capability::AttackChannel,
+            crate::input::capability::BreakBlockChannel,
+            crate::input::capability::PlaceBlockChannel,
+            crate::input::capability::SprintChannel,
+            crate::input::capability::LookChannel,
+        ));
 
         // 输入源实体：把 Godot 的输入通道指向刚建好的玩家。
         $world.spawn((

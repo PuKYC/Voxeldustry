@@ -24,17 +24,24 @@ func _run() -> void:
 	var client = ui.client
 	print("PROBE client=", client != null, " widgets=", ui.registry.widgets().size())
 
-	# P3：真实通道表 -> ButtonSpecs -> ActionButtonHost 的端到端检查。
+	# P3：真实通道表 -> 绑定层 -> 动作簇的端到端检查。
 	var host = ui.action_host
 	var button_count: int = 0 if host == null else host.buttons().size()
-	var tool_buttons := 0
+	var channel_keys: Array[String] = []
+	var button_actions: Array[String] = []
 	if host != null:
+		for row in host.channel_table():
+			if row is Dictionary:
+				channel_keys.append(String((row as Dictionary).get("key", "")))
 		for button in host.buttons():
-			if button.channel_key() == "tool":
-				tool_buttons += 1
+			button_actions.append(button.action_name())
+	var channels_ok := channel_keys.has("attack") and channel_keys.has("break_block") \
+		and channel_keys.has("place_block") and not channel_keys.has("tool")
+	var buttons_ok := button_count == 3 and button_actions.has("attack") \
+		and button_actions.has("place_block") and button_actions.has("jump")
 	print("PROBE action_host=", host != null, " buttons=", button_count,
-		" tool_buttons=", tool_buttons, " channels=", 0 if host == null else host.channel_table().size())
-	if host == null or button_count <= 0 or tool_buttons != 2:
+		" actions=", button_actions, " channels=", channel_keys.size(), " keys=", channel_keys)
+	if host == null or not channels_ok or not buttons_ok:
 		print("PROBE FAIL action buttons")
 		quit(1)
 		return

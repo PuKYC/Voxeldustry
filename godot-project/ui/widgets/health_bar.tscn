@@ -7,10 +7,11 @@ script = ExtResource("1_health_bar")
 custom_minimum_size = Vector2(260, 30)
 mouse_filter = 2
 widget_id = &"health_bar"
-tray = 0
+tray = 1
 align = 0
 priority = 20
 schemes = 7
+scheme_overrides = {1: {"align": 0, "priority": 20, "tray": 0}}
 
 [node name="Bar" type="ProgressBar" parent="."]
 layout_mode = 1

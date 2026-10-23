@@ -1,17 +1,19 @@
 class_name UiRoot
 extends CanvasLayer
-## UI 根：托盘 + 槽位 + 安全区 + 缩放 + 输入方案 + 菜单/暂停 + F3 调试层。
+## UI 根：9 个 HudSlot 区域层 + 安全区 + 缩放 + 输入方案 + 避让层 + 菜单/暂停 + F3 调试层。
 ##
 ## 布局树（全部代码构建，场景文件只挂脚本）：
 ##   UiTree(Control, IGNORE)
-##   └ SafeArea(MarginContainer)     ← 安全区 / 边距只在这里加
-##      └ VBox
-##         ├ TopTray(HBox)    [begin | center | end]
-##         ├ MidTray(HBox)    [左竖列 | 中央 CenterContainer | 右竖列]
-##         └ BottomTray(HBox) [begin | center | end]
+##   └ SafeArea(MarginContainer)          ← 安全区 / 边距只在这里加
+##      └ 9 × HudSlot（铺满 SafeArea、互相叠放、各自负责一个边缘）
+##         top_begin / top_center / top_end
+##         mid_begin / mid_center / mid_end
+##         bottom_begin / bottom_center / bottom_end
 ##
-## 元素不写坐标：HudWidget 只声明 tray/align/priority/schemes；
-## 容器负责重排，断点只控制显隐与边距。
+## 槽位最小尺寸只取 reserve（占位），不取子元素之和：任何数量的元素都不会
+## 把布局撑出屏幕，元素增减不会推动其它槽位（因此 mid_center 的准星恒居中）。
+## 触控区域（摇杆 / 动作簇 / 视角区）通过 update_touch_region() 登记矩形，
+## 区域层据此给对应槽位设置 inset（避让层），HUD 元素不再盖住摇杆或按钮。
 
 signal scheme_changed(scheme: int)
 signal compact_changed(level: int)
@@ -28,6 +30,8 @@ const TOUCH_PAD := 16.0
 const PHONE_TARGET_WIDTH := 900.0
 const TABLET_TARGET_WIDTH := 1280.0
 const TABLET_MIN_INCHES := 7.0
+## 平板触屏：动作簇 / 底部槽位离屏幕边缘更远（设计单位）。
+const TABLET_EXTRA_EDGE := 16.0
 
 const BUILTIN_WIDGET_PATHS: Array[String] = [
 	"res://ui/widgets/crosshair.tscn",
@@ -45,8 +49,9 @@ const DEBUG_OVERLAY_SCRIPT := preload("res://ui/debug/hud_debug_overlay.gd")
 @export var enable_pause_menu: bool = true
 ## 仅测试用：在桌面 headless 下强制走移动端缩放公式（验证 900/1280 逻辑宽）。
 @export var debug_force_mobile: bool = false
+## 仅测试用：关掉 user://ui_settings.cfg 的读取（冒烟测试可复现默认值）。
+@export var load_persisted_settings: bool = true
 ## 混合设备防抖：输入事件驱动的方案切换最小间隔（秒）。0 = 关闭冷却。
-## 手柄 + 键鼠同时接入时，避免两类事件互相把方案抢来抢去。
 @export var scheme_switch_cooldown: float = 0.5
 ## 手柄摇杆漂移阈值：轴值绝对值低于它不算「用了手柄」。
 @export var joypad_motion_threshold: float = 0.35
@@ -63,8 +68,9 @@ var debug_overlay: Control = null
 
 var _root: Control = null
 var _safe: MarginContainer = null
-var _vbox: VBoxContainer = null
 var _slots: Dictionary[String, Control] = {}
+## 触控区域 → 槽位 inset 的登记表（摇杆 / 动作簇 / 视角区共用）。
+var _touch_regions := TouchRegionRegistry.new()
 var _manager: Node = null
 var _user_scale := 1.0
 var _base_factor := 1.0
@@ -82,6 +88,8 @@ func _ready() -> void:
 	layer = 10
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_initialized = false
+	if load_persisted_settings:
+		UiState.load_settings()
 
 	_resolve_client()
 	_build_layout()
@@ -127,80 +135,14 @@ func _build_layout() -> void:
 	_safe.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_root.add_child(_safe)
 
-	_vbox = VBoxContainer.new()
-	_vbox.name = "Trays"
-	_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_vbox.add_theme_constant_override("separation", 12)
-	_safe.add_child(_vbox)
-
-	# 上：三个等宽槽，分别左对齐 / 居中 / 右对齐。
-	var top := HBoxContainer.new()
-	top.name = "TopTray"
-	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	top.add_theme_constant_override("separation", 12)
-	_vbox.add_child(top)
-	_add_top_bottom_slots(top, "top")
-
-	# 中：左竖列 + 中央 + 右竖列；中央吃掉剩余空间。
-	var mid := HBoxContainer.new()
-	mid.name = "MidTray"
-	mid.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	mid.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	mid.add_theme_constant_override("separation", 12)
-	_vbox.add_child(mid)
-
-	var left := _make_box_slot("MidBegin", true, BoxContainer.ALIGNMENT_CENTER)
-	left.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	mid.add_child(left)
-	_slots["mid_begin"] = left
-
-	var center := CenterContainer.new()
-	center.name = "MidCenter"
-	center.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	center.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	mid.add_child(center)
-	_slots["mid_center"] = center
-
-	var right := _make_box_slot("MidEnd", true, BoxContainer.ALIGNMENT_CENTER)
-	right.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	mid.add_child(right)
-	_slots["mid_end"] = right
-
-	# 下：与上对称。
-	var bottom := HBoxContainer.new()
-	bottom.name = "BottomTray"
-	bottom.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	bottom.add_theme_constant_override("separation", 12)
-	_vbox.add_child(bottom)
-	_add_top_bottom_slots(bottom, "bottom")
-
+	# 9 个区域层铺满 SafeArea、互相叠放；每个槽位只对自己的边缘负责。
+	_slots.clear()
+	var built := HudSlot.build_standard(_safe)
+	for key: String in built:
+		var slot: Variant = built[key]
+		if slot is Control:
+			_slots[key] = slot as Control
 	registry.setup(self, _slots)
-
-
-func _add_top_bottom_slots(row: HBoxContainer, prefix: String) -> void:
-	var begin := _make_box_slot(prefix + "_begin", false, BoxContainer.ALIGNMENT_BEGIN)
-	var center := _make_box_slot(prefix + "_center", false, BoxContainer.ALIGNMENT_CENTER)
-	var end := _make_box_slot(prefix + "_end", false, BoxContainer.ALIGNMENT_END)
-	for box in [begin, center, end]:
-		box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		row.add_child(box)
-	_slots[prefix + "_begin"] = begin
-	_slots[prefix + "_center"] = center
-	_slots[prefix + "_end"] = end
-
-
-func _make_box_slot(slot_name: String, vertical: bool, alignment: int) -> BoxContainer:
-	var box: BoxContainer
-	if vertical:
-		box = VBoxContainer.new()
-	else:
-		box = HBoxContainer.new()
-	box.name = slot_name
-	box.alignment = alignment
-	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	box.add_theme_constant_override("separation", 8)
-	return box
 
 
 func _build_theme() -> Theme:
@@ -210,6 +152,49 @@ func _build_theme() -> Theme:
 	theme.set_color("font_outline_color", "Label", Color(0.0, 0.0, 0.0, 0.9))
 	theme.set_constant("outline_size", "Label", 4)
 	return theme
+
+
+# ───────────────────────── 避让层 ─────────────────────────
+
+## 触控区域登记 / 更新占用矩形，reverses 形如 {"bottom_begin": Vector4(...)}。
+## HUD 只想让开某些槽位时用 reserves；只登记不避让就传空字典（例如视角区）。
+func register_touch_region(name: StringName, rect: Rect2, reserves: Dictionary = {}) -> void:
+	_touch_regions.register(name, rect, reserves)
+	_apply_slot_insets()
+
+
+func update_touch_region(name: StringName, rect: Rect2, reserves: Dictionary = {}) -> void:
+	_touch_regions.update(name, rect, reserves)
+	_apply_slot_insets()
+
+
+func release_touch_region(name: StringName) -> void:
+	_touch_regions.release(name)
+	_apply_slot_insets()
+
+
+func touch_regions() -> Dictionary:
+	return _touch_regions.regions()
+
+
+## 把登记表里的 inset 落到 9 个槽位上；平板触屏额外把底部槽位往里收一点。
+func _apply_slot_insets() -> void:
+	var insets: Dictionary = _touch_regions.slot_insets()
+	for key: String in _slots:
+		var value := Vector4.ZERO
+		var raw: Variant = insets.get(key, null)
+		if raw is Vector4:
+			value = raw
+		if UiState.platform == UiState.Platform.TABLET:
+			if key.begins_with("bottom_"):
+				value.w = maxf(value.w, TABLET_EXTRA_EDGE)
+				if key == "bottom_end":
+					value.z = maxf(value.z, TABLET_EXTRA_EDGE)
+				elif key == "bottom_begin":
+					value.x = maxf(value.x, TABLET_EXTRA_EDGE)
+		var slot := _slots[key] as HudSlot
+		if slot != null:
+			slot.set_inset(value)
 
 
 # ───────────────────────── 可选子场景 ─────────────────────────
@@ -238,12 +223,27 @@ func _instantiate_optional() -> void:
 				pause_menu.debug_overlay_requested.connect(_on_debug_overlay_requested)
 			if pause_menu.has_signal("debug_scheme_requested"):
 				pause_menu.debug_scheme_requested.connect(_on_debug_scheme_requested)
+			_connect_pause_settings()
 
 	debug_overlay = DEBUG_OVERLAY_SCRIPT.new()
 	debug_overlay.name = "HudDebugOverlay"
 	_root.add_child(debug_overlay)
 	debug_overlay.setup(self)
 	debug_overlay.visible = false
+
+
+## 期 3 设置区信号 → UiState + 落盘 + 立即生效。
+func _connect_pause_settings() -> void:
+	if pause_menu.has_signal("action_layout_changed"):
+		pause_menu.action_layout_changed.connect(_on_action_layout_changed)
+	if pause_menu.has_signal("button_scale_changed"):
+		pause_menu.button_scale_changed.connect(_on_button_scale_changed)
+	if pause_menu.has_signal("button_opacity_changed"):
+		pause_menu.button_opacity_changed.connect(_on_button_opacity_changed)
+	if pause_menu.has_signal("left_handed_changed"):
+		pause_menu.left_handed_changed.connect(_on_left_handed_changed)
+	if pause_menu.has_signal("joystick_mode_changed"):
+		pause_menu.joystick_mode_changed.connect(_on_joystick_mode_changed)
 
 
 func _load_scene_instance(path: String) -> Node:
@@ -256,8 +256,7 @@ func _load_scene_instance(path: String) -> Node:
 	return (resource as PackedScene).instantiate()
 
 
-## 动作按钮宿主：把通道表映射成 HudWidget 注册进托盘。
-## 原来的按钮逻辑在触屏层里（自己算坐标 + 安全区），现在复用槽位与 SafeArea。
+## 动作按钮宿主：绑定层把语义动作解析成触屏动作簇 + 键鼠/手柄键位提示。
 func _setup_action_buttons() -> void:
 	if not enable_touch_controls:
 		return
@@ -338,6 +337,9 @@ func _apply_scale() -> void:
 	win.content_scale_factor = factor
 	UiState.ui_scale = factor
 	_applying_scale = false
+	# 物理尺寸（按钮 / 摇杆）随 content_scale_factor 变化，重算一次。
+	if _initialized:
+		_apply_ui_settings()
 
 
 func _is_mobile() -> bool:
@@ -392,6 +394,8 @@ func _update_safe_area() -> void:
 	_safe.add_theme_constant_override("margin_top", int(round(pad + insets.y)))
 	_safe.add_theme_constant_override("margin_right", int(round(pad + insets.z)))
 	_safe.add_theme_constant_override("margin_bottom", int(round(pad + insets.w)))
+	# 平板 / 安全区变化会影响底部槽位 inset；区域层再对齐一次。
+	_apply_slot_insets()
 	# 触屏控件在 SafeArea 之外，安全区更新后要重新排一次（移动端 insets 延迟一帧才准）。
 	if touch_controls != null and touch_controls.has_method("refresh_layout"):
 		touch_controls.refresh_layout()
@@ -532,6 +536,10 @@ func open_pause_menu() -> void:
 		pause_menu.visible = true
 		if pause_menu.has_method("set_debug_overlay_state"):
 			pause_menu.set_debug_overlay_state(_debug_visible)
+		if pause_menu.has_method("set_scale_value"):
+			pause_menu.set_scale_value(UiState.ui_scale)
+		if pause_menu.has_method("refresh_settings_controls"):
+			pause_menu.refresh_settings_controls()
 		if pause_menu.has_method("open"):
 			pause_menu.open()
 	menu_changed.emit(true)
@@ -599,6 +607,46 @@ func set_ui_scale(value: float) -> void:
 
 func _on_ui_scale_changed(value: float) -> void:
 	set_ui_scale(value)
+
+
+# ───────────────────────── 期 3 设置（操作布局 / 按钮 / 触屏） ─────────────────────────
+
+func _apply_ui_settings() -> void:
+	if action_host != null and action_host.has_method("refresh_settings"):
+		action_host.refresh_settings()
+	if touch_controls != null and touch_controls.has_method("refresh_settings"):
+		touch_controls.refresh_settings()
+	_apply_slot_insets()
+
+
+func _on_action_layout_changed(value: int) -> void:
+	UiState.action_layout = clampi(value, UiState.ActionLayout.CONTEXT, UiState.ActionLayout.SPLIT)
+	UiState.save_settings()
+	_apply_ui_settings()
+
+
+func _on_button_scale_changed(value: float) -> void:
+	UiState.button_scale = clampf(value, 0.8, 1.3)
+	UiState.save_settings()
+	_apply_ui_settings()
+
+
+func _on_button_opacity_changed(value: float) -> void:
+	UiState.button_opacity = clampf(value, 0.35, 1.0)
+	UiState.save_settings()
+	_apply_ui_settings()
+
+
+func _on_left_handed_changed(value: bool) -> void:
+	UiState.left_handed = value
+	UiState.save_settings()
+	_apply_ui_settings()
+
+
+func _on_joystick_mode_changed(value: int) -> void:
+	UiState.joystick_mode = clampi(value, UiState.JoystickMode.FIXED, UiState.JoystickMode.FLOATING)
+	UiState.save_settings()
+	_apply_ui_settings()
 
 
 # ───────────────────────── 调试层 ─────────────────────────

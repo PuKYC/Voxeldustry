@@ -145,6 +145,8 @@ func _ready() -> void:
 	input_context.controlled_changed.connect(_on_input_controlled_changed)
 	input_context.capabilities_changed.connect(_on_input_capabilities_changed)
 	input_context.look_changed.connect(_on_input_look_changed)
+	# 语义动作重映射：BevyInput 每帧提交前按交互目标把 attack 改报 break_block。
+	input.set_input_context(input_context)
 
 	presenter.sound_library = sound_library
 	presenter.anim_library = anim_library

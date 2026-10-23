@@ -32,8 +32,12 @@ const KEY_BY_BINDING := {
 
 const MOUSE_BY_BINDING := {
 	"MouseLeft": MOUSE_BUTTON_LEFT,
+	"MouseMiddle": MOUSE_BUTTON_MIDDLE,
 	"MouseRight": MOUSE_BUTTON_RIGHT,
 }
+
+## 输入绑定层（槽位 / 提示 / 上下文重映射）。用 preload 避免依赖全局类名缓存。
+const INPUT_BINDINGS := preload("res://ui/input/input_bindings.gd")
 
 ## 动作名 -> 首次注册时的默认绑定令牌（game-core 的动作表只有 name / bit）。
 ## 表里没有的动作（例如 mod 新增）只注册动作名，请在编辑器里手动绑定。
@@ -46,8 +50,9 @@ const DEFAULT_BINDING_BY_ACTION := {
 	"glide": "Shift",
 	"flight_toggle": "F",
 	"interact": "E",
-	"primary_tool": "MouseLeft",
-	"secondary_tool": "MouseRight",
+	"attack": "MouseLeft",
+	"break_block": "MouseMiddle",
+	"place_block": "MouseRight",
 	"sprint": "Ctrl",
 	"crouch": "C",
 	"reload": "R",
@@ -63,6 +68,8 @@ var source_id: int = 1
 
 # _manager 不能标注成 Node —— 扩展方法在 Node 上不存在。
 var _manager = null
+## 输入能力上下文（BevyClient 在 input_context 就绪后注入）；空 = 不做上下文重映射。
+var _input_context = null
 var _action_names := PackedStringArray()
 var _held := {}
 var _pressed := {}
@@ -74,6 +81,12 @@ func setup(manager, p_source_id: int = 1) -> void:
 	_manager = manager
 	source_id = p_source_id
 	_register_actions()
+
+
+## 注入输入能力上下文：collect_and_submit 提交前按交互目标重映射语义动作
+## （CONTEXT 布局下 target=BLOCK 时 attack -> break_block）。空 = 原样提交。
+func set_input_context(ctx) -> void:
+	_input_context = ctx
 
 
 ## 由 BevyClient 在 _input 中转发。
@@ -117,10 +130,18 @@ func collect_and_submit() -> void:
 			_held[action_name] = true
 		if Input.is_action_just_pressed(action_name):
 			_pressed[action_name] = true
-			action_pressed.emit(action_name)
 		if Input.is_action_just_released(action_name):
 			_released[action_name] = true
-			action_released.emit(action_name)
+
+	# 上下文语义重映射（CONTEXT 布局：target=BLOCK 时 attack -> break_block）：
+	# 只重命名语义动作，不做能力过滤（能力过滤仍是 game-core 的职责）。
+	var held_actions := _remap(Array(_held.keys()))
+	var pressed_actions := _remap(Array(_pressed.keys()))
+	var released_actions := _remap(Array(_released.keys()))
+	for action in pressed_actions:
+		action_pressed.emit(String(action))
+	for action in released_actions:
+		action_released.emit(String(action))
 
 	# deadzone 传 0：死区/曲线是 game-core 的职责，避免两层死区叠加。
 	move = Input.get_vector("move_left", "move_right", "move_back", "move_forward", 0.0)
@@ -128,14 +149,31 @@ func collect_and_submit() -> void:
 	_look_accum = Vector2.ZERO
 
 	_manager.submit_input_frame(
-		PackedStringArray(_held.keys()),
-		PackedStringArray(_pressed.keys()),
-		PackedStringArray(_released.keys()),
+		PackedStringArray(held_actions),
+		PackedStringArray(pressed_actions),
+		PackedStringArray(released_actions),
 		move,
 		look_delta,
 		Time.get_ticks_msec(),
 		source_id
 	)
+
+
+## 按当前布局 / 通道状态 / 交互目标重映射动作名；context 为空时原样返回。
+func _remap(actions: Array) -> Array:
+	if _input_context == null or not is_instance_valid(_input_context):
+		return actions
+	var layout: int = int(INPUT_BINDINGS.ui_layout())
+	var channels: Array = []
+	var states: Dictionary = {}
+	var target_kind := 0
+	if _input_context.has_method("channels"):
+		channels = _input_context.channels()
+	if _input_context.has_method("channel_states"):
+		states = _input_context.channel_states()
+	if _input_context.has_method("interaction_target"):
+		target_kind = int(_input_context.interaction_target())
+	return INPUT_BINDINGS.remap_actions(actions, layout, channels, states, target_kind)
 
 
 ## 用 game-core 的动作表注册 / 校验 InputMap（已存在的动作不覆盖，尊重改键）。

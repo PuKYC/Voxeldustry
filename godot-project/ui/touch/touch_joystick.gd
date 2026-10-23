@@ -1,17 +1,23 @@
 extends Control
 ## 虚拟摇杆（单指）。
 ##
-## 只负责「触摸位置 -> 归一化方向 -> 四个移动动作的强度」：死区与死区后的线性
+## 只负责「触摸位置 -> 归一化方向 -> 动作强度」：死区与死区后的线性
 ## 重映射在这里做，真正的曲线 / 量化 / 能力过滤在 game-core。
 ##
 ## 多指：只跟踪落在本控件上的第一根手指（按 event.index 匹配），后来的手指忽略；
 ## 手指抬起时按 index 匹配，避免多指时误判。
+## 浮动摇杆由 touch_controls 的 JoystickZone 接管：按下时 begin_touch() 把手指
+## 交给摇杆，拖动走 move_touch()，抬手 end_touch() 归零。
 ## 退出 / 隐藏 / 菜单打开 / 窗口失焦时由父级调用 reset() 归零并释放全部动作。
 
 ## 归一化方向（x 向右为正，y 向下为正；已应用死区与重映射，长度 0..1）。
 signal vector_changed(direction: Vector2)
 
 const MOVE_ACTIONS := ["move_forward", "move_back", "move_left", "move_right"]
+## 摇杆推到边缘自动施加的冲刺动作（能力由 Rust 侧通道提供；InputMap 没有时安全跳过）。
+const SPRINT_ACTION := "sprint"
+## 推到边缘的阈值：direction 长度 >= 该值视为“跑”。
+const SPRINT_THRESHOLD := 0.95
 
 ## 底圈有效半径（设计单位）。
 @export var radius: float = 140.0
@@ -52,7 +58,32 @@ func _gui_input(event: InputEvent) -> void:
 		accept_event()
 
 
-## 归零并释放全部移动动作（隐藏 / 菜单 / 失焦 / 退出时调用）。
+## 外部（浮动摇杆区）把一根手指交给摇杆：local_position 是摇杆本地坐标。
+func begin_touch(index: int, local_position: Vector2) -> void:
+	if _touch_index != -1:
+		return
+	_touch_index = index
+	_active = true
+	_update_from_position(local_position)
+	queue_redraw()
+
+
+## 外部（浮动摇杆区）转发拖动：index 不匹配时忽略。
+func move_touch(index: int, local_position: Vector2) -> void:
+	if index != _touch_index:
+		return
+	_update_from_position(local_position)
+
+
+## 外部（浮动摇杆区）结束手指：index 不匹配返回 false。
+func end_touch(index: int) -> bool:
+	if index != _touch_index:
+		return false
+	reset()
+	return true
+
+
+## 归零并释放全部动作（隐藏 / 菜单 / 失焦 / 退出时调用）。
 func reset() -> void:
 	_touch_index = -1
 	_active = false
@@ -68,6 +99,11 @@ func direction() -> Vector2:
 	if travel <= 0.0:
 		return Vector2.ZERO
 	return _shape_direction(_knob_offset / travel)
+
+
+## 是否有一根手指正在控制摇杆。
+func is_active() -> bool:
+	return _active
 
 
 func _notification(what: int) -> void:
@@ -127,6 +163,8 @@ func _apply_direction(output: Vector2) -> void:
 	_press_axis("move_back", maxf(0.0, output.y))
 	_press_axis("move_left", maxf(0.0, -output.x))
 	_press_axis("move_right", maxf(0.0, output.x))
+	# 推到边缘等价于按住冲刺；松开 / 回中立即释放。InputMap 没有 sprint 时静默跳过。
+	_press_axis(SPRINT_ACTION, 1.0 if output.length() >= SPRINT_THRESHOLD else 0.0)
 	vector_changed.emit(output)
 
 
@@ -140,6 +178,8 @@ func _press_axis(action: String, strength: float) -> void:
 
 
 func _release_actions() -> void:
-	for action: String in MOVE_ACTIONS:
+	var actions: Array = MOVE_ACTIONS.duplicate()
+	actions.append(SPRINT_ACTION)
+	for action: String in actions:
 		if InputMap.has_action(action):
 			Input.action_release(action)

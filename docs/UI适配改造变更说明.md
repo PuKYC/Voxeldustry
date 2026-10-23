@@ -207,3 +207,26 @@ PROBE PASS
 - CJK 字体与本地化：UI 文案仍为英文。
 - mod UI 加载器（manifest 驱动）：仍只有 `register_external` 入口。
 - 设置项扩容：Settings 仍只有 UI SCALE；音量 / 灵敏度 / 摇杆死区 / 按钮布局要扩 `UiState` + 存档，属于后续轮次。
+
+
+## UI 布局与输入语义改造（2026-10-23，方案期 1–3）
+
+**问题**（真机横屏截图 + 代码阅读）：旧布局是 HBox / VBox 托盘，槽位最小尺寸 = 子元素之和，右侧 4 个动作按钮把 MidTray 撑出屏幕、Use 被切掉；子元素隐藏时槽位塌成 0，上下托盘高度变化会推动准星漂移；动作按钮默认落 mid_end 右侧竖列，与「右下角」约定不符；摇杆 / 视角区绝对定位，HUD 不知道避让。输入侧 Rust 通道表只有 tool，动作按物理键命名，UI 无法按语义能力控制显隐。
+
+**改动**：
+
+| 层 | 文件 | 改动 |
+| --- | --- | --- |
+| Rust | `game-core/src/input/{actions,capability,mod}.rs` | tool → attack / break_block / place_block 三个独立动作 + 通道 + 能力组件；眩晕削减三者 available；删除 TOOL_ACTIONS / ToolUseChannel |
+| Rust | `game-core/src/dev/spawn.rs` | 本地玩家补 Attack/BreakBlock/PlaceBlock/Sprint 能力组件 |
+| Rust | `presentation/payload/{mod,packed}.rs` + `godot-client-ext` | InteractionHint 增加 target:u8（none/entity/block），GPF1 池与 Godot 契约同步 |
+| 布局 | `godot-project/ui/hud_slot.gd`（新增） | 9 个区域层：最小尺寸只取 reserve、换行 / 换列、align / edge、inset、reserve 带 |
+| 布局 | `godot-project/ui/touch_regions.gd`（新增）、`ui_root.gd`、`hud_registry.gd` | 触控区域避让层；UiRoot 改 9 HudSlot；注册表去 BoxContainer 依赖；bottom_center 预留 72 |
+| 输入 | `ui/input/input_bindings.gd`（新增）、`action_cluster.gd`（新增）、`action_button_host.gd`、`widgets/action_button.gd`、`action_hints.gd`（新增） | 语义绑定层（直连 / 上下文 / 预设 / KBM 重映射）、右下角弧形动作簇、物理尺寸、透明度、左手镜像、键鼠提示 |
+| 触屏 | `ui/touch/touch_controls.gd`、`touch_joystick.gd` | 摇杆物理尺寸、左手镜像、浮动摇杆、避让登记、摇杆边缘自动 sprint |
+| 设置 | `ui/ui_state.gd`、`ui/screens/pause_menu.gd` | 操作布局 / 按钮大小 / 透明度 / 左手 / 摇杆模式，落盘 user://ui_settings.cfg；暂停菜单设置区 |
+| 测试 | `test/ui_layout_test.gd`、`input_bindings_test.gd`、`ui_settings_test.gd`（新增）、`ui_smoke_test.gd`、`ui_gameplay_probe.gd`、`tools/ui_check.sh` | 多视口布局 / 绑定层 / 设置落盘 / 新动作按钮断言；探针改为真实通道表 + 3 个 context 按钮 |
+
+**验证**：`tools/ui_check.sh` 四个脚本全过（146 + 41 + 114 + 122 项，0 失败）；`cargo test --workspace` 全过；`--gameplay` 探针真实通道表 9 个通道、无 tool、context 3 按钮。**headless，不是真机验证。**
+
+**边界**：期 4 快捷栏、期 5 拖动自定义布局不在本轮（只留 bottom_center 72 预留带）；攻击 / 破坏 / 放置玩法本身未实现（只打通语义动作与 UI）。

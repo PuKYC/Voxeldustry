@@ -5,6 +5,9 @@ extends HudWidget
 ## 数据源：BevyEnums.Payload.HEALTH（fields: current, max）。
 ## 只在「当前受控实体有 HEALTH 载荷」时显示；无 client / 无实体时隐藏。
 ## 全部信号驱动：client.listen_component + controlled_entity_changed，不轮询、不写坐标。
+##
+## 角色映射（期 3）：键鼠 / 手柄落 BOTTOM + BEGIN（左下），
+## TOUCH 方案通过 scheme_overrides 覆盖到 TOP + BEGIN（左上）。映射写在 .tscn 里。
 
 ## 数值文案：英文，避免本机缺 CJK 字体时显示方块。
 const VALUE_FORMAT := "%d / %d"

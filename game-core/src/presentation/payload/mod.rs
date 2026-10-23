@@ -218,11 +218,24 @@ impl RawVoxelGroupPayload {
     }
 }
 
+/// 交互提示的目标类型：无目标（仅提示按键，如"轻触交互"）。
+pub const INTERACTION_TARGET_NONE: u8 = 0;
+/// 交互提示的目标类型：实体（例如可拾取物 / NPC）。
+pub const INTERACTION_TARGET_ENTITY: u8 = 1;
+/// 交互提示的目标类型：方块（体素坐标，例如可破坏 / 可放置面）。
+pub const INTERACTION_TARGET_BLOCK: u8 = 2;
+
 /// 交互提示（状态）。
+///
+/// `target` 区分提示指向的目标类型（见 `INTERACTION_TARGET_*` 常量）：
+/// 0 = 无目标、1 = 实体、2 = 方块。它只是表现侧的目标分类，具体目标 id /
+/// 坐标由玩法侧另行下发。
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionHint {
     pub action: ActionId,
     pub enabled: bool,
+    /// 目标类型：`INTERACTION_TARGET_NONE` / `_ENTITY` / `_BLOCK`。
+    pub target: u8,
 }
 
 /// 把逻辑组件翻译成精简表现载荷。
