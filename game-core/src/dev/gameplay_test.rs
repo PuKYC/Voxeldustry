@@ -21,8 +21,8 @@ use game_engine::presentation::voxel::extract_raw_halo;
 use game_engine::presentation::RenderTransform;
 use game_engine::spatial::Size;
 use game_engine::voxel::{
-    ChunkKey, Collider, LinearVelocity, LockedAxes, Lod, MaxDepth, MeshBlock, Neighbourhood,
-    RigidBody, ShapeCastConfig, SleepingDisabled, SpatialQuery, SpatialQueryFilter, VoxOpsWrite,
+    ChunkKey, CoefficientCombine, Collider, Friction, LinearVelocity, LockedAxes, Lod, MaxDepth, MeshBlock, Neighbourhood,
+    Restitution, RigidBody, ShapeCastConfig, SleepingDisabled, SpatialQuery, SpatialQueryFilter, VoxOpsWrite,
     VoxTree, VoxVolume, VoxelCollider, VoxelInterner, CHUNK_DEPTH,
 };
 
@@ -105,6 +105,10 @@ fn spawn_gameplay_test_world(world: &mut World) {
     let collider_entity = world
         .spawn((
             Collider::capsule(PLAYER_CAPSULE_RADIUS, PLAYER_CAPSULE_LENGTH),
+            // 零摩擦且取 Min 合并：贴墙推进时墙面不会抵消重力把玩家「挂」在墙上；
+            // 地面停步靠 drive_physics_player 的加速度靠拢，不依赖摩擦。
+            Friction::ZERO.with_combine_rule(CoefficientCombine::Min),
+            Restitution::ZERO.with_combine_rule(CoefficientCombine::Min),
             Transform::from_xyz(0.0, PLAYER_CAPSULE_CENTER_Y, 0.0),
             ChildOf(_player),
         ))
@@ -218,7 +222,11 @@ fn drive_physics_player(
             &SpatialQueryFilter::from_excluded_entities([entity, collider.0]),
         );
 
-        if ground.is_some() && linear.y <= 0.1 {
+        // 只有命中面朝上（坡度 <= 约 60°）才算站在地面：贴墙时向下 cast 可能擦到
+        // 墙面，不能据此清零下坠速度或允许起跳（否则会挂墙 / 墙上连跳）。
+        let grounded = ground.is_some_and(|hit| hit.normal2.y > 0.5);
+
+        if grounded && linear.y <= 0.1 {
             if input.0.pressed & JUMP_CHANNEL_BIT != 0 {
                 linear.y = PLAYER_JUMP_SPEED;
             } else if linear.y < 0.0 {
