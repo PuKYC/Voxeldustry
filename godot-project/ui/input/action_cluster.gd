@@ -30,6 +30,10 @@ const ARC_SPEC_END := 320.0
 const ARC_USABLE_SWEEP := 90.0
 ## 弧半径系数：radius = (anchor_size + size) / 2 * ARC_RADIUS_FACTOR。
 const ARC_RADIUS_FACTOR := 1.05
+## 相邻按钮之间的最小空隙（设计单位）；排布保证任意两个按钮边缘间距 >= 此值。
+const BUTTON_GAP := 8.0
+## 放不下时半径最多放大到的倍数。
+const ARC_MAX_RADIUS_SCALE := 2.0
 ## 主按钮 role（CONTEXT 布局）；SPLIT 布局没有 primary，退化为第一个可见按钮。
 const ANCHOR_ROLE := "primary"
 const TOUCH_REGION_NAME := &"action_cluster"
@@ -214,19 +218,16 @@ func refresh_layout() -> void:
 	var anchor_half := anchor_size * 0.5
 	var rects: Dictionary = {}
 	rects[anchor_role] = Rect2(-anchor_half, -anchor_half, anchor_size, anchor_size)
-	var arc_index := 0
+	var others: Array = []
 	for role in visible_roles:
-		if role == anchor_role:
-			continue
-		var angle := _arc_angle(arc_index)
-		arc_index += 1
+		if role != anchor_role:
+			others.append({"role": role, "size": float(sizes[role])})
+	var centers := _arc_centers(anchor_size, others)
+	for role in centers:
 		var btn_size: float = sizes[role]
-		var radius := (anchor_size + btn_size) * 0.5 * ARC_RADIUS_FACTOR
-		var radians := deg_to_rad(angle)
-		var direction := Vector2(cos(radians), sin(radians))
+		var center: Vector2 = centers[role]
 		if _left_handed:
-			direction.x = -direction.x
-		var center := direction * radius
+			center.x = -center.x
 		rects[role] = Rect2(center - Vector2(btn_size, btn_size) * 0.5, Vector2(btn_size, btn_size))
 	# 4) 包围盒 + 内边距 = 簇最小尺寸。
 	var bbox: Rect2 = rects[anchor_role]
@@ -254,6 +255,58 @@ func refresh_layout() -> void:
 	_updating = false
 	_sync_touch_region()
 	_notify_parent_layout()
+
+
+## 弧形排布（防重叠）：按顺序沿弧放置，每个按钮取「与上一个（或主按钮）中心距 >=
+## 半径之和 + BUTTON_GAP」的最小角度；扇区（180°~270°）放不下就整体放大半径重试。
+## 返回 role -> 中心点（以主按钮中心为原点，右手坐标；左手由调用方镜像 x）。
+func _arc_centers(anchor_size: float, others: Array) -> Dictionary:
+	var result: Dictionary = {}
+	if others.is_empty():
+		return result
+	var scale := 1.0
+	while scale <= ARC_MAX_RADIUS_SCALE + 0.001:
+		result = {}
+		var ok := true
+		var prev_center := Vector2.ZERO
+		var prev_size := anchor_size
+		var angle := ARC_SPEC_START
+		for i in others.size():
+			var item: Dictionary = others[i]
+			var btn_size: float = item["size"]
+			var radius := ((anchor_size + btn_size) * 0.5 + BUTTON_GAP) * scale
+			var need := (btn_size + prev_size) * 0.5 + BUTTON_GAP
+			var center := Vector2.ZERO
+			var found := false
+			var a := angle
+			while a <= ARC_SPEC_START + ARC_USABLE_SWEEP + 0.001:
+				var r := deg_to_rad(a)
+				center = Vector2(cos(r), sin(r)) * radius
+				if i == 0 or center.distance_to(prev_center) >= need:
+					found = true
+					angle = a
+					break
+				a += 0.5
+			if not found:
+				ok = false
+				break
+			result[String(item["role"])] = center
+			prev_center = center
+			prev_size = btn_size
+		if ok:
+			return result
+		scale += 0.1
+	# 兜底：放不下时按最大半径均分扇区（仍尽量分开）。
+	result = {}
+	var count := others.size()
+	for i in count:
+		var item: Dictionary = others[i]
+		var btn_size: float = item["size"]
+		var radius := ((anchor_size + btn_size) * 0.5 + BUTTON_GAP) * ARC_MAX_RADIUS_SCALE
+		var t := 0.0 if count == 1 else float(i) / float(count - 1)
+		var r := deg_to_rad(ARC_SPEC_START + t * ARC_USABLE_SWEEP)
+		result[String(item["role"])] = Vector2(cos(r), sin(r)) * radius
+	return result
 
 
 ## 规格角度 -> 可用扇区内的有效角度（右手：左 -> 上；左手再做水平镜像）。
@@ -353,7 +406,15 @@ func _sync_touch_region() -> void:
 	if not visible_now:
 		_release_touch_region()
 		return
-	ui_root.update_touch_region(TOUCH_REGION_NAME, get_global_rect(), {})
+	var rect := get_global_rect()
+	var view_w := get_viewport_rect().size.x
+	# 簇占住屏幕一侧：让中间槽位（快捷栏等）从簇旁边让开，不再压在按钮下面。
+	var reserves := {}
+	if _left_handed:
+		reserves["bottom_center"] = Vector4(rect.end.x + PADDING, 0.0, 0.0, 0.0)
+	else:
+		reserves["bottom_center"] = Vector4(0.0, 0.0, maxf(0.0, view_w - rect.position.x) + PADDING, 0.0)
+	ui_root.update_touch_region(TOUCH_REGION_NAME, rect, reserves)
 
 
 func _release_touch_region() -> void:

@@ -401,8 +401,8 @@ func _test_touch_controls_mirror() -> void:
 		touch.queue_free()
 		stub.queue_free()
 		return
-	_check(joystick.radius >= touch.JOYSTICK_MIN_RADIUS,
-		"摇杆半径不小于 96（实际 %.1f）" % joystick.radius)
+	_check(joystick.radius >= touch.JOYSTICK_MIN_RADIUS and joystick.radius <= touch.JOYSTICK_MAX_RADIUS,
+		"摇杆半径在 [%.0f, %.0f]（实际 %.1f）" % [touch.JOYSTICK_MIN_RADIUS, touch.JOYSTICK_MAX_RADIUS, joystick.radius])
 
 	# 右手：摇杆在左、视角区在右 55%。
 	_check(joystick.position.x < view.x * 0.5,

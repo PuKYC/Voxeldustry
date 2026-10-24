@@ -20,7 +20,11 @@ const TOUCH_JOYSTICK_SCRIPT := preload("res://ui/touch/touch_joystick.gd")
 ## 视角区占屏幕宽度的比例（右手：右侧 55%；左手镜像到左侧 55%）。
 const LOOK_AREA_WIDTH_RATIO := 0.55
 ## 摇杆半径下限（设计单位）。
-const JOYSTICK_MIN_RADIUS := 96.0
+const JOYSTICK_MIN_RADIUS := 56.0
+## 摇杆半径上限（设计单位），防止高 DPI / 大屏上摇杆撑满半屏。
+const JOYSTICK_MAX_RADIUS := 110.0
+## 摇杆底圈半径的物理尺寸（毫米）：约 24mm 直径，拇指可覆盖。
+const JOYSTICK_RADIUS_MM := 12.0
 ## 摇杆控件最小边长（兜底；实际尺寸 = 半径 * 2 + 24）。
 const JOYSTICK_MIN_SIZE := 96.0
 const JOYSTICK_MARGIN := 40.0
@@ -29,7 +33,7 @@ const FLOAT_ZONE_WIDTH_RATIO := 0.5
 
 ## 视角灵敏度（乘在触摸位移上；曲线的其余部分在 game-core）。
 @export var look_sensitivity: float = 1.0
-## 摇杆底圈半径（设计单位）。0 = 按 UiState.physical_units(26) 自动计算；> 0 时覆盖（测试用）。
+## 摇杆底圈半径（设计单位）。0 = 按 UiState.physical_units(JOYSTICK_RADIUS_MM) 自动计算（夹在 MIN/MAX 之间）；> 0 时覆盖（测试用）。
 @export var joystick_radius: float = 0.0
 
 var _ui_root = null
@@ -169,7 +173,7 @@ func _layout_children() -> void:
 func _effective_joystick_radius() -> float:
 	if joystick_radius > 0.0:
 		return joystick_radius
-	return maxf(UiState.physical_units(26.0), JOYSTICK_MIN_RADIUS)
+	return clampf(UiState.physical_units(JOYSTICK_RADIUS_MM), JOYSTICK_MIN_RADIUS, JOYSTICK_MAX_RADIUS)
 
 
 func _uses_floating_zone() -> bool:
@@ -200,9 +204,15 @@ func _update_touch_regions() -> void:
 			var margin := JOYSTICK_MARGIN
 			var reserves := {}
 			if _left_handed:
-				reserves = {"bottom_end": Vector4(0.0, 0.0, joystick_rect.size.x + margin, 0.0)}
+				reserves = {
+					"bottom_end": Vector4(0.0, 0.0, joystick_rect.size.x + margin, 0.0),
+					"bottom_center": Vector4(0.0, 0.0, joystick_rect.size.x + margin * 2.0, 0.0),
+				}
 			else:
-				reserves = {"bottom_begin": Vector4(joystick_rect.size.x + margin, 0.0, 0.0, 0.0)}
+				reserves = {
+					"bottom_begin": Vector4(joystick_rect.size.x + margin, 0.0, 0.0, 0.0),
+					"bottom_center": Vector4(joystick_rect.size.x + margin * 2.0, 0.0, 0.0, 0.0),
+				}
 			_ui_root.update_touch_region(&"joystick", joystick_rect, reserves)
 	if _look_area != null:
 		_ui_root.update_touch_region(&"look_area", _look_area.get_global_rect(), {})
