@@ -18,6 +18,7 @@ extends Node3D
 @export var status_every_frames: int = 120
 
 var _client: Node = null
+var _camera: CameraRig = null
 var _frames: int = 0
 
 
@@ -35,7 +36,29 @@ func _ready() -> void:
 		_client.connect(&"bevy_error", _on_bevy_error)
 	if _client.has_signal("bevy_stopped"):
 		_client.connect(&"bevy_stopped", _on_bevy_stopped)
+	# start_bevy_voxel_demo 会生成一个落在地表上的玩家 + 后端相机；
+	# 把场景里的静态 Camera3D 换成跟随后端相机的 CameraRig，否则鼠标指向的
+	# 画面和 Rust 侧射线用的相机不是同一个位姿。
+	_setup_backend_camera()
 	print("[voxel_demo] mode=VOXEL_DEMO focus=%s（体素网格由 VoxelMeshNode 路径 B 渲染）" % focus_point)
+
+
+func _setup_backend_camera() -> void:
+	var legacy := get_node_or_null(^"Camera3D") as Camera3D
+	_camera = CameraRig.new()
+	_camera.name = "BackendCamera3D"
+	_camera.fov = 70.0
+	_camera.camera_mode = CameraRig.CameraMode.FOLLOW_BACKEND
+	# 场景没有 UiRoot 处理 Esc，不捕获鼠标，避免运行时无法退出窗口。
+	_camera.capture_mouse = false
+	add_child(_camera)
+	_camera.make_current()
+	_camera.position = Vector3(0.0, 30.0, 20.0)
+	_camera.look_at(focus_point, Vector3.UP)
+	# 必须在后端首帧之前绑定，否则会错过只下发一次的 CAMERA 载荷。
+	_camera.bind(_client)
+	if legacy != null:
+		legacy.current = false
 
 
 func _aim_camera() -> void:

@@ -4,10 +4,15 @@
 //! [`GameplayPlugin`] 只挂引擎的 `EngineSetPlugin`；阶段顺序由 game-engine
 //! 在 `FixedUpdate` 里一次 `.chain()` 声明（见 `game-engine/src/sim.rs`）。
 
+mod block_edit;
 mod camera;
 mod death;
 mod movement;
 
+pub use block_edit::{
+    block_edit_system, placement_overlaps_player, BlockEditConfig, BlockEditCooldown,
+    BlockEditPlugin, SelectedBlock, BREAK_BLOCK_BIT, PLACE_BLOCK_BIT,
+};
 pub use camera::{
     camera_system, facing_system, spawn_camera_rig, CameraFlag, CameraPlugin, CameraView, Facing,
     CAMERA_EYE_HEIGHT, LOOK_SENSITIVITY, PITCH_LIMIT,

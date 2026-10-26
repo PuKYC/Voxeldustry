@@ -6,9 +6,10 @@ use bevy::prelude::*;
 
 use game_engine::backend::GameModule;
 
-use crate::gameplay::{CameraPlugin, DeathPlugin, GameplayPlugin, MovementPlugin};
+use crate::gameplay::{BlockEditPlugin, CameraPlugin, DeathPlugin, GameplayPlugin, MovementPlugin};
 use crate::input::GameInputPlugin;
 use crate::prediction::PredictionPlugin;
+use crate::presentation::voxel_mesh::VoxelMeshRefreshPlugin;
 use crate::presentation::{register_synced_components, PresentationPlugin};
 use crate::spec::CoreSpec;
 use crate::static_data::StaticDataPlugin;
@@ -35,13 +36,52 @@ impl GameModule<CoreSpec> for CoreGame {
             AoIPlugin::<GlobalTransform>::default(),
         ));
         // 玩法层装配。
-        app.add_plugins((GameplayPlugin, MovementPlugin, DeathPlugin, CameraPlugin));
+        app.add_plugins((
+            GameplayPlugin,
+            MovementPlugin,
+            DeathPlugin,
+            CameraPlugin,
+            BlockEditPlugin,
+        ));
         // 体素世界层：游戏语义 / 数值 / 生成。v1 无执行。
         app.add_plugins(WorldPlugin);
         app.add_plugins(GameVoxelPlugin);
         app.add_plugins(TerrainPlugin);
+        // 脏块 -> RawVoxelGroups：编辑后同一渲染帧更新可见几何。
+        app.add_plugins(VoxelMeshRefreshPlugin);
         // 预测 / 回滚绑定（单人：全部 Predicted、delay 0、无重演）。
         app.add_plugins(PredictionPlugin);
         register_synced_components(app);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gameplay::BlockEditConfig;
+    use game_engine::voxel::{VoxelDirtySet, VoxelInterner};
+    use std::time::Duration;
+
+    /// 默认装配必须能完整跑 Update / FixedUpdate：编辑插件与脏块刷新插件都
+    /// 依赖体素资源，缺失时会在系统参数校验阶段 panic。
+    #[test]
+    fn core_game_builds_and_ticks() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(20),
+        ));
+        CoreGame.build(&mut app);
+        app.finish();
+        app.cleanup();
+
+        assert!(app.world().get_resource::<VoxelInterner>().is_some());
+        assert!(app.world().get_resource::<VoxelDirtySet>().is_some());
+        assert!(app.world().get_resource::<BlockEditConfig>().is_some());
+
+        for _ in 0..3 {
+            app.update();
+        }
     }
 }

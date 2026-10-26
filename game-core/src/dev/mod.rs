@@ -9,4 +9,6 @@ pub mod demo;
 pub mod gameplay_test;
 pub mod perf;
 mod spawn;
+#[cfg(feature = "physics")]
+pub mod voxel_viewer;
 pub(crate) use spawn::spawn_local_player;

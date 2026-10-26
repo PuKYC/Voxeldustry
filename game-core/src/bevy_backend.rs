@@ -34,6 +34,8 @@ pub struct BevyBackendConfig {
     pub terrain_perf: bool,
     /// 游戏内容测试场景：静态体素平台 + 带碰撞玩家（见 `dev::gameplay_test`）。
     pub gameplay_test: bool,
+    /// 体素 demo 观察者：在地形上生成可编辑的玩家 + 相机（见 `dev::voxel_viewer`）。
+    pub voxel_viewer: bool,
     /// Godot -> Bevy 的 LOD 运行期句柄（observer / thresholds / max_lod）。
     /// Some 时插入 [VoxelLodHandle]，运行期流式系统读它。
     pub voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
@@ -49,6 +51,7 @@ impl Default for BevyBackendConfig {
             terrain: None,
             terrain_perf: false,
             gameplay_test: false,
+            voxel_viewer: false,
             voxel_lod: None,
         }
     }
@@ -61,6 +64,7 @@ struct CoreGameModule {
     terrain: Option<TerrainConfig>,
     terrain_perf: bool,
     gameplay_test: bool,
+    voxel_viewer: bool,
     voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
 }
 
@@ -86,7 +90,12 @@ impl GameModule<CoreSpec> for CoreGameModule {
             let config = *app.world().resource::<TerrainConfig>();
             app.add_plugins(crate::dev::perf::VoxelPerfPlugin::new(config));
         }
-        if self.gameplay_test {
+        if self.voxel_viewer {
+            // 体素 demo：地形已由 TerrainPlugin 生成，这里只补一个落在地表上的
+            // 玩家 + 相机，让方块编辑系统有射线来源。
+            #[cfg(feature = "physics")]
+            app.add_plugins(crate::dev::voxel_viewer::VoxelViewerPlugin);
+        } else if self.gameplay_test {
             // 测试场景自带平台 / 玩家 / 相机，不再叠加 demo 或性能实体。
             #[cfg(feature = "physics")]
             app.add_plugins(crate::dev::gameplay_test::GameplayTestPlugin);
@@ -119,6 +128,7 @@ pub fn run_bevy_backend(
             terrain: config.terrain,
             terrain_perf: config.terrain_perf,
             gameplay_test: config.gameplay_test,
+            voxel_viewer: config.voxel_viewer,
             voxel_lod: config.voxel_lod,
         },
         bridge,

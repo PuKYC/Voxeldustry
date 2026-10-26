@@ -740,8 +740,7 @@ meta 字段：
 | 动作簇弧形手感未调 | 角度 / 半径 / 9–10 mm 都是初值 | 真机调参 |
 | 同槽位隐藏元素会重排 | 隐藏子元素不占位，同槽位其余元素会前移（跨槽位不受影响） | 若产品要求严格不位移，可改为「隐藏也占位」；当前按「跨槽位不变」验收 |
 | 单元素超尺寸被夹 | Godot 的 `size` 会被最小尺寸钳住，只能夹分配 footprint | `debug_warnings` 记录；跨槽位不受影响 |
-| 攻击 / 破坏 / 放置玩法未实现 | 语义动作与能力已通，但 Rust 侧没有消费系统；Interact 目标类型也依赖玩法产出 | 玩法落地后接 `ResolvedInput` 位与 `InteractionHint.target` |
-| 键鼠上下文重映射 | CONTEXT 预设下 attack 按 target 改报 break_block；玩法验证后可能调整 | 随玩法实测 |
+| 破坏 / 放置已接最小闭环 | `gameplay::block_edit` 消费 `ResolvedInput` 的 break/place 边沿，每 tick 写 `InteractionHint.target`；CONTEXT 预设下主按钮已能按 target 切 Break | 真机验证按钮显隐 / 置灰与手感；粗 LOD 不跟随编辑（见 [[11-当前状态与风险]]） |
 | 移动端 renderer 未定 | 仍是 Forward Plus | 与 UI 解耦，待性能测试 |
 | mod UI 加载器未做 | 只有 `register_external` API | 随 Mod M6 |
 | 手柄只做到方案检测 | 局内 HUD 无焦点链；动作提示可用但未做手柄图标 | 后续 |

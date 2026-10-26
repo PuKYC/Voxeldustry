@@ -9,8 +9,8 @@ use bevy::prelude::*;
 use bevy::time::Fixed;
 use game_engine::math::FixedPoint;
 use game_engine::voxel::{
-    Collider, RigidBody, VoxVolume, VoxelCollider, VoxelCollisionChunk, VoxelCollisionPlugin,
-    VoxelInterner, VoxelPlugin,
+    set_voxel, Collider, RigidBody, VoxVolume, VoxelCollider, VoxelCollisionChunk,
+    VoxelCollisionPlugin, VoxelDirtySet, VoxelInterner, VoxelPlugin,
 };
 use voxel::store::{ChunkKey, MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH};
 
@@ -125,6 +125,57 @@ fn per_chunk_colliders_are_derived_and_revoked_for_static_root() {
     assert!(
         chunk_entities(app.world_mut(), root).is_empty(),
         "移除 VoxelCollider 后必须撤销全部派生 chunk 实体"
+    );
+}
+
+/// T4 acceptance: a single voxel edit through `set_voxel` changes the volume,
+/// and the VoxelSet::Collision hash diff must rebuild that chunk collider.
+#[test]
+fn single_voxel_edit_rebuilds_the_affected_collision_chunk() {
+    let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+    let tree = full_chunk(&mut interner);
+    let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+    volume.insert_chunk(ChunkKey::new(0, 0, 0), tree);
+
+    let mut app = test_app(interner);
+    let root = app.world_mut().spawn((volume, VoxelCollider)).id();
+    run_fixed_update(&mut app);
+
+    let chunk = chunk_entities(app.world_mut(), root)[0];
+    let before_hash = app
+        .world()
+        .entity(chunk)
+        .get::<VoxelCollisionChunk>()
+        .expect("collision chunk")
+        .content_hash;
+
+    let mut dirty = VoxelDirtySet::new();
+    app.world_mut()
+        .resource_scope::<VoxelInterner, _>(|world, mut interner| {
+            let mut root_entity = world.entity_mut(root);
+            let mut volume = root_entity
+                .get_mut::<VoxVolume>()
+                .expect("root must keep its VoxVolume");
+            assert_eq!(
+                set_voxel(&mut volume, &mut interner, &mut dirty, [5, 6, 7], 0),
+                Ok(true)
+            );
+        });
+
+    run_fixed_update(&mut app);
+
+    let after = app
+        .world()
+        .entity(chunk)
+        .get::<VoxelCollisionChunk>()
+        .expect("chunk must still exist");
+    assert_ne!(
+        before_hash, after.content_hash,
+        "the edited chunk's structural hash must change"
+    );
+    assert!(
+        app.world().entity(chunk).get::<Collider>().is_some(),
+        "the rebuilt chunk must keep its avian Collider"
     );
 }
 

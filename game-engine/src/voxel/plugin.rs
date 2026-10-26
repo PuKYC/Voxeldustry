@@ -7,7 +7,7 @@
 
 use bevy::prelude::*;
 
-use super::change::{apply_voxel_changes, VoxelSet};
+use super::change::{apply_voxel_changes, VoxelChangeBuffer, VoxelSet};
 use super::dirty::VoxelDirtySet;
 use super::interner::{update_voxel_memory_metric, VoxelInterner, VoxelMemoryMetric};
 
@@ -38,7 +38,10 @@ impl Plugin for VoxelPlugin {
         }
         app.init_resource::<VoxelDirtySet>()
             .init_resource::<VoxelMemoryMetric>()
-            .add_systems(Update, update_voxel_memory_metric);
+            .add_systems(
+                Update,
+                (update_voxel_memory_metric, ensure_voxel_change_buffers),
+            );
         app.add_systems(FixedUpdate, apply_voxel_changes.in_set(VoxelSet::Apply))
             .configure_sets(
                 FixedUpdate,
@@ -46,5 +49,18 @@ impl Plugin for VoxelPlugin {
             );
         // 碰撞派生 / 撤销系统由 VoxelCollisionPlugin（physics feature）注册；
         // 这里只固定 Apply -> Collision -> Mesh 的阶段顺序。
+    }
+}
+
+/// 给每个带 `VoxVolume` 的实体补一个 `VoxelChangeBuffer`。
+///
+/// 装配方（地形 / demo / 测试）只负责挂体素容器；编辑缓冲由世界层统一补齐，
+/// 这样 `apply_voxel_changes` 不会因为漏挂组件而静默跳过编辑。
+fn ensure_voxel_change_buffers(
+    mut commands: Commands,
+    query: Query<Entity, (With<super::volume::VoxVolume>, Without<VoxelChangeBuffer>)>,
+) {
+    for entity in &query {
+        commands.entity(entity).insert(VoxelChangeBuffer::new());
     }
 }

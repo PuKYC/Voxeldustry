@@ -25,12 +25,17 @@
 //! 矩形是位置无关的：块原点（米）由节点的 Transform 载荷给出，LOD 缩放
 //! voxel_size * 2^lod 由渲染侧按 RawVoxelPayload.lod 计算。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
-use game_engine::voxel::{ChunkKey, RectInstance};
+use game_engine::presentation::voxel::{extract_raw_halo, raw_halo_has_solid_interior};
+use game_engine::voxel::{
+    ChunkKey, DirtyChunk, Lod, MeshBlock, Neighbourhood, RectInstance, VoxVolume, VoxelBox,
+    VoxelDirtySet, VoxelInterner,
+};
 
 use crate::static_data::voxel::FACE_COUNT;
+use crate::voxel::terrain::blocks::group_key;
 
 /// 一个 mesh 块（32³ 基础跨度）的原始体素缓冲（内部 32³ + halo 层，共 34³）。
 ///
@@ -114,6 +119,143 @@ pub fn rect_scale_meters(voxel_size_m: f32, lod: u8) -> f32 {
     voxel_size_m * (1u32 << u32::from(lod)) as f32
 }
 
+/// 把世界层脏块刷新成新的 RawVoxelGroups 载荷（表现侧唯一通道）。
+///
+/// 只在 Update 运行，读取 FixedUpdate 里 `apply_voxel_changes` 留下的
+/// [`VoxelDirtySet`]，在 [`CollectPresentationSet`] 之前改写
+/// [`VoxChunkGroupRaw`]，因此同一渲染帧就能看到新几何。
+///
+/// 刷新范围：
+/// - 编辑块本身；
+/// - 当编辑范围贴到 chunk 边界时，halo 受影响的 6 面 / 12 棱 / 8 角邻块
+///   （最多 26 个），否则接缝 AO 会保留旧值。
+///
+/// LOD 限制：只刷新 `lod == 0` 的分组。粗 LOD 块由 terrain 的
+/// `GeneratedBlockCache` 按 LOD 直接生成，不读 `VoxVolume` 的编辑；玩家在
+/// 触及距离内始终处于 LOD0，因此本闭环不做粗块回写（见 docs 的 LOD 风险）。
+pub struct VoxelMeshRefreshPlugin;
+
+impl Plugin for VoxelMeshRefreshPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            refresh_dirty_voxel_meshes.before(game_engine::presentation::CollectPresentationSet),
+        );
+    }
+}
+
+/// 消费脏块并增量重建 `VoxChunkGroupRaw` 内受影响的块。
+pub fn refresh_dirty_voxel_meshes(
+    mut dirty: ResMut<VoxelDirtySet>,
+    interner: Res<VoxelInterner>,
+    mut groups: Query<(&VoxVolume, &mut VoxChunkGroupRaw)>,
+) {
+    let edits = dirty.take_edits();
+    if edits.is_empty() {
+        return;
+    }
+    let affected = affected_chunk_keys(&edits);
+    if affected.is_empty() {
+        return;
+    }
+
+    for (volume, mut raw) in &mut groups {
+        // 粗 LOD 的 raw 不是从 VoxVolume 折叠出来的，不能在这里改。
+        if raw.lod != 0 {
+            continue;
+        }
+        let Some(anchor) = raw.chunks.keys().next().copied() else {
+            continue;
+        };
+        let region = group_key(anchor, 0);
+        for key in &affected {
+            if group_key(*key, 0) != region {
+                continue;
+            }
+            refresh_group_chunk(volume, interner.inner(), &mut raw, *key);
+        }
+    }
+}
+
+/// 编辑块 + 受 halo 影响的邻块（确定性升序）。
+fn affected_chunk_keys(edits: &[DirtyChunk]) -> BTreeSet<ChunkKey> {
+    let axis = game_engine::voxel::chunk_voxels_per_axis() as u8;
+    let mut keys = BTreeSet::new();
+    for edit in edits {
+        keys.insert(edit.key);
+        for dx in -1i32..=1 {
+            for dy in -1i32..=1 {
+                for dz in -1i32..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    if !side_touched(edit.edited, dx, 0, axis)
+                        || !side_touched(edit.edited, dy, 1, axis)
+                        || !side_touched(edit.edited, dz, 2, axis)
+                    {
+                        continue;
+                    }
+                    keys.insert(ChunkKey::new(
+                        edit.key.x + dx,
+                        edit.key.y + dy,
+                        edit.key.z + dz,
+                    ));
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn side_touched(edited: VoxelBox, delta: i32, axis: usize, chunk_axis: u8) -> bool {
+    match delta {
+        -1 => edited.min[axis] == 0,
+        1 => edited.max[axis] >= chunk_axis,
+        _ => true,
+    }
+}
+
+fn refresh_group_chunk(
+    volume: &VoxVolume,
+    interner: &game_engine::voxel::VoxInterner<u8>,
+    raw: &mut VoxChunkGroupRaw,
+    key: ChunkKey,
+) {
+    let Some(tree) = volume.get_chunk(&key) else {
+        return;
+    };
+    let mut neighbours = Neighbourhood::none();
+    for dx in -1i8..=1 {
+        for dy in -1i8..=1 {
+            for dz in -1i8..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let neighbour = ChunkKey::new(
+                    key.x + i32::from(dx),
+                    key.y + i32::from(dy),
+                    key.z + i32::from(dz),
+                );
+                if let Some(tree) = volume.get_chunk(&neighbour) {
+                    neighbours.set(dx, dy, dz, tree);
+                }
+            }
+        }
+    }
+
+    let halo = extract_raw_halo(tree, interner, MeshBlock::new(key, Lod::new(0)), neighbours);
+    let solid = raw_halo_has_solid_interior(&halo);
+    match raw.chunks.get_mut(&key) {
+        // 保留原有 skirt_mask：它由 LOD 分区决定，与方块内容无关。
+        Some(entry) => entry.0 = halo,
+        // 新变成实心的块（例如在空 chunk 里放方块）必须补进组，否则不可见。
+        None if solid => {
+            raw.chunks.insert(key, (halo, 0));
+        }
+        None => {}
+    }
+}
+
 /// Godot 侧 `VoxelMaterialLibrary.build_face_material_map()` 产出的映射表长度：
 /// 256 个 block × 6 个面（face = plane*2+dir，顺序 `[+x, -x, +y, -y, +z, -z]`）。
 pub const FACE_MATERIAL_MAP_LEN: usize = 256 * FACE_COUNT;
@@ -155,10 +297,11 @@ pub fn mesh_raw_halo_for_render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
+    use crate::static_data::voxel::{DEFAULT_VOXEL_SIZE, GRASS_BLOCK};
     use game_engine::presentation::voxel::{
         pack_rect, pack_rect_with_ao, raw_halo_index, unpack_ao, unpack_rect, RAW_VOXELS,
     };
+    use game_engine::voxel::{set_voxel, MaxDepth, VoxOpsWrite, VoxTree, CHUNK_DEPTH};
 
     fn rect(
         plane: u8,
@@ -374,5 +517,162 @@ mod tests {
         assert!(mesh_raw_halo_for_render(0, &stone, 0, &[])
             .iter()
             .all(|w| unpack_rect(*w).material == STONE_BLOCK));
+    }
+
+    fn tree_with_voxels(interner: &mut VoxelInterner, voxels: &[(IVec3, u8)]) -> VoxTree<u8> {
+        let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+        for (point, value) in voxels {
+            let _ = tree.set(interner.inner_mut(), *point, *value);
+        }
+        tree
+    }
+
+    fn raw_for(interner: &VoxelInterner, tree: &VoxTree<u8>, key: ChunkKey) -> Vec<u8> {
+        extract_raw_halo(
+            tree,
+            interner.inner(),
+            MeshBlock::new(key, Lod::new(0)),
+            Neighbourhood::none(),
+        )
+    }
+
+    fn edit_volume(
+        app: &mut App,
+        entity: Entity,
+        dirty: &mut VoxelDirtySet,
+        voxel: [i32; 3],
+        value: u8,
+    ) {
+        app.world_mut()
+            .resource_scope::<VoxelInterner, _>(|world, mut interner| {
+                let mut entity_mut = world.entity_mut(entity);
+                let mut volume = entity_mut.get_mut::<VoxVolume>().expect("volume");
+                assert_eq!(
+                    set_voxel(&mut volume, &mut interner, dirty, voxel, value),
+                    Ok(true)
+                );
+            });
+        // resource_scope 结束后把脏集放回 App，供 Update 系统消费。
+        app.world_mut().insert_resource(std::mem::take(dirty));
+    }
+
+    #[test]
+    fn dirty_edit_refreshes_group_raw_halo() {
+        let key = ChunkKey::new(0, 0, 0);
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let tree = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let raw = raw_for(&interner, &tree, key);
+        let index = raw_halo_index(6, 1, 1);
+        assert_eq!(raw[index], GRASS_BLOCK);
+
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume.insert_chunk(key, tree);
+        let mut chunks = BTreeMap::new();
+        chunks.insert(key, (raw, 0));
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+        let entity = app
+            .world_mut()
+            .spawn((volume, VoxChunkGroupRaw { lod: 0, chunks }))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        edit_volume(&mut app, entity, &mut dirty, [5, 0, 0], 0);
+        app.update();
+
+        let raw = app
+            .world()
+            .entity(entity)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group");
+        assert_eq!(
+            raw.chunks[&key].0[index], 0,
+            "breaking a voxel must clear its halo byte in the same update"
+        );
+    }
+
+    #[test]
+    fn dirty_edit_adds_a_newly_solid_chunk_to_the_group() {
+        let key0 = ChunkKey::new(0, 0, 0);
+        let key1 = ChunkKey::new(1, 0, 0);
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let tree0 = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let raw0 = raw_for(&interner, &tree0, key0);
+        let tree1 = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume.insert_chunk(key0, tree0);
+        volume.insert_chunk(key1, tree1);
+        let mut chunks = BTreeMap::new();
+        chunks.insert(key0, (raw0, 0));
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+        let entity = app
+            .world_mut()
+            .spawn((volume, VoxChunkGroupRaw { lod: 0, chunks }))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        // chunk 1 的局部 (0,0,0) = body 体素 (32,0,0)。
+        edit_volume(&mut app, entity, &mut dirty, [32, 0, 0], GRASS_BLOCK);
+        app.update();
+
+        let raw = app
+            .world()
+            .entity(entity)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group");
+        let (halo, _) = raw
+            .chunks
+            .get(&key1)
+            .expect("newly solid chunk must be added");
+        assert_eq!(halo[raw_halo_index(1, 1, 1)], GRASS_BLOCK);
+    }
+
+    #[test]
+    fn halo_affected_keys_expand_only_on_touched_boundaries() {
+        let key = ChunkKey::new(0, 0, 0);
+        let center = DirtyChunk {
+            key,
+            edited: VoxelBox {
+                min: [1, 1, 1],
+                max: [2, 2, 2],
+            },
+        };
+        assert_eq!(
+            affected_chunk_keys(&[center]),
+            BTreeSet::from([key]),
+            "a center edit must not dirty neighbours"
+        );
+
+        let corner = DirtyChunk {
+            key,
+            edited: VoxelBox {
+                min: [0, 0, 0],
+                max: [1, 1, 1],
+            },
+        };
+        let keys = affected_chunk_keys(&[corner]);
+        assert_eq!(keys.len(), 8, "corner edit reaches the 8 chunks around it");
+        assert!(keys.contains(&ChunkKey::new(-1, -1, -1)));
+        assert!(keys.contains(&ChunkKey::new(0, 0, 0)));
+
+        let full = DirtyChunk {
+            key,
+            edited: VoxelBox::FULL,
+        };
+        assert_eq!(
+            affected_chunk_keys(&[full]).len(),
+            27,
+            "a whole-chunk edit touches all 26 halo neighbours"
+        );
     }
 }

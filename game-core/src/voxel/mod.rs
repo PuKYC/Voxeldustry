@@ -12,11 +12,13 @@
 pub mod body;
 pub mod dock;
 pub mod lod;
+pub mod pick;
 pub mod terrain;
 
 pub use body::{AutomatonTag, Body, BodyKind, IslandTag, ShipTag, StructureTag};
 pub use dock::DockRecord;
 pub use lod::{lod_for_distance, LodPolicy, VoxelLodConfig, MAX_LOD};
+pub use pick::{pick_nearest, raycast_volume, VolumeHit, VoxelPickHit, VoxelRay};
 
 // 面向 FFI 的引擎体素类型重导出。godot-client-ext 只依赖 game-core，
 // 需要经 game_core::voxel::* 取到这些机制类型。

@@ -21,9 +21,10 @@ use game_engine::presentation::voxel::extract_raw_halo;
 use game_engine::presentation::RenderTransform;
 use game_engine::spatial::Size;
 use game_engine::voxel::{
-    ChunkKey, CoefficientCombine, Collider, Friction, LinearVelocity, LockedAxes, Lod, MaxDepth, MeshBlock, Neighbourhood,
-    Restitution, RigidBody, ShapeCastConfig, SleepingDisabled, SpatialQuery, SpatialQueryFilter, VoxOpsWrite,
-    VoxTree, VoxVolume, VoxelCollider, VoxelInterner, CHUNK_DEPTH,
+    ChunkKey, CoefficientCombine, Collider, Friction, LinearVelocity, LockedAxes, Lod, MaxDepth,
+    MeshBlock, Neighbourhood, Restitution, RigidBody, ShapeCastConfig, SleepingDisabled,
+    SpatialQuery, SpatialQueryFilter, VoxOpsWrite, VoxTree, VoxVolume, VoxelCollider,
+    VoxelInterner, CHUNK_DEPTH,
 };
 
 use super::spawn_local_player;

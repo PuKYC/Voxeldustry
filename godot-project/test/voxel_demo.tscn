@@ -21,3 +21,4 @@ manager_path = NodePath("../BevyAppManager")
 entity_parent = NodePath("..")
 mode = 1
 enable_demo = false
+source_id = 4

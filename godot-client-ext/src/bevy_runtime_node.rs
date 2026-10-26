@@ -148,7 +148,16 @@ impl BevyAppManager {
     /// `enable_demo = false` 时不挂 `game-core::dev::demo`（生产环境应为 `false`）。
     #[func]
     fn start_bevy_with_config(&mut self, fixed_hz: f64, runner_hz: f64, enable_demo: bool) {
-        self.start_backend(fixed_hz, runner_hz, enable_demo, None, None, false, false);
+        self.start_backend(
+            fixed_hz,
+            runner_hz,
+            enable_demo,
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
     }
 
     /// 启动性能测试场景：生成 `entity_count` 个每 tick 移动的实体（取代 demo）。
@@ -158,13 +167,25 @@ impl BevyAppManager {
     #[func]
     fn start_bevy_perf_test(&mut self, fixed_hz: f64, runner_hz: f64, entity_count: i64) {
         let count = usize::try_from(entity_count).unwrap_or(1).max(1);
-        self.start_backend(fixed_hz, runner_hz, false, Some(count), None, false, false);
+        self.start_backend(
+            fixed_hz,
+            runner_hz,
+            false,
+            Some(count),
+            None,
+            false,
+            false,
+            false,
+        );
     }
 
     /// 启动体素地形 demo：挂 `TerrainConfig::default()`（radius 2 / max_lod 1）。
     ///
     /// 地形在 Startup 生成一次，产出带 `VoxChunkRaw` 的 mesh 块实体；
     /// 贪婪 meshing 在 Godot 侧调 gdext `mesh_voxel_halo` 现算，再由 VoxelMeshNode 渲染。
+    /// 同时挂体素观察者（`dev::voxel_viewer`）：一个落在地表上的玩家 + 相机，
+    /// 让 break_block / place_block 有射线来源；输入源 ID = 4，Godot 侧
+    /// `voxel_demo.tscn` 的 `BevyClient.source_id` 必须与它一致。
     ///
     /// 默认 radius 2 / max_lod 1（144 子块）：release ≈ 2–4 s，**debug ≈ 30 s**
     /// （生成是 debug 下的瓶颈）。只想快速看一眼可以用
@@ -179,6 +200,7 @@ impl BevyAppManager {
             Some(TerrainConfig::default()),
             false,
             false,
+            true,
         );
     }
 
@@ -202,7 +224,16 @@ impl BevyAppManager {
             max_lod,
             ..TerrainConfig::default()
         };
-        self.start_backend(fixed_hz, runner_hz, false, None, Some(terrain), true, false);
+        self.start_backend(
+            fixed_hz,
+            runner_hz,
+            false,
+            None,
+            Some(terrain),
+            true,
+            false,
+            false,
+        );
     }
 
     /// 启动游戏内容测试场景：静态体素平台（可见 + 碰撞）与带碰撞的玩家。
@@ -210,7 +241,7 @@ impl BevyAppManager {
     /// Godot 侧对应 `test/gameplay_test.tscn`（`BevyClient.mode = gameplay_test`）。
     #[func]
     fn start_bevy_gameplay_test(&mut self, fixed_hz: f64, runner_hz: f64) {
-        self.start_backend(fixed_hz, runner_hz, false, None, None, false, true);
+        self.start_backend(fixed_hz, runner_hz, false, None, None, false, true, false);
     }
 
     #[func]
@@ -617,6 +648,7 @@ impl BevyAppManager {
         terrain: Option<TerrainConfig>,
         terrain_perf: bool,
         gameplay_test: bool,
+        voxel_viewer: bool,
     ) {
         if self.worker.is_some() {
             self.shutdown_blocking();
@@ -639,6 +671,7 @@ impl BevyAppManager {
             terrain,
             terrain_perf,
             gameplay_test,
+            voxel_viewer,
             voxel_lod: Some(self.voxel_lod.clone()),
         };
 

@@ -19,9 +19,9 @@ use game_engine::presentation::voxel::{
 use game_engine::rng::RngState;
 use game_engine::voxel::{
     chunk_key, chunk_voxels_per_axis, count_body_nodes, extract_block, lod_block_origin,
-    neighbors6, release_body, ChunkKey, DirtyChunk, Lod, MaxDepth, MeshBlock, VoxOpsBulkWrite,
-    VoxOpsState, VoxOpsWrite, VoxTree, VoxVolume, VoxelAabb, VoxelBox, VoxelDirtySet,
-    VoxelInterner, CHUNK_DEPTH,
+    neighbors6, release_body, set_voxel, ChunkKey, DirtyChunk, Lod, MaxDepth, MeshBlock,
+    VoxOpsBulkWrite, VoxOpsState, VoxOpsWrite, VoxTree, VoxVolume, VoxelAabb, VoxelBox,
+    VoxelDirtySet, VoxelInterner, CHUNK_DEPTH,
 };
 use voxel::mesh::{extract_block_tree_with_ao, extract_block_with_ao, AoRectBatch};
 use voxel::store::VoxInterner;
@@ -170,6 +170,94 @@ fn incremental_mesh_equals_full_mesh() {
     );
     assert_eq!(incremental.origin, full.origin);
     assert_eq!(incremental.lod, full.lod);
+}
+
+/// T2 acceptance: a single `set_voxel` edit followed by the incremental cache
+/// must reuse most slices and rebuild only the dirty slice range.
+#[test]
+fn set_voxel_rebuilds_only_dirty_incremental_slices() {
+    let key = chunk_key(0, 0, 0);
+    let block = MeshBlock::new(key, Lod::new(0));
+    let mut interner = VoxelInterner::new(8 * 1024 * 1024);
+    let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+    volume.insert_chunk(key, build_chunk(&mut interner, base_voxel));
+
+    let mut wrapped = WrappedBlockCache::default();
+    let mut ext_cache = ExternalMaskCache::default();
+    let mut cache = IncrementalMeshCache::default();
+    let plan = MeshBlockDirty {
+        block,
+        internal: true,
+        faces: FaceMask(0),
+    };
+
+    let (_, first_changed) = mesh_block_incremental(
+        &volume.chunks,
+        interner.inner_mut(),
+        &mut wrapped,
+        &mut ext_cache,
+        &mut cache,
+        plan,
+        [None; 6],
+    );
+    assert!(first_changed, "first build must produce geometry");
+    let total_slices = cache.last_report().expect("first report").total_slices;
+    assert!(
+        total_slices > 6,
+        "terrain must span more than the 6 outer slices"
+    );
+
+    let mut dirty = VoxelDirtySet::new();
+    assert_eq!(
+        set_voxel(&mut volume, &mut interner, &mut dirty, [16, 16, 16], 7),
+        Ok(true)
+    );
+    let edits = dirty.take_edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].edited, VoxelBox::of_voxel([16, 16, 16]));
+
+    // The edit path owns wrapper invalidation; the incremental cache entry must
+    // survive so the rebuild is a slice diff, not a cold start.
+    wrapped.invalidate_covered(interner.inner_mut(), key);
+    let (_, changed) = mesh_block_incremental(
+        &volume.chunks,
+        interner.inner_mut(),
+        &mut wrapped,
+        &mut ext_cache,
+        &mut cache,
+        plan,
+        [None; 6],
+    );
+    assert!(changed, "one voxel edit must change the mesh");
+
+    let report = cache.last_report().expect("incremental report");
+    assert!(
+        report.total_slices >= total_slices,
+        "a new material can add slice keys, never drop existing ones"
+    );
+    assert!(
+        report.dirty_slices > 0,
+        "the edited slice range must be dirty"
+    );
+    assert!(
+        report.dirty_slices < report.total_slices,
+        "must not rebuild every slice: dirty={} total={}",
+        report.dirty_slices,
+        report.total_slices
+    );
+    assert!(
+        report.reused_slices > 0,
+        "untouched slices must be reused: reused={} total={}",
+        report.reused_slices,
+        report.total_slices
+    );
+    assert!(
+        report.changed_slices > 0,
+        "the material change must alter at least one rect"
+    );
+
+    cache.clear();
+    wrapped.clear(interner.inner_mut());
 }
 
 // ---------------------------------------------------------------------------

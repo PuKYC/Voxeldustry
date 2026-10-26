@@ -44,7 +44,7 @@ pub use avian3d::prelude::{
     CoefficientCombine, Collider, ColliderOf, Friction, LinearVelocity, LockedAxes, Restitution,
     RigidBody, ShapeCastConfig, SleepingDisabled, SpatialQuery, SpatialQueryFilter,
 };
-pub use change::{apply_voxel_changes, VoxelChangeBuffer, VoxelEdit, VoxelSet};
+pub use change::{apply_voxel_changes, set_voxel, VoxelChangeBuffer, VoxelEdit, VoxelSet};
 #[cfg(feature = "physics")]
 pub use collision::{
     build_chunk_voxels, build_voxel_collider, cleanup_voxel_colliders, collect_chunk_solid_voxels,

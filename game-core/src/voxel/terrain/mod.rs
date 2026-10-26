@@ -54,7 +54,7 @@ use game_engine::presentation::voxel::{
 use game_engine::presentation::RenderTransform;
 use game_engine::spatial::Size;
 use game_engine::voxel::{
-    ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelInterner,
+    ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelDirtySet, VoxelInterner,
 };
 
 use crate::presentation::voxel_mesh::VoxChunkGroupRaw;
@@ -162,7 +162,34 @@ pub(crate) fn register_systems(app: &mut App) {
         .init_resource::<TerrainStreamState>()
         // 观察者写入者在 FixedUpdate；流式重划分放 Update 以便同 tick 看到新位置。
         .add_systems(Startup, build_terrain)
+        // 编辑后包装缓存必须失效：否则下一次 LOD 流式重划分会用旧树重新
+        // extract，把玩家刚改的方块「回滚」掉。脏集由 mesh 刷新系统消费，
+        // 所以这里只 peek，并且必须排在那之前。
+        .add_systems(
+            Update,
+            invalidate_stale_terrain_caches
+                .before(crate::presentation::voxel_mesh::refresh_dirty_voxel_meshes)
+                .before(stream_terrain_lod),
+        )
         .add_systems(Update, stream_terrain_lod);
+}
+
+/// 把脏块的包装树从 `WrappedBlockCache` / 邻块缓存里清掉。
+///
+/// 只处理 LOD0 的包装树：粗 LOD 由 `GeneratedBlockCache` 从生成器重算，
+/// 不读 `VoxVolume` 的编辑。
+fn invalidate_stale_terrain_caches(
+    mut interner: ResMut<VoxelInterner>,
+    dirty: Res<VoxelDirtySet>,
+    mut wrapped: ResMut<WrappedBlockCache>,
+    mut neighbors: ResMut<TerrainNeighborBlocks>,
+) {
+    for edit in dirty.peek_edits() {
+        wrapped.invalidate_covered(interner.inner_mut(), edit.key);
+        neighbors
+            .0
+            .invalidate_covered(interner.inner_mut(), edit.key);
+    }
 }
 
 /// 已产出的 mesh 分组实体索引：`GroupKey -> Entity`（BTreeMap 键升序 = 确定性）。

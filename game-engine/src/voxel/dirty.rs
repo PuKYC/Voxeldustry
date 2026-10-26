@@ -50,7 +50,7 @@ impl VoxelBox {
 }
 
 /// 一个被编辑的子块及其块内体素范围。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirtyChunk {
     /// 子块坐标。
     pub key: ChunkKey,
