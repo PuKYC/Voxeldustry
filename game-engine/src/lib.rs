@@ -42,3 +42,5 @@ pub mod voxel;
 pub mod streaming;
 #[cfg(feature = "voxel")]
 pub mod residency;
+#[cfg(feature = "voxel")]
+pub mod save;

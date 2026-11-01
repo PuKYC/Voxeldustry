@@ -1,0 +1,236 @@
+//! 存档容器的线格式常量、内存类型与 §1.1 摘要算法。
+//!
+//! 这里只有“数据长什么样”，没有字节读写；编解码在 codec 模块。
+//! 字段/偏移/宽度逐字节照《存档格式规格》§2（world.meta）与 §3（region 文件）。
+
+use std::collections::BTreeMap;
+
+use ::voxel::ChunkKey;
+
+use crate::body_key::BodyKey;
+
+pub use crate::streaming::{ChunkRecord, EntityRecord};
+
+/// world.meta 魔数：b"VXWORLD\0"（§2 偏移 0）。
+pub const WORLD_MAGIC: [u8; 8] = *b"VXWORLD\0";
+/// region 文件魔数：b"VXREGION"（§3 偏移 0）。
+pub const REGION_MAGIC: [u8; 8] = *b"VXREGION";
+/// 世界格式版本；未来只升不降（§2 偏移 8 / §6.1）。
+pub const FORMAT_VERSION: u16 = 1;
+/// 组件负载编码；v1 = 1 = postcard 1.1.3（§2 偏移 12 / §4.3）。
+pub const CODEC_ID: u16 = 1;
+/// world.meta 头长（§2 偏移 10）。
+pub const WORLD_HEADER_LEN: u16 = 48;
+/// region 头长（§3 偏移 10）。
+pub const REGION_HEADER_LEN: u16 = 32;
+/// 一条 body 记录的字节数（§2）。
+pub const BODY_RECORD_LEN: usize = 54;
+/// 一条 region 索引项的字节数（§3）。
+pub const REGION_INDEX_ENTRY_LEN: usize = 32;
+/// 一条提案记录的字节数（§3.3）。
+pub const PROPOSAL_RECORD_LEN: usize = 56;
+/// 文件尾摘要长度（§0 / §1.1）。
+pub const DIGEST_LEN: usize = 8;
+/// body 表上限（§2 偏移 40）。
+pub const MAX_BODY_COUNT: u32 = 65_536;
+/// 单 region 区块数上限（§3 偏移 12）。
+pub const MAX_CHUNK_COUNT: u32 = 64;
+/// 单条记录体长度上限（§0）。
+pub const MAX_RECORD_LEN: u32 = 16 * 1024 * 1024;
+/// region 文件长度上限（§0）。
+pub const MAX_REGION_FILE_LEN: u64 = 64 * 1024 * 1024;
+/// 单个组件负载长度上限（§4.1：payload_len ≤ 1 MiB）。
+pub const MAX_COMPONENT_PAYLOAD_LEN: u32 = 1024 * 1024;
+/// region 的边长（块数）：x/z 各 4 块，y 带 4 块（§1）。
+pub const REGION_SIZE: i32 = 4;
+
+/// §1.1 的 splitmix64。**唯一允许的哈希实现**，不与别的哈希混用。
+#[must_use]
+pub const fn splitmix64(x: u64) -> u64 {
+    let mut x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// §1.1 的文件尾摘要：覆盖它之前的**全部字节**，按 8 字节小端分块。
+///
+/// 只做纠错，不防篡改（64 位非密码学）。
+#[must_use]
+pub fn digest(bytes: &[u8]) -> u64 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64;
+    for chunk in bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h = splitmix64(h ^ u64::from_le_bytes(word));
+    }
+    splitmix64(h ^ bytes.len() as u64)
+}
+
+/// region 键：逐轴 div_euclid(REGION_SIZE)，负坐标不是截断除法（§1）。
+#[must_use]
+pub fn region_of(key: ChunkKey) -> ChunkKey {
+    ChunkKey::new(
+        key.x.div_euclid(REGION_SIZE),
+        key.y.div_euclid(REGION_SIZE),
+        key.z.div_euclid(REGION_SIZE),
+    )
+}
+
+/// body 的 kind_tag（§2：0 岛 / 1 船 / 2 结构 / 3 自动机）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum BodyKind {
+    /// 岛：用 anchored + biome，通常按 Miss 生成。
+    Island = 0,
+    /// 船。
+    Ship = 1,
+    /// 结构。§2 说 attach_tag 非 2 只有结构可用；本层只校验枚举值与
+    /// attach_tag = 1 的 attach_to 引用，不强制 kind 与 attach 的组合。
+    Structure = 2,
+    /// 自动机。
+    Automaton = 3,
+}
+
+impl BodyKind {
+    /// 线格式的 kind_tag。
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// 从 kind_tag 还原；未知值返回 None（调用方必须拒绝，不能跳过 body）。
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Island),
+            1 => Some(Self::Ship),
+            2 => Some(Self::Structure),
+            3 => Some(Self::Automaton),
+            _ => None,
+        }
+    }
+}
+
+/// body 的 attach_tag（§2：0 世界 / 1 body / 2 自由）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum AttachTag {
+    /// 锚在世界。
+    World = 0,
+    /// 挂在另一个 body 上；此时 attach_to 必须非 0 且是表中的另一个 body。
+    Body = 1,
+    /// 自由。
+    Free = 2,
+}
+
+impl AttachTag {
+    /// 线格式的 attach_tag。
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// 从 attach_tag 还原；未知值返回 None（调用方必须拒绝）。
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::World),
+            1 => Some(Self::Body),
+            2 => Some(Self::Free),
+            _ => None,
+        }
+    }
+}
+
+/// 一条 54 B 的 body 记录（§2）。
+///
+/// 线格式末尾的 reserved u16 不是内存字段，编码恒写 0、解码要求 0。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyRecord {
+    /// body 的稳定 ID（= 表键）。
+    pub id: BodyKey,
+    /// kind_tag。
+    pub kind: BodyKind,
+    /// attach_tag。
+    pub attach: AttachTag,
+    /// 岛用；其余 kind 应为 0（§2 的“置 0”是写方归一化，本层不据此判损坏）。
+    pub biome: u8,
+    /// 岛用（0/1）；其余 kind 应为 0（同上，本层不做归一化）。
+    pub anchored: u8,
+    /// I40F24 位模式（to_bits），必须 > 0。
+    pub voxel_size: i64,
+    /// 漂移 I40F24 位模式（x/y/z）；非岛应为 0（同上，本层不做归一化）。
+    pub drift: [i64; 3],
+    /// 仅 attach = Body 时非 0，且必须是表中另一个 body（允许前向引用）。
+    pub attach_to: BodyKey,
+}
+
+/// world.meta 的内存形态（§2）。
+///
+/// bodies 用 BTreeMap 保证按 BodyKey 严格升序写盘/读盘，不看任何 HashMap 顺序（§8）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WorldMeta {
+    /// 世界种子（§2 偏移 16）。
+    pub seed: u64,
+    /// 快照时的游戏累计 tick（§2 偏移 24）。
+    pub world_tick: u64,
+    /// StableIdAllocator 的下一个 ID（§2 偏移 32）。
+    pub next_stable_entity_id: u64,
+    /// body 表：键必须等于 BodyRecord::id；最多 MAX_BODY_COUNT 条。
+    pub bodies: BTreeMap<BodyKey, BodyRecord>,
+}
+
+impl WorldMeta {
+    /// body 表条数（线格式 body_count）。
+    #[must_use]
+    pub fn body_count(&self) -> u32 {
+        u32::try_from(self.bodies.len()).unwrap_or(u32::MAX)
+    }
+}
+
+/// 一个 region 文件的内存形态（§3）。
+///
+/// 索引项里的 generator_version 存在每条 ChunkRecord 里；record_offset/record_len、
+/// index_offset、max_stable_entity_id 都是编码时现算、解码时校验的派生值，不重复存字段。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RegionFile {
+    /// 本 region 的区块记录，按 ChunkKey 升序（BTreeMap 天然保证）。
+    pub chunks: BTreeMap<ChunkKey, ChunkRecord>,
+}
+
+impl RegionFile {
+    /// 区块数（线格式 chunk_count）。
+    #[must_use]
+    pub fn chunk_count(&self) -> u32 {
+        u32::try_from(self.chunks.len()).unwrap_or(u32::MAX)
+    }
+
+    /// 本 region 实体最大 ID；无实体为 0（§3 偏移 24）。
+    #[must_use]
+    pub fn max_stable_entity_id(&self) -> u64 {
+        self.chunks
+            .values()
+            .flat_map(|record| record.entities.iter())
+            .map(|entity| entity.stable_entity_id)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 是否没有区块记录（合法：chunk_count = 0 的空文件）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+}
+
+/// 一条组件记录（§4.1 的 ComponentRecord，不含外层 envelope）。
+///
+/// payload 是 codec_id = 1 的编码结果，本模块当**不透明字节**原样往返。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ComponentRecord {
+    /// 稳定类型 ID；0 非法，升序且同实体不重复。
+    pub stable_type_id: u32,
+    /// postcard 负载（本轮不解析），长度 ≤ MAX_COMPONENT_PAYLOAD_LEN。
+    pub payload: Vec<u8>,
+}
