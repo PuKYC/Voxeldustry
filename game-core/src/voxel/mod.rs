@@ -43,25 +43,32 @@ impl Plugin for GameVoxelPlugin {
 mod tests {
     use super::*;
     use crate::static_data::voxel::DEFAULT_BIOME;
+    use game_engine::identity::{StableEntityId, StableIdPlugin, StableIdWorldExt};
     use game_engine::math::FixedPoint;
 
     #[test]
     fn game_voxel_plugin_spawns_bodies_and_applies_lod_policy() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
         app.add_plugins(GameVoxelPlugin);
         // 只用 app.update() 的测试必须显式 finish，Avian 在 Plugin::finish 注册诊断资源。
         app.finish();
 
         app.world_mut()
-            .spawn((Body::island(true, DEFAULT_BIOME), IslandTag));
-        app.world_mut().spawn((Body::ship(), ShipTag));
+            .spawn_stable((Body::island(true, DEFAULT_BIOME), IslandTag));
+        app.world_mut().spawn_stable((Body::ship(), ShipTag));
         app.world_mut()
-            .spawn((Body::structure(Attachment::World), StructureTag));
-        app.world_mut().spawn((Body::automaton(), AutomatonTag));
+            .spawn_stable((Body::structure(Attachment::World), StructureTag));
+        app.world_mut()
+            .spawn_stable((Body::automaton(), AutomatonTag));
 
         let mut bodies = app.world_mut().query::<&Body>();
         assert_eq!(bodies.iter(app.world()).count(), 4);
+
+        // 所有 body 都必须带 StableEntityId（spawn 点统一走 spawn_stable）。
+        let mut bodies_with_id = app.world_mut().query::<(&Body, &StableEntityId)>();
+        assert_eq!(bodies_with_id.iter(app.world()).count(), 4);
 
         let mut islands = app.world_mut().query::<(&Body, &IslandTag)>();
         assert_eq!(islands.iter(app.world()).count(), 1);

@@ -17,6 +17,7 @@
 
 pub mod aoi;
 pub mod backend;
+pub mod body_key;
 pub mod bridge;
 pub mod identity;
 pub mod ids;
@@ -37,3 +38,7 @@ pub mod strategy;
 /// 体素世界层；仅 feature = "voxel" 编译。
 #[cfg(feature = "voxel")]
 pub mod voxel;
+#[cfg(feature = "voxel")]
+pub mod streaming;
+#[cfg(feature = "voxel")]
+pub mod residency;
