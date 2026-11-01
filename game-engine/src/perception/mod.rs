@@ -261,9 +261,14 @@ pub fn memory_path_component_visible<S: 'static>(
 
 /// 【Debug 统计】：记录本帧发生的可见性契约违规次数。
 ///
-/// 仅在 Debug 模式下存在。除了触发 error! 日志外，还会递增此计数器。
+/// **类型始终存在**，只有自检系统与 `init_resource` 在 Debug 模式注册
+/// （见 `define_privacy_components!`）。类型本身不做 cfg 门控，是因为
+/// `cargo test --release` 的 doctest 会用 `debug_assertions` 重编调用方 crate，
+/// 而依赖 rlib 已按 release 编译——此时若类型被 cfg 掉，宏展开会直接编译失败
+/// （E0432/E0425）。release 下没人插入它，等于一个零成本的空类型。
+///
+/// 除了触发 error! 日志外，还会递增此计数器。
 /// 可用于在 Dev UI 中实时监控违规情况，或在集成测试中作为断言信号。
-#[cfg(debug_assertions)]
 #[derive(Resource, Default, Debug)]
 pub struct VisibilityViolations(pub usize);
 
