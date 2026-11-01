@@ -35,7 +35,9 @@
 mod codec;
 mod format;
 mod fs_atomic;
+pub mod persist;
 pub mod plugin;
+mod snapshot;
 pub mod store;
 
 pub use codec::{
@@ -58,6 +60,13 @@ pub use plugin::{
     PollReport, SaveConfig, SaveFailed, SavePlugin, SaveSet, SaveStats, SaveStore, SaveSucceeded,
     POLL_APPLY_BUDGET,
 };
+
+/// 组件负载编解码与类型注册表（§4）：postcard 1.1.3 + `StableTypeId`。
+pub use persist::{
+    ApplyReport, OpaqueComponents, PersistComponent, PersistPlugin, PersistRegistry, StableTypeId,
+};
+
+pub use snapshot::{capture, EntitySnapshot, Persist};
 
 /// 文件 IO 层（§1 目录命名、§5 原子写与崩溃一致性）。
 pub use store::{
@@ -118,7 +127,7 @@ impl fmt::Display for SaveError {
 impl std::error::Error for SaveError {}
 
 /// SaveError 的失败类别。所有变体都只含整数/静态串，方便断言与日志。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SaveErrorKind {
     /// 字节不够：需要 need，实际只剩 have。
     Truncated { need: usize, have: usize },
@@ -180,6 +189,13 @@ pub enum SaveErrorKind {
         kind: std::io::ErrorKind,
         raw: Option<i32>,
     },
+    /// 组件负载（codec_id = 1 的 postcard）编解码失败（§4.3）。
+    ///
+    /// `what` 是阶段（postcard encode / decode），`detail` 是原始错误文本。
+    Payload {
+        what: &'static str,
+        detail: String,
+    },
 }
 
 impl fmt::Display for SaveErrorKind {
@@ -231,6 +247,7 @@ impl fmt::Display for SaveErrorKind {
                     "digest mismatch: stored {stored:016X}, computed {computed:016X}"
                 )
             }
+            Self::Payload { what, detail } => write!(f, "{what} failed: {detail}"),
             Self::BodyKeyMismatch { map, record } => {
                 write!(f, "body map key {map} != record id {record}")
             }

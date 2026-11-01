@@ -10,6 +10,7 @@ fixed = { workspace = true }
 rand_pcg = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true }
+postcard = { workspace = true }
 rstar = { workspace = true }
 crossbeam-channel = { workspace = true }
 bevy_replicon = { workspace = true, optional = true }
