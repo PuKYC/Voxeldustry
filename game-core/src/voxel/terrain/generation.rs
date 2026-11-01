@@ -141,6 +141,11 @@ impl WorldGenerator {
     ///
     /// 键是 `(origin, lod)` 的纯函数：不依赖生成顺序，也不读其它块
     /// （L3 确定性约束）。
+    ///
+    /// **已知债务（阶段 3 / doc 12 §9）**：本函数**不读 `VoxVolume`**，所以粗
+    /// LOD 只由 `(origin, lod)` 决定，**不反映玩家编辑**。
+    /// `invalidate_stale_terrain_caches` 清缓存只能避免“返回旧树”，重生成仍是
+    /// 生成器原始内容；让粗 LOD 跟随编辑需要 edit-aware 下采样，属阶段 3。
     #[must_use]
     pub fn generate_block_at_lod(
         &self,

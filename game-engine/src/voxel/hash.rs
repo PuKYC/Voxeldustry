@@ -101,21 +101,13 @@ pub fn dec_ref_recursive(interner: &mut VoxInterner<u8>, root: &BlockId) {
     }
 }
 
-/// 释放一个体素体：遍历所有 chunk 根做 dec_ref_recursive 并清空容器。
-/// 返回释放的根数量。
+/// 释放一个体素体：逐树 `dec_ref_recursive` 并清空容器。
+/// 返回释放的非空根数量（实现委托给 [`VoxVolume::clear`]，避免两份拷贝）。
 ///
-/// 注意：若调用点持有表现层的 WrappedBlockCache，必须先用
-/// `crate::presentation::voxel::release_body_with_cache`，否则包装缓存里的
-/// root 引用会把 body 节点钉住。本函数保持原签名不变，供无缓存的调用点使用。
+/// 注意：若调用点持有表现层 / terrain 的块缓存，必须先清缓存，否则缓存里的
+/// root 引用会把 body 节点钉住：
+/// - 只有 `WrappedBlockCache`：`crate::presentation::voxel::release_body_with_cache`；
+/// - terrain（四份缓存）：`game_core::voxel::terrain::release_terrain_body`。
 pub fn release_body(interner: &mut VoxInterner<u8>, volume: &mut VoxVolume) -> usize {
-    let mut released = 0;
-    for tree in volume.chunks.values() {
-        let root = tree.get_root_id();
-        if !root.is_empty() {
-            interner.dec_ref_recursive(&root);
-            released += 1;
-        }
-    }
-    volume.chunks.clear();
-    released
+    volume.clear(interner)
 }

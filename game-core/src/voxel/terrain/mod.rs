@@ -54,7 +54,8 @@ use game_engine::presentation::voxel::{
 use game_engine::presentation::RenderTransform;
 use game_engine::spatial::Size;
 use game_engine::voxel::{
-    ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelDirtySet, VoxelInterner,
+    dec_ref_recursive, release_body, ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume,
+    VoxelDirtySet, VoxelInterner,
 };
 
 use crate::presentation::voxel_mesh::VoxChunkGroupRaw;
@@ -71,7 +72,7 @@ pub use blocks::{
     nearest_axis_distance_m, nearest_block_distance_m, neighbor_origins, skirt_mask, y_band_layers,
     FaceNeighbor, GroupKey, TerrainBlock, TerrainPartition, REGION_BLOCKS, TERRAIN_MARGIN_CHUNKS,
 };
-use generated::GeneratedBlockCache;
+pub use generated::GeneratedBlockCache;
 
 /// 地形生成参数（体素层资源）。装配方在 `add_plugins(GameVoxelPlugin)` **之前**
 /// `insert_resource` 后，[TerrainPlugin] 就会注册地形生成系统；不插入则不生成。
@@ -174,21 +175,49 @@ pub(crate) fn register_systems(app: &mut App) {
         .add_systems(Update, stream_terrain_lod);
 }
 
-/// 把脏块的包装树从 `WrappedBlockCache` / 邻块缓存里清掉。
+/// 把 `key` 在 terrain 四份块缓存里覆盖的条目全部失效（所有 LOD）。
 ///
-/// 只处理 LOD0 的包装树：粗 LOD 由 `GeneratedBlockCache` 从生成器重算，
-/// 不读 `VoxVolume` 的编辑。
+/// 四份实例缺一不可：`WrappedBlockCache`、`TerrainNeighborBlocks`、
+/// `TerrainGeneratedBlocks::own`、`TerrainGeneratedBlocks::neighbors`。
+/// 编辑与组重建复用本函数，避免只清 wrapper 的旧口径。
+///
+/// 注意：粗 LOD 的 `GeneratedBlockCache` 重生成仍只由 `(origin, lod)` 决定、
+/// 不读 `VoxVolume`（阶段 3 / doc 12 §9 的债），所以“失效”只保证缓存不陈旧，
+/// 不代表粗 LOD 内容会跟随编辑。
+fn invalidate_chunk_caches(
+    interner: &mut VoxelInterner,
+    key: ChunkKey,
+    wrapped: &mut WrappedBlockCache,
+    generated: &mut TerrainGeneratedBlocks,
+    neighbors: &mut TerrainNeighborBlocks,
+) {
+    wrapped.invalidate_covered(interner.inner_mut(), key);
+    neighbors.0.invalidate_covered(interner.inner_mut(), key);
+    generated.own.invalidate_covered(interner.inner_mut(), key);
+    generated
+        .neighbors
+        .invalidate_covered(interner.inner_mut(), key);
+}
+
+/// 编辑后失效本块在**四份块缓存**里的所有 LOD 条目。
+///
+/// 粗 LOD 目前不读编辑（见 [`invalidate_chunk_caches`] 的债务说明），
+/// 但缓存必须清：否则后续重新提取会拿到编辑前的旧树。
 fn invalidate_stale_terrain_caches(
     mut interner: ResMut<VoxelInterner>,
     dirty: Res<VoxelDirtySet>,
     mut wrapped: ResMut<WrappedBlockCache>,
+    mut generated: ResMut<TerrainGeneratedBlocks>,
     mut neighbors: ResMut<TerrainNeighborBlocks>,
 ) {
     for edit in dirty.peek_edits() {
-        wrapped.invalidate_covered(interner.inner_mut(), edit.key);
-        neighbors
-            .0
-            .invalidate_covered(interner.inner_mut(), edit.key);
+        invalidate_chunk_caches(
+            &mut interner,
+            edit.key,
+            &mut wrapped,
+            &mut generated,
+            &mut neighbors,
+        );
     }
 }
 
@@ -257,6 +286,70 @@ pub struct TerrainGeneratedBlocks {
     pub own: GeneratedBlockCache,
     /// 26 邻按 LOD 生成的树。
     pub neighbors: GeneratedBlockCache,
+}
+
+/// 唯一卸载入口：把一个基础子块从 [`VoxVolume`] 与给定缓存里彻底移除。
+///
+/// `VoxTree` 没有 `Drop`，所以顺序固定、不能交换：
+///
+/// 1. **先失效本块在所有 LOD 的缓存**：[`WrappedBlockCache::invalidate_covered`]
+///    与 [`GeneratedBlockCache::invalidate_covered`] 都对
+///    `lod == 0..=MAX_LOD` 用 `lod_block_origin(key, lod)` 反推缓存键，删掉
+///    「覆盖该基础子块」的条目（粗 LOD 条目可能同时覆盖别的子块，这里按保守
+///    口径整条失效）并 `dec_ref_recursive` 其 root；
+/// 2. [`VoxVolume::take_chunk_raw`] 把树取出来（**不要**裸调它并让返回值析构，
+///    那是静默泄漏；它叫 `raw` 就是因为释放引用的责任在调用方）；
+/// 3. 对取回树的 root 显式 `dec_ref_recursive`。
+///
+/// 返回 `false` 表示 `VoxVolume` 里本来就没有这个块（缓存仍会被失效），
+/// 因此对同一块重复调用是安全的、幂等的。
+///
+/// **邻块缓存要一起清**：[`TerrainNeighborBlocks`] 与
+/// [`TerrainGeneratedBlocks::neighbors`] 是独立的缓存实例，`extract_block_raw`
+/// 会把 26 邻（含本块）预热进去。若它们也持有该块/其覆盖块，必须对每一份缓存
+/// 各调用一次本函数（只有真正从 `VoxVolume` 取回树的那次返回 `true`）；
+/// 否则残留的 root 引用会把节点钉在 interner 里，`alive_nodes` 回不到基线。
+/// 按《体素流式_实现文档》第 8 节，`Render → Data` 降档时就应先清掉这些
+/// 表现层缓存，`Data → None` 再走本入口。
+pub fn unload_chunk(
+    interner: &mut VoxelInterner,
+    volume: &mut VoxVolume,
+    wrapped: &mut WrappedBlockCache,
+    generated: &mut GeneratedBlockCache,
+    key: ChunkKey,
+) -> bool {
+    wrapped.invalidate_covered(interner.inner_mut(), key);
+    generated.invalidate_covered(interner.inner_mut(), key);
+
+    let Some(tree) = volume.take_chunk_raw(&key) else {
+        return false;
+    };
+    let root = tree.get_root_id();
+    dec_ref_recursive(interner.inner_mut(), &root);
+    true
+}
+
+/// 地形整卷释放的唯一入口：先清**四份块缓存**，再 `release_body`。
+///
+/// 这是 terrain 场景对 `game_engine::presentation::voxel::release_body_with_cache`
+/// 的替代品：后者只清 `WrappedBlockCache`，`max_lod > 0` 时
+/// [`TerrainGeneratedBlocks`]（own + neighbors）与 [`TerrainNeighborBlocks`]
+/// 里的 root 引用会把粗 LOD 节点钉在 interner 里（不 panic，只涨内存）。
+///
+/// 调用方把 terrain 的四份缓存一起传进来，不要自己拼清缓存顺序。
+/// 返回释放的非空 chunk root 数量。
+pub fn release_terrain_body(
+    interner: &mut VoxelInterner,
+    volume: &mut VoxVolume,
+    wrapped: &mut WrappedBlockCache,
+    generated: &mut TerrainGeneratedBlocks,
+    neighbors: &mut TerrainNeighborBlocks,
+) -> usize {
+    wrapped.clear(interner.inner_mut());
+    neighbors.0.clear(interner.inner_mut());
+    generated.own.clear(interner.inner_mut());
+    generated.neighbors.clear(interner.inner_mut());
+    release_body(interner.inner_mut(), volume)
 }
 
 /// 地形统计（demo / perf / 测试断言用；不进协议）。
@@ -586,16 +679,7 @@ fn invalidate_group(
     neighbors: &mut TerrainNeighborBlocks,
 ) {
     for origin in blocks {
-        wrapped.invalidate_covered(interner.inner_mut(), *origin);
-        generated
-            .own
-            .invalidate_covered(interner.inner_mut(), *origin);
-        generated
-            .neighbors
-            .invalidate_covered(interner.inner_mut(), *origin);
-        neighbors
-            .0
-            .invalidate_covered(interner.inner_mut(), *origin);
+        invalidate_chunk_caches(interner, *origin, wrapped, generated, neighbors);
     }
 }
 
@@ -889,8 +973,60 @@ mod tests {
     use super::*;
     use game_engine::identity::{StableEntityId, StableIdPlugin};
     use game_engine::voxel::{
-        chunk_key, count_body_nodes, release_body, MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH,
+        chunk_content_hash, chunk_key, count_body_nodes, lod_block_origin, release_body, MaxDepth,
+        VoxOpsBulkWrite, VoxOpsRead, VoxOpsWrite, VoxTree, CHUNK_DEPTH,
     };
+
+    /// 把一个基础子块在本块缓存对里**所有 LOD** 预热：
+    /// LOD0 走包装缓存，LOD>0 走按 LOD 生成的缓存（与生产路径一致）。
+    fn warm_chunk_all_lods(
+        interner: &mut VoxelInterner,
+        volume: &VoxVolume,
+        wrapped: &mut WrappedBlockCache,
+        generated: &mut GeneratedBlockCache,
+        generator: &WorldGenerator,
+        key: ChunkKey,
+    ) {
+        for raw_lod in 0..=MAX_LOD {
+            let lod = Lod::new(raw_lod);
+            let block = MeshBlock::new(lod_block_origin(key, lod), lod);
+            let _ = wrapped.get_or_wrap(&volume.chunks, interner.inner_mut(), block);
+            if raw_lod > 0 {
+                let _ = generated.get_or_generate(interner.inner_mut(), generator, block);
+            }
+        }
+    }
+
+    /// 把 `key` 在 terrain **四份缓存实例**里所有 LOD 预热一遍。
+    ///
+    /// LOD0 只进两份 wrapped 缓存（生产路径如此）；LOD>0 同时进 wrapped 与
+    /// generated，用来验证失效口径覆盖四份实例。
+    fn warm_chunk_all_four_caches(
+        interner: &mut VoxelInterner,
+        volume: &VoxVolume,
+        wrapped: &mut WrappedBlockCache,
+        neighbors: &mut TerrainNeighborBlocks,
+        generated: &mut TerrainGeneratedBlocks,
+        generator: &WorldGenerator,
+        key: ChunkKey,
+    ) {
+        for raw_lod in 0..=MAX_LOD {
+            let lod = Lod::new(raw_lod);
+            let block = MeshBlock::new(lod_block_origin(key, lod), lod);
+            let _ = wrapped.get_or_wrap(&volume.chunks, interner.inner_mut(), block);
+            let _ = neighbors
+                .0
+                .get_or_wrap(&volume.chunks, interner.inner_mut(), block);
+            if raw_lod > 0 {
+                let _ = generated
+                    .own
+                    .get_or_generate(interner.inner_mut(), generator, block);
+                let _ = generated
+                    .neighbors
+                    .get_or_generate(interner.inner_mut(), generator, block);
+            }
+        }
+    }
 
     /// 半径 0（1 个 XZ 单元）：debug 下生成最便宜，单元测试够用。
     ///
@@ -1145,6 +1281,114 @@ mod tests {
         });
     }
 
+    /// 整卷释放必须清 terrain 四份缓存；`max_lod > 0` 时 generated（own+neighbors）
+    /// 不能把粗 LOD 节点钉在 interner 里。
+    #[test]
+    fn release_terrain_body_clears_all_caches_at_nonzero_lod() {
+        let mut app = streaming_app_resources(2, 1);
+        let baseline = app
+            .world()
+            .resource::<VoxelInterner>()
+            .inner()
+            .alive_nodes();
+        spawn_synthetic_volume(&mut app, 2, 1);
+
+        set_stream_config(
+            &mut app,
+            VoxelLodConfig {
+                max_lod: 1,
+                thresholds_m: [1.0, 2.0, 3.0],
+            },
+        );
+        // 远观察者 -> 分区合并到 LOD1，填充 generated.own / neighbors。
+        set_stream_observer(&mut app, [10_000.0, 0.0, 0.0]);
+        app.update();
+
+        let stats = *app.world().resource::<TerrainStats>();
+        assert!(
+            stats.lod_blocks[1] > 0,
+            "必须产出 LOD1 块才能覆盖 generated 缓存：{:?}",
+            stats.lod_blocks
+        );
+
+        // 把四份缓存暂时取出，补预热两份 wrapped 缓存（全 LOD），再整卷释放。
+        let mut wrapped = app
+            .world_mut()
+            .remove_resource::<WrappedBlockCache>()
+            .expect("WrappedBlockCache");
+        let mut neighbors = app
+            .world_mut()
+            .remove_resource::<TerrainNeighborBlocks>()
+            .expect("TerrainNeighborBlocks");
+        let mut generated = app
+            .world_mut()
+            .remove_resource::<TerrainGeneratedBlocks>()
+            .expect("TerrainGeneratedBlocks");
+        assert!(!generated.own.is_empty() || !generated.neighbors.is_empty());
+
+        let entity = volume_entity(app.world_mut());
+        let generator = WorldGenerator::from_seed(0xC0FF_EE);
+        let key = chunk_key(0, 0, 0);
+        let world = app.world_mut();
+        world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
+            let volume = world.get::<VoxVolume>(entity).expect("VoxVolume");
+            warm_chunk_all_four_caches(
+                &mut interner,
+                volume,
+                &mut wrapped,
+                &mut neighbors,
+                &mut generated,
+                &generator,
+                key,
+            );
+        });
+        assert!(!wrapped.is_empty() && !neighbors.0.is_empty());
+
+        let released = {
+            let world = app.world_mut();
+            world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
+                let entity = volume_entity(world);
+                let mut entity_mut = world.entity_mut(entity);
+                let mut volume = entity_mut
+                    .get_mut::<VoxVolume>()
+                    .expect("地形根实体必须带 VoxVolume 组件");
+                release_terrain_body(
+                    &mut interner,
+                    &mut volume,
+                    &mut wrapped,
+                    &mut generated,
+                    &mut neighbors,
+                )
+            })
+        };
+
+        assert!(released > 0);
+        assert!(wrapped.is_empty(), "WrappedBlockCache 未清空");
+        assert!(neighbors.0.is_empty(), "TerrainNeighborBlocks 未清空");
+        assert!(generated.own.is_empty(), "generated.own 未清空");
+        assert!(generated.neighbors.is_empty(), "generated.neighbors 未清空");
+        {
+            let volume = app
+                .world()
+                .entity(entity)
+                .get::<VoxVolume>()
+                .expect("VoxVolume");
+            assert!(volume.is_empty(), "整卷释放后 volume 必须为空");
+        }
+        assert_eq!(
+            app.world()
+                .resource::<VoxelInterner>()
+                .inner()
+                .alive_nodes(),
+            baseline,
+            "四份缓存 + body 全部释放后，存活节点必须回空 interner 基线"
+        );
+
+        app.world_mut().insert_resource(wrapped);
+        app.world_mut().insert_resource(neighbors);
+        app.world_mut().insert_resource(generated);
+    }
+
     /// 大半径 LOD 场景：debug 下生成太慢，只在需要时手动跑。
     #[test]
     #[ignore = "半径 8 / LOD3 的生成在 debug 下很慢；release 手动运行"]
@@ -1157,10 +1401,8 @@ mod tests {
 
     // ─────────────── 运行期流式重划分（合成体素，不跑 worldgen）───────────────
 
-    /// 合成实心体素 + 只挂 key 资源的 App：跳过 worldgen，测试快且完全确定。
-    ///
-    /// 直接调用私有系统 stream_terrain_lod，等于把流式逻辑从生成里隔离出来验证。
-    fn streaming_app(radius: i32, max_lod: u8) -> App {
+    /// 只装资源 / 系统、**不建 volume** 的流式 App（用于需要先记空 interner 基线的测试）。
+    fn streaming_app_resources(radius: i32, max_lod: u8) -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.add_plugins(StableIdPlugin);
@@ -1182,7 +1424,11 @@ mod tests {
         app.add_systems(Update, stream_terrain_lod);
         // 只用 app.update() 的测试必须显式 finish，Avian 在 Plugin::finish 注册诊断资源。
         app.finish();
+        app
+    }
 
+    /// 给流式 App 塞一份合成实心体素（跳过 worldgen）。
+    fn spawn_synthetic_volume(app: &mut App, radius: i32, max_lod: u8) {
         let world = app.world_mut();
         let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
         world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
@@ -1193,6 +1439,14 @@ mod tests {
             }
             world.spawn(volume);
         });
+    }
+
+    /// 合成实心体素 + 只挂 key 资源的 App：跳过 worldgen，测试快且完全确定。
+    ///
+    /// 直接调用私有系统 stream_terrain_lod，等于把流式逻辑从生成里隔离出来验证。
+    fn streaming_app(radius: i32, max_lod: u8) -> App {
+        let mut app = streaming_app_resources(radius, max_lod);
+        spawn_synthetic_volume(&mut app, radius, max_lod);
         app
     }
 
@@ -1474,5 +1728,307 @@ mod tests {
         assert!(matches!(sig_same[&member].0[0], FaceNeighbor::Same(_)));
         assert_eq!(sig_same[&member].1, 0);
         assert_ne!(sig_coarser, sig_same, "邻块 LOD 变化必须改变组重建签名");
+    }
+
+    // ─────────────── 编辑失效：四份缓存 + LOD0 内容（阶段 -1 补丁）───────────────
+
+    /// 编辑失效必须清 terrain 的**四份缓存实例**（own + neighbors × wrapped/generated），
+    /// 而不是只看 wrapper；LOD0 重新提取的内容必须等于编辑后的 volume。
+    ///
+    /// 粗 LOD 内容跟随编辑属阶段 3（`generate_block_at_lod` 不读 volume），
+    /// 这里只锁定“缓存不会返回编辑前旧树”。
+    #[test]
+    fn invalidate_chunk_caches_clears_all_four_instances_and_lod0_reflects_edit() {
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let generator = WorldGenerator::from_seed(0xC0FF_EE);
+        let key = chunk_key(0, 0, 0);
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume.insert_chunk(key, generator.generate_chunk(interner.inner_mut(), key));
+
+        let mut wrapped = WrappedBlockCache::default();
+        let mut neighbors = TerrainNeighborBlocks::default();
+        let mut generated = TerrainGeneratedBlocks::default();
+        warm_chunk_all_four_caches(
+            &mut interner,
+            &volume,
+            &mut wrapped,
+            &mut neighbors,
+            &mut generated,
+            &generator,
+            key,
+        );
+        // 先确认四份实例都真的预热了（否则“清空”断言没有意义）。
+        for raw_lod in 0..=MAX_LOD {
+            let lod = Lod::new(raw_lod);
+            let origin = lod_block_origin(key, lod);
+            assert!(wrapped.get(origin, lod).is_some(), "wrapped LOD{raw_lod}");
+            assert!(
+                neighbors.0.get(origin, lod).is_some(),
+                "neighbors LOD{raw_lod}"
+            );
+            if raw_lod > 0 {
+                assert!(
+                    generated.own.get(origin, lod).is_some(),
+                    "generated.own LOD{raw_lod}"
+                );
+                assert!(
+                    generated.neighbors.get(origin, lod).is_some(),
+                    "generated.neighbors LOD{raw_lod}"
+                );
+            }
+        }
+
+        // 编辑一个体素（取一个与当前值不同的值），记录编辑后的 body 哈希。
+        let edit = bevy::math::IVec3::new(1, 2, 3);
+        let current = volume
+            .get_chunk(&key)
+            .expect("chunk 必须存在")
+            .get(interner.inner(), edit)
+            .unwrap_or(0);
+        let edited = if current == 9 { 8 } else { 9 };
+        assert!(
+            volume.get_chunk_mut(&key).expect("chunk 必须存在").set(
+                interner.inner_mut(),
+                edit,
+                edited
+            ),
+            "编辑必须改变树"
+        );
+        let edited_hash = chunk_content_hash(interner.inner(), volume.get_chunk(&key).unwrap());
+
+        invalidate_chunk_caches(
+            &mut interner,
+            key,
+            &mut wrapped,
+            &mut generated,
+            &mut neighbors,
+        );
+
+        // 四份实例 × 所有 LOD：该 key 覆盖的条目必须全部消失。
+        for raw_lod in 0..=MAX_LOD {
+            let lod = Lod::new(raw_lod);
+            let origin = lod_block_origin(key, lod);
+            assert!(
+                wrapped.get(origin, lod).is_none(),
+                "wrapped LOD{raw_lod} 未失效"
+            );
+            assert!(
+                neighbors.0.get(origin, lod).is_none(),
+                "neighbors LOD{raw_lod} 未失效"
+            );
+            assert!(
+                generated.own.get(origin, lod).is_none(),
+                "generated.own LOD{raw_lod} 未失效"
+            );
+            assert!(
+                generated.neighbors.get(origin, lod).is_none(),
+                "generated.neighbors LOD{raw_lod} 未失效"
+            );
+        }
+
+        // LOD0 走 wrapped 路径重新提取：hash 与体素都必须等于编辑后的 volume。
+        let rewrapped = wrapped.get_or_wrap(
+            &volume.chunks,
+            interner.inner_mut(),
+            MeshBlock::new(key, Lod::new(0)),
+        );
+        assert_eq!(
+            chunk_content_hash(interner.inner(), rewrapped),
+            edited_hash,
+            "LOD0 重提取必须读到编辑后的内容"
+        );
+        assert_eq!(rewrapped.get(interner.inner(), edit), Some(edited));
+        wrapped.clear(interner.inner_mut());
+    }
+
+    // ─────────────── 唯一卸载入口 unload_chunk（阶段 -1）───────────────
+
+    /// 卸载后 body 可达节点回 0，两套「本块」缓存的所有 LOD 条目都被清空，
+    /// interner 存活节点回到基线；重复卸载幂等。
+    #[test]
+    fn unload_chunk_returns_body_and_caches_to_baseline() {
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let generator = WorldGenerator::from_seed(0xC0FF_EE);
+        let keys = [chunk_key(0, 0, 0), chunk_key(1, 0, 0)];
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        let baseline = interner.inner().alive_nodes();
+        assert_eq!(count_body_nodes(interner.inner(), &volume), 0);
+
+        let mut wrapped = WrappedBlockCache::default();
+        let mut generated = GeneratedBlockCache::default();
+        for &key in &keys {
+            let tree = generator.generate_chunk(interner.inner_mut(), key);
+            volume.insert_chunk(key, tree);
+            warm_chunk_all_lods(
+                &mut interner,
+                &volume,
+                &mut wrapped,
+                &mut generated,
+                &generator,
+                key,
+            );
+        }
+        assert!(count_body_nodes(interner.inner(), &volume) > 0);
+        // 两个基础子块在 LOD0 各一条，LOD>0 的粗块覆盖两者、每档各一条：
+        // 这证明卸载测试确实覆盖了「所有 LOD」，而不是只清 LOD0。
+        assert_eq!(
+            wrapped.len(),
+            keys.len() + usize::from(MAX_LOD),
+            "包装缓存必须预热 LOD0 + 每个粗 LOD"
+        );
+        assert_eq!(
+            generated.len(),
+            usize::from(MAX_LOD),
+            "生成缓存必须预热每个粗 LOD"
+        );
+
+        for &key in &keys {
+            assert!(
+                unload_chunk(
+                    &mut interner,
+                    &mut volume,
+                    &mut wrapped,
+                    &mut generated,
+                    key
+                ),
+                "volume 里有树时必须返回 true"
+            );
+            assert!(!volume.contains_chunk(&key));
+        }
+        assert!(volume.is_empty());
+        assert_eq!(count_body_nodes(interner.inner(), &volume), 0);
+        assert!(wrapped.is_empty(), "LOD0..=MAX_LOD 的包装条目都必须失效");
+        assert!(generated.is_empty(), "LOD>0 的生成条目都必须失效");
+        assert_eq!(
+            interner.inner().alive_nodes(),
+            baseline,
+            "缓存与 body 的引用都归还后，存活节点必须回基线"
+        );
+
+        // 幂等：没有树可取时返回 false，不重复 dec_ref、不 panic。
+        assert!(
+            !unload_chunk(
+                &mut interner,
+                &mut volume,
+                &mut wrapped,
+                &mut generated,
+                keys[0]
+            ),
+            "重复卸载必须返回 false"
+        );
+    }
+
+    /// 同一块 load → unload 循环 100 轮，存活节点数不增长。
+    ///
+    /// 每轮改一个不同体素，避免「内容完全相同 -> hash-cons 复用节点」把泄漏
+    /// 掩盖成「不增长」。粗 LOD 生成缓存由上一个测试覆盖，这里只走包装缓存，
+    /// 保证 100 轮在 debug 下也够快。
+    #[test]
+    fn unload_chunk_cycle_does_not_grow_nodes() {
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let key = chunk_key(0, 0, 0);
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        let baseline = interner.inner().alive_nodes();
+
+        for cycle in 0..100 {
+            let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+            tree.fill(interner.inner_mut(), 2);
+            let _ = tree.set(
+                interner.inner_mut(),
+                bevy::math::IVec3::new(cycle % 32, 0, 0),
+                9,
+            );
+            volume.insert_chunk(key, tree);
+            assert!(count_body_nodes(interner.inner(), &volume) > 0);
+
+            let mut wrapped = WrappedBlockCache::default();
+            for raw_lod in 0..=MAX_LOD {
+                let lod = Lod::new(raw_lod);
+                let block = MeshBlock::new(lod_block_origin(key, lod), lod);
+                let _ = wrapped.get_or_wrap(&volume.chunks, interner.inner_mut(), block);
+            }
+            assert!(!wrapped.is_empty());
+
+            let mut generated = GeneratedBlockCache::default();
+            assert!(unload_chunk(
+                &mut interner,
+                &mut volume,
+                &mut wrapped,
+                &mut generated,
+                key
+            ));
+            assert!(wrapped.is_empty());
+            assert_eq!(count_body_nodes(interner.inner(), &volume), 0);
+            assert_eq!(
+                interner.inner().alive_nodes(),
+                baseline,
+                "第 {cycle} 轮 load → unload 后节点数增长（引用泄漏）"
+            );
+        }
+    }
+
+    /// 编辑过的块卸载后重生成：同一编辑重放，chunk_content_hash 与卸载前一致。
+    ///
+    /// 编辑不是生成器的输入（当前没有存档层），所以「重生成」= 同一生成器 +
+    /// 重放同一编辑；这同时验证 unload 的 dec_ref 没有误伤仍被共享的节点。
+    #[test]
+    fn unload_reload_of_edited_chunk_keeps_content_hash() {
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let generator = WorldGenerator::from_seed(0xC0FF_EE);
+        let key = chunk_key(0, 0, 0);
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        let mut wrapped = WrappedBlockCache::default();
+        let mut generated = GeneratedBlockCache::default();
+
+        let edit = bevy::math::IVec3::new(3, 4, 5);
+        let mut tree = generator.generate_chunk(interner.inner_mut(), key);
+        let _ = tree.set(interner.inner_mut(), edit, 9);
+        volume.insert_chunk(key, tree);
+        let hash_before = chunk_content_hash(
+            interner.inner(),
+            volume.get_chunk(&key).expect("块必须已插入"),
+        );
+        let nodes_before = count_body_nodes(interner.inner(), &volume);
+        assert!(nodes_before > 0);
+
+        warm_chunk_all_lods(
+            &mut interner,
+            &volume,
+            &mut wrapped,
+            &mut generated,
+            &generator,
+            key,
+        );
+        assert!(unload_chunk(
+            &mut interner,
+            &mut volume,
+            &mut wrapped,
+            &mut generated,
+            key
+        ));
+        assert_eq!(count_body_nodes(interner.inner(), &volume), 0);
+        assert!(wrapped.is_empty() && generated.is_empty());
+
+        // 重生成 + 重放编辑 -> 相同内容、相同哈希。
+        let mut reloaded = generator.generate_chunk(interner.inner_mut(), key);
+        let _ = reloaded.set(interner.inner_mut(), edit, 9);
+        volume.insert_chunk(key, reloaded);
+        assert_eq!(
+            chunk_content_hash(
+                interner.inner(),
+                volume.get_chunk(&key).expect("重生成块必须已插入"),
+            ),
+            hash_before,
+            "卸载/重生成不得改变编辑后块的内容哈希"
+        );
+        assert_eq!(
+            count_body_nodes(interner.inner(), &volume),
+            nodes_before,
+            "同内容的可达节点数必须一致"
+        );
+
+        // 收尾：本测试的缓存已清空，直接整卷释放。
+        let _ = release_body(interner.inner_mut(), &mut volume);
+        assert_eq!(count_body_nodes(interner.inner(), &volume), 0);
     }
 }

@@ -21,7 +21,7 @@
 pub use ::voxel::lod_quadtree::{restricted_quadtree, QuadLeaf};
 pub use ::voxel::mesh::{
     build_tree_occupancy, build_tree_occupancy_lod, extract_block, tree_voxel_is_solid,
-    voxel_material, FaceNeighbor, MeshBlock, Neighbourhood, RectBatch, RectInstance,
+    voxel_material, FaceNeighbor, MeshBlock, Neighbourhood, RectBatch, RectInstance, MAX_LOD,
 };
 pub use ::voxel::store::*;
 
@@ -130,6 +130,9 @@ mod tests {
         let k0 = keys[0];
         let mut changed = build_tree(k0, &mut ic);
         let _ = changed.set(ic.inner_mut(), bevy::math::IVec3::new(1, 1, 1), 42);
+        // 覆盖已有 key：先取旧树并显式归还引用，不能直接 insert 后丢返回值。
+        let old = vc.take_chunk_raw(&k0).expect("vc 必须已有 k0");
+        dec_ref_recursive(ic.inner_mut(), &old.get_root_id());
         vc.insert_chunk(k0, changed);
         assert_ne!(content_hash(ia.inner(), &va), content_hash(ic.inner(), &vc));
     }
@@ -214,5 +217,37 @@ mod tests {
         assert_eq!(w.z, FixedPoint::from_num(8));
         let f = world_meters_f32([2, 4, 8], vs, Lod::new(1));
         assert_eq!(f, [2.0, 4.0, 8.0]);
+    }
+
+    #[test]
+    fn clear_releases_all_chunk_roots_to_baseline() {
+        let keys = [chunk_key(0, 0, 0), chunk_key(1, 0, 0), chunk_key(0, 2, 1)];
+        let mut interner = test_interner();
+        let baseline = interner.inner().alive_nodes();
+        let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+        for &k in keys.iter() {
+            volume.insert_chunk(k, build_tree(k, &mut interner));
+        }
+        assert!(interner.inner().alive_nodes() > baseline);
+        assert_eq!(volume.clear(interner.inner_mut()), keys.len());
+        assert!(volume.is_empty());
+        assert_eq!(count_body_nodes(interner.inner(), &volume), 0);
+        assert_eq!(
+            interner.inner().alive_nodes(),
+            baseline,
+            "clear 必须逐树 dec_ref_recursive，不能直接 chunks.clear()"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "insert_chunk 覆盖已有 key")]
+    fn insert_chunk_overwrite_is_caught_in_debug() {
+        let mut interner = test_interner();
+        let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+        let k = chunk_key(0, 0, 0);
+        volume.insert_chunk(k, build_tree(k, &mut interner));
+        // 故意覆盖：旧树会被丢弃（debug_assert 在插入前拦住）。
+        let _ = volume.insert_chunk(k, build_tree(k, &mut interner));
     }
 }

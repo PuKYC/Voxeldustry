@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use bevy::prelude::*;
-use voxel::store::{ChunkKey, Lod, VoxTree};
+use voxel::store::{ChunkKey, Lod, VoxInterner, VoxTree};
 
 use crate::identity::StableEntityId;
 use crate::math::{FixedPoint, Vec3F};
@@ -58,16 +58,50 @@ impl VoxVolume {
         self.chunks.get_mut(key)
     }
 
+    /// 插入一个子块。
+    ///
+    /// 覆盖已有 key 是危险的：旧树会被返回，调用方一旦丢弃就静默泄漏
+    /// （`VoxTree` 没有 `Drop`）。debug 构建下直接拦截；要替换请先
+    /// `take_chunk_raw` 并显式 `dec_ref_recursive` 旧 root。
     pub fn insert_chunk(&mut self, key: ChunkKey, tree: VoxTree<u8>) -> Option<VoxTree<u8>> {
+        debug_assert!(
+            !self.chunks.contains_key(&key),
+            "insert_chunk 覆盖已有 key 会丢弃旧树（VoxTree 无 Drop）；覆盖请先 take_chunk_raw 再 dec_ref_recursive"
+        );
         self.chunks.insert(key, tree)
     }
 
-    pub fn remove_chunk(&mut self, key: &ChunkKey) -> Option<VoxTree<u8>> {
+    /// 低层取树：**只供唯一的卸载入口 `unload_chunk` 使用**
+    /// （`game_core::voxel::terrain::unload_chunk`）。
+    ///
+    /// `VoxTree` 没有 `Drop`：返回值被直接析构时 root 的引用计数不会归还，
+    /// 节点永久驻留 interner（不 panic，只涨内存）。业务代码必须走
+    /// `unload_chunk`：它先失效缓存、再取树、最后显式 `dec_ref_recursive`。
+    ///
+    /// 名字里的 `raw` 就是这个意思：拿到树之后，释放引用的责任在调用方。
+    /// 整卷释放用 `release_body`；terrain 四份缓存用 `release_terrain_body`；
+    /// 只有一份 `WrappedBlockCache` 时用 `release_body_with_cache`。
+    pub fn take_chunk_raw(&mut self, key: &ChunkKey) -> Option<VoxTree<u8>> {
         self.chunks.remove(key)
     }
 
-    pub fn clear(&mut self) {
-        self.chunks.clear();
+    /// 清空容器，并把每个 chunk root 的引用归还 interner。
+    ///
+    /// `VoxTree` 没有 `Drop`：直接 `chunks.clear()` 会把 root 引用永久留在
+    /// interner 里（静默泄漏，不 panic）。返回归还的非空 root 数量。
+    ///
+    /// 等价于 [`crate::voxel::release_body`] 的清空部分；整卷释放优先用
+    /// `release_body` / terrain 的 `release_terrain_body`。
+    pub fn clear(&mut self, interner: &mut VoxInterner<u8>) -> usize {
+        let mut released = 0;
+        for (_, tree) in std::mem::take(&mut self.chunks) {
+            let root = tree.get_root_id();
+            if !root.is_empty() {
+                interner.dec_ref_recursive(&root);
+                released += 1;
+            }
+        }
+        released
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&ChunkKey, &VoxTree<u8>)> {

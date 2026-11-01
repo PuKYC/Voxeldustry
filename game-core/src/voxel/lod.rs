@@ -10,7 +10,10 @@ use game_engine::voxel::Lod;
 use crate::static_data::voxel::LOD_DISTANCE_THRESHOLDS;
 
 /// v1 支持的最高 LOD（LOD 0..=3，对应 depth 5..=8）。
-pub const MAX_LOD: u8 = 3;
+///
+/// 唯一来源是 `crates/voxel` 的 `voxel::mesh::MAX_LOD`；本模块只 re-export，
+/// 不再保留第二份数字，避免 mesh 与 game-core 的定义漂移。
+pub use game_engine::voxel::MAX_LOD;
 
 /// 距离 -> Lod。
 ///
