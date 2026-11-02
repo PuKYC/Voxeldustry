@@ -33,6 +33,7 @@
 //! 摘要不符时才报 digest。这样破坏性测试能指到被改的字段。
 
 mod codec;
+mod content;
 mod format;
 mod fs_atomic;
 pub mod persist;
@@ -40,6 +41,7 @@ pub mod plugin;
 mod snapshot;
 pub mod store;
 
+pub use content::{export_chunk, install_chunk};
 pub use codec::{
     decode_chunk_record, decode_component_table, decode_region, decode_world_meta,
     encode_chunk_record, encode_component_table, encode_region, encode_world_meta,
