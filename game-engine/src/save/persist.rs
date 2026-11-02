@@ -23,6 +23,11 @@
 //!   逐条 insert），返回错误由上层判整份 region 损坏；
 //! - 未注册组件 ID -> 进 `OpaqueComponents`，不报错，只在返回里列出（上层告警一次）；
 //! - 注册表里类型 ID 为 0 或重复 -> 注册时即拒绝，不静默覆盖。
+//!
+//! # Persist 标记自身
+//!
+//! 快照准入标记 [`Persist`] 本身也以类型 ID 1（引擎保留）落盘，因此
+//! 「保存 -> 载入」后的实体天然仍是存档对象，再保存时不会丢标记。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,6 +37,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::identity::StableEntityId;
 use crate::ids::{partition_of, IdPartition};
+use crate::save::snapshot::Persist;
 use crate::save::{
     decode_component_table, encode_component_table, ComponentRecord, EntityRecord, SaveError,
     SaveErrorKind,
@@ -474,7 +480,8 @@ impl OpaqueComponents {
     }
 }
 
-/// 只注册两个资源；组件类型由游戏侧启动时 `registry.register::<T>()`。
+/// 注册两个资源，并登记引擎保留的 [`Persist`]（类型 ID 1）；其余组件类型由
+/// 游戏侧启动时 `registry.register::<T>()`。
 #[derive(Default)]
 pub struct PersistPlugin;
 
@@ -482,6 +489,12 @@ impl Plugin for PersistPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PersistRegistry>()
             .init_resource::<OpaqueComponents>();
+        // 先 init 再注册：ID 1 是引擎保留给 Persist 的，被业务组件抢先占用说明
+        // 契约冲突，直接 panic 而不是让存档悄悄丢标记。
+        app.world_mut()
+            .resource_mut::<PersistRegistry>()
+            .register::<Persist>()
+            .expect("register Persist: stable_type_id 1 是引擎保留 ID，业务组件不得占用");
     }
 }
 

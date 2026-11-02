@@ -29,6 +29,9 @@
 //! 只有带 [`Persist`] 的实体。`AI` / `Real` 这类纯运行时标记永远不带 `Persist`
 //! （AI 永不进账本），所以它们不会出现在快照里，也不需要在这里再判一次。
 //!
+//! [`Persist`] 自身也以类型 ID 1 落盘（见它的 `PersistComponent` 实现），所以
+//! 「保存 -> 载入」后的实体天然仍带 `Persist`，下次快照不会漏掉它。
+//!
 //! # 确定性（§8）
 //!
 //! `World::iter_entities` 的遍历顺序**不是** API 契约（它按 archetype 布局走），
@@ -51,11 +54,12 @@ use std::collections::BTreeMap;
 
 use ::voxel::ChunkKey;
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
 use crate::residency::ChunkAnchor;
-use crate::save::persist::{OpaqueComponents, PersistRegistry};
+use crate::save::persist::{OpaqueComponents, PersistComponent, PersistRegistry, StableTypeId};
 use crate::save::{ChunkRecord, EntityRecord, SaveError, SaveErrorKind};
 
 /// 可存档标记：只有带这个组件的实体才进存档快照。
@@ -64,10 +68,21 @@ use crate::save::{ChunkRecord, EntityRecord, SaveError, SaveErrorKind};
 /// 的 `StableTypeId` 各用一套命名空间，编号撞车没有含义。`0` 是保留值，捕获时拒绝。
 ///
 /// `AI` / `Real` 永远不会带它：AI 不进账本，`Real` 的视觉状态也不需要落盘。
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// 这个标记本身也是 `PersistComponent`（类型 ID 1，引擎保留），所以它的
+/// `prototype_type_id` 会随实体一起落盘，载入后仍是存档对象。
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Persist {
     /// 实体原型 ID；必须非 0。
     pub prototype_type_id: u32,
+}
+
+impl PersistComponent for Persist {
+    /// 1 是引擎保留的 Persist 类型 ID，业务组件不得占用。
+    ///
+    /// 快照准入标记必须自己也在存档里，否则「保存 -> 载入 -> 再保存」会丢掉
+    /// `Persist`，实体下次不再被快照收集。
+    const STABLE_TYPE_ID: StableTypeId = StableTypeId::new(1);
 }
 
 /// 一次捕获得到的实体分组：`(BodyKey, ChunkKey)` -> 该块实体（按 `stable_entity_id` 升序）。
@@ -240,7 +255,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::save::decode_component_table;
-    use crate::save::persist::{PersistComponent, StableTypeId};
+    use crate::save::persist::{PersistComponent, PersistPlugin, StableTypeId};
 
     /// 测试用可存档组件：只关心“注册后能被编进 payload”。
     #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +268,13 @@ mod tests {
     fn registry() -> PersistRegistry {
         let mut registry = PersistRegistry::new();
         registry.register::<Health>().expect("注册 Health");
+        registry
+    }
+
+    /// Health + Persist（引擎保留 ID 1）。
+    fn registry_with_persist() -> PersistRegistry {
+        let mut registry = registry();
+        registry.register::<Persist>().expect("注册 Persist");
         registry
     }
 
@@ -513,5 +535,84 @@ mod tests {
         assert!(record.entities.is_empty(), "快照里没有该块时必须清空");
         assert_eq!(record.content, Some(vec![0xDE, 0xAD]));
         assert_eq!(record.generator_version, 7);
+    }
+
+    /// Persist 自身进 payload：capture -> apply 到空实体后标记仍在。
+    #[test]
+    fn persist_component_round_trips() {
+        let mut world = empty_world();
+        let source = spawn_persist(&mut world, 1, 7, anchor(4, chunk(0, 0, 0)));
+        world.entity_mut(source).insert(Health(5));
+
+        let registry = registry_with_persist();
+        let snapshot = capture(&world, &registry, &OpaqueComponents::default()).expect("捕获成功");
+        let records = snapshot.for_chunk(body(4), chunk(0, 0, 0));
+        assert_eq!(records.len(), 1);
+
+        let mut target_world = World::new();
+        let target = target_world.spawn_empty().id();
+        let mut opaque = OpaqueComponents::default();
+        let report = registry
+            .apply_entity(&mut target_world, target, &records[0], &mut opaque)
+            .expect("应用成功");
+
+        assert_eq!(report.applied, 2, "Persist 与 Health 都要应用");
+        assert!(report.opaque_type_ids.is_empty());
+        assert!(opaque.is_empty());
+
+        let persist = target_world
+            .get::<Persist>(target)
+            .expect("Persist 必须随存档恢复");
+        assert_eq!(persist.prototype_type_id, 7);
+        assert_eq!(target_world.get::<Health>(target), Some(&Health(5)));
+    }
+
+    /// 最小 App 装 PersistPlugin：引擎保留 ID 1 已登记，名字指向 Persist。
+    #[test]
+    fn persist_registered_by_plugin() {
+        let mut app = App::new();
+        app.add_plugins(PersistPlugin);
+
+        let registry = app.world().resource::<PersistRegistry>();
+        assert!(
+            registry.contains(StableTypeId::new(1)),
+            "PersistPlugin 必须注册引擎保留 ID 1"
+        );
+        assert_eq!(
+            registry.name_of(StableTypeId::new(1)),
+            Some(std::any::type_name::<Persist>())
+        );
+        assert_eq!(registry.len(), 1, "最小 App 里只有 PersistPlugin 这一项");
+    }
+
+    /// 保存 -> 载入 -> 再保存：两条 EntityRecord 逐字节相等（Persist 不丢）。
+    #[test]
+    fn resave_after_apply_matches() {
+        let registry = registry_with_persist();
+
+        let mut first_world = empty_world();
+        let source = spawn_persist(&mut first_world, 21, 7, anchor(6, chunk(0, 0, 0)));
+        first_world.entity_mut(source).insert(Health(11));
+        let first = capture(&first_world, &registry, &OpaqueComponents::default()).expect("第一次捕获");
+        let first_record = first.for_chunk(body(6), chunk(0, 0, 0))[0].clone();
+
+        // 载入：空世界里先放好 StableEntityId / ChunkAnchor，再把组件表应用上去。
+        let mut second_world = empty_world();
+        let target = second_world
+            .spawn((StableEntityId(21), anchor(6, chunk(0, 0, 0))))
+            .id();
+        let mut opaque = OpaqueComponents::default();
+        registry
+            .apply_entity(&mut second_world, target, &first_record, &mut opaque)
+            .expect("应用成功");
+        assert!(opaque.is_empty());
+
+        let second =
+            capture(&second_world, &registry, &OpaqueComponents::default()).expect("第二次捕获");
+        assert_eq!(second.entity_count(), 1, "载入后的实体必须仍带 Persist");
+        let second_record = &second.for_chunk(body(6), chunk(0, 0, 0))[0];
+
+        assert_eq!(first_record, *second_record, "再保存必须逐字节相同");
+        assert_eq!(first_record.payload, second_record.payload);
     }
 }
