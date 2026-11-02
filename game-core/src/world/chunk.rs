@@ -22,9 +22,10 @@
 //!
 //! ## 本轮范围与已知偏离
 //!
-//! - 只实现 [WorldChunkSet::Residency] 的 `apply_residency_changes` 与
-//!   [WorldChunkSet::Dirty] 的 `mark_dirty`；[WorldChunkSet::Lifecycle]
-//!   （`unload_members` / `spawn_members`）留到下一轮，只占住集合顺序。
+//! - 已实现 [WorldChunkSet::Residency] 的 `apply_residency_changes`、
+//!   [WorldChunkSet::Dirty] 的 `mark_dirty`，以及 [WorldChunkSet::Lifecycle]
+//!   的 `unload_members`（只做销毁，发生在 Streaming 落盘之后）。恢复端
+//!   `spawn_members` 留到下一轮。
 //! - `mark_dirty` **只标实体当前所在的 region**。文档要求新旧两个 region 都标脏，
 //!   但 `Changed<ChunkAnchor>` 拿不到变更前的值；要等后续引入组件历史 / 上一帧
 //!   镜像后再补旧 region。
@@ -40,9 +41,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bevy::ecs::message::MessageCursor;
 use bevy::prelude::*;
 use game_engine::body_key::BodyKey;
-use game_engine::residency::{ChunkAnchor, ChunkReached, GameTickSet, Residency};
+use game_engine::identity::{StableEntityId, StableEntityIndex};
+use game_engine::residency::{ChunkAnchor, ChunkReached, GameTickSet, Real, Residency};
 use game_engine::save::Persist;
 use game_engine::voxel::ChunkKey;
 
@@ -251,7 +254,7 @@ pub enum WorldChunkSet {
     Residency,
     /// 按 `Changed<ChunkAnchor>` 标脏 region。
     Dirty,
-    /// 实体卸载 / 重建（本轮只占位）。
+    /// 实体销毁 / 重建：销毁在 Streaming 落盘之后；恢复端后续补。
     Lifecycle,
 }
 
@@ -301,7 +304,13 @@ impl Plugin for WorldChunkPlugin {
             FixedUpdate,
             apply_residency_changes.in_set(WorldChunkSet::Residency),
         )
-        .add_systems(FixedUpdate, mark_dirty.in_set(WorldChunkSet::Dirty));
+        .add_systems(FixedUpdate, mark_dirty.in_set(WorldChunkSet::Dirty))
+        .add_systems(
+            FixedUpdate,
+            unload_members
+                .in_set(WorldChunkSet::Lifecycle)
+                .in_set(GameTickSet::WorldChunk),
+        );
     }
 }
 
@@ -365,6 +374,68 @@ pub fn mark_dirty(
     }
 }
 
+/// 系统 3：区块降到 `None` 时销毁块内要存档的实体（exclusive）。
+///
+/// 顺序由 [GameTickSet] 决定（`Residency -> Streaming -> WorldChunk -> ...`），
+/// 本系统在 [WorldChunkSet::Lifecycle]，所以这些块的内容与实体**已经**由
+/// Streaming 的 `persist_pending_unloads` 写进存档，这里只做销毁。恢复端
+/// （`spawn_members`）留到下一轮。
+///
+/// - 只认 `to == Residency::None`：`Render -> Data` 是渲染档清理，实体不销毁；
+/// - 只销毁 `(body, chunk)` 与消息完全一致的 [Persist] 实体，同 body 的其它块、
+///   同块的其它 body 都不受影响；
+/// - `Without<Real>`：[Real]（AI / 真实模拟）**永不进账本**，即使误挂了 [Persist]
+///   也不在这里销毁——这是该约束的第二道保险（第一道在驻留层，不给它发 `None`）；
+/// - 幂等：消息游标保证每条只处理一次；先 `get_entity` 探活再 `despawn`，实体被
+///   别的路径先销毁时不会 panic；索引用 `remove_by_entity`，重复调用无副作用；
+/// - 索引资源缺失（headless 装配）时跳过摘除：`StableIdPlugin` 的
+///   `unregister_removed_stable_ids` 会在 PostUpdate 按 `RemovedComponents` 兜底；
+/// - 确定性：先按 `(StableEntityId, Entity)` 排序再逐个销毁，不依赖查询顺序。
+pub fn unload_members(world: &mut World, mut cursor: Local<MessageCursor<ChunkWillUnload>>) {
+    // 同一块可能在同 tick 收到重复消息：按块键去重，只处理一次。
+    let mut targets: BTreeSet<(BodyKey, ChunkKey)> = BTreeSet::new();
+    {
+        let messages = world.resource::<Messages<ChunkWillUnload>>();
+        for message in cursor.read(messages) {
+            if message.to == Residency::None {
+                targets.insert((message.body, message.key));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+
+    // 收集 + 排序放在同一个只读阶段：销毁会改 archetype，不能边查边改。
+    let mut victims: Vec<(u64, Entity)> = Vec::new();
+    {
+        let mut query =
+            world.query_filtered::<(Entity, &ChunkAnchor), (With<Persist>, Without<Real>)>();
+        for (entity, anchor) in query.iter(world) {
+            if !targets.contains(&(anchor.body, anchor.chunk)) {
+                continue;
+            }
+            // 缺 StableEntityId 的实体同样要销毁（存档层会拒绝它），排序键用 MAX 兜底。
+            let stable = world
+                .get::<StableEntityId>(entity)
+                .map_or(u64::MAX, |id| id.0);
+            victims.push((stable, entity));
+        }
+    }
+    victims.sort_unstable();
+
+    for (_stable, entity) in victims {
+        // 已被别的路径销毁（例如读档重建）：跳过，别再 despawn 一次。
+        if world.get_entity(entity).is_err() {
+            continue;
+        }
+        if let Some(mut index) = world.get_resource_mut::<StableEntityIndex>() {
+            index.remove_by_entity(entity);
+        }
+        world.despawn(entity);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +451,7 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .add_message::<ChunkReached>()
             .add_message::<ChunkWillUnload>()
+            .init_resource::<StableEntityIndex>()
             .add_plugins(WorldChunkPlugin);
         app
     }
@@ -396,6 +468,38 @@ mod tests {
             .resource_mut::<Messages<WorldChunkUnloading>>()
             .drain()
             .collect()
+    }
+
+    /// 测试组件：证明销毁带走的是整个实体，而不只是索引条目。
+    #[derive(Component, Debug)]
+    struct Cargo;
+
+    /// spawn 一个「要存档」的实体，并按生产装配那样登记进 [StableEntityIndex]。
+    fn spawn_persisted(app: &mut App, b: BodyKey, key: ChunkKey, id: u64) -> Entity {
+        let entity = app
+            .world_mut()
+            .spawn((
+                StableEntityId(id),
+                Persist {
+                    prototype_type_id: 7,
+                },
+                ChunkAnchor::new(b, key),
+                Cargo,
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<StableEntityIndex>()
+            .insert(StableEntityId(id), entity);
+        entity
+    }
+
+    fn write_unload(app: &mut App, b: BodyKey, key: ChunkKey, to: Residency) {
+        app.world_mut().write_message(ChunkWillUnload {
+            body: b,
+            key,
+            from: Residency::Data,
+            to,
+        });
     }
 
     #[test]
@@ -677,5 +781,117 @@ mod tests {
         app.add_message::<ChunkWillUnload>();
         app.insert_resource(WorldChunkConfig { region_size: 0 });
         app.add_plugins(WorldChunkPlugin);
+    }
+
+    #[test]
+    fn unload_members_despawns_persisted_entities() {
+        let mut app = test_app();
+        let b = body(11);
+        let key = ChunkKey::new(2, -1, 0);
+        let entity = spawn_persisted(&mut app, b, key, 41);
+        assert_eq!(
+            app.world()
+                .resource::<StableEntityIndex>()
+                .entity(StableEntityId(41)),
+            Some(entity)
+        );
+
+        write_unload(&mut app, b, key, Residency::None);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        assert!(
+            app.world().get_entity(entity).is_err(),
+            "降到 None 后块内 Persist 实体必须被销毁"
+        );
+        let index = app.world().resource::<StableEntityIndex>();
+        assert_eq!(index.entity(StableEntityId(41)), None);
+        assert_eq!(index.id(entity), None);
+
+        // 消息已消费：再跑一帧不重复处理、不 panic。
+        app.world_mut().run_schedule(FixedUpdate);
+        assert!(app.world().get_entity(entity).is_err());
+    }
+
+    #[test]
+    fn unload_members_keeps_real_entities() {
+        let mut app = test_app();
+        let b = body(12);
+        let key = ChunkKey::new(0, 0, 0);
+        let persisted = spawn_persisted(&mut app, b, key, 51);
+        // 同时挂 Persist：排除必须来自 Real，而不是「没有 Persist 所以不管」。
+        let real = app
+            .world_mut()
+            .spawn((
+                StableEntityId(52),
+                Persist {
+                    prototype_type_id: 9,
+                },
+                Real,
+                ChunkAnchor::new(b, key),
+                Cargo,
+            ))
+            .id();
+
+        write_unload(&mut app, b, key, Residency::None);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        assert!(app.world().get_entity(persisted).is_err());
+        assert!(
+            app.world().get_entity(real).is_ok(),
+            "带 Real 的实体永不进账本，即使误挂 Persist 也不能销毁"
+        );
+    }
+
+    #[test]
+    fn unload_members_ignores_render_demotion() {
+        let mut app = test_app();
+        let b = body(13);
+        let key = ChunkKey::new(1, 1, 1);
+        let entity = spawn_persisted(&mut app, b, key, 61);
+
+        // Render -> Data 只是渲染档清理，不属于数据生命周期卸载。
+        write_unload(&mut app, b, key, Residency::Data);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        assert!(app.world().get_entity(entity).is_ok());
+        assert_eq!(
+            app.world()
+                .resource::<StableEntityIndex>()
+                .entity(StableEntityId(61)),
+            Some(entity)
+        );
+    }
+
+    #[test]
+    fn unload_members_only_touches_matching_chunk() {
+        let mut app = test_app();
+        let b = body(14);
+        let other_body = body(15);
+        let key = ChunkKey::new(3, 0, -2);
+        let same_body_other_chunk = ChunkKey::new(3, 0, -1);
+        let victim = spawn_persisted(&mut app, b, key, 71);
+        let sibling_chunk = spawn_persisted(&mut app, b, same_body_other_chunk, 72);
+        // 同块、不同 body（例如另一条船）。
+        let other_body_same_chunk = spawn_persisted(&mut app, other_body, key, 73);
+
+        write_unload(&mut app, b, key, Residency::None);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        assert!(app.world().get_entity(victim).is_err());
+        assert!(
+            app.world().get_entity(sibling_chunk).is_ok(),
+            "同 body 的另一块不受影响"
+        );
+        assert!(
+            app.world().get_entity(other_body_same_chunk).is_ok(),
+            "同块的另一个 body 不受影响"
+        );
+        let index = app.world().resource::<StableEntityIndex>();
+        assert_eq!(index.entity(StableEntityId(71)), None);
+        assert_eq!(index.entity(StableEntityId(72)), Some(sibling_chunk));
+        assert_eq!(
+            index.entity(StableEntityId(73)),
+            Some(other_body_same_chunk)
+        );
     }
 }
