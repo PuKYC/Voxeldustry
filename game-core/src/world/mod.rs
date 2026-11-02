@@ -10,12 +10,16 @@ pub mod island;
 pub mod load;
 pub mod rng;
 pub mod save;
+pub mod save_plugin;
 pub mod seed;
 
 pub use island::{Biome, Island, IslandId, IslandRegistry};
 pub use load::{load_world, LoadStats, LoadedWorld};
 pub use rng::WorldRng;
 pub use save::{capture_world, write_capture, WorldCapture};
+pub use save_plugin::{
+    SaveNow, WorldSaveConfig, WorldSavePaths, WorldSavePlugin, WorldSaveStatus,
+};
 pub use seed::WorldSeed;
 // BiomeId 定义在 static_data（游戏数值），这里重导出以满足 world 语义入口。
 pub use crate::static_data::voxel::BiomeId;
