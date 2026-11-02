@@ -11,7 +11,11 @@
 //!
 //! 本文件只有类型，没有 IO：真正的字节编解码在存档层（`game-core/src/save`），
 //! 这里只描述“查表该返回什么、记录里有什么”。
+//!
+//! 流式层只经 `ChunkPersistence` 这个 `Resource` 包装访问 `ChunkStore`，
+//! 不直接持有 trait 对象；默认值 `NoStore` 保证脱离存档也能单独运行。
 
+use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 
 use crate::body_key::BodyKey;
@@ -217,6 +221,24 @@ pub struct NoStore;
 impl ChunkStore for NoStore {
     fn lookup(&self, _body: BodyKey, _key: ChunkKey) -> StoreLookup {
         StoreLookup::Miss
+    }
+}
+
+/// 读档查询的 Resource 包装：流式层只经它访问 `ChunkStore`。
+#[derive(Resource)]
+pub struct ChunkPersistence(pub Box<dyn ChunkStore>);
+
+impl Default for ChunkPersistence {
+    fn default() -> Self {
+        Self(Box::new(NoStore))
+    }
+}
+
+impl ChunkPersistence {
+    /// 转发给内部 `ChunkStore`；语义与 `ChunkStore::lookup` 完全一致。
+    #[must_use]
+    pub fn lookup(&self, body: BodyKey, key: ChunkKey) -> StoreLookup {
+        self.0.lookup(body, key)
     }
 }
 
@@ -460,5 +482,36 @@ mod tests {
         lookup = StoreLookup::Hit(content_record());
         assert!(!lookup.is_pending());
         assert_eq!(lookup.record(), Some(&content_record()));
+    }
+
+    /// 默认 `ChunkPersistence` 包装 `NoStore`，所以永远查不到存档。
+    #[test]
+    fn chunk_persistence_defaults_to_miss() {
+        let persistence = ChunkPersistence::default();
+        assert_eq!(persistence.lookup(body(), chunk()), StoreLookup::Miss);
+        assert_eq!(persistence.lookup(body(), ChunkKey::new(0, 0, 0)), StoreLookup::Miss);
+    }
+
+    /// 包装层必须原样转发给内部 store，记录的每个字段都要一致。
+    #[test]
+    fn chunk_persistence_forwards_to_inner_store() {
+        /// 测试用 store：不论查询哪个块都返回同一条记录。
+        struct FixedStore(ChunkRecord);
+
+        impl ChunkStore for FixedStore {
+            fn lookup(&self, _body: BodyKey, _key: ChunkKey) -> StoreLookup {
+                StoreLookup::Hit(self.0.clone())
+            }
+        }
+
+        let record = content_record();
+        let persistence = ChunkPersistence(Box::new(FixedStore(record.clone())));
+        let found = persistence.lookup(body(), chunk());
+        assert_eq!(found, StoreLookup::Hit(record.clone()));
+        let found = found.record().expect("命中时必须有记录");
+        assert_eq!(found.generator_version, record.generator_version);
+        assert_eq!(found.content, record.content);
+        assert_eq!(found.proposals, record.proposals);
+        assert_eq!(found.entities, record.entities);
     }
 }

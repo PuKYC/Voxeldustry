@@ -19,6 +19,6 @@ pub mod types;
 
 pub use gen_table::{GenError, GenState, GenTable, Slot, WorkState};
 pub use types::{
-    ChunkRecord, ChunkStore, EntityRecord, NoStore, ProposalRecord, RecordError, StoreLookup,
-    MAX_PROPOSAL_EXTENT,
+    ChunkPersistence, ChunkRecord, ChunkStore, EntityRecord, NoStore, ProposalRecord, RecordError,
+    StoreLookup, MAX_PROPOSAL_EXTENT,
 };
