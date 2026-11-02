@@ -20,31 +20,42 @@
 //! - `Render -> Data`：销毁分组实体 + 失效四份表现层缓存（`wrapped`、
 //!   `generated.own`、`generated.neighbors`、`neighbors.0`），**保留体素
 //!   内容**；不发 [ChunkWillUnload]、不计 `unloaded`。
-//! - `Render | Data -> None`：先销毁分组实体（若存在）、把 `(body, key, from)`
-//!   记入 [PendingUnloads]；整块内容与 `Persist` 实体落盘后才真正释放（见下）。
+//! - `Render | Data -> None`：先销毁分组实体（若存在）、只把 `(body, key,
+//!   from)` 记入 [PendingUnloads]；**不**发 [ChunkWillUnload]、**不**释放任何
+//!   东西（树与实体都留在容器里）。整块内容与 `Persist` 实体**确认落盘**后
+//!   才发消息并真正释放（见下）。
+//! - 卸载未确认期间的升档（复活）：把该 pair 从 [PendingUnloads] 移除，树仍
+//!   在容器里，走「已在容器」的快路径直接结算，不查存档、不重生成。
 //! - 重复消息幂等：同一 `(body, key)` 最多一个分组实体；`Render` 消息只在
 //!   首次产出（或首次判定全空气）时发一次。
 //!
 //! ## 每 tick 的流水线
 //!
-//! 卸载拆成**同 tick 顺序执行**的三段，保证数据先写出去再释放：
+//! 卸载拆成**同 tick 顺序执行**的三段，保证数据**确认**写出去之后才释放：
 //!
 //! 1. [intake_residency_changes]：消费 [ResidencyChanged]。
-//!    - 升档：`GenTable::enqueue` + 记入 [StreamWanted]；若块**已经在**
-//!      `VoxVolume` 里且生成态还是 `Undetermined`（地形 Startup 已生成 /
-//!      上一轮装载留下的数据），直接结算并发 [ChunkReached]，不重生成；
+//!    - 升档：先撤销同 pair 的 [PendingUnloads] 登记（复活；树还在容器里，
+//!      绝不释放、绝不再发卸载消息），再 `GenTable::enqueue` + 记入
+//!      [StreamWanted]；若块**已经在** `VoxVolume` 里且生成态是
+//!      `Undetermined`（地形 Startup 已生成 / 上一轮装载留下的数据），或这是
+//!      一次复活，直接结算并发 [ChunkReached]，不重生成、不查存档；
 //!    - 降档（`to == None`，或 `Render -> Data`）：只有「请求还在队列里」或
 //!      「块真的还在容器里」才动作，因此重复的降档消息既不二次释放也不二次计数。
-//!      `to == None` 时只取消生成、发 [ChunkWillUnload]、把 `(pair, from)` 记进
-//!      [PendingUnloads]；同一 pair 已在表里就什么都不再做（去重）。
-//! 2. [persist_pending_unloads]：每 tick 至多 `capture` 一次实体快照，把每个
-//!    待卸载块的整块 content 与该块的 `Persist` 实体组装成
+//!      `to == None` 时只 `GenTable::cancel` 并把 `(pair, PendingUnload)`
+//!      记进 [PendingUnloads]（不发 [ChunkWillUnload]、不释放）；同一 pair
+//!      已在表里就什么都不再做（去重）。
+//! 2. [persist_pending_unloads]：只为 `version == None` 的条目 `capture` 一次
+//!    实体快照（同一块只提交一次，不每 tick 重写），把整块 content 与该块的
+//!    `Persist` 实体组装成
 //!    [ChunkRecord](game_engine::streaming::ChunkRecord) 写进
-//!    [SaveStore](game_engine::save::SaveStore)。没有存档资源（headless / 单测）
-//!    时整个阶段跳过，**不动** [PendingUnloads]。
-//! 3. [release_pending_unloads]：取走 [PendingUnloads]，逐块做真正的释放
-//!    （四份缓存 `unload_chunk`、`GenTable::reset`、`stats.unloaded`）；
-//!    第 2 段写盘失败也照常释放，块不会被卡住。
+//!    [SaveStore](game_engine::save::SaveStore)（空块改为 `delete`）；
+//!    `Ok(v)` 把版本记进条目，`Err` 只在本块首次失败时 `warn!` 并保留条目，
+//!    下一 tick 重试。没有存档资源（headless / 单测）时整个阶段跳过。
+//! 3. [release_pending_unloads]：逐条判断，只有「没有 [SaveStore]」、
+//!    「store 没有后台线程（永远不会确认落盘）」或「`version` 已确认落盘」才发
+//!    [ChunkWillUnload] 并真正释放（四份缓存 `unload_chunk`、
+//!    `GenTable::reset`、`stats.unloaded`）；未确认的条目留在表里，下一 tick
+//!    再看。
 //! 4. [resolve_chunks]（`Wanted` 键序，每 tick 最多
 //!    [VoxelStreamConfig::max_resolve_per_tick] 个）：问
 //!    [ChunkPersistence]：`Hit` 且有整块内容 → 装树，生成器零调用；
@@ -135,11 +146,20 @@ pub struct StreamStats {
     pub generated: u64,
     /// 累计真正卸载的块数（重复降档消息不重复计数）。
     pub unloaded: u64,
+    /// 当前还没落盘确认的待卸载块数（[PendingUnloads] 长度），
+    /// 每次 [release_pending_unloads] 跑完刷新。
+    pub pending_unloads: usize,
     /// 当前存活的分组实体数（[RenderGroups] 里 `Some` 的数量），每次增删后刷新。
     pub render_groups: usize,
 }
 
-/// 即将卸载一个区块的**数据**（在释放之前发出，监听方还能读到内容）。
+/// 即将卸载一个区块的**数据**（在**落盘确认之后、释放之前**发出）。
+///
+/// 与旧实现的区别：消息不再在登记卸载时发，而是等存档的
+/// [SaveStore::is_committed] 确认后才发。**注意**：同一个系统里紧接着就做释放，
+/// 所以后续系统读到这条消息时体素树已经从容器里拿走了——它只是一条「这个块的数据
+/// 要没了」的通知，不要把容器内容当作仍可读。需要内容的消费方应该读存档记录，
+/// 或者自己缓存（`WorldChunkPlugin` 的实体销毁只按 `ChunkAnchor` 走，不读体素）。
 ///
 /// 只有 `to == None` 的降档才发这个信息：`Render -> Data` 只是渲染档清理，
 /// 不属于本轮数据生命周期的卸载。
@@ -174,14 +194,30 @@ pub struct ChunkEntities {
 #[derive(Resource, Debug, Default)]
 pub struct StreamWanted(pub BTreeMap<(BodyKey, ChunkKey), Residency>);
 
-/// 待落盘并释放的区块：`(body, key) -> 卸载前档位`。
+/// 一条待卸载登记。
 ///
-/// 由 [intake_residency_changes] 的 `to == None` 分支记入，
-/// [persist_pending_unloads] 把内容与实体写进存档后，由
-/// [release_pending_unloads] 取走并真正释放。键序 = `(BodyKey, ChunkKey)`
-/// 升序，落盘与释放都按同一顺序，不依赖哈希。
+/// 生命周期：`version == None`（还没提交给存档）→
+/// [persist_pending_unloads] 写/删成功得到 `Some(v)` → 等
+/// [SaveStore::is_committed] 确认 v 落盘 → [release_pending_unloads] 释放。
+/// 写盘失败时 `failed` 置位（同一块只 `warn!` 一次），条目保留、下一 tick 重试。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingUnload {
+    /// 卸载前的驻留档位（释放时原样带进 [ChunkWillUnload]）。
+    pub from: Residency,
+    /// 已提交给存档的版本号；`None` = 还没写。
+    pub version: Option<u64>,
+    /// 上一次提交是否失败（用来只警告一次）。
+    pub failed: bool,
+}
+
+/// 待落盘并释放的区块：`(body, key) -> PendingUnload`。
+///
+/// 由 [intake_residency_changes] 的 `to == None` 分支记入（此时**不释放**
+/// 任何东西），[persist_pending_unloads] 把内容与实体提交给存档，由
+/// [release_pending_unloads] 在确认落盘后取走并真正释放。键序 =
+/// `(BodyKey, ChunkKey)` 升序，落盘与释放都按同一顺序，不依赖哈希。
 #[derive(Resource, Debug, Default)]
-pub struct PendingUnloads(pub BTreeMap<(BodyKey, ChunkKey), Residency>);
+pub struct PendingUnloads(pub BTreeMap<(BodyKey, ChunkKey), PendingUnload>);
 
 /// 已到达 [Residency::Render] 的块 -> 分组实体。
 ///
@@ -236,7 +272,6 @@ pub fn intake_residency_changes(
     mut gen: ResMut<GenTable>,
     mut wanted: ResMut<StreamWanted>,
     mut pending: ResMut<PendingUnloads>,
-    mut will_unload: MessageWriter<ChunkWillUnload>,
     mut reached: MessageWriter<ChunkReached>,
     mut index: Option<ResMut<StableEntityIndex>>,
     mut allocator: Option<ResMut<StableIdAllocator>>,
@@ -264,7 +299,6 @@ pub fn intake_residency_changes(
                 &mut gen,
                 &mut wanted,
                 &mut pending,
-                &mut will_unload,
                 &mut volumes,
                 &mut interner,
                 &mut wrapped,
@@ -275,6 +309,12 @@ pub fn intake_residency_changes(
             );
             continue;
         }
+
+        // 复活：上一轮降档还挂在 [PendingUnloads]（写盘未确认）。树还在容器里，
+        // 直接撤销登记即可——绝不能释放，也不能再发 ChunkWillUnload。
+        // 这一步必须早于下面的 Render 幂等检查，否则一次「Render -> None 未确认
+        // 就重新升 Render」的请求会被当成重复 Render 丢掉。
+        let revived = pending.0.remove(&pair).is_some();
 
         // 幂等：该块已经到过 Render（有分组实体，或已判定全空气）时，
         // 重复的 Render 请求不再入队、不再发第二条 Render 消息。
@@ -299,7 +339,12 @@ pub fn intake_residency_changes(
         let Ok(volume) = volumes.get(entity) else {
             continue;
         };
-        if !volume.contains_chunk(&key) || gen.gen_state(pair) != GenState::Undetermined {
+        // 快路径条件：树在容器里，且生成态是 Undetermined（地形 Startup /
+        // 上一轮装载留下的数据）**或者**这是一次复活（demote 已把 work 置为
+        // Cancelled，内容态可能是任意值；树就在容器里，不该再查存档/重生成）。
+        if !volume.contains_chunk(&key)
+            || (gen.gen_state(pair) != GenState::Undetermined && !revived)
+        {
             continue;
         }
 
@@ -495,11 +540,12 @@ pub fn resolve_chunks(
 }
 /// 降档处理：先按需清理渲染档，再把数据卸载**登记**进 [PendingUnloads]。
 ///
-/// **重复消息不二次释放的判据**：第一次降档会把队列项移除、把 `(pair, from)`
-/// 记进 [PendingUnloads]；第二次同样的消息在去重检查处直接返回——不发
-/// [ChunkWillUnload]、不重复登记。真正的释放（缓存 / `GenTable::reset` /
-/// `stats.unloaded`）由 [release_pending_unloads] 在本 tick 稍后统一做，
-/// 中间隔着 [persist_pending_unloads] 的落盘，保证数据先写出去。
+/// **重复消息不二次释放的判据**：第一次降档会把队列项移除、把
+/// `(pair, PendingUnload { from, version: None, failed: false })` 记进
+/// [PendingUnloads]；第二次同样的消息在去重检查处直接返回——不重复登记。
+/// 此时**不发** [ChunkWillUnload]、**不**释放任何东西（树与实体都留着）。
+/// 真正的释放（缓存 / `GenTable::reset` / `stats.unloaded`）由
+/// [release_pending_unloads] 在 [persist_pending_unloads] 确认落盘之后做。
 ///
 /// `Render -> Data` 只销毁分组实体 + 失效四份表现层缓存，体素内容原样保留，
 /// 因此**不**进 [PendingUnloads]、**不**发卸载消息、**不**计 `unloaded`。
@@ -513,7 +559,6 @@ fn demote(
     gen: &mut GenTable,
     wanted: &mut StreamWanted,
     pending: &mut PendingUnloads,
-    will_unload: &mut MessageWriter<ChunkWillUnload>,
     volumes: &mut Query<&mut VoxVolume>,
     interner: &mut VoxelInterner,
     wrapped: &mut WrappedBlockCache,
@@ -552,43 +597,53 @@ fn demote(
     }
 
     // 去重：同一 pair 已经登记过（同一 tick 里的第二次降档）就什么都不再做。
-    // 释放要等 [persist_pending_unloads] 写完存档，此时树还在容器里，所以
+    // 释放要等 [persist_pending_unloads] 确认落盘，此时树还在容器里，所以
     // `present` 仍然成立，第二次消息必须在这里被挡住。
     if pending.0.contains_key(&pair) {
         return;
     }
 
+    // 只取消生成并登记；消息与释放都推到确认落盘之后
+    // （[release_pending_unloads]）。
     gen.cancel(pair);
-    will_unload.write(ChunkWillUnload { body, key, from, to });
-    pending.0.insert(pair, from);
+    pending.0.insert(
+        pair,
+        PendingUnload {
+            from,
+            version: None,
+            failed: false,
+        },
+    );
 }
 
-/// 系统 2：把待卸载区块的整块内容与 `Persist` 实体写进存档（exclusive）。
+/// 系统 2：把待卸载区块的整块内容与 `Persist` 实体提交给存档（exclusive）。
 ///
 /// 顺序在 [intake_residency_changes] 之后、[release_pending_unloads] 之前：
-/// 写盘先于释放，导出 content 时树还在容器里。
+/// 提交先于释放，导出 content 时树还在容器里。
 ///
-/// - [PendingUnloads] 为空，或没有 [SaveStore]（headless / 单测）→ 直接返回，
-///   不改 pending，释放阶段照常执行；
-/// - 每 tick 至多 [capture] 一次实体快照，失败只 `warn!`，本 tick 不写盘，
-///   但**不阻断**释放；
+/// - 只处理 `version == None` 的条目：同一块只提交一次，不每 tick 重写；
+/// - 没有待提交条目，或没有 [SaveStore]（headless / 单测）→ 直接返回；
+/// - 只在存在待提交条目时 [capture] 一次实体快照，失败只 `warn!`，本 tick
+///   不写盘（条目保持 `version == None`，下一 tick 重试）；
 /// - 空块（content 与 entities 都空）不写记录，改为删除该块的旧记录：磁盘上可能
 ///   还留着上一次的 `ChunkRecord`，静默跳过会让旧内容在重载后复活；
-/// - [SaveStore::write] / [SaveStore::delete] 的 `Err` 只 `warn!`，同样不阻断释放。
+/// - [SaveStore::write] / [SaveStore::delete] 的 `Ok(v)` 记进条目的
+///   `version`；`Err` 只在该块**第一次**失败时 `warn!`，置 `failed` 并保留
+///   条目，下一 tick 重试。
 pub fn persist_pending_unloads(world: &mut World) {
-    let has_pending = world
+    let needs_write = world
         .get_resource::<PendingUnloads>()
-        .is_some_and(|pending| !pending.0.is_empty());
-    if !has_pending {
+        .is_some_and(|pending| pending.0.values().any(|entry| entry.version.is_none()));
+    if !needs_write {
         return;
     }
-    // 没有存档（headless / 单测）：跳过写盘，但保留 pending，让释放照常发生。
+    // 没有存档（headless / 单测）：跳过写盘，释放阶段会立即释放。
     if world.get_resource::<SaveStore>().is_none() {
         return;
     }
 
-    let world: &World = &*world;
     let snapshot = {
+        let world: &World = &*world;
         let (Some(registry), Some(opaque)) = (
             world.get_resource::<PersistRegistry>(),
             world.get_resource::<OpaqueComponents>(),
@@ -605,64 +660,135 @@ pub fn persist_pending_unloads(world: &mut World) {
         }
     };
 
-    let Some(pending) = world.get_resource::<PendingUnloads>() else {
-        return;
-    };
-    let Some(store) = world.get_resource::<SaveStore>() else {
-        return;
-    };
-    let generator_version = world.resource::<VoxelStreamConfig>().generator_version;
-    let Some(interner) = world.get_resource::<VoxelInterner>() else {
+    if world.get_resource::<VoxelInterner>().is_none() {
         warn!("stream: 卸载落盘缺少 VoxelInterner，本 tick 跳过写盘");
         return;
-    };
-    let index = world.get_resource::<StableEntityIndex>();
-
-    for ((body, key), _from) in &pending.0 {
-        let content = body_entity(index, *body)
-            .and_then(|entity| world.get::<VoxVolume>(entity))
-            .and_then(|volume| export_chunk(volume, *key, interner.inner()));
-        let entities = snapshot.for_chunk(*body, *key).to_vec();
-        if content.is_none() && entities.is_empty() {
-            // 空块：既没有整块内容也没有 Persist 实体，validate 会拒绝全空记录。
-            // 不能静默跳过：磁盘上可能还有这块的旧记录，必须显式删除，否则重载后
-            // 旧内容会复活。删除与写入一样只在 Flush 落盘，这里只标墓碑。
-            if let Err(error) = store.delete(*body, *key) {
-                warn!("stream: 卸载落盘删除空区块 {key:?} 失败（不阻断释放）：{error:?}");
-            }
-            continue;
-        }
-        let record = ChunkRecord {
-            generator_version,
-            content,
-            proposals: Vec::new(),
-            entities,
-        };
-        if let Err(error) = store.write(*body, *key, record) {
-            warn!("stream: 卸载落盘写区块 {key:?} 失败（不阻断释放）：{error:?}");
-        }
     }
+    let generator_version = world.resource::<VoxelStreamConfig>().generator_version;
+
+    world.resource_scope::<PendingUnloads, _>(|world, mut pending| {
+        let world: &World = &*world;
+        let Some(store) = world.get_resource::<SaveStore>() else {
+            return;
+        };
+        let Some(interner) = world.get_resource::<VoxelInterner>() else {
+            return;
+        };
+        let index = world.get_resource::<StableEntityIndex>();
+
+        for ((body, key), entry) in pending.0.iter_mut() {
+            if entry.version.is_some() {
+                // 已经提交过：等确认，不要每 tick 重写。
+                continue;
+            }
+            let content = body_entity(index, *body)
+                .and_then(|entity| world.get::<VoxVolume>(entity))
+                .and_then(|volume| export_chunk(volume, *key, interner.inner()));
+            let entities = snapshot.for_chunk(*body, *key).to_vec();
+            let empty = content.is_none() && entities.is_empty();
+            let result = if empty {
+                // 空块：既没有整块内容也没有 Persist 实体，validate 会拒绝全空记录。
+                // 不能静默跳过：磁盘上可能还有这块的旧记录，必须显式删除，否则重载后
+                // 旧内容会复活。删除与写入一样只在 Flush 落盘，这里只标墓碑。
+                store.delete(*body, *key)
+            } else {
+                store.write(
+                    *body,
+                    *key,
+                    ChunkRecord {
+                        generator_version,
+                        content,
+                        proposals: Vec::new(),
+                        entities,
+                    },
+                )
+            };
+            match result {
+                Ok(version) => {
+                    entry.version = Some(version);
+                    entry.failed = false;
+                }
+                Err(error) => {
+                    if !entry.failed {
+                        if empty {
+                            warn!("stream: 卸载落盘删除空区块 {key:?} 失败（下一 tick 重试）：{error:?}");
+                        } else {
+                            warn!("stream: 卸载落盘写区块 {key:?} 失败（下一 tick 重试）：{error:?}");
+                        }
+                        entry.failed = true;
+                    }
+                }
+            }
+        }
+    });
 }
 
-/// 系统 3：真正释放 [PendingUnloads] 里的区块（exclusive）。
+/// 系统 3：真正释放 [PendingUnloads] 里**已确认落盘**的区块（exclusive）。
 ///
-/// 取走整张表后逐块做旧 demote 的收尾：四份缓存的 [unload_chunk]（顺序与旧
-/// 实现一致）、[GenTable::reset]、`stats.unloaded += 1`。落盘阶段失败或根本
-/// 没有存档时也照常走到这里，块不会被卡死。
+/// 逐条判断释放条件（满足其一即可）：
+///
+/// - 没有 [SaveStore]（headless / 单测）：立即释放；
+/// - `store.has_worker() == false`：没有后台线程就永远不会有确认（`flush` 直接
+///   返回 0），等了也是泄漏；这只可能出现在测试替身或 `shutdown_worker` 之后，
+///   此时释放是唯一能收敛的选择；
+/// - `version == Some(v)` 且 `store.is_committed(body, key, v)`：已落盘。
+///
+/// **有意的取舍**：后台持续写失败（磁盘满、权限）时条目会一直留在表里，块不释放、
+/// 内存不回收，但数据不会静默丢失；`StreamStats::pending_unloads` 是这条积压的
+/// 观测量，排查时看它是否持续增长。
+///
+/// 释放顺序固定：先发 [ChunkWillUnload]（纯通知，见该消息的文档）→ 四份缓存的
+/// [unload_chunk]（顺序与旧实现一致）→ [GenTable::reset] →
+/// `stats.unloaded += 1` → 从表里移除。未确认的条目留在表里，下一 tick 再看。
+/// 每次运行后把 `stats.pending_unloads` 刷成剩余条目数。
 pub fn release_pending_unloads(world: &mut World) {
     let pending = {
-        let Some(mut pending) = world.get_resource_mut::<PendingUnloads>() else {
+        let Some(mut table) = world.get_resource_mut::<PendingUnloads>() else {
             return;
         };
-        if pending.0.is_empty() {
-            return;
-        }
-        std::mem::take(&mut pending.0)
+        std::mem::take(&mut table.0)
     };
-
-    for ((body, key), from) in pending {
-        release_unloaded_chunk(world, body, key, from);
+    if pending.is_empty() {
+        world.resource_mut::<StreamStats>().pending_unloads = 0;
+        return;
     }
+
+    let mut ready = Vec::new();
+    let mut kept = BTreeMap::new();
+    {
+        let store = world.get_resource::<SaveStore>();
+        let has_worker = store.is_some_and(|store| store.has_worker());
+        for (pair, entry) in pending {
+            let release = match store {
+                // 没有存档 / 没有后台线程：永远不会确认，不能无限等。
+                None => true,
+                Some(_) if !has_worker => true,
+                Some(store) => entry
+                    .version
+                    .is_some_and(|version| store.is_committed(pair.0, pair.1, version)),
+            };
+            if release {
+                ready.push((pair, entry));
+            } else {
+                kept.insert(pair, entry);
+            }
+        }
+    }
+
+    // 先写回未确认的条目，再释放（释放会可变借用 world）。
+    world.resource_mut::<PendingUnloads>().0 = kept;
+    for ((body, key), entry) in ready {
+        // 消息紧贴在释放之前发出；监听方读到它时树已经被取走（见类型文档）。
+        world.write_message(ChunkWillUnload {
+            body,
+            key,
+            from: entry.from,
+            to: Residency::None,
+        });
+        release_unloaded_chunk(world, body, key, entry.from);
+    }
+    let remaining = world.resource::<PendingUnloads>().0.len();
+    world.resource_mut::<StreamStats>().pending_unloads = remaining;
 }
 
 /// 释放单个已登记卸载的区块（exclusive 版本，语义与旧 demote 收尾一致）。
@@ -1691,18 +1817,30 @@ mod tests {
         harness.demote(key);
         harness.tick();
 
-        assert!(
-            !harness.volume().contains_chunk(&key),
-            "落盘与释放必须在同一 tick 内完成"
-        );
-        assert_eq!(harness.stats().unloaded, 1);
+        // 未确认落盘：树还在、无消息、不计数；记录只在内存缓冲里。
+        assert!(harness.volume().contains_chunk(&key), "未确认前不得释放");
+        assert!(harness.will_unload().is_empty(), "未确认前不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
         assert_eq!(
             harness.app.world().resource::<SaveStore>().stats().buffered,
             1,
             "卸载必须把记录写进内存缓冲"
         );
+        assert_eq!(
+            read_back(&harness, dir.path(), key),
+            None,
+            "还在缓冲，未落盘"
+        );
 
         flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key), "确认落盘后才释放");
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
+
         let record = read_back(&harness, dir.path(), key).expect("卸载后存档里必须留下该块");
         assert_eq!(
             record.content.as_deref(),
@@ -1736,7 +1874,19 @@ mod tests {
         harness.demote(key);
         harness.tick();
 
+        assert!(harness.volume().contains_chunk(&key), "未确认前不得释放");
+        assert!(harness.will_unload().is_empty(), "未确认前不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
+
         flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key), "确认落盘后才释放");
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
+
         let record = read_back(&harness, dir.path(), key).expect("卸载后存档里必须留下该块");
         assert!(record.content.is_some(), "内容与实体必须落在同一条记录");
         assert_eq!(record.entities.len(), 1, "该块只应有一条实体记录");
@@ -1781,20 +1931,39 @@ mod tests {
         harness.demote(key);
         harness.tick();
 
-        assert_eq!(
-            harness.will_unload().len(),
-            1,
-            "重复降档只许发一条 ChunkWillUnload"
+        // 未确认：只登记一次、只提交一次，不发消息也不释放。
+        assert!(
+            harness.will_unload().is_empty(),
+            "未确认落盘前不得发卸载消息"
         );
-        assert_eq!(harness.stats().unloaded, 1, "重复降档只许释放一次");
-        assert!(!harness.volume().contains_chunk(&key));
+        assert_eq!(harness.stats().unloaded, 0, "未确认前不得释放");
+        assert_eq!(harness.stats().pending_unloads, 1, "重复降档只许登记一次");
+        assert!(harness.volume().contains_chunk(&key));
         assert_eq!(
             harness.app.world().resource::<SaveStore>().stats().buffered,
             1,
             "重复降档只许写一条记录"
         );
 
+        // 再跑一 tick：version 已是 Some，不得重写。
+        harness.tick();
+        assert_eq!(
+            harness.app.world().resource::<SaveStore>().stats().buffered,
+            1,
+            "已提交的块不得每 tick 重写"
+        );
+
         flush_store(&harness);
+        harness.tick();
+
+        assert_eq!(
+            harness.will_unload().len(),
+            1,
+            "确认后只许发一条 ChunkWillUnload"
+        );
+        assert_eq!(harness.stats().unloaded, 1, "重复降档只许释放一次");
+        assert!(!harness.volume().contains_chunk(&key));
+
         let paths = SavePaths::new(dir.path());
         let region = read_region(&paths, harness.body, key)
             .expect("读回 region 失败")
@@ -1818,13 +1987,27 @@ mod tests {
         harness.demote(key);
         harness.tick();
 
-        assert_eq!(harness.stats().unloaded, 1);
+        // 空块走 delete：墓碑也要等确认落盘才释放。
+        assert!(harness.will_unload().is_empty(), "未确认前不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
         assert_eq!(
             harness.app.world().resource::<SaveStore>().stats().buffered,
             0,
             "无内容无实体的块不得写记录"
         );
+        assert_eq!(
+            harness.app.world().resource::<SaveStore>().stats().tombstones,
+            1,
+            "空块必须标删除"
+        );
+
         flush_store(&harness);
+        harness.tick();
+
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
         assert_eq!(
             read_back(&harness, dir.path(), key),
             None,
@@ -1870,7 +2053,10 @@ mod tests {
         harness.demote(key);
         harness.tick();
 
-        assert_eq!(harness.stats().unloaded, 1);
+        // 删除只是墓碑：确认落盘前不释放、不发消息。
+        assert!(harness.will_unload().is_empty(), "未确认前不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
         {
             let store = harness.app.world().resource::<SaveStore>();
             assert_eq!(store.stats().buffered, 0, "空块不得写记录");
@@ -1879,6 +2065,11 @@ mod tests {
         }
 
         flush_store(&harness);
+        harness.tick();
+
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
         assert!(
             read_back(&harness, dir.path(), key).is_none(),
             "卸载空块必须删掉磁盘上的旧记录"
@@ -1887,6 +2078,279 @@ mod tests {
             !paths.region(harness.body, key).exists(),
             "region 变空后文件必须删除"
         );
+    }
+
+    #[test]
+    fn unload_waits_for_commit_before_releasing() {
+        let dir = TempDir::new("unload-wait-commit");
+        let key = chunk_key(26, 0, 26);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        harness.tick();
+        assert!(harness.volume().contains_chunk(&key));
+
+        harness.demote(key);
+        harness.tick();
+
+        assert!(
+            harness.volume().contains_chunk(&key),
+            "未确认落盘前树必须留在容器里"
+        );
+        assert!(harness.will_unload().is_empty(), "未确认前不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
+        assert_eq!(
+            harness.app.world().resource::<SaveStore>().stats().buffered,
+            1,
+            "demote 后必须已经提交给存档（进内存缓冲）"
+        );
+        assert_eq!(read_back(&harness, dir.path(), key), None, "还在缓冲，未落盘");
+
+        flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key), "确认落盘后必须释放");
+        assert_eq!(
+            harness.will_unload(),
+            vec![ChunkWillUnload {
+                body: harness.body,
+                key,
+                from: Residency::Data,
+                to: Residency::None,
+            }]
+        );
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert!(
+            read_back(&harness, dir.path(), key).is_some(),
+            "落盘后必须能读回内容"
+        );
+    }
+
+    #[test]
+    fn upgrade_before_commit_keeps_chunk_and_cancels_unload() {
+        let dir = TempDir::new("unload-revive-before-commit");
+        let key = chunk_key(27, 0, 27);
+        let (_, expected) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        harness.tick();
+        let generated_after_load = harness.stats().generated;
+
+        harness.demote(key);
+        harness.tick();
+        assert_eq!(harness.stats().pending_unloads, 1);
+        assert!(harness.volume().contains_chunk(&key));
+        let _ = harness.will_unload();
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert!(harness.volume().contains_chunk(&key), "复活后树必须还在");
+        assert!(harness.will_unload().is_empty(), "复活不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(
+            harness.stats().generated,
+            generated_after_load,
+            "复活走快路径，不得重生成"
+        );
+        assert_eq!(harness.content_hash(&key), expected, "内容必须保持原样");
+
+        // 存档里那条未确认的写仍可落盘，但不得反过来触发释放。
+        flush_store(&harness);
+        harness.tick();
+        assert!(harness.volume().contains_chunk(&key), "落盘后树仍必须保留");
+        assert!(harness.will_unload().is_empty());
+        assert_eq!(harness.stats().pending_unloads, 0);
+    }
+
+    #[test]
+    fn upgrade_after_commit_still_keeps_chunk() {
+        let dir = TempDir::new("unload-revive-after-commit");
+        let key = chunk_key(28, 0, 28);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        harness.tick();
+
+        harness.demote(key);
+        harness.tick();
+        assert!(harness.volume().contains_chunk(&key));
+        assert_eq!(harness.stats().pending_unloads, 1);
+
+        // 已 committed，但还没到 release 阶段就被升档撤回。
+        flush_store(&harness);
+        let _ = harness.will_unload();
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert!(
+            harness.volume().contains_chunk(&key),
+            "已 committed 但还没释放时升档必须保留块"
+        );
+        assert!(harness.will_unload().is_empty(), "复活不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 0);
+
+        harness.tick();
+        assert!(harness.volume().contains_chunk(&key));
+        assert!(harness.will_unload().is_empty());
+        assert_eq!(harness.stats().unloaded, 0);
+    }
+
+    #[test]
+    fn failed_write_does_not_release() {
+        let dir = TempDir::new("unload-failed-write");
+        let key = chunk_key(29, 0, 29);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        harness.tick();
+
+        // 用目录占住 region 文件路径：后台写必然失败。
+        let region = SavePaths::new(dir.path()).region(harness.body, key);
+        std::fs::create_dir_all(&region).expect("创建占位目录");
+
+        harness.demote(key);
+        harness.tick();
+
+        {
+            let store = harness.app.world().resource::<SaveStore>();
+            store.flush();
+            for _ in 0..1000 {
+                store.poll();
+                if store.stats().in_flight_writes == 0 && store.stats().dirty > 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(store.stats().in_flight_writes, 0, "写盘请求必须已回收");
+            assert!(store.stats().dirty > 0, "失败的写必须重新标脏");
+            let entry = harness
+                .app
+                .world()
+                .resource::<PendingUnloads>()
+                .0
+                .get(&(harness.body, key))
+                .expect("条目必须保留");
+            let version = entry.version.expect("失败前必须已经提交过版本");
+            assert!(
+                !store.is_committed(harness.body, key, version),
+                "写盘失败不得算 committed"
+            );
+        }
+
+        assert!(harness.volume().contains_chunk(&key), "写盘失败时树必须保留");
+        assert!(harness.will_unload().is_empty(), "写盘失败不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
+
+        // 清掉占位目录后重试，落盘成功才释放。
+        std::fs::remove_dir_all(&region).expect("删除占位目录");
+        flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key), "确认落盘后才释放");
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
+    }
+
+    #[test]
+    fn air_chunk_delete_waits_for_commit_before_releasing() {
+        let dir = TempDir::new("unload-air-wait-commit");
+        let key = chunk_key(30, 0, 30);
+        let mut harness = harness(vec![Answer::Pending]);
+        attach_save_store(&mut harness, dir.path());
+
+        // 预置一条磁盘旧记录并落盘。
+        harness
+            .app
+            .world()
+            .resource::<SaveStore>()
+            .write(
+                harness.body,
+                key,
+                ChunkRecord {
+                    generator_version: 1,
+                    content: Some(vec![7; 4]),
+                    proposals: Vec::new(),
+                    entities: Vec::new(),
+                },
+            )
+            .expect("预写旧记录");
+        flush_store(&harness);
+        let paths = SavePaths::new(dir.path());
+        assert!(
+            paths.region(harness.body, key).is_file(),
+            "旧记录必须先在磁盘上"
+        );
+
+        harness.upgrade(key);
+        harness.tick();
+        assert!(!harness.volume().contains_chunk(&key), "Pending 不得装块");
+
+        harness.demote(key);
+        harness.tick();
+
+        // 删除只是墓碑：确认落盘前不释放、不发消息。
+        assert!(harness.will_unload().is_empty(), "未确认前不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().pending_unloads, 1);
+        assert_eq!(
+            harness.app.world().resource::<SaveStore>().stats().tombstones,
+            1,
+            "空块必须标删除"
+        );
+
+        flush_store(&harness);
+        harness.tick();
+
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
+        assert!(
+            read_back(&harness, dir.path(), key).is_none(),
+            "卸载空块必须删掉磁盘上的旧记录"
+        );
+        assert!(
+            !paths.region(harness.body, key).exists(),
+            "region 变空后文件必须删除"
+        );
+    }
+
+    #[test]
+    fn pending_unloads_release_only_once() {
+        let dir = TempDir::new("unload-once");
+        let key = chunk_key(31, 0, 31);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        harness.tick();
+        harness.demote(key);
+        harness.tick();
+        flush_store(&harness);
+        harness.tick();
+
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert_eq!(harness.will_unload().len(), 1);
+
+        // 再 tick 两次：不得重复释放、不得重复发消息。
+        harness.tick();
+        harness.tick();
+        assert_eq!(harness.stats().unloaded, 1, "同一块只许释放一次");
+        assert_eq!(harness.stats().pending_unloads, 0);
+        assert!(harness.will_unload().is_empty(), "不得重复发卸载消息");
     }
 
     #[test]

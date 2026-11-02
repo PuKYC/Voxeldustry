@@ -296,6 +296,32 @@ impl SaveStore {
         self.state().tick
     }
 
+    /// 该块**已确认落盘**的最高版本号；从未成功写过或删过返回 `None`。
+    ///
+    /// “确认”指后台线程回报 `WriteOutcome::Ok`（原子写 + fsync 已完成），不是
+    /// 指记录进了内存缓冲。调用方（流式层的卸载释放）用它决定数据是否安全落地。
+    #[must_use]
+    pub fn committed_version(&self, body: BodyKey, key: ChunkKey) -> Option<u64> {
+        self.state().committed.get(&(body, key)).copied()
+    }
+
+    /// 版本 `version` 是否已经落盘（`committed_version >= version`）。
+    ///
+    /// 版本号全局单调，因此“更新的版本已落盘”也算这一版安全：那块的最新内容
+    /// 已经在磁盘上，不会因为释放内存而丢数据。
+    #[must_use]
+    pub fn is_committed(&self, body: BodyKey, key: ChunkKey, version: u64) -> bool {
+        self.committed_version(body, key)
+            .is_some_and(|done| done >= version)
+    }
+
+    /// 是否有后台 IO 线程。没有线程的 store（测试替身）永远不会回报落盘确认，
+    /// 调用方不能无限等它。
+    #[must_use]
+    pub fn has_worker(&self) -> bool {
+        self.worker.is_some()
+    }
+
     /// 只读快照。
     #[must_use]
     pub fn stats(&self) -> SaveStats {
@@ -329,21 +355,21 @@ impl SaveStore {
     /// 把一个块写进内存缓冲（同键覆盖、最新赢），等 `Flush` 交给后台。
     ///
     /// 组合非法的记录（§3.1：三者全空、`content` 与提案并存）直接拒绝，不进缓冲。
+    ///
+    /// 返回这一版写的**版本号**：全局单调递增（不按块复位），调用方可以拿它配
+    /// [`SaveStore::is_committed`] 判断这次写是否真的落了盘。同键覆盖时旧版本的
+    /// 迟到结果不会清掉更新的意图（版本比较），但“旧版本内容确实写过盘”这件事
+    /// 仍会计入 committed——版本号单调，所以不会把它误当成新版本已落盘。
     pub fn write(
         &self,
         body: BodyKey,
         key: ChunkKey,
         record: ChunkRecord,
-    ) -> Result<(), RecordError> {
+    ) -> Result<u64, RecordError> {
         record.validate()?;
         let id = (body, key);
         let mut state = self.state();
-        let version = state
-            .versions
-            .get(&id)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1);
+        let version = state.next_version();
         state.versions.insert(id, version);
         state.buffer.insert(id, record);
         state.tombstones.remove(&id);
@@ -352,7 +378,7 @@ impl SaveStore {
         state.in_flight_reads.remove(&id);
         state.ready.remove(&id);
         state.misses.remove(&id);
-        Ok(())
+        Ok(version)
     }
 
     /// 标记一个块“不应再有记录”（卸载空块时调用）。
@@ -362,17 +388,13 @@ impl SaveStore {
     /// 队列和预算；失败时墓碑保留，下一次 Flush 重试（见类型级文档的删除语义）。
     ///
     /// 返回 `Result` 与 [`SaveStore::write`] 对称，调用方可以对两者用同一套
-    /// `Err` → warn 处理；目前没有会失败的校验。
-    pub fn delete(&self, body: BodyKey, key: ChunkKey) -> Result<(), RecordError> {
+    /// `Err` → warn 处理；目前没有会失败的校验。成功时返回本次删除的**版本号**
+    ///（与 `write` 同一条全局递增序列，可以交给 [`SaveStore::is_committed`]）。
+    pub fn delete(&self, body: BodyKey, key: ChunkKey) -> Result<u64, RecordError> {
         let id = (body, key);
         let mut state = self.state();
-        let version = state
-            .versions
-            .get(&id)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1);
-        // 版本 +1：在途的旧写/旧读因此作废，迟到的成功不会清掉墓碑。
+        let version = state.next_version();
+        // 换一个新版本号：在途的旧写/旧读因此作废，迟到的成功不会清掉墓碑。
         state.versions.insert(id, version);
         state.buffer.remove(&id);
         state.tombstones.insert(id);
@@ -380,7 +402,7 @@ impl SaveStore {
         state.in_flight_reads.remove(&id);
         state.ready.remove(&id);
         state.misses.insert(id);
-        Ok(())
+        Ok(version)
     }
 
     /// `ChunkStore::lookup` 的实现（§7）。
@@ -557,12 +579,25 @@ struct ReadTicket {
     issued_tick: u64,
 }
 
+impl StoreState {
+    /// 取一个全新的版本号（全局递增，写/删共用一条序列）。
+    fn next_version(&mut self) -> u64 {
+        self.next_version = self.next_version.saturating_add(1);
+        self.next_version
+    }
+}
+
 #[derive(Debug, Default)]
 struct StoreState {
     tick: u64,
     next_epoch: u64,
-    /// 每个块的最新版本（同键覆盖时 +1）。
+    /// 全局递增的版本发号器：写/删都取一个新号，永不复用。
+    next_version: u64,
+    /// 每个块**当前意图**的版本（同键覆盖时换成新号，落盘成功后移除）。
     versions: BTreeMap<ChunkId, u64>,
+    /// 每个块**已经确认落盘**的最高版本；只增不减。写入成功、删除成功（含
+    /// “本来就没有”的 no-op）都记一笔，供调用方判断某次写是否已经落地。
+    committed: BTreeMap<ChunkId, u64>,
     /// 内存缓冲：最新内容，写盘确认前一直在。
     buffer: BTreeMap<ChunkId, ChunkRecord>,
     /// 墓碑：该块不应再有记录，等 Flush 把删除落到磁盘（与 buffer 互斥）。
@@ -635,6 +670,13 @@ fn apply_write(state: &mut StoreState, result: WriteResult, report: &mut PollRep
     }
     match result.outcome {
         WriteOutcome::Ok { path } => {
+            // 落盘确认只增不减：即使这条结果被更新的意图压过，它代表的内容
+            // 也确实在磁盘上了（版本号全局单调，后写的号更大）。
+            state
+                .committed
+                .entry(id)
+                .and_modify(|done| *done = (*done).max(result.version))
+                .or_insert(result.version);
             // 期间没有更新的写/删 → 目标状态已落盘，可以丢；否则保留最新意图。
             if state.versions.get(&id).copied() == Some(result.version) {
                 state.buffer.remove(&id);
@@ -1614,5 +1656,109 @@ mod tests {
         assert_eq!(failed.len(), 1, "Poll 必须把超时发成 SaveFailed");
         let succeeded = app.world().resource::<Messages<SaveSucceeded>>();
         assert_eq!(succeeded.len(), 0);
+    }
+
+    #[test]
+    fn version_numbers_are_globally_monotonic() {
+        let dir = TempDir::new("version-monotonic");
+        let store = SaveStore::new(config(&dir));
+        let b = body(9);
+        let first = store.write(b, key(0, 0, 0), record(1)).expect("写缓冲");
+        let second = store.write(b, key(1, 0, 0), record(2)).expect("写缓冲");
+        let third = store.write(b, key(0, 0, 0), record(3)).expect("写缓冲");
+        assert!(second > first, "不同块也必须共用一条递增序列：{first} -> {second}");
+        assert!(third > second, "同块覆盖要换新号：{second} -> {third}");
+        // 删除也取同一条序列的号。
+        let deleted = store.delete(b, key(1, 0, 0)).expect("标删除");
+        assert!(deleted > third, "删除也要取新号：{third} -> {deleted}");
+    }
+
+    #[test]
+    fn committed_version_is_only_recorded_after_flush() {
+        let dir = TempDir::new("committed-write");
+        let b = body(10);
+        let k = key(0, 0, 0);
+        let store = SaveStore::new(config(&dir));
+        let version = store.write(b, k, record(1)).expect("写缓冲");
+        assert_eq!(store.committed_version(b, k), None, "进缓冲不算落盘");
+        assert!(!store.is_committed(b, k, version));
+
+        assert_eq!(store.flush(), 1);
+        let report = pump(&store);
+        assert_eq!(report.successes.len(), 1);
+        assert_eq!(store.committed_version(b, k), Some(version));
+        assert!(store.is_committed(b, k, version));
+    }
+
+    #[test]
+    fn committed_version_is_recorded_after_delete() {
+        let dir = TempDir::new("committed-delete");
+        let b = body(11);
+        let k = key(0, 0, 0);
+        let store = SaveStore::new(config(&dir));
+        store.write(b, k, record(1)).expect("写缓冲");
+        let written = store.flush();
+        assert_eq!(written, 1);
+        pump(&store);
+        let before_delete = store.committed_version(b, k).expect("写成功必须确认");
+
+        let version = store.delete(b, k).expect("标删除");
+        assert_eq!(store.committed_version(b, k), Some(before_delete), "删除没落盘前不确认");
+        assert!(!store.is_committed(b, k, version), "删除没落盘前不能算确认");
+        store.flush();
+        pump(&store);
+        assert!(store.is_committed(b, k, version), "删除成功也要记版本");
+    }
+
+    #[test]
+    fn a_newer_write_invalidates_committed_check() {
+        let dir = TempDir::new("committed-newer");
+        let b = body(12);
+        let k = key(0, 0, 0);
+        let store = SaveStore::new(config(&dir));
+        let first = store.write(b, k, record(1)).expect("写缓冲");
+        store.flush();
+        pump(&store);
+        assert!(store.is_committed(b, k, first));
+
+        // 第一次已落盘，但第二次是更新的内容：在它自己落盘前不能算安全。
+        let second = store.write(b, k, record(2)).expect("写缓冲");
+        assert!(store.is_committed(b, k, first), "旧版本已落地，事实不变");
+        assert!(!store.is_committed(b, k, second));
+        store.flush();
+        pump(&store);
+        assert!(store.is_committed(b, k, second));
+    }
+
+    #[test]
+    fn failed_write_never_gets_committed() {
+        let dir = TempDir::new("committed-fail");
+        let b = body(13);
+        let k = key(0, 0, 0);
+        let paths = SavePaths::new(dir.path());
+        // 目标路径被目录占住 → rename 必失败。
+        fs::create_dir_all(paths.region(b, k)).expect("占位目录");
+        let store = SaveStore::new(config(&dir));
+        let version = store.write(b, k, record(1)).expect("写缓冲");
+        store.flush();
+        let report = pump(&store);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(store.committed_version(b, k), None, "写失败绝不能确认");
+        assert!(!store.is_committed(b, k, version));
+
+        // 障碍清掉后重试成功，同一版本号才算落地。
+        fs::remove_dir_all(paths.region(b, k)).expect("清掉障碍");
+        store.flush();
+        pump(&store);
+        assert!(store.is_committed(b, k, version));
+    }
+
+    #[test]
+    fn has_worker_reports_background_io() {
+        let dir = TempDir::new("has-worker");
+        let online = SaveStore::new(config(&dir));
+        assert!(online.has_worker());
+        let offline = SaveStore::offline(config(&dir));
+        assert!(!offline.has_worker(), "离线 store 永远不会回报落盘确认");
     }
 }
