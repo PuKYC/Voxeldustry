@@ -6,7 +6,7 @@
 //! 本模块只定义类型与标签；v1 不执行 AI、不做功能方块。
 
 use bevy::prelude::*;
-use game_engine::identity::{StableEntityId, StableIdWorldExt};
+use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
 use game_engine::math::Vec3F;
 use game_engine::voxel::Attachment;
 
@@ -113,13 +113,76 @@ pub fn spawn_island_entity(
         "spawn_island_entity：缺少 IslandRegistry 资源；请先插入 IslandRegistry 资源"
     );
 
-    let (entity, stable_id) = world.spawn_stable((Body::island(anchored, biome), IslandTag));
-    let island_id = IslandId(stable_id.0);
+    let entity = world.spawn((Body::island(anchored, biome), IslandTag)).id();
+    let stable_id = attach_island_entity(world, entity, drift, anchored, biome);
+
+    (entity, IslandId(stable_id.0))
+}
+
+/// 把一个**已经存在**的实体升级为正式 island body：分配 / 复用 `StableEntityId`
+/// 并在 [`IslandRegistry`] 里登记 `IslandId(id.0)`。
+///
+/// 与 [`spawn_island_entity`] 的关系：后者 = `spawn` + 本函数。需要给由
+/// `Commands` 生成、或由引擎 / 存档恢复出来的实体补上「稳定 ID + 注册表条目」
+/// 时（例如地形根实体），直接调本函数。
+///
+/// **幂等**：实体已有 `StableEntityId` 时直接返回它，不再次分配；注册表里
+/// 缺条目才补插，已有条目不覆盖（重复调用不会把 anchored / drift / biome 改掉，
+/// 也不会重复插入）。`StableEntityIndex` 的双向映射在两条路径上都会保证存在。
+///
+/// 要求 `IslandRegistry` 已作为资源插入（`WorldPlugin` 会注册）；缺失时 panic，
+/// 与 [`spawn_island_entity`] 同样的诊断信息——静默跳过会让岛从注册表消失。
+#[track_caller]
+pub fn attach_island_entity(
+    world: &mut World,
+    entity: Entity,
+    drift: Vec3F,
+    anchored: bool,
+    biome: BiomeId,
+) -> StableEntityId {
+    assert!(
+        world.get_resource::<IslandRegistry>().is_some(),
+        "attach_island_entity：缺少 IslandRegistry 资源；请先插入 IslandRegistry 资源"
+    );
+
+    // ── 幂等路径：已有稳定 ID，只补注册表 / 索引，绝不二次分配 ──
+    if let Some(existing) = world.get::<StableEntityId>(entity).copied() {
+        let island_id = IslandId(existing.0);
+        {
+            let mut registry = world.resource_mut::<IslandRegistry>();
+            if !registry.contains(island_id) {
+                registry.insert(island_id, Island::new(drift, anchored, biome));
+            }
+        }
+        // 索引可能缺失（例如读档后只插了组件、没走 spawn_stable），补齐是幂等的。
+        if world.resource::<StableEntityIndex>().id(entity) != Some(existing) {
+            world
+                .resource_mut::<StableEntityIndex>()
+                .insert(existing, entity);
+        }
+        return existing;
+    }
+
+    assert!(
+        world.get_resource::<StableIdAllocator>().is_some(),
+        "attach_island_entity：缺少 StableIdAllocator 资源；请先插入 StableIdAllocator 资源"
+    );
+    assert!(
+        world.get_resource::<StableEntityIndex>().is_some(),
+        "attach_island_entity：缺少 StableEntityIndex 资源；请先插入 StableEntityIndex 资源"
+    );
+
+    // ── 分配路径：与 spawn_stable 相同的三步（组件 / 索引 / 注册表）──
+    let stable_id = world.resource_mut::<StableIdAllocator>().allocate();
+    world.entity_mut(entity).insert(stable_id);
+    world
+        .resource_mut::<StableEntityIndex>()
+        .insert(stable_id, entity);
     world
         .resource_mut::<IslandRegistry>()
-        .insert(island_id, Island::new(drift, anchored, biome));
+        .insert(IslandId(stable_id.0), Island::new(drift, anchored, biome));
 
-    (entity, island_id)
+    stable_id
 }
 
 // ── 标签组件（同一实体上的第二、第三……个语义标记）──────────────────────────
@@ -142,7 +205,7 @@ pub struct AutomatonTag;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_engine::identity::StableIdPlugin;
+    use game_engine::identity::{StableIdPlugin, StableIdWorldExt};
     use game_engine::math::FixedPoint;
 
     #[test]
@@ -199,6 +262,9 @@ mod tests {
             BodyKey::from(island_id),
             BodyKey::from_entity(world, entity).expect("岛实体必须有稳定 ID")
         );
+        // 只分配一个稳定 ID：发号器 1 -> 2，索引恰好一条。
+        assert_eq!(world.resource::<StableIdAllocator>().next_id(), 2);
+        assert_eq!(world.resource::<StableEntityIndex>().len(), 1);
 
         let drift2 = Vec3F::new(
             FixedPoint::from_num(-4),
@@ -212,6 +278,9 @@ mod tests {
             BodyKey::from_entity(world, entity).expect("岛实体必须有稳定 ID"),
             BodyKey::from_entity(world, entity2).expect("岛实体必须有稳定 ID")
         );
+        // 第二次调用再分配一个：发号器 2 -> 3，索引两条，ID 各不相同。
+        assert_eq!(world.resource::<StableIdAllocator>().next_id(), 3);
+        assert_eq!(world.resource::<StableEntityIndex>().len(), 2);
         let registry = world.resource::<IslandRegistry>();
         assert_eq!(registry.len(), 2);
         let island2 = registry.get(island_id2).expect("第二个岛必须在注册表里");
@@ -229,6 +298,98 @@ mod tests {
         app.finish();
 
         let _ = spawn_island_entity(app.world_mut(), Vec3F::ZERO, true, BiomeId(0));
+    }
+
+    /// (b) attach_island_entity 幂等：同一实体两次调用 -> 同一 StableEntityId、
+    /// 注册表一条、发号器不动、索引双向可查，且已有条目的语义不被覆盖。
+    #[test]
+    fn attach_island_entity_is_idempotent() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.insert_resource(IslandRegistry::new());
+        app.finish();
+
+        let world = app.world_mut();
+        let entity = world.spawn(()).id();
+        let drift = Vec3F::new(
+            FixedPoint::from_num(0),
+            FixedPoint::from_num(1),
+            FixedPoint::from_num(2),
+        );
+
+        let first = attach_island_entity(world, entity, drift, true, BiomeId(3));
+        assert_eq!(first, StableEntityId(1), "首次 attach 必须分配下一个稳定 ID");
+        assert_eq!(world.get::<StableEntityId>(entity), Some(&first));
+        assert_eq!(world.resource::<StableIdAllocator>().next_id(), 2);
+
+        // 同一实体再来一次（故意传不同的语义参数）：仍返回同一 ID，不二次分配。
+        let second = attach_island_entity(world, entity, Vec3F::ZERO, false, BiomeId(0));
+        assert_eq!(second, first, "重复 attach 必须返回同一个 StableEntityId");
+        assert_eq!(
+            world.resource::<StableIdAllocator>().next_id(),
+            2,
+            "幂等路径不得从发号器取号"
+        );
+        {
+            let registry = world.resource::<IslandRegistry>();
+            assert_eq!(registry.len(), 1, "同一实体只能有一条注册表记录");
+            assert_eq!(
+                registry.ids().collect::<Vec<_>>(),
+                vec![IslandId(first.0)],
+                "注册表键必须是实体稳定 ID"
+            );
+            let island = registry.get(IslandId(first.0)).expect("注册表必须有对应条目");
+            // 已有条目不覆盖：重复 attach 不把锚定岛的 drift / anchored / biome 改掉。
+            assert_eq!(island.drift, drift);
+            assert!(island.anchored);
+            assert_eq!(island.biome, BiomeId(3));
+        }
+        // StableEntityIndex 双向可查。
+        {
+            let index = world.resource::<StableEntityIndex>();
+            assert_eq!(index.id(entity), Some(first));
+            assert_eq!(index.entity(first), Some(entity));
+            assert_eq!(index.len(), 1);
+        }
+    }
+
+    /// 已有 StableEntityId 但注册表条目丢失（模拟读档只恢复组件）：
+    /// attach 必须补插条目、复用原 ID、不动发号器。
+    #[test]
+    fn attach_island_entity_repairs_missing_registry_entry_without_allocating() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.insert_resource(IslandRegistry::new());
+        app.finish();
+
+        let world = app.world_mut();
+        let entity = world.spawn(()).id();
+        let id = attach_island_entity(world, entity, Vec3F::ZERO, true, BiomeId(1));
+
+        world.resource_mut::<IslandRegistry>().remove(IslandId(id.0));
+        assert!(world.resource::<IslandRegistry>().is_empty());
+
+        let again = attach_island_entity(world, entity, Vec3F::ZERO, true, BiomeId(1));
+        assert_eq!(again, id, "已有 StableEntityId 时不得重新分配");
+        assert_eq!(world.resource::<StableIdAllocator>().next_id(), 2);
+        assert!(world.resource::<IslandRegistry>().contains(IslandId(id.0)));
+        assert_eq!(world.resource::<IslandRegistry>().len(), 1);
+        assert_eq!(world.resource::<StableEntityIndex>().id(entity), Some(id));
+    }
+
+    /// 与 spawn_island_entity 相同的可诊断信息：缺注册表资源直接 panic。
+    #[test]
+    #[should_panic(expected = "缺少 IslandRegistry 资源")]
+    fn attach_island_entity_requires_registry_resource() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.finish();
+
+        let entity = app.world_mut().spawn(()).id();
+        let _ = attach_island_entity(app.world_mut(), entity, Vec3F::ZERO, true, BiomeId(0));
     }
 
     #[test]

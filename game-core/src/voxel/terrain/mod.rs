@@ -47,6 +47,7 @@ use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
+use game_engine::math::Vec3F;
 use game_engine::presentation::voxel::{
     extract_raw_halo_with_faces, raw_halo_has_solid_interior, FaceNeighbor as MeshFaceNeighbor,
     WrappedBlockCache, RAW_VOXELS,
@@ -61,9 +62,10 @@ use game_engine::voxel::{
 use crate::presentation::voxel_mesh::VoxChunkGroupRaw;
 use crate::presentation::PresentedTransform;
 use crate::static_data::voxel::{BiomeId, DEFAULT_BIOME, DEFAULT_VOXEL_SIZE};
+use crate::voxel::body::attach_island_entity;
 use crate::voxel::lod::{VoxelLodConfig, MAX_LOD};
 use crate::voxel::terrain::generation::WorldGenerator;
-use crate::world::WorldSeed;
+use crate::world::{IslandRegistry, WorldSeed};
 
 use blocks::FaceNeighbor as TerrainFaceNeighbor;
 pub use blocks::{
@@ -152,6 +154,9 @@ impl Plugin for TerrainPlugin {
 /// 本身只以组件存在（生成时把 `VoxVolume` spawn 到实体上）。
 pub(crate) fn register_systems(app: &mut App) {
     app.init_resource::<TerrainGroups>()
+        // 地形根实体要成为正式 island body（StableEntityId + IslandRegistry 条目），
+        // 所以本插件保证注册表存在；WorldPlugin 已经 init 过时这里是 no-op。
+        .init_resource::<IslandRegistry>()
         .init_resource::<TerrainGroupMembers>()
         .init_resource::<TerrainNeighborBlocks>()
         // 表现层网格机制不注册插件；WrappedBlockCache 由唯一消费者 core 侧 init。
@@ -162,7 +167,9 @@ pub(crate) fn register_systems(app: &mut App) {
         .init_resource::<VoxelLodObserver>()
         .init_resource::<TerrainStreamState>()
         // 观察者写入者在 FixedUpdate；流式重划分放 Update 以便同 tick 看到新位置。
-        .add_systems(Startup, build_terrain)
+        // build_terrain 用 Commands 生成地形根实体；紧随其后的 exclusive system
+        // 会在运行前 flush 这些命令，因此能拿到那个实体（见 attach_terrain_body）。
+        .add_systems(Startup, (build_terrain, attach_terrain_body).chain())
         // 编辑后包装缓存必须失效：否则下一次 LOD 流式重划分会用旧树重新
         // extract，把玩家刚改的方块「回滚」掉。脏集由 mesh 刷新系统消费，
         // 所以这里只 peek，并且必须排在那之前。
@@ -869,6 +876,30 @@ fn build_terrain(
     );
 }
 
+/// 把地形根实体升级成正式 island body：挂 `StableEntityId` + 写 [IslandRegistry]。
+///
+/// `build_terrain` 用 `Commands` 生成地形根实体，所以这里必须是 **exclusive system**
+/// （`&mut World`）：executor 在运行 exclusive system 之前会 flush 排在前面的命令
+/// 队列，`Startup` 里 chain 在 `build_terrain` 之后就能看到该实体。
+/// 这一点由 `terrain_root_entity_is_a_registered_island_body` 实测（一次 `update()`
+/// 后体素实体必须已带稳定 ID 且注册表有对应条目）。
+///
+/// 地形是锚定岛：`drift = ZERO`、`anchored = true`、`biome = TerrainConfig.biome`。
+/// 幂等：已带 `StableEntityId` 的实体被 `Without<StableEntityId>` 排除，重复运行
+/// 不会二次分配；即使被再次 attach，[`attach_island_entity`] 也复用原 ID。
+fn attach_terrain_body(world: &mut World) {
+    let biome = world.resource::<TerrainConfig>().biome;
+    // 先收集成 Vec 结束查询对 world 的借用，再逐实体 attach（需要 &mut World）。
+    let entities: Vec<Entity> = {
+        let mut query =
+            world.query_filtered::<Entity, (With<VoxVolume>, Without<StableEntityId>)>();
+        query.iter(world).collect()
+    };
+    for entity in entities {
+        attach_island_entity(world, entity, Vec3F::ZERO, true, biome);
+    }
+}
+
 /// 运行期流式重划分：按观察者把 LOD 分区 diff 到 [TerrainGroups]，增删分组实体。
 ///
 /// 输入优先级：若存在 [VoxelLodHandle] 且 observer / config 为 Some，则覆写
@@ -971,6 +1002,7 @@ fn stream_terrain_lod(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::IslandId;
     use game_engine::identity::{StableEntityId, StableIdPlugin};
     use game_engine::voxel::{
         chunk_content_hash, chunk_key, count_body_nodes, lod_block_origin, release_body, MaxDepth,
@@ -1066,6 +1098,71 @@ mod tests {
             app.world().entity(entity).get::<VoxVolume>().is_some(),
             "体素容器必须是实体上的 VoxVolume 组件"
         );
+    }
+
+    /// (c) 地形根实体是正式 island body：一次 `update()`（Startup 里的
+    /// `build_terrain` -> `attach_terrain_body`）之后必须已有 StableEntityId 与
+    /// IslandRegistry 条目；anchored = true、drift = ZERO、biome = 配置值。
+    ///
+    /// 这条同时是「exclusive system 能看到 build_terrain 的 Commands」的实测：
+    /// 地形根实体只由 `Commands` 生成，若命令没 flush，这里的查询会是空、
+    /// 注册表里也不会有任何条目。
+    #[test]
+    fn terrain_root_entity_is_a_registered_island_body() {
+        let mut app = terrain_app(0, 0);
+        app.update();
+
+        let world = app.world_mut();
+        let entities: Vec<Entity> = {
+            let mut query = world.query_filtered::<Entity, With<VoxVolume>>();
+            query.iter(world).collect()
+        };
+        assert_eq!(entities.len(), 1, "地形根实体必须恰好一个");
+        let entity = entities[0];
+
+        let stable = *world
+            .get::<StableEntityId>(entity)
+            .expect("地形根实体必须有 StableEntityId：attach_terrain_body 必须在 Startup 生效");
+        let config_biome = world.resource::<TerrainConfig>().biome;
+
+        // StableEntityIndex 双向可查。
+        {
+            let index = world.resource::<StableEntityIndex>();
+            assert_eq!(index.id(entity), Some(stable));
+            assert_eq!(index.entity(stable), Some(entity));
+        }
+        // 注册表里恰好一条地形岛，语义字段正确。
+        {
+            let registry = world.resource::<IslandRegistry>();
+            assert_eq!(registry.len(), 1, "地形是唯一一条岛注册表记录");
+            let island = registry
+                .get(IslandId(stable.0))
+                .expect("地形根实体必须在 IslandRegistry 里有对应条目");
+            assert!(island.anchored, "地形是锚定岛");
+            assert_eq!(island.drift, Vec3F::ZERO, "锚定地形 drift 必须为零");
+            assert_eq!(island.biome, config_biome, "biome 必须取 TerrainConfig.biome");
+        }
+
+        // 幂等：直接再跑一次系统（等价于 Startup 重复执行），不新增条目、不取号。
+        let next_id = world.resource::<StableIdAllocator>().next_id();
+        attach_terrain_body(world);
+        assert_eq!(world.resource::<IslandRegistry>().len(), 1);
+        assert_eq!(world.resource::<StableIdAllocator>().next_id(), next_id);
+        assert_eq!(world.get::<StableEntityId>(entity), Some(&stable));
+
+        // 再 update 一次（Update 里的流式系统）也不新增注册表条目 / 不再分配 ID。
+        app.update();
+        assert_eq!(
+            app.world().resource::<IslandRegistry>().len(),
+            1,
+            "再 update 一次不得新增岛注册表条目"
+        );
+        assert_eq!(
+            app.world().resource::<StableIdAllocator>().next_id(),
+            next_id,
+            "再 update 一次不得再分配稳定 ID"
+        );
+        assert_eq!(app.world().get::<StableEntityId>(entity), Some(&stable));
     }
 
     #[test]
@@ -1572,9 +1669,10 @@ mod tests {
         assert_eq!(before.blocks, after.blocks);
         assert_eq!(before.groups, after.groups);
         assert_eq!(after.groups, app.world().resource::<TerrainGroups>().len());
+        // 分组实体 + 地形根实体（正式 island body，见 attach_terrain_body）。
         assert_eq!(
             app.world().resource::<StableEntityIndex>().len(),
-            after.groups
+            after.groups + 1
         );
     }
 
