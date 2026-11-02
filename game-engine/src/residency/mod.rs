@@ -185,6 +185,30 @@ impl ChunkAnchor {
     }
 }
 
+/// 可选覆盖：该实体锚定在哪个体（岛 / 船 / 结构）上。
+///
+/// 缺省时按实体自己的 [`StableEntityId`] 推导（「实体即体」的旧约定）；
+/// 玩家、船内 NPC 这类「不是体、但站在某个体上」的实体显式挂它。
+/// [`BodyKey::INVALID`] 视为未设置（实体变成未锚定，驻留层忽略它）。
+///
+/// **已知限制**：请求来源键仍是解析后的体的键（`RequestSource::Agent` /
+/// `Observer` 用 `body.stable_id()`），所以同一体上的多个同类来源共用一个键，
+/// 它们的来源快照会互相覆盖（覆盖语义见 [`RequestSource`]）；多观察者场景
+/// 需要按实体 ID 分键，本轮未做。
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyRef(pub BodyKey);
+
+impl Default for BodyRef {
+    /// 缺省即「未设置」＝ [`BodyKey::INVALID`]。
+    ///
+    /// 刻意不给 [`BodyKey`] 本身实现 `Default`：那个类型上「缺省值」很容易被误用成
+    /// 合法键，无效值必须显式写 [`BodyKey::INVALID`]。
+    #[inline]
+    fn default() -> Self {
+        Self(BodyKey::INVALID)
+    }
+}
+
 /// 可选：实体正在作业的区块（通常一两个）。AI 作业时由 AI 系统写入。
 ///
 /// 每项自带 [`BodyKey`]：作业对象可能在别的体（岛 / 船）上。
@@ -672,9 +696,29 @@ pub enum ResidencySet {
 
 // ───────────────────────────── 内部小工具 ─────────────────────────────
 
-/// 从实体读稳定 ID。缺失时 debug 断言、release 告警并忽略该实体（文档 `5 约束）。
+/// 解析实体锚定在哪个体上。
+///
+/// 优先级：有效的 [`BodyRef`] 覆盖 > 实体自己的 [`StableEntityId`]。
+/// 无效的 [`BodyRef`]（[`BodyKey::INVALID`]）视作显式“未设置”：告警并返回 `None`，
+/// 实体因此变成未锚定，驻留层忽略它。
+///
+/// 注意：来源键（[`RequestSource`] 的 id）仍由解析后的体的 `stable_id()` 得出，
+/// 不是 `body_ref` 本身；缺省时它就是实体自己的 ID。
 #[track_caller]
-pub(crate) fn body_key_for(entity: Entity, id: Option<&StableEntityId>) -> Option<BodyKey> {
+pub(crate) fn body_key_for(
+    entity: Entity,
+    id: Option<&StableEntityId>,
+    body_ref: Option<&BodyRef>,
+) -> Option<BodyKey> {
+    if let Some(body_ref) = body_ref {
+        if body_ref.0.is_valid() {
+            return Some(body_ref.0);
+        }
+        warn!(
+            "residency: entity {entity:?} 的 BodyRef 是 BodyKey::INVALID，已忽略（实体未锚定）"
+        );
+        return None;
+    }
     match id {
         Some(id) => Some(BodyKey(*id)),
         None => {

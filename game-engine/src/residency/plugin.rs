@@ -10,7 +10,7 @@ use bevy::prelude::*;
 
 use super::Observer as ObserverTag;
 use super::{
-    body_key_for, chunk_of, observer_chunks, AwaitingChunks, ChunkAnchor, ChunkReached,
+    body_key_for, chunk_of, observer_chunks, AwaitingChunks, BodyRef, ChunkAnchor, ChunkReached,
     GameTickSet, LogicPos, PathCorridor, PinRequests, Real, RequestSource, Residency,
     ResidencyChanged, ResidencyConfig, ResidencySet, ResidencyStats, ResidencyTable, UnsavedEditClear,
     UnsavedEditMark, WorkSites,
@@ -75,18 +75,24 @@ impl Plugin for ResidencyPlugin {
 
 // ───────────────────────────── Anchor ─────────────────────────────
 
-/// 按 LogicPos 重算 ChunkAnchor（只在位置变化或锚点刚插入时算）。
+/// 按 LogicPos 重算 ChunkAnchor（位置、锚点或 BodyRef 变化时算）。
 ///
 /// **只用定点整数**：chunk_of 内部是 i64::div_euclid。禁止 f32 参与块归属。
 /// 过渡期位置来源是 LogicPos；将来 BodyPose 落地后只改这里。
 fn update_anchors(
     mut anchors: Query<
-        (Entity, &LogicPos, &mut ChunkAnchor, Option<&StableEntityId>),
-        Or<(Changed<LogicPos>, Added<ChunkAnchor>)>,
+        (
+            Entity,
+            &LogicPos,
+            &mut ChunkAnchor,
+            Option<&StableEntityId>,
+            Option<&BodyRef>,
+        ),
+        Or<(Changed<LogicPos>, Added<ChunkAnchor>, Changed<BodyRef>)>,
     >,
 ) {
-    for (entity, pos, mut anchor, id) in &mut anchors {
-        let Some(body) = body_key_for(entity, id) else {
+    for (entity, pos, mut anchor, id, body_ref) in &mut anchors {
+        let Some(body) = body_key_for(entity, id, body_ref) else {
             continue;
         };
         let next = ChunkAnchor::new(body, chunk_of(pos.0));
@@ -130,6 +136,7 @@ fn collect_requests(
             &ChunkAnchor,
             Option<&WorkSites>,
             Option<&PathCorridor>,
+            Option<&BodyRef>,
         ),
         (
             With<Real>,
@@ -148,11 +155,18 @@ fn collect_requests(
             &ChunkAnchor,
             Option<&WorkSites>,
             Option<&PathCorridor>,
+            Option<&BodyRef>,
         ),
         With<Real>,
     >,
     changed_observers: Query<
-        (Entity, Option<&StableEntityId>, &ChunkAnchor, &ObserverTag),
+        (
+            Entity,
+            Option<&StableEntityId>,
+            &ChunkAnchor,
+            &ObserverTag,
+            Option<&BodyRef>,
+        ),
         (
             With<ObserverTag>,
             Or<(Added<ObserverTag>, Changed<ChunkAnchor>, Changed<ObserverTag>)>,
@@ -168,8 +182,8 @@ fn collect_requests(
         BTreeMap::new();
 
     // 1) Real 实体：锚点块 ∪ WorkSites ∪ PathCorridor，档位 Data。
-    for (entity, id, anchor, sites, corridor) in &changed_agents {
-        let Some(body) = body_key_for(entity, id) else {
+    for (entity, id, anchor, sites, corridor, body_ref) in &changed_agents {
+        let Some(body) = body_key_for(entity, id, body_ref) else {
             continue;
         };
         plans.insert(
@@ -184,10 +198,10 @@ fn collect_requests(
     removed_entities.extend(removed_corridors.read());
     for entity in removed_entities {
         // 实体已销毁时 observer 已经清理过，这里跳过。
-        let Ok((_, id, anchor, sites, corridor)) = all_agents.get(entity) else {
+        let Ok((_, id, anchor, sites, corridor, body_ref)) = all_agents.get(entity) else {
             continue;
         };
-        let Some(body) = body_key_for(entity, id) else {
+        let Some(body) = body_key_for(entity, id, body_ref) else {
             continue;
         };
         plans.insert(
@@ -197,8 +211,8 @@ fn collect_requests(
     }
 
     // 2) Observer 实体：以锚点为中心、半径 radius 的三维球，档位 Render。
-    for (entity, id, anchor, observer) in &changed_observers {
-        let Some(body) = body_key_for(entity, id) else {
+    for (entity, id, anchor, observer, body_ref) in &changed_observers {
+        let Some(body) = body_key_for(entity, id, body_ref) else {
             continue;
         };
         plans.insert(

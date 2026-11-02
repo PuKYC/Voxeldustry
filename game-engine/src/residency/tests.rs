@@ -172,6 +172,103 @@ fn update_anchors_writes_negative_chunk() {
     assert!(harness.table().is_requested(body(1), key(-1, -2, 0)));
 }
 
+// ───────────────────────────── BodyRef 覆盖 ─────────────────────────────
+
+#[test]
+fn body_ref_overrides_self_id() {
+    let mut harness = Harness::new(ResidencyConfig::default());
+    let entity = harness
+        .app
+        .world_mut()
+        .spawn((
+            StableEntityId(7),
+            Real,
+            pos_voxels(32, 0, 0),
+            BodyRef(body(99)),
+        ))
+        .id();
+
+    harness.tick();
+
+    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    assert_eq!(anchor.body, body(99));
+    assert_eq!(anchor.chunk, key(1, 0, 0));
+    // 请求记在覆盖后的体上，而不是实体自己的 ID 上。
+    assert!(harness.table().is_requested(body(99), key(1, 0, 0)));
+    assert!(!harness.table().is_requested(body(7), key(1, 0, 0)));
+}
+
+#[test]
+fn missing_body_ref_falls_back_to_self() {
+    let mut harness = Harness::new(ResidencyConfig::default());
+    let entity = harness.spawn_real(7, pos_voxels(0, 0, 0));
+
+    harness.tick();
+
+    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    assert_eq!(anchor.body, body(7));
+    assert_eq!(anchor.chunk, key(0, 0, 0));
+}
+
+#[test]
+fn invalid_body_ref_unanchors_entity() {
+    let mut harness = Harness::new(ResidencyConfig::default());
+    let entity = harness
+        .app
+        .world_mut()
+        .spawn((
+            StableEntityId(7),
+            Real,
+            pos_voxels(0, 0, 0),
+            BodyRef(BodyKey::INVALID),
+        ))
+        .id();
+
+    harness.tick();
+
+    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    assert_eq!(anchor.body, BodyKey::INVALID);
+    assert!(!anchor.is_valid());
+    // 无效 BodyRef 的实体不参与驻留，也不发任何变化消息。
+    assert!(harness
+        .table()
+        .requests_of(RequestSource::Agent(StableEntityId(7)))
+        .is_empty());
+    assert!(harness.take_changes().is_empty());
+}
+
+#[test]
+fn body_ref_change_reanchors() {
+    let mut harness = Harness::new(ResidencyConfig::default());
+    let entity = harness
+        .app
+        .world_mut()
+        .spawn((
+            StableEntityId(7),
+            Real,
+            pos_voxels(0, 0, 0),
+            BodyRef(body(99)),
+        ))
+        .id();
+
+    harness.tick();
+    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    assert_eq!(anchor.body, body(99));
+
+    // 只改 BodyRef（位置不变）：Changed<BodyRef> 必须触发锚点重算。
+    harness
+        .app
+        .world_mut()
+        .entity_mut(entity)
+        .insert(BodyRef(body(100)));
+    harness.tick();
+
+    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    assert_eq!(anchor.body, body(100));
+    assert_eq!(anchor.chunk, key(0, 0, 0));
+    assert!(harness.table().is_requested(body(100), key(0, 0, 0)));
+}
+
 // ───────────────────────────── 请求收集 ─────────────────────────────
 
 #[test]
