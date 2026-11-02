@@ -7,11 +7,13 @@
 //! 数值表在 crate::static_data::voxel（WorldTables）；体素插件在 crate::voxel。
 
 pub mod island;
+pub mod load;
 pub mod rng;
 pub mod save;
 pub mod seed;
 
 pub use island::{Biome, Island, IslandId, IslandRegistry};
+pub use load::{load_world, LoadStats, LoadedWorld};
 pub use rng::WorldRng;
 pub use save::{capture_world, write_capture, WorldCapture};
 pub use seed::WorldSeed;

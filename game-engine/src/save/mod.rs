@@ -72,8 +72,8 @@ pub use snapshot::{capture, EntitySnapshot, Persist};
 
 /// 文件 IO 层（§1 目录命名、§5 原子写与崩溃一致性）。
 pub use store::{
-    read_region, read_world_meta, region_origin, write_atomic, write_region, write_world_meta,
-    SavePaths,
+    read_region, read_world_meta, region_origin, regions_on_disk, write_atomic, write_region,
+    write_world_meta, SavePaths,
 };
 
 use std::fmt;

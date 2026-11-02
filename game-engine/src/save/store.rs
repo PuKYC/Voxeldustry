@@ -207,6 +207,36 @@ fn region_file_name(origin: ChunkKey) -> String {
     format!("region_{}_{}_{}", origin.x, origin.y, origin.z)
 }
 
+/// 从文件名解析 region 键（接受可选的 `.recovered` 后缀，其它后缀调用方先跳过）。
+///
+/// 只接受 `region_file_name` 的规范输出：`+1`、前导零、多余分量都必须拒绝，
+/// 否则同一个 region 可能对应多个文件，枚举就不再是确定的。
+fn parse_region_file_name(name: &str) -> Option<ChunkKey> {
+    let base = name.strip_suffix(".recovered").unwrap_or(name);
+    let rest = base.strip_prefix("region_")?;
+    let mut parts = rest.split('_');
+    let x = parts.next()?.parse::<i32>().ok()?;
+    let y = parts.next()?.parse::<i32>().ok()?;
+    let z = parts.next()?.parse::<i32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let key = ChunkKey::new(x, y, z);
+    (region_file_name(key) == base).then_some(key)
+}
+
+/// 文件名不是规范的 `region_<x>_<y>_<z>`：拒绝而不是跳过（未知文件可能是玩家/工具放错）。
+fn invalid_region_name(path: &Path) -> SaveError {
+    SaveError::new(
+        path.display().to_string(),
+        0,
+        SaveErrorKind::InvalidValue {
+            what: "region file name",
+            value: 0,
+        },
+    )
+}
+
 /// 缺省写目标被 quarantine 时的错误：拒绝写，不覆盖主文件、不静默降级（§5.3）。
 fn quarantined_error(path: &Path) -> SaveError {
     SaveError::new(
@@ -339,6 +369,46 @@ pub fn read_region(
         MAX_REGION_FILE_LEN,
         decode_region,
     )
+}
+
+/// 列出某个 body 目录里**可用** region 文件的 region 键（升序、去重）。
+///
+/// 后缀规则（§1 / §5.3）：
+///
+/// - `.tmp`：写入中的崩溃残留，跳过；
+/// - `.corrupt`：读失败时保留的原字节备份，跳过；
+/// - `.recovered`：同名 region 的可用数据（读路径优先它），只计一次；
+/// - 其余文件名必须严格是 `region_<x>_<y>_<z>`（有符号十进制、无前导零），
+///   解析不出就返回 `Err`，不静默跳过。
+///
+/// 返回的是 **region 键**（逐轴 `div_euclid(REGION_SIZE)` 的那套），不是锚点块键；
+/// 调用方要读文件时必须用 [`SavePaths::region`]（或传锚点块键给 [`read_region`]），
+/// 它会先做 [`region_origin`]。
+///
+/// 目录不存在（该 body 没有任何 region）返回空列表；其它 IO 错误返回 `Err`。
+pub fn regions_on_disk(paths: &SavePaths, body: BodyKey) -> Result<Vec<ChunkKey>, SaveError> {
+    let dir = paths.body_dir(body);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(io_error(fs_atomic::STAGE_READ, &dir, err)),
+    };
+
+    let mut regions = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error(fs_atomic::STAGE_READ, &dir, err))?;
+        let file_name = entry.file_name();
+        let path = dir.join(&file_name);
+        let Some(name) = file_name.to_str() else {
+            return Err(invalid_region_name(&path));
+        };
+        if name.ends_with(".tmp") || name.ends_with(".corrupt") {
+            continue;
+        }
+        let key = parse_region_file_name(name).ok_or_else(|| invalid_region_name(&path))?;
+        regions.insert(key);
+    }
+    Ok(regions.into_iter().collect())
 }
 
 /// 原子写一个 region 文件，返回**实际**写到的路径（可能是 `.recovered`）。
@@ -856,5 +926,84 @@ mod tests {
             "world.meta.corrupt",
             "追加后缀，不能替换扩展名"
         );
+    }
+
+    #[test]
+    fn regions_on_disk_sorts_dedups_and_skips_suffixes() {
+        let dir = TempDir::new("regions-list");
+        let paths = dir.paths();
+        let b = body(9);
+
+        let first = write_region(&paths, b, key(0, 0, 0), &region(1)).expect("写 region 0");
+        let second = write_region(&paths, b, key(5, 0, 0), &RegionFile::default())
+            .expect("写 region 1");
+
+        // 同 region 的 .recovered：是可用数据，但只算一次。
+        let recovered_bytes = encode_region(&region(2)).expect("编码");
+        fs::write(paths.recovered(&first), &recovered_bytes).expect("写 .recovered");
+
+        // 只有 .recovered、没有主文件的 region：仍要枚举出来。
+        let only_recovered = paths.region(b, key(8, 0, 0));
+        fs::create_dir_all(only_recovered.parent().expect("body 目录")).expect("建目录");
+        fs::write(
+            paths.recovered(&only_recovered),
+            encode_region(&RegionFile::default()).expect("编码"),
+        )
+        .expect("写 .recovered");
+
+        // 崩溃残留与损坏备份：即使文件名主体非法也必须跳过，不能报错。
+        fs::write(paths.tmp(&second), b"tmp").expect("写 .tmp");
+        fs::write(paths.corrupt(&second), b"corrupt").expect("写 .corrupt");
+        fs::write(
+            paths.body_dir(b).join("region_not_a_key.tmp"),
+            b"tmp",
+        )
+        .expect("写非法 .tmp");
+        fs::write(
+            paths.body_dir(b).join("region_not_a_key.corrupt"),
+            b"corrupt",
+        )
+        .expect("写非法 .corrupt");
+
+        assert_eq!(
+            regions_on_disk(&paths, b).expect("枚举 region"),
+            vec![key(0, 0, 0), key(1, 0, 0), key(2, 0, 0)],
+            "必须按 region 键升序、去重，并跳过 .tmp/.corrupt"
+        );
+    }
+
+    #[test]
+    fn regions_on_disk_missing_dir_is_empty() {
+        let dir = TempDir::new("regions-missing");
+        let paths = dir.paths();
+
+        assert!(regions_on_disk(&paths, body(1)).expect("缺目录 = 空").is_empty());
+    }
+
+    #[test]
+    fn regions_on_disk_rejects_malformed_name() {
+        for name in [
+            "bogus",
+            "region_0_0",
+            "region_+1_0_0",
+            "region_01_0_0",
+            "region_0_0_0.recovered.bak",
+        ] {
+            let dir = TempDir::new("regions-bad-name");
+            let paths = dir.paths();
+            let b = body(3);
+            let body_dir = paths.body_dir(b);
+            fs::create_dir_all(&body_dir).expect("建目录");
+            fs::write(body_dir.join(name), b"x").expect("写文件");
+
+            let err = regions_on_disk(&paths, b).expect_err("非法文件名必须报错");
+            assert!(
+                matches!(
+                    err.kind(),
+                    SaveErrorKind::InvalidValue { what, .. } if *what == "region file name"
+                ),
+                "{name}: {err}"
+            );
+        }
     }
 }
