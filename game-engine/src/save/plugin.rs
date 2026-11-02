@@ -41,10 +41,12 @@
 //! - 读失败的告警由调用方决定：本层把原因放进 [`SaveFailed`]。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -206,6 +208,35 @@ pub struct SaveStats {
     pub tombstones: usize,
 }
 
+// ───────────────────────────── 屏障错误 ─────────────────────────────
+
+/// [`SaveStore::quiesce`] 失败的原因。
+///
+/// 与 [`RecordError`] 分开放：那个是“这条记录本身非法”，这个是“屏障等不到
+/// 一个可以安全落盘的时刻”，调用方对两者的处置不同（前者拒绝写，后者放弃
+/// 本次全量存档并报告）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuiesceError {
+    /// 没有后台线程：永远不会确认，屏障无意义。
+    NoWorker,
+    /// 后台线程已退出，仍有未完成的写。
+    WorkerDead,
+    /// 超时：后台一直没把在途写做完。
+    Timeout,
+}
+
+impl fmt::Display for QuiesceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoWorker => write!(f, "存档屏障无意义：没有后台 IO 线程"),
+            Self::WorkerDead => write!(f, "存档后台线程已退出，仍有未完成的写"),
+            Self::Timeout => write!(f, "存档屏障超时：后台未在限定时间内完成在途写"),
+        }
+    }
+}
+
+impl std::error::Error for QuiesceError {}
+
 // ───────────────────────────── SaveStore ─────────────────────────────
 
 /// 存档资源：内存缓冲 + 在途状态 + 后台 IO 线程句柄。
@@ -336,6 +367,16 @@ impl SaveStore {
             ready_hits: state.ready.len(),
             tombstones: state.tombstones.len(),
         }
+    }
+
+    /// 还没交给后台的脏块数（写或删除）。
+    ///
+    /// [`SaveStore::quiesce`] 返回 `Ok` 后仍可能非 0：写失败会被
+    /// [`apply_write`] 重新标脏，留到下一 tick 的 `Flush` 重试。SaveNow 用它
+    /// 决定是否提示“本次快照已写入，但还有块没落盘”。
+    #[must_use]
+    pub fn dirty_count(&self) -> usize {
+        self.state().dirty.len()
     }
 
     /// 后台线程是否还活着（诊断用）。
@@ -506,6 +547,69 @@ impl SaveStore {
             sent += 1;
         }
         sent
+    }
+
+    /// 同步屏障：把所有脏块交给后台，并阻塞到所有在途写都有结果（成功或失败）。
+    ///
+    /// 返回 `Ok` 只保证**此刻没有在途 region 写**、且每个脏块至少投递过一次。
+    /// 不保证磁盘与内存完全一致：写失败会被 [`apply_write`] 重新标脏，残留的
+    /// 脏块留给下一 tick 的 `Flush` 重试。等待循环里刻意不再 `flush()`——磁盘
+    /// 满、坏块这类永久失败如果每轮重投，会让屏障一直重试到超时。
+    ///
+    /// 为什么需要：SaveNow 会整文件重写 region（见 game-core 的
+    /// `write_capture` 合并写）。后台写是“读旧 region -> 插入本块 -> 整文件
+    /// 覆盖”，若与本函数之后的 SaveNow 重叠，后台那条写可能在 SaveNow 之后
+    /// 落地、用旧内容覆盖它。屏障把两条写路径在时间上分开。
+    ///
+    /// 不持锁睡眠：每轮只短暂加锁读一次进度，睡眠前 guard 已经释放。
+    pub fn quiesce(&self, timeout: Duration) -> Result<(), QuiesceError> {
+        // flush() 在 worker 为 None 时直接返回 0，所以“没有线程”必须先判，
+        // 否则会在下面的循环里空转到超时。
+        if !self.worker_running() {
+            // 线程已经没了：先把通道里已经回来的结果收掉（shutdown 前完成的写
+            // 可能还排在结果通道里），再判断有没有永远等不到确认的写。
+            while !self.poll().applied.is_empty() {}
+            if self.dirty_count() > 0 || self.in_flight_write_count() > 0 {
+                return Err(QuiesceError::WorkerDead);
+            }
+            // 从未有过后台线程（离线 store / 测试替身）：屏障没有意义，是否
+            // 继续由调用方决定（SaveNow 在无 worker 时直接跳过屏障）。
+            if !self.has_worker() {
+                return Err(QuiesceError::NoWorker);
+            }
+        }
+
+        let started = Instant::now();
+        // flush 受 write_budget_per_tick 限制，要循环到 dirty 排空（每次发送
+        // 都会把块从 dirty 移进 in_flight_writes）。
+        while self.flush() > 0 {}
+
+        // 发送阶段就可能发现线程已经退出（jobs 通道关闭）：留下未投递的脏块
+        // 不能报 Ok，否则 SaveNow 会以为屏障成功。
+        if !self.worker_running() && self.dirty_count() > 0 {
+            return Err(QuiesceError::WorkerDead);
+        }
+
+        loop {
+            // poll 一次最多应用 POLL_APPLY_BUDGET 条；结果多时要多轮，直到没有
+            // 可应用的结果，否则会在结果还没收完时白睡 1ms。
+            while !self.poll().applied.is_empty() {}
+            if self.in_flight_write_count() == 0 {
+                return Ok(());
+            }
+            if !self.worker_running() {
+                return Err(QuiesceError::WorkerDead);
+            }
+            if started.elapsed() >= timeout {
+                return Err(QuiesceError::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// 在途写数量（屏障内部用，避免每轮构造整个 [`SaveStats`]）。
+    fn in_flight_write_count(&self) -> usize {
+        self.state().in_flight_writes.len()
     }
 
     /// 回收后台结果 + 处理读超时，返回本 tick 要发的消息。
@@ -1206,6 +1310,141 @@ mod tests {
         assert_eq!(store.stats().dirty, 1);
         assert_eq!(store.flush(), 1);
         assert_eq!(store.stats().dirty, 0);
+    }
+
+    #[test]
+    fn quiesce_flushes_dirty_records() {
+        let dir = TempDir::new("quiesce-flush");
+        let paths = SavePaths::new(dir.path());
+        let b = body(1);
+        let keys = [key(0, 0, 0), key(1, 0, 0), key(2, 0, 0)];
+        let store = SaveStore::new(config(&dir));
+        for (index, k) in keys.iter().enumerate() {
+            store
+                .write(b, *k, record(index as u8 + 1))
+                .expect("写缓冲");
+        }
+
+        store.quiesce(Duration::from_secs(5)).expect("屏障应成功");
+
+        assert_eq!(store.stats().dirty, 0);
+        assert_eq!(store.stats().in_flight_writes, 0);
+        let region = read_region(&paths, b, keys[0])
+            .expect("读 region")
+            .expect("屏障返回后 region 必须已落盘");
+        for (index, k) in keys.iter().enumerate() {
+            assert_eq!(
+                region.chunks.get(k),
+                Some(&record(index as u8 + 1)),
+                "第 {index} 块必须原样落盘"
+            );
+            assert!(
+                store.committed_version(b, *k).is_some(),
+                "第 {index} 块必须有落盘确认"
+            );
+        }
+    }
+
+    #[test]
+    fn quiesce_is_noop_when_idle() {
+        let dir = TempDir::new("quiesce-idle");
+        let store = SaveStore::new(config(&dir));
+
+        let started = Instant::now();
+        store.quiesce(Duration::from_secs(5)).expect("空闲屏障应成功");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "没有在途写时必须立即返回，不能等超时"
+        );
+    }
+
+    #[test]
+    fn quiesce_without_worker_is_an_error() {
+        let dir = TempDir::new("quiesce-offline");
+        let store = SaveStore::offline(config(&dir));
+
+        assert_eq!(
+            store.quiesce(Duration::from_millis(200)),
+            Err(QuiesceError::NoWorker),
+            "离线 store 没有后台线程，屏障没有意义"
+        );
+    }
+
+    #[test]
+    fn quiesce_drains_more_than_one_poll_batch() {
+        let dir = TempDir::new("quiesce-poll-batch");
+        let b = body(2);
+        let total = POLL_APPLY_BUDGET + 5;
+        let store = SaveStore::new(SaveConfig {
+            write_budget_per_tick: 4,
+            ..config(&dir)
+        });
+
+        // 每块落在不同 region，避免 69 次整文件读改写相互放大；同时验证
+        // poll 一次只应用 64 条时，屏障会继续轮询直到最后一个结果。
+        let mut versions = BTreeMap::new();
+        for index in 0..total {
+            let k = key(index as i32 * 4, 0, 0);
+            let version = store
+                .write(b, k, record((index % 251) as u8))
+                .expect("写缓冲");
+            versions.insert(k, version);
+        }
+
+        store
+            .quiesce(Duration::from_secs(10))
+            .expect("超过一批结果的屏障也必须成功");
+
+        assert_eq!(store.stats().dirty, 0);
+        assert_eq!(store.stats().in_flight_writes, 0);
+        for (k, version) in &versions {
+            assert!(
+                store.is_committed(b, *k, *version),
+                "块 {k:?} 的结果在第二批里，也必须被 quiesce 收完"
+            );
+        }
+    }
+
+    #[test]
+    fn quiesce_detects_dead_worker() {
+        let dir = TempDir::new("quiesce-dead");
+        let b = body(3);
+        let k = key(0, 0, 0);
+        let mut store = SaveStore::new(config(&dir));
+        store.shutdown_worker();
+        store.write(b, k, record(1)).expect("写缓冲");
+
+        let started = Instant::now();
+        let error = store.quiesce(Duration::from_millis(200)).expect_err("必须失败");
+        assert_eq!(error, QuiesceError::WorkerDead, "线程已退出且还有脏块");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "线程已死时必须立刻判定，不能等满超时"
+        );
+    }
+
+    #[test]
+    fn quiesce_does_not_retry_failed_writes() {
+        let dir = TempDir::new("quiesce-write-fail");
+        let b = body(4);
+        let k = key(0, 0, 0);
+        let paths = SavePaths::new(dir.path());
+        // 目标位置被目录占住：后台写必失败，apply_write 会把块重新标脏。
+        fs::create_dir_all(paths.region(b, k)).expect("占位目录");
+        let store = SaveStore::new(config(&dir));
+        store.write(b, k, record(5)).expect("写缓冲");
+
+        let started = Instant::now();
+        store
+            .quiesce(Duration::from_secs(2))
+            .expect("写失败不应让屏障失败");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "等待循环不能重投失败的写，否则永久失败会拖到超时"
+        );
+        assert_eq!(store.stats().in_flight_writes, 0);
+        assert_eq!(store.stats().dirty, 1, "失败写留到下一 tick 重试");
+        assert_eq!(store.committed_version(b, k), None);
     }
 
     #[test]

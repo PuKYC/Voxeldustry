@@ -59,8 +59,8 @@ pub use crate::streaming::{ChunkRecord, EntityRecord};
 
 /// 存档接线：后台 IO 线程 + `ChunkStore` 实现 + 每 tick 系统。
 pub use plugin::{
-    PollReport, SaveConfig, SaveFailed, SavePlugin, SaveSet, SaveStats, SaveStore, SaveSucceeded,
-    POLL_APPLY_BUDGET,
+    PollReport, QuiesceError, SaveConfig, SaveFailed, SavePlugin, SaveSet, SaveStats, SaveStore,
+    SaveSucceeded, POLL_APPLY_BUDGET,
 };
 
 /// 组件负载编解码与类型注册表（§4）：postcard 1.1.3 + `StableTypeId`。

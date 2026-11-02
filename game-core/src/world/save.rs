@@ -36,9 +36,9 @@ use bevy::prelude::{Entity, World};
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableIdAllocator};
 use game_engine::save::{
-    capture as capture_snapshot, export_chunk, region_of, write_region, write_world_meta, AttachTag,
-    BodyKind as SaveBodyKind, BodyRecord, ChunkRecord, OpaqueComponents, PersistRegistry, RegionFile,
-    SaveError, SaveErrorKind, SavePaths, WorldMeta,
+    capture as capture_snapshot, export_chunk, read_region, region_of, write_region,
+    write_world_meta, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord,
+    OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths, WorldMeta,
 };
 use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelInterner};
 
@@ -217,6 +217,16 @@ pub fn capture_world(
 /// 而 `store::write_region` 的第三个参数吃的是**块键**——它自己再 `region_of` 一次
 /// 得到文件名。所以这里传该 region 里最小的块键（`region_of(块键) == 键`，文件名
 /// 恰好是 region 键）；直接传 region 键会被再除一次，region 索引 ≥ 2 时落错文件。
+///
+/// **为什么必须合并写**：SaveNow 是「当前已加载块」的快照，而一个 region 文件里
+/// 还可能有更早卸载时由流式层写入的块（整块内容 + 实体都写进同一个文件）。如果
+/// 按 capture 整文件重写，那些已卸载块的记录就会被抹掉——静默丢失存档。所以写
+/// 每个 region 前先 `read_region`，把磁盘上已有、本次 capture 没覆盖的块原样保留
+///（capture 里的块优先）；文件不存在时行为与以前一致。
+///
+/// **并发前提**：调用方必须先做 `SaveStore::quiesce`（见 `world/save_plugin.rs`
+/// 的 `save_now_system`），否则在途的「读旧 region -> 整文件覆盖」写会与本函数
+/// 竞争：后台那条写可能在 SaveNow 之后落地，用旧内容盖掉这里刚写下的块。
 pub fn write_capture(paths: &SavePaths, capture: &WorldCapture) -> Result<(), SaveError> {
     for ((body, region_key), file) in &capture.regions {
         let Some(anchor) = file.chunks.keys().next().copied() else {
@@ -232,7 +242,20 @@ pub fn write_capture(paths: &SavePaths, capture: &WorldCapture) -> Result<(), Sa
             *region_key,
             "WorldCapture 的 region 键必须是其块键的 region_of"
         );
-        write_region(paths, *body, anchor, file)?;
+        // capture 里的块优先；磁盘上已有、但本次没采集到的块原样保留。读失败
+        // （含 .corrupt 备份语义）直接上抛，不能退化成整文件覆盖。
+        match read_region(paths, *body, anchor)? {
+            Some(existing) => {
+                let mut merged = file.clone();
+                for (chunk_key, record) in existing.chunks {
+                    merged.chunks.entry(chunk_key).or_insert(record);
+                }
+                write_region(paths, *body, anchor, &merged)?;
+            }
+            None => {
+                write_region(paths, *body, anchor, file)?;
+            }
+        }
     }
     write_world_meta(paths, &capture.meta)?;
     Ok(())
@@ -662,6 +685,128 @@ mod tests {
                 "region ({body:?}, {region_key:?}) 往返必须逐字段相等"
             );
         }
+    }
+
+    /// 磁盘上已有的、与 capture 无关的块记录；marker 区分不同版本。
+    fn stored_record(marker: u8) -> ChunkRecord {
+        ChunkRecord {
+            generator_version: 3,
+            content: Some(vec![marker; 4]),
+            proposals: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn write_capture_preserves_records_not_in_capture() {
+        let chunk_a = ChunkKey::new(0, 0, 0);
+        let chunk_b = ChunkKey::new(1, 0, 0); // 与 A 同 region
+        let mut world = test_world(0xC0FFEE);
+        let (_, body_key) = spawn_island_with_chunks(
+            &mut world,
+            Vec3F::ZERO,
+            true,
+            BiomeId(1),
+            &[chunk_a],
+        );
+        let capture = capture_world(&mut world, 3, 1).expect("采集成功");
+        let captured_a = capture.regions[&(body_key, region_of(chunk_a))].chunks[&chunk_a].clone();
+
+        // 磁盘上先有一个更完整的旧 region：A 是旧版本，B 是 capture 完全没采集到的块
+        //（现实中是更早卸载时由流式层写进去的）。
+        let dir = TempDir::new("merge_keep");
+        let paths = SavePaths::new(dir.path());
+        let mut existing = RegionFile::default();
+        existing.chunks.insert(chunk_a, stored_record(9));
+        existing.chunks.insert(chunk_b, stored_record(7));
+        write_region(&paths, body_key, chunk_a, &existing).expect("预写旧 region");
+
+        write_capture(&paths, &capture).expect("合并落盘成功");
+
+        let merged = read_region(&paths, body_key, chunk_a)
+            .expect("读 region")
+            .expect("region 必须存在");
+        assert_eq!(
+            merged.chunks.get(&chunk_a),
+            Some(&captured_a),
+            "capture 里的块优先，不能被磁盘旧版本盖住"
+        );
+        assert_eq!(
+            merged.chunks.get(&chunk_b),
+            Some(&stored_record(7)),
+            "磁盘上已有、本次没采集到的块必须原样保留"
+        );
+        assert_eq!(merged.chunks.len(), 2, "不能多也不能少");
+    }
+
+    #[test]
+    fn write_capture_replaces_record_when_capture_has_same_chunk() {
+        let chunk_a = ChunkKey::new(0, 0, 0);
+        let mut world = test_world(0xBEEF);
+        let (_, body_key) = spawn_island_with_chunks(
+            &mut world,
+            Vec3F::ZERO,
+            true,
+            BiomeId(1),
+            &[chunk_a],
+        );
+        let capture = capture_world(&mut world, 4, 1).expect("采集成功");
+        let captured_a = capture.regions[&(body_key, region_of(chunk_a))].chunks[&chunk_a].clone();
+
+        let dir = TempDir::new("merge_replace");
+        let paths = SavePaths::new(dir.path());
+        let mut existing = RegionFile::default();
+        existing.chunks.insert(chunk_a, stored_record(9));
+        write_region(&paths, body_key, chunk_a, &existing).expect("预写旧 region");
+
+        write_capture(&paths, &capture).expect("落盘成功");
+
+        let merged = read_region(&paths, body_key, chunk_a)
+            .expect("读 region")
+            .expect("region 必须存在");
+        assert_eq!(
+            merged.chunks.get(&chunk_a),
+            Some(&captured_a),
+            "同块必须用 capture 的新内容覆盖磁盘旧内容"
+        );
+        assert_ne!(
+            merged.chunks.get(&chunk_a),
+            Some(&stored_record(9)),
+            "覆盖后不能残留旧内容"
+        );
+    }
+
+    #[test]
+    fn write_capture_creates_region_when_missing() {
+        let chunk_a = ChunkKey::new(0, 0, 0);
+        let mut world = test_world(0x1234);
+        let (_, body_key) = spawn_island_with_chunks(
+            &mut world,
+            Vec3F::ZERO,
+            true,
+            BiomeId(1),
+            &[chunk_a],
+        );
+        let capture = capture_world(&mut world, 5, 1).expect("采集成功");
+        let dir = TempDir::new("merge_new");
+        let paths = SavePaths::new(dir.path());
+        assert!(
+            !paths.region(body_key, chunk_a).exists(),
+            "前提：目标 region 文件不存在"
+        );
+
+        write_capture(&paths, &capture).expect("没有旧文件时照常创建");
+
+        let written = read_region(&paths, body_key, chunk_a)
+            .expect("读 region")
+            .expect("region 必须被创建");
+        assert_eq!(
+            written.chunks.get(&chunk_a),
+            capture.regions[&(body_key, region_of(chunk_a))]
+                .chunks
+                .get(&chunk_a),
+            "没有旧文件时内容应完全来自 capture"
+        );
     }
 
     #[test]

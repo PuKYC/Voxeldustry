@@ -33,6 +33,15 @@
 //! 孤儿 region（下次覆盖），不会出现「meta 指向不存在的 region」。
 //! 失败时 saves / last_world_tick 都不前进。
 //!
+//! # 落盘屏障
+//!
+//! 采集前先 [SaveStore::quiesce]：把流式层攒下的脏块全部交给后台，并等在途
+//! 写结束。这样 SaveNow 与后台 region 写不会交叉——否则后台那条「读旧
+//! region -> 整文件覆盖」的写可能在 SaveNow 之后落地，用旧内容盖掉刚写的
+//! 快照；[write_capture] 的合并写也只有在没有并发写时才可靠。屏障失败直接
+//! 记 last_error 并放弃本次存档，不写 meta / region。没有后台线程的 store
+//!（离线测试替身）跳过屏障：它永远不会写盘，磁盘就是权威。
+//!
 //! # 无触发零 IO
 //!
 //! 没有触发时只读资源（tick / 状态），不建目录、不碰文件、不 stat 路径。
@@ -58,6 +67,10 @@ use game_engine::residency::GameTickSet;
 use game_engine::save::{SaveConfig, SavePaths, SaveSet, SaveStore};
 
 use crate::world::save::{capture_world, write_capture};
+
+/// SaveNow 前落盘屏障的超时：正常 flush 是亚毫秒级，5s 已经意味着磁盘或后台
+/// 线程异常；宁可本次存档失败并报错，也不要把主线程无限卡在存档上。
+const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 世界存盘配置（由装配方插入，也可作为 [WorldSavePlugin] 的构造参数）。
 #[derive(Resource, Clone, Debug, PartialEq, Eq)]
@@ -186,6 +199,9 @@ fn refresh_paths(world: &mut World) {
 }
 
 /// exclusive 存档系统：&mut World 才能跑 [capture_world]。
+///
+/// 采集前先做 [SaveStore::quiesce] 屏障：它保证 SaveNow 与后台 region 写不
+/// 交叉，[write_capture] 的合并写（保留已卸载块）才不会被在途的旧内容覆盖。
 fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>) {
     // 先消费消息：无论后面成功与否，本 tick 的请求都只算一次。
     let requested = {
@@ -213,6 +229,35 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
     }
 
     refresh_paths(world);
+
+    // 落盘屏障：先让流式层把脏块交给后台并等在途写结束，否则后台那条
+    //「读旧 region -> 整文件覆盖」可能在下面的 write_capture 之后落地。
+    let quiesce_failure = match world.get_resource::<SaveStore>() {
+        // 上面已经确认 SaveStore 存在；这里只是拿不到借用时不 panic。
+        None => None,
+        Some(store) if !store.has_worker() => {
+            // 离线 store（测试替身）不会写盘，磁盘就是权威，屏障无意义。
+            None
+        }
+        Some(store) => match store.quiesce(QUIESCE_TIMEOUT) {
+            Ok(()) => {
+                let dirty = store.dirty_count();
+                if dirty > 0 {
+                    warn!(
+                        "世界存档：屏障完成，但仍有 {dirty} 个块未落盘（写失败？）；本次快照照常写入，残留块交给 Flush 重试"
+                    );
+                }
+                None
+            }
+            Err(error) => Some(error),
+        },
+    };
+    if let Some(error) = quiesce_failure {
+        // 屏障失败时后台可能还有写会落地：不能采集 / 写 meta，否则合并写
+        // 的前提（没有并发 region 写）不成立，可能再次丢块。
+        record_error(world, format!("落盘屏障失败：{error}"));
+        return;
+    }
 
     match capture_world(world, tick, config.generator_version) {
         Ok(capture) => {
@@ -261,8 +306,8 @@ mod tests {
     use game_engine::math::{FixedPoint, Vec3F};
     use game_engine::residency::ChunkAnchor;
     use game_engine::save::{
-        read_region, read_world_meta, OpaqueComponents, Persist, PersistPlugin, PersistRegistry,
-        SavePlugin,
+        read_region, read_world_meta, region_of, ChunkRecord, OpaqueComponents, Persist,
+        PersistPlugin, PersistRegistry, SavePlugin,
     };
     use game_engine::voxel::{
         ChunkKey, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelInterner, CHUNK_DEPTH,
@@ -618,5 +663,112 @@ mod tests {
             .get::<VoxVolume>(body_entity)
             .expect("body 必须带 VoxVolume");
         assert!(volume.contains_chunk(&chunk), "块必须装回原来的 body");
+    }
+
+    /// 一条不在任何 VoxVolume 里、但组合合法的块记录（content 对存档层是不透明
+    /// 字节，不要求能装回 VoxTree）。
+    fn pending_record(marker: u8) -> ChunkRecord {
+        ChunkRecord {
+            generator_version: GENERATOR_VERSION,
+            content: Some(vec![marker; 8]),
+            proposals: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn save_now_quiesces_pending_store_writes_before_capture() {
+        let dir = TempDir::new("quiesce_before_capture");
+        let mut app = test_app(dir.path(), None);
+        let (body, loaded) = spawn_island_with_chunk(app.world_mut());
+        let pending = ChunkKey::new(3, 0, 0); // 与已加载块 (2,0,0) 同 region
+        assert_eq!(region_of(pending), region_of(loaded));
+
+        // 把 Flush 周期调大：本 tick 的 SaveSet::Flush 不会提前把这条写交给
+        // 后台，只有 SaveNow 前的屏障会做——否则测不到屏障本身。
+        app.insert_resource(SaveStore::new(SaveConfig {
+            root: dir.path().to_path_buf(),
+            flush_interval_ticks: 1000,
+            ..SaveConfig::default()
+        }));
+        let version = app
+            .world()
+            .resource::<SaveStore>()
+            .write(body, pending, pending_record(0xAB))
+            .expect("写缓冲");
+        {
+            let store = app.world().resource::<SaveStore>();
+            assert_eq!(store.dirty_count(), 1, "前提：这条写还只在缓冲里");
+            assert_eq!(store.committed_version(body, pending), None);
+        }
+
+        app.world_mut().write_message(SaveNow);
+        tick(&mut app);
+
+        let paths = SavePaths::new(dir.path());
+        let file = read_region(&paths, body, pending)
+            .expect("读 region")
+            .expect("屏障必须先把它落盘");
+        assert!(
+            file.chunks.contains_key(&pending),
+            "屏障必须先把待写块交给后台并落盘"
+        );
+        assert!(
+            file.chunks.contains_key(&loaded),
+            "capture 里已加载的块也必须保留（合并写生效）"
+        );
+        assert!(
+            app.world()
+                .resource::<SaveStore>()
+                .is_committed(body, pending, version),
+            "屏障返回时落盘确认必须已经回收"
+        );
+        let status = app.world().resource::<WorldSaveStatus>();
+        assert_eq!(status.saves, 1);
+        assert_eq!(status.last_world_tick, Some(1));
+        assert_eq!(status.last_error, None);
+    }
+
+    #[test]
+    fn save_now_continues_when_barrier_leaves_dirty_writes() {
+        let dir = TempDir::new("quiesce_dirty_after");
+        let mut app = test_app(dir.path(), None);
+        let (body, loaded) = spawn_island_with_chunk(app.world_mut());
+        let pending = ChunkKey::new(6, 0, 0); // region (1,0,0)，与已加载块分开
+        assert_ne!(region_of(pending), region_of(loaded));
+        let paths = SavePaths::new(dir.path());
+        // 目标位置被目录占住：这条待写块的后台写永久失败，apply_write 会把它
+        // 重新标脏；屏障对此只保证“没有在途写”，所以应返回 Ok。
+        fs::create_dir_all(paths.region(body, pending)).expect("占位目录");
+
+        app.insert_resource(SaveStore::new(SaveConfig {
+            root: dir.path().to_path_buf(),
+            flush_interval_ticks: 1000,
+            ..SaveConfig::default()
+        }));
+        app.world()
+            .resource::<SaveStore>()
+            .write(body, pending, pending_record(0xCD))
+            .expect("写缓冲");
+
+        app.world_mut().write_message(SaveNow);
+        tick(&mut app);
+
+        // 屏障 Ok（但有残留脏块）不能阻止本次快照：当前世界本身必须落盘。
+        let status = app.world().resource::<WorldSaveStatus>();
+        assert_eq!(status.saves, 1, "有残留脏块时仍应写完当前快照");
+        assert_eq!(status.last_world_tick, Some(1));
+        assert_eq!(status.last_error, None);
+        assert!(paths.world_meta().exists(), "meta 必须写入");
+        assert!(
+            paths.region(body, loaded).is_file(),
+            "已加载块照常落盘，不受另一个 region 写失败影响"
+        );
+        let store = app.world().resource::<SaveStore>();
+        assert_eq!(store.committed_version(body, pending), None);
+        assert!(
+            store.dirty_count() > 0,
+            "失败的块要留脏，等后续 Flush 重试"
+        );
     }
 }
