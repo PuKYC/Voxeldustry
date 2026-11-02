@@ -34,15 +34,58 @@
 //! 必须先装 crate::voxel::GameVoxelPlugin；TerrainMode::Streaming 时地形插件
 //! 会产出一个空体素 body 作为流式层的容器（Eager 地形也能接，只是 Startup
 //! 已经把块生成好，流式层会走「块已在容器」的快路径）。
+//!
+//! ## 本地玩家 = 观察者（过渡）
+//!
+//! 玩家实体不是「体」：[LocalPlayer] 只是输入 / 表现标记，它没有自己的
+//! [VoxVolume]。因此 [attach_local_player_streaming] 给玩家挂 [Observer]
+//! （请求 `Render` 档）和 [BodyRef]（指向唯一地形体），而不是 [Real]：
+//! `Real` 表示「需要真实模拟的体」，驻留层会按实体自己的稳定 ID 去找容器，
+//! 而玩家没有容器。
+//!
+//! 位置来源仍是 [LogicPos]（过渡，单位是**体局部米**）：`Transform` 是渲染侧
+//! f32 米坐标，不能参与块归属（确定性 L3），[logic_pos_for_transform] 在**体位于
+//! 原点**时把它转成定点米并吸附到体素网格。这不是权威位姿：船体 / 多岛落地后
+//! 必须改成 `BodyPose` + 世界→体变换，当前实现只支持原点地形体。
+//!
+//! 渲染半径来自 [StreamingPlayerConfig::render_radius_chunks]；缺
+//! [ChunkAnchor] 由 [Observer] 的 `#[require(ChunkAnchor)]` 自动补，本插件
+//! 不手写锚点。`IslandRegistry` 不是恰好一个岛时每个玩家只 warn 一次并
+//! 跳过，避免把玩家锚到错误的体上。
+
+use std::collections::BTreeSet;
 
 use bevy::prelude::*;
-use game_engine::residency::{GameTickSet, ResidencyPlugin};
+use game_engine::identity::StableEntityId;
+use game_engine::math::{FixedPoint, Vec3F};
+use game_engine::residency::{
+    BodyRef, GameTickSet, LogicPos, Observer, ResidencyPlugin, ResidencySet,
+};
 use game_engine::save::{SaveConfig, SavePlugin, SaveStore};
 
+use crate::input::control::LocalPlayer;
+use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
+use crate::voxel::body::BodyKey;
 use crate::voxel::stream::VoxelStreamPlugin;
 use crate::voxel::GameVoxelPlugin;
 use crate::world::chunk::WorldChunkPlugin;
 use crate::world::save_plugin::{SaveRoot, WorldSaveConfig, WorldSavePlugin};
+use crate::world::IslandRegistry;
+
+/// 本地玩家作为流式观察者的参数。
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingPlayerConfig {
+    /// 观察者渲染半径（体素块）。默认 2（约 5×5 块、72 m 见方）。
+    pub render_radius_chunks: u8,
+}
+
+impl Default for StreamingPlayerConfig {
+    fn default() -> Self {
+        Self {
+            render_radius_chunks: 2,
+        }
+    }
+}
 
 /// 把驻留 / 流式 / 世界区块 /（可选）存档管线接进 App。
 ///
@@ -57,6 +100,8 @@ impl Plugin for StreamingWorldPlugin {
             "StreamingWorldPlugin 依赖 GameVoxelPlugin"
         );
 
+        app.init_resource::<StreamingPlayerConfig>();
+
         // 顺序不能反：WorldChunkPlugin 在 build 里断言 ChunkReached / ChunkWillUnload /
         // ChunkEntities 三条消息已存在，而它们分别由 ResidencyPlugin / VoxelStreamPlugin 注册。
         app.add_plugins(ResidencyPlugin::default());
@@ -64,6 +109,16 @@ impl Plugin for StreamingWorldPlugin {
         app.add_plugins(WorldChunkPlugin);
 
         configure_tick_sets(app);
+
+        // 玩家观察者必须在 Anchor 之前补齐 LogicPos / BodyRef / Observer，
+        // 否则第一 tick 的 update_anchors 看不到这些组件，请求要滞后一 tick。
+        app.add_systems(
+            FixedUpdate,
+            (attach_local_player_streaming, sync_local_player_logic_pos)
+                .chain()
+                .in_set(GameTickSet::Residency)
+                .before(ResidencySet::Anchor),
+        );
 
         // 存档可选：SaveRoot 是装配方的显式选择；没有它就不碰磁盘。
         let save_root = app
@@ -109,6 +164,99 @@ fn configure_tick_sets(app: &mut App) {
     );
 }
 
+/// 渲染世界坐标（米，f32）→ 体局部 `LogicPos`（定点米）。
+///
+/// **过渡换算**：当前没有权威 `BodyPose`，只能从 `Transform` 反推；只在「体位于
+/// 原点、无旋转 / 缩放」时成立（地形体就是这样），船体 / 多岛必须先做世界→体变换。
+///
+/// 落点吸附到体素网格（0.45 m）：f32 的 28.8 实际是 28.799999，正好落在块边界
+/// （2 × 14.4 m）下方一点，不吸附会被 `chunk_of` 的向下取整算进前一块。f32 只出现
+/// 在这一步，块归属仍由 `chunk_of` 用定点整数计算。
+fn logic_pos_for_transform(pos: Vec3) -> LogicPos {
+    let inv = FixedPoint::from_num(1) / DEFAULT_VOXEL_SIZE;
+    let snap = |v: f32| (FixedPoint::from_num(v) * inv).round() * DEFAULT_VOXEL_SIZE;
+    LogicPos(Vec3F::new(snap(pos.x), snap(pos.y), snap(pos.z)))
+}
+
+/// 给本地玩家补上流式观察者身份（幂等）。
+///
+/// 只在「实体刚添加、`Transform` 变了、`BodyRef` 缺失或刚变、`Observer`
+/// 缺失」时进入；进入后仍逐个检查 Option，已经齐全的组件不会重复写。
+/// 地形体不唯一时每个玩家只 `warn!` 一次并跳过，避免把玩家锚到错误的体上。
+#[allow(clippy::type_complexity)]
+fn attach_local_player_streaming(
+    mut commands: Commands,
+    config: Res<StreamingPlayerConfig>,
+    registry: Res<IslandRegistry>,
+    mut warned: Local<BTreeSet<Entity>>,
+    players: Query<
+        (
+            Entity,
+            &Transform,
+            Option<&StableEntityId>,
+            Option<&BodyRef>,
+            Option<&Observer>,
+        ),
+        (
+            With<LocalPlayer>,
+            Or<(
+                Added<LocalPlayer>,
+                Changed<Transform>,
+                // BodyRef 被写成 INVALID 时也要能修回来；有效值不会再触发。
+                Changed<BodyRef>,
+                Without<BodyRef>,
+                Without<Observer>,
+            )>,
+        ),
+    >,
+) {
+    // 当前世界只有一个原点地形体；多于一个时无法判断玩家站在哪个体上，
+    // 宁可不动也不能瞎锚。
+    let terrain_body = if registry.len() == 1 {
+        registry.ids().next().map(BodyKey::from)
+    } else {
+        None
+    };
+    let Some(terrain_body) = terrain_body else {
+        for (entity, ..) in &players {
+            if warned.insert(entity) {
+                warn!(
+                    "streaming: IslandRegistry 有 {} 个岛（需要恰好 1 个地形体），玩家 {entity:?} 暂不挂 Observer/BodyRef",
+                    registry.len()
+                );
+            }
+        }
+        return;
+    };
+
+    for (entity, transform, _stable_id, body_ref, observer) in &players {
+        if observer.is_none() {
+            commands.entity(entity).insert(Observer {
+                radius: config.render_radius_chunks,
+            });
+        }
+        if body_ref.is_none_or(|body| !body.0.is_valid()) {
+            commands.entity(entity).insert(BodyRef(terrain_body));
+        }
+        // 新玩家第一个 tick 就要有正确位置，不能等 Changed<Transform>。
+        commands
+            .entity(entity)
+            .insert(logic_pos_for_transform(transform.translation));
+    }
+}
+
+/// 玩家 `Transform` 变化后同步 `LogicPos`（体素归属只读定点）。
+///
+/// 与 [attach_local_player_streaming] 分开：新玩家由 attach 负责第一份
+/// `LogicPos`，这里只跟随后续移动。
+fn sync_local_player_logic_pos(
+    mut players: Query<(&Transform, &mut LogicPos), (With<LocalPlayer>, Changed<Transform>)>,
+) {
+    for (transform, mut logic) in &mut players {
+        logic.0 = logic_pos_for_transform(transform.translation).0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,13 +266,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use game_engine::body_key::BodyKey;
-    use game_engine::identity::{StableEntityId, StableIdPlugin};
-    use game_engine::residency::{ChunkReached, ResidencyTable};
+    use game_engine::identity::{StableEntityId, StableIdPlugin, StableIdWorldExt};
+    use game_engine::residency::{
+        BodyRef, ChunkAnchor, ChunkReached, LogicPos, Observer, ResidencyTable,
+    };
     use game_engine::save::SaveStore;
     use game_engine::streaming::{ChunkPersistence, GenTable, StoreLookup};
     use game_engine::voxel::{chunk_key, VoxVolume};
 
-    use crate::voxel::stream::{ChunkEntities, ChunkWillUnload, PendingUnloads};
+    use crate::input::control::LocalPlayer;
+    use crate::voxel::stream::{
+        ChunkEntities, ChunkWillUnload, PendingUnloads, RenderGroups, StreamStats,
+    };
     use crate::voxel::terrain::{
         TerrainConfig, TerrainGroups, TerrainMode, TerrainPlugin, TerrainStats,
     };
@@ -372,6 +525,148 @@ mod tests {
             only_volume(&mut app).chunk_count(),
             0,
             "没有请求时流式管线不应偷偷生成任何块"
+        );
+    }
+
+    #[test]
+    fn player_becomes_observer_anchored_to_terrain_body() {
+        let mut app = terrain_app(Some(TerrainMode::Streaming), true);
+        app.update();
+
+        let (player, _) = app
+            .world_mut()
+            .spawn_stable((LocalPlayer, Transform::from_xyz(0.0, 0.0, 0.0)));
+        app.world_mut().run_schedule(FixedUpdate);
+
+        let terrain_body = {
+            let world = app.world();
+            let registry = world.resource::<IslandRegistry>();
+            assert_eq!(registry.len(), 1, "测试地形必须恰好是一个岛");
+            BodyKey::from(registry.ids().next().expect("唯一岛必须有 id"))
+        };
+
+        let world = app.world();
+        let observer = world
+            .get::<Observer>(player)
+            .expect("玩家第一 tick 就必须是 Observer");
+        assert_eq!(observer.radius, 2, "默认渲染半径来自 StreamingPlayerConfig");
+        assert_eq!(
+            world.get::<BodyRef>(player).expect("玩家必须挂 BodyRef").0,
+            terrain_body,
+            "玩家应锚到唯一地形体"
+        );
+        let anchor = world
+            .get::<ChunkAnchor>(player)
+            .expect("Observer 的 #[require] 必须补 ChunkAnchor");
+        assert!(anchor.is_valid(), "锚点必须已经解析出 body");
+        assert_eq!(anchor.body, terrain_body);
+        assert_eq!(anchor.chunk, chunk_key(0, 0, 0), "原点玩家在 (0,0,0) 块");
+
+        // 幂等：第二 tick 不再重复插入，锚点也不漂移。
+        app.world_mut().run_schedule(FixedUpdate);
+        let world = app.world();
+        assert_eq!(
+            world
+                .get::<Observer>(player)
+                .expect("Observer 不能消失")
+                .radius,
+            2
+        );
+        assert_eq!(
+            world.get::<BodyRef>(player).expect("BodyRef 不能消失").0,
+            terrain_body
+        );
+        assert_eq!(
+            world
+                .get::<ChunkAnchor>(player)
+                .expect("ChunkAnchor 不能消失")
+                .chunk,
+            chunk_key(0, 0, 0),
+            "静止玩家第二 tick 的锚点不能变化"
+        );
+    }
+
+    #[test]
+    fn player_requests_load_render_chunks() {
+        let mut app = terrain_app(Some(TerrainMode::Streaming), true);
+        app.update();
+
+        app.world_mut()
+            .spawn_stable((LocalPlayer, Transform::from_xyz(0.0, 0.0, 0.0)));
+        // 半径 2 的球约 33 块，流式预算 8 块/tick；留足余量等全部结算。
+        for _ in 0..16 {
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+
+        assert!(
+            only_volume(&mut app).chunk_count() > 0,
+            "Observer 必须把 Render 请求送进流式层并装块"
+        );
+
+        let world = app.world();
+        let stats = world.resource::<StreamStats>();
+        assert!(stats.generated > 0, "生成路径必须真的产出区块");
+        assert!(stats.render_groups > 0, "统计数据也应记录存活分组");
+
+        let groups = world.resource::<RenderGroups>();
+        assert!(!groups.0.is_empty(), "RenderGroups 不能为空");
+        assert!(
+            groups.0.values().any(Option::is_some),
+            "至少一个区块应产出实际分组实体（非全空气）"
+        );
+    }
+
+    #[test]
+    fn logic_pos_follows_transform() {
+        let mut app = terrain_app(Some(TerrainMode::Streaming), true);
+        app.update();
+
+        let (player, _) = app
+            .world_mut()
+            .spawn_stable((LocalPlayer, Transform::from_xyz(0.0, 0.0, 0.0)));
+        app.world_mut().run_schedule(FixedUpdate);
+
+        app.world_mut()
+            .entity_mut(player)
+            .get_mut::<Transform>()
+            .expect("玩家必须有 Transform")
+            .translation = Vec3::new(28.8, 0.0, 0.0);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        let world = app.world();
+        let anchor = world.get::<ChunkAnchor>(player).expect("玩家必须已锚定");
+        assert_eq!(anchor.chunk.x, 2, "28.8 m = 64 体素 = 第 2 块（0 起算）");
+        let logic = world.get::<LogicPos>(player).expect("玩家必须有 LogicPos");
+        // LogicPos 在本仓库按体局部米存放（chunk_of 的块边 = 0.45 * 32 米），
+        // 换算回体素应为 64。
+        assert_eq!(
+            (logic.0.x / DEFAULT_VOXEL_SIZE).round().to_num::<i64>(),
+            64,
+            "28.8 m / 0.45 m 每体素 = 64 体素"
+        );
+    }
+
+    #[test]
+    fn player_without_terrain_body_is_not_anchored() {
+        let mut app = terrain_app(Some(TerrainMode::Streaming), true);
+        app.update();
+        app.world_mut().resource_mut::<IslandRegistry>().clear();
+
+        let (player, _) = app
+            .world_mut()
+            .spawn_stable((LocalPlayer, Transform::from_xyz(0.0, 0.0, 0.0)));
+        for _ in 0..3 {
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+
+        let world = app.world();
+        assert!(
+            world.get::<Observer>(player).is_none(),
+            "没有地形体时不能瞎挂 Observer"
+        );
+        assert!(
+            world.get::<BodyRef>(player).is_none(),
+            "没有地形体时不能瞎写 BodyRef"
         );
     }
 }

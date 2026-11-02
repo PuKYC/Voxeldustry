@@ -31,8 +31,9 @@
 //! [`LogicPos`] 作为定点逻辑坐标来源。**将来 `BodyPose` 落地后替换**：`update_anchors`
 //! 改为从 `BodyPose` 取坐标即可，本模块其余部分不依赖位置来源。
 //!
-//! 坐标约定：`LogicPos` 是**体（岛）局部**的定点体素坐标，单位是体素（`Vec3F` 的原始位），
-//! 与 `ChunkKey` 的岛局部语义一致；浮岛的世界坐标换算由上游负责，本模块不做。
+//! 坐标约定：`LogicPos` 是**体（岛）局部**的定点坐标，单位是**米**（`Vec3F` 的原始位就是
+//! Q24 米）；块归属由 [`chunk_of`] 按「一块 = 32 体素 = 14.4 m」整除得出，与 `ChunkKey`
+//! 的岛局部语义一致。浮岛的世界坐标换算由上游负责，本模块不做。
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,7 +113,10 @@ pub fn observer_chunks(anchor: ChunkKey, radius: u8) -> Vec<ChunkKey> {
 
 // ───────────────────────────── 标签组件 ─────────────────────────────
 
-/// 定点逻辑坐标（体 / 岛局部，单位：体素）。
+/// 定点逻辑坐标（体 / 岛局部，单位：**米**）。
+///
+/// 注意不是体素计数：`chunk_of` 以 `VOXEL_SIZE_RAW * 32`（14.4 m）为块边长整除，
+/// 写成体素数会让锚点偏 1/0.45 ≈ 2.22 倍。
 ///
 /// **过渡组件**：仓库还没有权威位姿组件，先用它推算 [`ChunkAnchor`]。
 /// 将来 `BodyPose` 落地后替换本组件，`update_anchors` 改读 `BodyPose`，
