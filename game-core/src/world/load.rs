@@ -32,6 +32,7 @@ use bevy::prelude::{Entity, Resource, World};
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
 use game_engine::math::{FixedPoint, Vec3F};
+use game_engine::residency::ChunkAnchor;
 use game_engine::save::{
     install_chunk, read_region, read_world_meta, region_of, regions_on_disk, AttachTag, BodyKind,
     BodyRecord, OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths,
@@ -549,10 +550,15 @@ fn apply_plan_entities(world: &mut World, plan: &Plan) -> Result<usize, SaveErro
         world.resource_scope::<OpaqueComponents, _>(|world, mut opaque| {
             for body in &plan.bodies {
                 for file in &body.regions {
-                    for chunk in file.chunks.values() {
+                    for (&key, chunk) in &file.chunks {
                         for record in &chunk.entities {
                             let entity = ensure_entity(world, record.stable_entity_id);
                             registry.apply_entity(world, entity, record, &mut opaque)?;
+                            // `ChunkAnchor` 是分组键、不在 payload 里；不补的话读档后的
+                            // 实体既不会被 `capture` 收集，也不会被 `unload_members` 销毁。
+                            world
+                                .entity_mut(entity)
+                                .insert(ChunkAnchor::new(body.key, key));
                             applied += 1;
                         }
                     }
@@ -565,7 +571,12 @@ fn apply_plan_entities(world: &mut World, plan: &Plan) -> Result<usize, SaveErro
     Ok(applied)
 }
 
-fn ensure_entity(world: &mut World, id: u64) -> Entity {
+/// 按稳定 ID 找实体，没有就新建并登记索引。
+///
+/// 区块运行期的实体恢复（`WorldChunkPlugin` 的 `restore_members`）复用同一入口，
+/// 保证「启动期批量恢复」与「运行期按 [ChunkEntities](crate::voxel::stream::ChunkEntities)
+/// 恢复」对同一个稳定 ID 落到同一个实体上。调用方需保证 [StableEntityIndex] 已初始化。
+pub(crate) fn ensure_entity(world: &mut World, id: u64) -> Entity {
     let stable = StableEntityId(id);
     if let Some(entity) = world.resource::<StableEntityIndex>().entity(stable) {
         return entity;
@@ -1034,6 +1045,11 @@ mod tests {
             .entity(entity_id)
             .expect("只有实体的块也要恢复实体");
         assert!(loaded.get::<TestMarker>(entity).is_some());
+        assert_eq!(
+            loaded.get::<ChunkAnchor>(entity),
+            Some(&ChunkAnchor::new(body_key, chunk_b)),
+            "读档必须按分组键补回 ChunkAnchor，否则实体再存不回去"
+        );
     }
 
     #[test]

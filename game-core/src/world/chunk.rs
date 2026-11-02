@@ -24,8 +24,11 @@
 //!
 //! - 已实现 [WorldChunkSet::Residency] 的 `apply_residency_changes`、
 //!   [WorldChunkSet::Dirty] 的 `mark_dirty`，以及 [WorldChunkSet::Lifecycle]
-//!   的 `unload_members`（只做销毁，发生在 Streaming 落盘之后）。恢复端
-//!   `spawn_members` 留到下一轮。
+//!   的两端：`restore_members`（恢复）与 `unload_members`（销毁，发生在
+//!   Streaming 落盘之后）。
+//! - 运行期恢复只由流式层发来的 [ChunkEntities] 驱动（存档命中、整块内容装成功后
+//!   才发）。启动期的批量恢复仍走 `load_world` 的装载流程，不经过本模块，避免同一批
+//!   实体被应用两次。
 //! - `mark_dirty` **只标实体当前所在的 region**。文档要求新旧两个 region 都标脏，
 //!   但 `Changed<ChunkAnchor>` 拿不到变更前的值；要等后续引入组件历史 / 上一帧
 //!   镜像后再补旧 region。
@@ -46,10 +49,11 @@ use bevy::prelude::*;
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex};
 use game_engine::residency::{ChunkAnchor, ChunkReached, GameTickSet, Real, Residency};
-use game_engine::save::Persist;
+use game_engine::save::{OpaqueComponents, Persist, PersistRegistry};
 use game_engine::voxel::ChunkKey;
 
-use crate::voxel::ChunkWillUnload;
+use crate::voxel::stream::{ChunkEntities, ChunkWillUnload};
+use crate::world::load::ensure_entity;
 
 /// 世界区块配置。
 ///
@@ -254,7 +258,8 @@ pub enum WorldChunkSet {
     Residency,
     /// 按 `Changed<ChunkAnchor>` 标脏 region。
     Dirty,
-    /// 实体销毁 / 重建：销毁在 Streaming 落盘之后；恢复端后续补。
+    /// 实体恢复 / 销毁：恢复消费流式层的 [ChunkEntities]；销毁在 Streaming
+    /// 落盘之后。
     Lifecycle,
 }
 
@@ -289,6 +294,10 @@ impl Plugin for WorldChunkPlugin {
             app.world().contains_resource::<Messages<ChunkWillUnload>>(),
             "WorldChunkPlugin 依赖 ChunkWillUnload 消息；请先 add_plugins(VoxelStreamPlugin)"
         );
+        assert!(
+            app.world().contains_resource::<Messages<ChunkEntities>>(),
+            "WorldChunkPlugin 依赖 ChunkEntities 消息；请先 add_plugins(VoxelStreamPlugin)"
+        );
 
         app.configure_sets(
             FixedUpdate,
@@ -307,7 +316,8 @@ impl Plugin for WorldChunkPlugin {
         .add_systems(FixedUpdate, mark_dirty.in_set(WorldChunkSet::Dirty))
         .add_systems(
             FixedUpdate,
-            unload_members
+            (restore_members, unload_members)
+                .chain()
                 .in_set(WorldChunkSet::Lifecycle)
                 .in_set(GameTickSet::WorldChunk),
         );
@@ -374,12 +384,75 @@ pub fn mark_dirty(
     }
 }
 
-/// 系统 3：区块降到 `None` 时销毁块内要存档的实体（exclusive）。
+/// 系统 3：按流式层发来的 [ChunkEntities] 恢复块内实体（exclusive）。
+///
+/// 顺序由 [GameTickSet] 决定（`Residency -> Streaming -> WorldChunk`）：Streaming
+/// 的 `resolve_chunks` 在存档命中且整块内容装成功后写消息，本系统在同一 tick 的
+/// [WorldChunkSet::Lifecycle] 读到。运行期恢复**只**由这条消息驱动；启动期的批量
+/// 恢复走 `load_world`，不经过这里。
+///
+/// - 逐条消息按 `(stable_entity_id, 记录顺序)` 排序后再应用，不依赖查询/哈希顺序；
+/// - 复用 `load_world` 的 `ensure_entity`：稳定 ID 已存在就更新同一个实体，所以重复
+///   投递幂等，[Persist] 等组件按记录覆盖；
+/// - 单个实体应用失败只 `error!` 并跳过，不回滚整块、不 panic；
+/// - 缺 [PersistRegistry] / [OpaqueComponents]（headless 装配）时整条消息 warn 后跳过。
+pub fn restore_members(world: &mut World, mut cursor: Local<MessageCursor<ChunkEntities>>) {
+    // 先把消息复制出来并释放 `Messages` 借用，后面才能继续改世界。
+    let batches: Vec<ChunkEntities> = {
+        let messages = world.resource::<Messages<ChunkEntities>>();
+        cursor.read(messages).cloned().collect()
+    };
+
+    for batch in batches {
+        if batch.entities.is_empty() {
+            continue;
+        }
+        if !world.contains_resource::<PersistRegistry>()
+            || !world.contains_resource::<OpaqueComponents>()
+        {
+            warn!(
+                "world chunk: 缺少 PersistRegistry/OpaqueComponents，跳过 body {:?} 区块 {:?} 的 {} 个实体恢复",
+                batch.body,
+                batch.key,
+                batch.entities.len()
+            );
+            continue;
+        }
+
+        // 先排好序再应用：稳定 ID 优先，同一 ID 保持记录顺序。
+        let mut order: Vec<usize> = (0..batch.entities.len()).collect();
+        order.sort_by_key(|&i| (batch.entities[i].stable_entity_id, i));
+
+        world.resource_scope::<PersistRegistry, _>(|world, registry| {
+            world.resource_scope::<OpaqueComponents, _>(|world, mut opaque| {
+                for &i in &order {
+                    let record = &batch.entities[i];
+                    let entity = ensure_entity(world, record.stable_entity_id);
+                    match registry.apply_entity(world, entity, record, &mut opaque) {
+                        Ok(_) => {
+                            // `ChunkAnchor` 是分组键、不在 payload 里：恢复时必须按消息补上，
+                            // 否则该实体下次 `capture` / `unload_members` 都找不到。
+                            world
+                                .entity_mut(entity)
+                                .insert(ChunkAnchor::new(batch.body, batch.key));
+                        }
+                        Err(error) => error!(
+                            "world chunk: 恢复实体 {}（body {:?}，区块 {:?}）失败：{error}",
+                            record.stable_entity_id, batch.body, batch.key
+                        ),
+                    }
+                }
+            });
+        });
+    }
+}
+
+/// 系统 4：区块降到 `None` 时销毁块内要存档的实体（exclusive）。
 ///
 /// 顺序由 [GameTickSet] 决定（`Residency -> Streaming -> WorldChunk -> ...`），
 /// 本系统在 [WorldChunkSet::Lifecycle]，所以这些块的内容与实体**已经**由
-/// Streaming 的 `persist_pending_unloads` 写进存档，这里只做销毁。恢复端
-/// （`spawn_members`）留到下一轮。
+/// Streaming 的 `persist_pending_unloads` 写进存档，这里只做销毁。恢复端由
+/// 同一 chain 里的 [restore_members] 负责。
 ///
 /// - 只认 `to == Residency::None`：`Render -> Data` 是渲染档清理，实体不销毁；
 /// - 只销毁 `(body, chunk)` 与消息完全一致的 [Persist] 实体，同 body 的其它块、
@@ -440,6 +513,8 @@ pub fn unload_members(world: &mut World, mut cursor: Local<MessageCursor<ChunkWi
 mod tests {
     use super::*;
     use game_engine::identity::StableEntityId;
+    use game_engine::save::{capture, EntityRecord, PersistComponent, StableTypeId};
+    use serde::{Deserialize, Serialize};
 
     fn body(id: u64) -> BodyKey {
         BodyKey::new(StableEntityId(id))
@@ -451,6 +526,7 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .add_message::<ChunkReached>()
             .add_message::<ChunkWillUnload>()
+            .add_message::<ChunkEntities>()
             .init_resource::<StableEntityIndex>()
             .add_plugins(WorldChunkPlugin);
         app
@@ -893,5 +969,155 @@ mod tests {
             index.entity(StableEntityId(73)),
             Some(other_body_same_chunk)
         );
+    }
+
+    /// 测试用可存档组件：值要能跨 `capture` -> `apply_entity` 原样回来。
+    #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct RestoreMarker(u32);
+
+    impl PersistComponent for RestoreMarker {
+        const STABLE_TYPE_ID: StableTypeId = StableTypeId::new(21);
+    }
+
+    /// 给 App 装恢复所需的资源：注册 [RestoreMarker] 与 [Persist]。
+    fn attach_restore_registry(app: &mut App) {
+        let mut registry = PersistRegistry::new();
+        registry.register::<RestoreMarker>().expect("注册测试组件");
+        registry.register::<Persist>().expect("注册 Persist");
+        app.insert_resource(registry);
+        app.insert_resource(OpaqueComponents::default());
+    }
+
+    /// 用真实 `capture` 从源世界造一条记录，保证负载与存档路径一致。
+    fn capture_records(b: BodyKey, key: ChunkKey, id: u64, value: u32) -> Vec<EntityRecord> {
+        let mut world = World::new();
+        world.spawn((
+            StableEntityId(id),
+            Persist {
+                prototype_type_id: 9,
+            },
+            ChunkAnchor::new(b, key),
+            RestoreMarker(value),
+        ));
+
+        let mut registry = PersistRegistry::new();
+        registry.register::<RestoreMarker>().expect("注册测试组件");
+        registry.register::<Persist>().expect("注册 Persist");
+        let snapshot = capture(&world, &registry, &OpaqueComponents::default()).expect("capture");
+        snapshot.for_chunk(b, key).to_vec()
+    }
+
+    fn write_entities(app: &mut App, b: BodyKey, key: ChunkKey, entities: Vec<EntityRecord>) {
+        app.world_mut().write_message(ChunkEntities {
+            body: b,
+            key,
+            entities,
+        });
+    }
+
+    #[test]
+    fn restore_members_spawns_from_record() {
+        let mut app = test_app();
+        attach_restore_registry(&mut app);
+        let b = body(21);
+        let key = ChunkKey::new(-2, 1, 3);
+        let records = capture_records(b, key, 88, 5);
+        assert_eq!(records.len(), 1, "capture 应产出一条实体记录");
+
+        write_entities(&mut app, b, key, records);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        // 记录里只有组件表负载；ChunkAnchor 是分组键，不在 payload 里。
+        let mut query = app
+            .world_mut()
+            .query::<(&StableEntityId, &RestoreMarker, &Persist)>();
+        let restored: Vec<_> = query
+            .iter(app.world())
+            .map(|(id, marker, persist)| (*id, *marker, *persist))
+            .collect();
+        assert_eq!(restored.len(), 1, "一条记录只应恢复一个实体");
+        let (id, marker, persist) = restored[0];
+        assert_eq!(id, StableEntityId(88));
+        assert_eq!(marker, RestoreMarker(5));
+        assert_eq!(persist.prototype_type_id, 9);
+
+        let index = app.world().resource::<StableEntityIndex>();
+        let indexed = index
+            .entity(StableEntityId(88))
+            .expect("索引应登记恢复的实体");
+        assert!(app.world().get::<RestoreMarker>(indexed).is_some());
+        assert_eq!(
+            app.world().get::<ChunkAnchor>(indexed),
+            Some(&ChunkAnchor::new(b, key)),
+            "ChunkAnchor 不在 payload 里，恢复时必须按消息的分组键补回"
+        );
+    }
+
+    #[test]
+    fn restored_entity_is_destroyed_by_later_unload() {
+        let mut app = test_app();
+        attach_restore_registry(&mut app);
+        let b = body(24);
+        let key = ChunkKey::new(-1, 0, 2);
+        write_entities(&mut app, b, key, capture_records(b, key, 91, 8));
+        app.world_mut().run_schedule(FixedUpdate);
+
+        // 恢复出来的实体必须带 anchor，否则降到 None 时 unload_members 找不到它。
+        write_unload(&mut app, b, key, Residency::None);
+        app.world_mut().run_schedule(FixedUpdate);
+
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, With<StableEntityId>>();
+        assert_eq!(
+            query.iter(app.world()).count(),
+            0,
+            "恢复后的实体再次卸载时必须被销毁"
+        );
+    }
+
+    #[test]
+    fn restore_members_is_idempotent() {
+        let mut app = test_app();
+        attach_restore_registry(&mut app);
+        let b = body(22);
+        let key = ChunkKey::new(1, 1, 1);
+        let records = capture_records(b, key, 89, 6);
+
+        // 同一条记录投递两次：第二次必须更新同一个实体，而不是再 spawn 一个。
+        for _ in 0..2 {
+            write_entities(&mut app, b, key, records.clone());
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, With<StableEntityId>>();
+        let restored: Vec<Entity> = query.iter(app.world()).collect();
+        assert_eq!(restored.len(), 1, "重复投递不应产生第二个实体");
+        assert_eq!(
+            app.world().get::<RestoreMarker>(restored[0]),
+            Some(&RestoreMarker(6))
+        );
+        let index = app.world().resource::<StableEntityIndex>();
+        assert_eq!(index.entity(StableEntityId(89)), Some(restored[0]));
+    }
+
+    #[test]
+    fn restore_members_skips_missing_registry() {
+        let mut app = test_app();
+        // 不插入 PersistRegistry / OpaqueComponents：模拟 headless 装配。
+        let b = body(23);
+        let key = ChunkKey::new(0, 0, 0);
+        let records = capture_records(b, key, 90, 7);
+        write_entities(&mut app, b, key, records);
+
+        app.world_mut().run_schedule(FixedUpdate);
+
+        assert!(app.world().get_resource::<PersistRegistry>().is_none());
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, With<StableEntityId>>();
+        assert_eq!(query.iter(app.world()).count(), 0, "缺注册表时应整条跳过");
     }
 }

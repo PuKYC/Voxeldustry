@@ -51,6 +51,13 @@
 //!    `Hit` 无内容 / `Miss` → 真正跑 [WorldGenerator]；`Pending` → 留在队列，
 //!    下一 tick 再问。
 //!
+//! ## 实体恢复
+//!
+//! 存档命中且记录带实体、整块内容装成功时，[resolve_chunks] 发一条
+//! [ChunkEntities]（生成路径、空实体、intake 的「块已在容器」快路径都不发——
+//! 启动期的实体已由 `load_world` 应用）。真正的重建由 `WorldChunkPlugin` 的
+//! Lifecycle 阶段消费这条消息完成，流式层只负责把记录递过去。
+//!
 //! ## 依赖
 //!
 //! 插件假定 [GameVoxelPlugin](crate::voxel::GameVoxelPlugin) 已装配，并且
@@ -74,7 +81,9 @@ use game_engine::presentation::voxel::{
 };
 use game_engine::presentation::RenderTransform;
 use game_engine::residency::{ChunkReached, GameTickSet, Residency, ResidencyChanged};
-use game_engine::save::{capture, export_chunk, OpaqueComponents, PersistRegistry, SaveStore};
+use game_engine::save::{
+    capture, export_chunk, EntityRecord, OpaqueComponents, PersistRegistry, SaveStore,
+};
 use game_engine::spatial::Size;
 use game_engine::streaming::{ChunkPersistence, ChunkRecord, GenState, GenTable, StoreLookup};
 use game_engine::voxel::{
@@ -146,6 +155,21 @@ pub struct ChunkWillUnload {
     pub to: Residency,
 }
 
+/// 存档命中装块成功后要恢复的实体记录。
+///
+/// 由 [resolve_chunks] 在 `Hit(record)` 且 `record.entities` 非空、整块内容
+/// `install_chunk` 成功之后发出；生成路径与空实体不发。消费方是
+/// `WorldChunkPlugin` 的 Lifecycle 阶段（同一 tick，Streaming 之后）。
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+pub struct ChunkEntities {
+    /// 所属体素容器（body）。
+    pub body: BodyKey,
+    /// 实体记录归属的区块。
+    pub key: ChunkKey,
+    /// 该块的实体记录，保持存档顺序（消费方自行按稳定 ID 排序）。
+    pub entities: Vec<EntityRecord>,
+}
+
 /// 待结算队列：`(body, key) -> 目标档位`，键序即结算顺序。
 #[derive(Resource, Debug, Default)]
 pub struct StreamWanted(pub BTreeMap<(BodyKey, ChunkKey), Residency>);
@@ -189,6 +213,7 @@ impl Plugin for VoxelStreamPlugin {
             .init_resource::<RenderGroups>()
             .init_resource::<PendingUnloads>()
             .add_message::<ChunkWillUnload>()
+            .add_message::<ChunkEntities>()
             .add_systems(
                 FixedUpdate,
                 (
@@ -312,6 +337,7 @@ pub fn resolve_chunks(
     seed: Option<Res<WorldSeed>>,
     terrain: Option<Res<TerrainConfig>>,
     mut reached: MessageWriter<ChunkReached>,
+    mut entities_out: MessageWriter<ChunkEntities>,
     mut groups: ResMut<RenderGroups>,
     mut stats: ResMut<StreamStats>,
 ) {
@@ -361,16 +387,61 @@ pub fn resolve_chunks(
 
         match persistence.lookup(body, key) {
             StoreLookup::Pending => pending += 1,
-            StoreLookup::Hit(record) => match record.content {
-                Some(bytes) => {
-                    match game_engine::save::install_chunk(
-                        &mut volume,
-                        key,
-                        &bytes,
-                        interner.inner_mut(),
-                    ) {
-                        Ok(old) => {
-                            release_tree(&mut interner, old);
+            StoreLookup::Hit(record) => {
+                let ChunkRecord {
+                    content, entities, ..
+                } = record;
+                match content {
+                    Some(bytes) => {
+                        match game_engine::save::install_chunk(
+                            &mut volume,
+                            key,
+                            &bytes,
+                            interner.inner_mut(),
+                        ) {
+                            Ok(old) => {
+                                release_tree(&mut interner, old);
+                                // 装块成功后才发；生成路径与空实体不发。
+                                if !entities.is_empty() {
+                                    entities_out.write(ChunkEntities {
+                                        body,
+                                        key,
+                                        entities,
+                                    });
+                                }
+                                let raw = extract_block_raw(&volume, &interner, key, level);
+                                finish_chunk(
+                                    pair,
+                                    level,
+                                    raw,
+                                    &mut allocator,
+                                    index.as_deref_mut(),
+                                    &mut commands,
+                                    &mut groups,
+                                    &mut reached,
+                                    &mut gen,
+                                    &mut wanted,
+                                    &mut stats,
+                                );
+                                stats.loaded_from_store += 1;
+                            }
+                            Err(error) => {
+                                error!("stream: 存档内容装不进区块 {key:?}：{error}");
+                                drop_request(&mut gen, &mut wanted, pair);
+                            }
+                        }
+                    }
+                    None => {
+                        if generate_into(
+                            pair,
+                            &mut volume,
+                            &mut interner,
+                            seed.as_deref(),
+                            terrain.as_deref(),
+                            &mut gen,
+                            &mut wanted,
+                            &mut stats,
+                        ) {
                             let raw = extract_block_raw(&volume, &interner, key, level);
                             finish_chunk(
                                 pair,
@@ -385,42 +456,10 @@ pub fn resolve_chunks(
                                 &mut wanted,
                                 &mut stats,
                             );
-                            stats.loaded_from_store += 1;
-                        }
-                        Err(error) => {
-                            error!("stream: 存档内容装不进区块 {key:?}：{error}");
-                            drop_request(&mut gen, &mut wanted, pair);
                         }
                     }
                 }
-                None => {
-                    if generate_into(
-                        pair,
-                        &mut volume,
-                        &mut interner,
-                        seed.as_deref(),
-                        terrain.as_deref(),
-                        &mut gen,
-                        &mut wanted,
-                        &mut stats,
-                    ) {
-                        let raw = extract_block_raw(&volume, &interner, key, level);
-                        finish_chunk(
-                            pair,
-                            level,
-                            raw,
-                            &mut allocator,
-                            index.as_deref_mut(),
-                            &mut commands,
-                            &mut groups,
-                            &mut reached,
-                            &mut gen,
-                            &mut wanted,
-                            &mut stats,
-                        );
-                    }
-                }
-            },
+            }
             StoreLookup::Miss => {
                 if generate_into(
                     pair,
@@ -908,8 +947,8 @@ mod tests {
     use game_engine::identity::{StableIdPlugin, StableIdWorldExt};
     use game_engine::residency::ChunkAnchor;
     use game_engine::save::{
-        export_chunk, read_region, OpaqueComponents, Persist, PersistComponent, PersistRegistry,
-        SaveConfig, SavePaths, SaveStore, StableTypeId,
+        export_chunk, read_region, EntityRecord, OpaqueComponents, Persist, PersistComponent,
+        PersistRegistry, SaveConfig, SavePaths, SaveStore, StableTypeId,
     };
     use game_engine::streaming::{ChunkRecord, ChunkStore, StoreLookup};
     use game_engine::voxel::{chunk_content_hash, chunk_key};
@@ -927,6 +966,8 @@ mod tests {
         Miss,
         Pending,
         Hit(Option<Vec<u8>>),
+        /// 完整记录（可带实体），用于验证恢复消息。
+        Record(ChunkRecord),
     }
 
     /// 按调用顺序回答的假存档；脚本用尽后重复最后一条。
@@ -964,6 +1005,7 @@ mod tests {
                     proposals: Vec::new(),
                     entities: Vec::new(),
                 }),
+                Answer::Record(record) => StoreLookup::Hit(record.clone()),
             }
         }
     }
@@ -1049,6 +1091,14 @@ mod tests {
             self.app
                 .world_mut()
                 .resource_mut::<Messages<ChunkWillUnload>>()
+                .drain()
+                .collect()
+        }
+
+        fn chunk_entities(&mut self) -> Vec<ChunkEntities> {
+            self.app
+                .world_mut()
+                .resource_mut::<Messages<ChunkEntities>>()
                 .drain()
                 .collect()
         }
@@ -1773,6 +1823,59 @@ mod tests {
             read_back(&harness, dir.path(), key),
             None,
             "空块不得在存档里留下记录"
+        );
+    }
+
+    #[test]
+    fn hit_with_entities_emits_chunk_entities() {
+        let key = chunk_key(3, 0, 3);
+        let (bytes, _) = generated_bytes(key);
+        let entities = vec![
+            EntityRecord {
+                stable_entity_id: 7,
+                stable_type_id: 11,
+                payload: vec![1, 2, 3],
+            },
+            EntityRecord {
+                stable_entity_id: 9,
+                stable_type_id: 11,
+                payload: vec![4],
+            },
+        ];
+        let record = ChunkRecord {
+            generator_version: 1,
+            content: Some(bytes),
+            proposals: Vec::new(),
+            entities: entities.clone(),
+        };
+        let mut harness = harness(vec![Answer::Record(record)]);
+
+        harness.upgrade(key);
+        harness.tick();
+
+        let emitted = harness.chunk_entities();
+        assert_eq!(emitted.len(), 1, "命中带实体只发一条 ChunkEntities");
+        assert_eq!(emitted[0].body, harness.body);
+        assert_eq!(emitted[0].key, key);
+        assert_eq!(emitted[0].entities, entities);
+        assert!(harness.volume().contains_chunk(&key));
+        assert_eq!(harness.stats().loaded_from_store, 1);
+        assert_eq!(harness.stats().generated, 0);
+    }
+
+    #[test]
+    fn generated_chunk_emits_no_chunk_entities() {
+        let key = chunk_key(4, 0, 4);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert!(harness.volume().contains_chunk(&key));
+        assert_eq!(harness.stats().generated, 1);
+        assert!(
+            harness.chunk_entities().is_empty(),
+            "生成路径不得发 ChunkEntities"
         );
     }
 }
