@@ -141,7 +141,9 @@ pub enum TerrainMode {
     /// 急切：Startup 生成全部块 + 全部渲染组（旧路径）。
     #[default]
     Eager,
-    /// 流式：只建**空**体素容器 + 正式 body 身份；块与渲染组交给驻留/流式管线。
+    /// 流式：地形体由 [StreamingWorldPlugin](crate::world::StreamingWorldPlugin) 的
+    /// 启动引导创建（有档走 load_world 恢复，无档/坏档才建**空**容器）；本插件
+    /// 不再注册 Startup，块与渲染组交给驻留/流式管线。
     Streaming,
 }
 
@@ -171,9 +173,11 @@ impl Plugin for TerrainPlugin {
 ///
 /// 两条路径共享全部资源初始化，只在 Startup 生成系统与 Update 流式系统上分流：
 /// - [TerrainMode::Eager]：Startup 生成全部块 + 全部组，Update 继续跑旧 LOD 重划分；
-/// - [TerrainMode::Streaming]：Startup 只建空容器（块由驻留/流式管线装），
-///   **不**注册 `stream_terrain_lod`——它和流式层会同时读写同一批块缓存，
-///   造成「旧系统把流式装进来的块又覆盖/回滚」的竞态。
+/// - [TerrainMode::Streaming]：本插件**不注册 Startup**：地形体由
+///   [StreamingWorldPlugin](crate::world::StreamingWorldPlugin) 的引导系统创建
+///   （有档读档、无档/坏档建空容器），块由驻留/流式管线装。这里也**不**注册
+///   stream_terrain_lod——它和流式层会同时读写同一批块缓存，造成「旧系统把
+///   流式装进来的块又覆盖/回滚」的竞态。
 pub(crate) fn register_systems(app: &mut App, mode: TerrainMode) {
     app.init_resource::<TerrainGroups>()
         // 地形根实体要成为正式 island body（StableEntityId + IslandRegistry 条目），
@@ -208,15 +212,17 @@ pub(crate) fn register_systems(app: &mut App, mode: TerrainMode) {
                 .add_systems(Update, stream_terrain_lod);
         }
         TerrainMode::Streaming => {
-            // 只建空容器：块与渲染组由 GameTickSet::Streaming 按真实请求产生。
-            // 不注册 stream_terrain_lod：它和流式层会同时读写同一批块缓存，
+            // Startup 不在这里注册：地形体由 StreamingWorldPlugin 的引导系统创建
+            // （有档 load_world 恢复、无档/坏档建空容器）。两边都注册会在读档成功
+            // 后多出一个空地形体，违背「有档不生成」。
+            //
+            // 也不注册 stream_terrain_lod：它和流式层会同时读写同一批块缓存，
             // 造成「旧系统把流式装进来的块又覆盖/回滚」的竞态。
-            app.add_systems(Startup, (build_empty_terrain, attach_terrain_body).chain())
-                .add_systems(
-                    Update,
-                    invalidate_stale_terrain_caches
-                        .before(crate::presentation::voxel_mesh::refresh_dirty_voxel_meshes),
-                );
+            app.add_systems(
+                Update,
+                invalidate_stale_terrain_caches
+                    .before(crate::presentation::voxel_mesh::refresh_dirty_voxel_meshes),
+            );
         }
     }
 }
@@ -851,26 +857,6 @@ fn apply_group_diff(
     }
 }
 
-/// Streaming 模式的 Startup：只出**空**体素容器与正式 body 身份，不生成任何块。
-///
-/// 与 [build_terrain] 的 spawn 形状保持一致（physics 时同样挂 `VoxelCollider`），
-/// 后续 `attach_terrain_body` 不区分模式，直接把该实体升级成 island body。
-/// 块与渲染组交给驻留 / 流式管线：没有 Real/Observer 请求时容器就保持空。
-///
-/// [TerrainStats] 显式归零（而不是依赖 `init_resource` 的默认值）：统计是消费者
-/// 读取的「当前地形规模」，切到流式模式后必须从 0 开始，不能残留任何生成口径。
-fn build_empty_terrain(mut commands: Commands, mut stats: ResMut<TerrainStats>) {
-    *stats = TerrainStats::default();
-    let volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
-    // physics：与 build_terrain 的 spawn 形状一致，让空地形也派生 avian 碰撞体；
-    // 块内容到达后由体素/物理层按脏块更新。
-    #[cfg(feature = "physics")]
-    commands.spawn((volume, game_engine::voxel::VoxelCollider));
-    #[cfg(not(feature = "physics"))]
-    commands.spawn(volume);
-    debug!("terrain: streaming 模式只建空体素容器，块交给驻留/流式管线");
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_terrain(
     mut commands: Commands,
@@ -937,16 +923,20 @@ fn build_terrain(
 
 /// 把地形根实体升级成正式 island body：挂 `StableEntityId` + 写 [IslandRegistry]。
 ///
-/// `build_terrain` 用 `Commands` 生成地形根实体，所以这里必须是 **exclusive system**
-/// （`&mut World`）：executor 在运行 exclusive system 之前会 flush 排在前面的命令
-/// 队列，`Startup` 里 chain 在 `build_terrain` 之后就能看到该实体。
-/// 这一点由 `terrain_root_entity_is_a_registered_island_body` 实测（一次 `update()`
-/// 后体素实体必须已带稳定 ID 且注册表有对应条目）。
+/// 两种调用方都把它 chain 在「容器出现」之后：
+/// - Eager：`build_terrain` 用 `Commands` spawn，executor 在运行 exclusive system
+///   前会 flush 命令队列；
+/// - Streaming：`bootstrap_streaming_world` 要么读档恢复 body（已带稳定 ID，被
+///   `Without<StableEntityId>` 排除），要么直接 `world.spawn` 空容器。
+///
+/// 所以这里必须是 **exclusive system**（`&mut World`）。Eager 路径由
+/// `terrain_root_entity_is_a_registered_island_body` 实测（一次 `update()` 后体素
+/// 实体必须已带稳定 ID 且注册表有对应条目）。
 ///
 /// 地形是锚定岛：`drift = ZERO`、`anchored = true`、`biome = TerrainConfig.biome`。
 /// 幂等：已带 `StableEntityId` 的实体被 `Without<StableEntityId>` 排除，重复运行
 /// 不会二次分配；即使被再次 attach，[`attach_island_entity`] 也复用原 ID。
-fn attach_terrain_body(world: &mut World) {
+pub(crate) fn attach_terrain_body(world: &mut World) {
     let biome = world.resource::<TerrainConfig>().biome;
     // 先收集成 Vec 结束查询对 world 的借用，再逐实体 attach（需要 &mut World）。
     let entities: Vec<Entity> = {
@@ -1199,7 +1189,10 @@ mod tests {
                 .expect("地形根实体必须在 IslandRegistry 里有对应条目");
             assert!(island.anchored, "地形是锚定岛");
             assert_eq!(island.drift, Vec3F::ZERO, "锚定地形 drift 必须为零");
-            assert_eq!(island.biome, config_biome, "biome 必须取 TerrainConfig.biome");
+            assert_eq!(
+                island.biome, config_biome,
+                "biome 必须取 TerrainConfig.biome"
+            );
         }
 
         // 幂等：直接再跑一次系统（等价于 Startup 重复执行），不新增条目、不取号。

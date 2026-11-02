@@ -21,19 +21,37 @@
 //! 5. [GameTickSet::Save]：**落盘放在最后**，才能看到本 tick 产生的全部脏块
 //!    与卸载删除，不会把刚写进内存的内容漏掉。
 //!
+//! ## 启动引导：有档不生成
+//!
+//! Startup 先跑 [bootstrap_streaming_world]，按 [SaveRoot] 决定世界从哪来：
+//!
+//! - 有 root 且 [load_world] 读到存档：恢复 body / 块 / 实体后**直接返回**，
+//!   不再 spawn 空容器。这是「有档不生成」在世界级的唯一落点，读档成功与
+//!   新建世界由同一条 match/return 分支保证互斥，不靠标志位猜；
+//! - 没有 root、或 world.meta 不存在：spawn 一个空 VoxVolume，块交给后续
+//!   驻留 / 流式管线按请求装；
+//! - 读档失败（坏档 / 缺资源）：error! 记录后按新世界降级，空容器照建，
+//!   绝不让坏档把启动卡死。
+//!
+//! 引导与 [attach_terrain_body] 用 chain 串起来，保证「先恢复或建容器，再挂
+//! body 身份」；用 chain 而不是依赖插件添加顺序，是因为 CoreGame 里
+//! TerrainPlugin 先于本插件，而 Startup 的系统顺序由插入顺序 + chain 决定。
+//!
 //! ## 存档是可选的
 //!
 //! 有 [SaveRoot] 资源且 App 里还没有 SaveStore 时，安装引擎的 SavePlugin 与
 //! game-core 的 WorldSavePlugin；没有 SaveRoot 就什么都不装：ChunkPersistence
 //! 保持默认的 NoStore，流式层照常装卸，只是不落盘（headless / 单测）。
 //! 已有 SaveStore（例如测试或上层已经装过 SavePlugin）时跳过，避免重复注册
-//! 系统与后台线程。
+//! 系统与后台线程。读档 / 落盘依赖的 PersistPlugin 则由本插件无条件补装
+//! （判重），所以即使没有 SaveRoot，读档所需的 PersistRegistry 也在。
 //!
 //! ## 装配前提
 //!
-//! 必须先装 crate::voxel::GameVoxelPlugin；TerrainMode::Streaming 时地形插件
-//! 会产出一个空体素 body 作为流式层的容器（Eager 地形也能接，只是 Startup
-//! 已经把块生成好，流式层会走「块已在容器」的快路径）。
+//! 必须先装 crate::voxel::GameVoxelPlugin 与 crate::voxel::terrain::TerrainPlugin
+//! （TerrainMode::Streaming）：地形体由本插件的引导系统创建（读档恢复或空容器），
+//! TerrainPlugin 不再注册 Startup。Eager 地形也能接，只是 Startup 已经把块
+//! 生成好，流式层会走「块已在容器」的快路径。
 //!
 //! ## 本地玩家 = 观察者（过渡）
 //!
@@ -61,14 +79,16 @@ use game_engine::math::{FixedPoint, Vec3F};
 use game_engine::residency::{
     BodyRef, GameTickSet, LogicPos, Observer, ResidencyPlugin, ResidencySet,
 };
-use game_engine::save::{SaveConfig, SavePlugin, SaveStore};
+use game_engine::save::{PersistPlugin, SaveConfig, SavePaths, SavePlugin, SaveStore};
 
 use crate::input::control::LocalPlayer;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
 use crate::voxel::stream::VoxelStreamPlugin;
-use crate::voxel::GameVoxelPlugin;
+use crate::voxel::terrain::{attach_terrain_body, TerrainStats};
+use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
+use crate::world::load::load_world;
 use crate::world::save_plugin::{SaveRoot, WorldSaveConfig, WorldSavePlugin};
 use crate::world::IslandRegistry;
 
@@ -89,8 +109,9 @@ impl Default for StreamingPlayerConfig {
 
 /// 把驻留 / 流式 / 世界区块 /（可选）存档管线接进 App。
 ///
-/// 依赖：先装 crate::voxel::GameVoxelPlugin；TerrainMode::Streaming 时由
-/// TerrainPlugin 产出空体素 body。
+/// 依赖：先装 crate::voxel::GameVoxelPlugin 与 crate::voxel::terrain::TerrainPlugin
+/// （TerrainMode::Streaming）。Startup 引导负责读档或建空地形体，见模块文档
+/// 「启动引导：有档不生成」。
 pub struct StreamingWorldPlugin;
 
 impl Plugin for StreamingWorldPlugin {
@@ -99,6 +120,13 @@ impl Plugin for StreamingWorldPlugin {
             app.is_plugin_added::<GameVoxelPlugin>(),
             "StreamingWorldPlugin 依赖 GameVoxelPlugin"
         );
+
+        // 读档要求 PersistRegistry / OpaqueComponents，落盘也会用它们；WorldSavePlugin
+        // 自己不装 PersistPlugin。重复添加会让 register::<Persist>() 撞同一类型 ID
+        // 而 panic，所以先判重（上层测试可能已经装过）。
+        if !app.is_plugin_added::<PersistPlugin>() {
+            app.add_plugins(PersistPlugin);
+        }
 
         app.init_resource::<StreamingPlayerConfig>();
 
@@ -109,6 +137,14 @@ impl Plugin for StreamingWorldPlugin {
         app.add_plugins(WorldChunkPlugin);
 
         configure_tick_sets(app);
+
+        // Streaming 的地形体创建已从 TerrainPlugin 挪到这里：有档读档、无档建空
+        // 容器，再由 attach_terrain_body 挂 body 身份。chain 保证顺序，与插件添加
+        // 顺序无关（CoreGame 先加 TerrainPlugin）。
+        app.add_systems(
+            Startup,
+            (bootstrap_streaming_world, attach_terrain_body).chain(),
+        );
 
         // 玩家观察者必须在 Anchor 之前补齐 LogicPos / BodyRef / Observer，
         // 否则第一 tick 的 update_anchors 看不到这些组件，请求要滞后一 tick。
@@ -144,6 +180,57 @@ impl Plugin for StreamingWorldPlugin {
             config: WorldSaveConfig::default(),
         });
     }
+}
+
+/// Streaming 模式的 Startup 引导：有存档就读档，没有就建空地形体。
+///
+/// 读档成功时**直接 return**：世界里已经有存档恢复出来的 body / 块，不能再
+/// spawn 空容器，否则会出现一个空地形体外加一个读回来的地形体。无 SaveRoot、
+/// world.meta 不存在、读档失败三种情况共用下面同一条新建路径；坏档只降级
+/// （error!）不 panic，避免玩家被一份坏档永久卡在启动。
+///
+/// 这里必须能在没有任何 SaveStore 时运行（无 SaveRoot 的 headless / 单测），
+/// 所以只按 SaveRoot 决定是否碰磁盘，不无条件取 SaveStore。
+fn bootstrap_streaming_world(world: &mut World) {
+    let save_root = world.get_resource::<SaveRoot>().map(|root| root.0.clone());
+    if let Some(root) = save_root {
+        let paths = SavePaths::new(root);
+        match load_world(world, &paths) {
+            Ok(Some(loaded)) => {
+                info!(
+                    "world: 读档完成（tick={} bodies={} chunks={} entities={} orphan_regions={}），跳过空地形",
+                    loaded.world_tick,
+                    loaded.stats.bodies,
+                    loaded.stats.chunks,
+                    loaded.stats.entities,
+                    loaded.stats.orphan_regions,
+                );
+                // 有档不生成：load_world 已经把 body 与块装回世界，这里必须结束，
+                // 不能再落到下面的空容器分支。
+                return;
+            }
+            Ok(None) => {
+                info!("world: 没有存档，按新世界启动");
+            }
+            Err(error) => {
+                error!("world: 读档失败，按新世界启动：{error}");
+            }
+        }
+    }
+
+    // 新建世界：只出空容器，块由驻留 / 流式管线按请求装；body 身份交给紧随其后的
+    // attach_terrain_body。TerrainStats 由 TerrainPlugin 注册；缺资源时跳过，避免
+    // 引导系统依赖插件注册的先后细节。
+    if let Some(mut stats) = world.get_resource_mut::<TerrainStats>() {
+        *stats = TerrainStats::default();
+    }
+    let volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+    // physics：与 terrain::build_terrain 的 spawn 形状一致（原 Streaming Startup
+    // 的空容器也挂 VoxelCollider），块内容到达后由体素/物理层按脏块更新。
+    #[cfg(feature = "physics")]
+    world.spawn((volume, game_engine::voxel::VoxelCollider));
+    #[cfg(not(feature = "physics"))]
+    world.spawn(volume);
 }
 
 /// 固定 [GameTickSet] 的全局顺序：驻留 → 流式 → 世界区块 → 玩法 → 存档。
@@ -270,9 +357,11 @@ mod tests {
     use game_engine::residency::{
         BodyRef, ChunkAnchor, ChunkReached, LogicPos, Observer, ResidencyTable,
     };
-    use game_engine::save::SaveStore;
+    use game_engine::save::{SavePaths, SaveStore};
     use game_engine::streaming::{ChunkPersistence, GenTable, StoreLookup};
-    use game_engine::voxel::{chunk_key, VoxVolume};
+    use game_engine::voxel::{
+        chunk_key, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelInterner, CHUNK_DEPTH,
+    };
 
     use crate::input::control::LocalPlayer;
     use crate::voxel::stream::{
@@ -282,7 +371,7 @@ mod tests {
         TerrainConfig, TerrainGroups, TerrainMode, TerrainPlugin, TerrainStats,
     };
     use crate::world::chunk::RegionIndex;
-    use crate::world::save_plugin::WorldSavePaths;
+    use crate::world::save_plugin::{SaveNow, SaveRoot, WorldSavePaths, WorldSaveStatus};
     use crate::world::{IslandRegistry, WorldPlugin};
 
     /// std::env::temp_dir 下的唯一子目录；Drop 时整棵删掉（与 world::save_plugin
@@ -322,6 +411,18 @@ mod tests {
     ///
     /// 不插 TerrainMode 等价于 Eager；需要 Streaming 时显式插入。
     fn terrain_app(mode: Option<TerrainMode>, with_pipeline: bool) -> App {
+        terrain_app_with_root(mode, with_pipeline, None)
+    }
+
+    /// 同 terrain_app，但可在 StreamingWorldPlugin 之前插入 SaveRoot。
+    ///
+    /// root 必须在 add_plugins(StreamingWorldPlugin) 之前进入世界：插件的 build
+    /// 只有那时才能决定是否安装 SavePlugin / WorldSavePlugin。
+    fn terrain_app_with_root(
+        mode: Option<TerrainMode>,
+        with_pipeline: bool,
+        root: Option<&Path>,
+    ) -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.add_plugins(StableIdPlugin);
@@ -334,6 +435,9 @@ mod tests {
         });
         if let Some(mode) = mode {
             app.insert_resource(mode);
+        }
+        if let Some(root) = root {
+            app.insert_resource(SaveRoot(root.to_path_buf()));
         }
         app.add_plugins(TerrainPlugin);
         if with_pipeline {
@@ -357,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn streaming_terrain_starts_empty_with_body_identity() {
-        let mut app = terrain_app(Some(TerrainMode::Streaming), false);
+    fn streaming_boot_without_save_creates_empty_terrain() {
+        let mut app = terrain_app(Some(TerrainMode::Streaming), true);
         app.update();
 
         // 先拿实体，再读卷：空容器里一个块都没有。
@@ -393,6 +497,141 @@ mod tests {
         assert_eq!(stats.lod_groups, [0; 4]);
         assert_eq!(stats.skipped_empty, 0);
         assert!(world.resource::<TerrainGroups>().is_empty());
+    }
+
+    /// 真插件装配：Streaming 引导建空容器 -> 手工塞一个实心块 -> SaveNow 落盘。
+    ///
+    /// 返回第一 App 地形体的稳定 ID，供第二次启动比对。走 SaveNow 的真实路径
+    /// （而不是直接 capture_world），同时覆盖「写盘」与「启动读档」两端。
+    fn boot_and_save_one_chunk(root: &Path) -> StableEntityId {
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(root));
+        app.update();
+
+        // 实心块不依赖世界生成器的地表高度，块内容一定非空（空树可能被存成 None）。
+        let chunk = chunk_key(0, 0, 0);
+        let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+        {
+            let mut interner = app.world_mut().resource_mut::<VoxelInterner>();
+            tree.fill(interner.inner_mut(), 1);
+        }
+        let body = {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<Entity, With<VoxVolume>>();
+            let entity = query.iter(world).next().expect("引导后应有地形体");
+            let body = world
+                .get::<StableEntityId>(entity)
+                .copied()
+                .expect("地形体必须有稳定 ID");
+            world
+                .get_mut::<VoxVolume>(entity)
+                .expect("地形体必须带 VoxVolume")
+                .insert_chunk(chunk, tree);
+            body
+        };
+
+        app.world_mut().write_message(SaveNow);
+        app.world_mut().run_schedule(FixedUpdate);
+        let status = app.world().resource::<WorldSaveStatus>();
+        assert!(
+            status.last_error.is_none(),
+            "SaveNow 落盘失败：{:?}",
+            status.last_error
+        );
+        assert_eq!(status.saves, 1, "SaveNow 必须成功落盘一次");
+        assert!(
+            SavePaths::new(root).world_meta().exists(),
+            "world.meta 必须落盘"
+        );
+
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+        body
+    }
+
+    #[test]
+    fn streaming_boot_with_save_loads_world_and_skips_empty_terrain() {
+        let dir = TempDir::new("boot_load");
+        let saved_body = boot_and_save_one_chunk(dir.path());
+
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        app.update();
+
+        {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<Entity, With<VoxVolume>>();
+            let entities: Vec<Entity> = query.iter(world).collect();
+            assert_eq!(entities.len(), 1, "读档成功后世界里不能多出一个空地形体");
+            let entity = entities[0];
+            assert_eq!(
+                world.get::<StableEntityId>(entity).copied(),
+                Some(saved_body),
+                "读档必须恢复存档里的 body 身份"
+            );
+            assert_eq!(
+                world
+                    .get::<VoxVolume>(entity)
+                    .expect("带 VoxVolume")
+                    .chunk_count(),
+                1,
+                "存档里的块数必须恢复"
+            );
+            assert_eq!(
+                world.resource::<IslandRegistry>().len(),
+                1,
+                "岛屿注册表必须只有存档里的地形这一个岛"
+            );
+        }
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+    }
+
+    #[test]
+    fn streaming_boot_with_corrupt_save_falls_back_to_empty_terrain() {
+        let dir = TempDir::new("boot_corrupt");
+        let _ = boot_and_save_one_chunk(dir.path());
+
+        // 尾部翻一位：world.meta 解码失败，read_with_recovery 会先备份 .corrupt，
+        // 再把错误交给引导系统降级，而不是当成「没有存档」。
+        let meta = SavePaths::new(dir.path()).world_meta();
+        let mut bytes = std::fs::read(&meta).expect("读 world.meta");
+        assert!(bytes.len() > 2, "world.meta 不应为空");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&meta, bytes).expect("写坏 world.meta");
+
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        app.update();
+
+        {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<Entity, With<VoxVolume>>();
+            let entities: Vec<Entity> = query.iter(world).collect();
+            assert_eq!(entities.len(), 1, "坏档降级后应恰有一个空地形体");
+            assert_eq!(
+                world
+                    .get::<VoxVolume>(entities[0])
+                    .expect("带 VoxVolume")
+                    .chunk_count(),
+                0,
+                "坏档降级必须从空地形开始"
+            );
+            assert_eq!(
+                world.resource::<IslandRegistry>().len(),
+                1,
+                "坏档降级后岛屿注册表必须有且只有一个地形岛"
+            );
+        }
+        let paths = SavePaths::new(dir.path());
+        assert!(
+            paths.corrupt(&meta).exists(),
+            "坏档必须被备份成 .corrupt：{:?}",
+            paths.corrupt(&meta)
+        );
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
     }
 
     #[test]
