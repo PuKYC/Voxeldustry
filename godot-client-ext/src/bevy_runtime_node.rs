@@ -16,13 +16,16 @@ use godot::builtin::{
     Array, PackedByteArray, PackedFloat32Array, PackedInt64Array, PackedStringArray, VarDictionary,
 };
 use godot::prelude::*;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use game_core::bevy_backend::*;
 use game_core::presentation::semantics::SemanticRegistry;
 use game_core::spec::ClientBridge;
-use game_core::voxel::terrain::{nearest_block_distance_m, TerrainConfig, VoxelLodRuntime};
+use game_core::voxel::terrain::{
+    nearest_block_distance_m, TerrainConfig, TerrainMode, VoxelLodRuntime,
+};
 use game_core::voxel::VoxelLodConfig;
 
 use crate::presentation_bridge;
@@ -157,6 +160,8 @@ impl BevyAppManager {
             false,
             false,
             false,
+            TerrainMode::Eager,
+            None,
         );
     }
 
@@ -176,6 +181,8 @@ impl BevyAppManager {
             false,
             false,
             false,
+            TerrainMode::Eager,
+            None,
         );
     }
 
@@ -201,6 +208,38 @@ impl BevyAppManager {
             false,
             false,
             true,
+            TerrainMode::Eager,
+            None,
+        );
+    }
+
+    /// 流式体素场景：地形只建空容器，玩家作为观察者按需加载区块，并启用世界存档。
+    ///
+    /// 与 start_bevy_voxel_demo 的区别：
+    /// - 地形走 `TerrainMode::Streaming`，Startup 不生成任何块，块由驻留 / 流式管线
+    ///   按玩家位置请求，所以进场景是秒开而不是等全量生成；
+    /// - `save_dir` 非空时接上存档层（启动读档、SaveNow / 退场落盘）；
+    /// - 仍然挂 voxel_viewer，给一个带相机 / 玩家的可玩场景 —— 流式管线要靠本地
+    ///   玩家当观察者锚点，没有它永远不会有区块请求。
+    ///
+    /// 约定：`save_dir` 传空字符串表示「不落盘」。GDScript 侧没有 `Option`，
+    /// 传 `""` 比让调用方再造一套重载简单。
+    #[func]
+    fn start_bevy_streaming(&mut self, fixed_hz: f64, runner_hz: f64, save_dir: GString) {
+        // 空字符串 = 纯内存跑流式（不读档、不写盘）：空路径不是合法存档根，
+        // 与其让 SavePaths 去拼相对当前工作目录的怪路径，不如明确当成 None。
+        let save_dir = save_dir.to_string();
+        self.start_backend(
+            fixed_hz,
+            runner_hz,
+            false,
+            None,
+            Some(TerrainConfig::default()),
+            false,
+            false,
+            true,
+            TerrainMode::Streaming,
+            godot_save_dir(&save_dir),
         );
     }
 
@@ -233,6 +272,8 @@ impl BevyAppManager {
             true,
             false,
             false,
+            TerrainMode::Eager,
+            None,
         );
     }
 
@@ -241,7 +282,18 @@ impl BevyAppManager {
     /// Godot 侧对应 `test/gameplay_test.tscn`（`BevyClient.mode = gameplay_test`）。
     #[func]
     fn start_bevy_gameplay_test(&mut self, fixed_hz: f64, runner_hz: f64) {
-        self.start_backend(fixed_hz, runner_hz, false, None, None, false, true, false);
+        self.start_backend(
+            fixed_hz,
+            runner_hz,
+            false,
+            None,
+            None,
+            false,
+            true,
+            false,
+            TerrainMode::Eager,
+            None,
+        );
     }
 
     #[func]
@@ -637,6 +689,18 @@ impl BevyAppManager {
     }
 }
 
+/// Godot 传来的存档目录 -> `Option<PathBuf>`：空字符串 = 不落盘。
+///
+/// 抽成自由函数是为了能被单测直接调用（`start_backend` 一调就起后台线程，
+/// 单测里不能碰）。
+fn godot_save_dir(dir: &str) -> Option<PathBuf> {
+    if dir.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(dir))
+    }
+}
+
 impl BevyAppManager {
     /// 启动后台 Bevy 后端的公共实现（被各 `#[func]` 启动入口复用）。
     fn start_backend(
@@ -649,6 +713,10 @@ impl BevyAppManager {
         terrain_perf: bool,
         gameplay_test: bool,
         voxel_viewer: bool,
+        // 末尾追加而不是插在中间：bool 换 bool 位置挪错也会编译通过，
+        // 放末尾能逼每个既有调用点显式写 TerrainMode::Eager / None。
+        terrain_mode: TerrainMode,
+        save_dir: Option<PathBuf>,
     ) {
         if self.worker.is_some() {
             self.shutdown_blocking();
@@ -673,6 +741,8 @@ impl BevyAppManager {
             gameplay_test,
             voxel_viewer,
             voxel_lod: Some(self.voxel_lod.clone()),
+            terrain_mode,
+            save_dir,
         };
 
         // 跨边界句柄：Godot 主线程留一份，后台线程拿一份克隆（内部是 Arc 共享）。
@@ -764,5 +834,21 @@ impl BevyAppManager {
 impl Drop for BevyAppManager {
     fn drop(&mut self) {
         self.shutdown_blocking();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GDScript 没有 Option：空字符串是「不要存档」的唯一表示，
+    /// 非空则原样当路径（包括相对路径，交给引擎侧解析）。
+    #[test]
+    fn empty_save_dir_means_no_persistence() {
+        assert_eq!(godot_save_dir(""), None);
+        assert_eq!(
+            godot_save_dir("/tmp/ecs_game_save"),
+            Some(PathBuf::from("/tmp/ecs_game_save"))
+        );
     }
 }
