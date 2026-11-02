@@ -1,12 +1,28 @@
-//! Data 档流式加载器：驻留档位变化的**数据生命周期**（装载 / 卸载 / 等待存档）。
+//! 流式加载器：驻留档位变化的**数据生命周期**（装载 / 卸载 / 等待存档）
+//! 与**渲染档落地**（分组实体 + 表现层缓存失效）。
 //!
 //! ## 职责边界
 //!
-//! 本模块只负责 [Residency::Data]：把 [ResidencyChanged] 的升档请求变成
-//! 「体素容器里真的有这棵树」，把降档请求变成「树被真正释放」。渲染档
-//! （[Residency::Render]：网格 / 碰撞 / 表现层缓存）不在本轮范围内：
-//! 对 `to == Render` 的请求同样只装数据并发 [ChunkReached] `level: Data`，
-//! 不触碰任何渲染资源，也不发假消息。
+//! - [Residency::Data]：把 [ResidencyChanged] 的升档请求变成「体素容器里真的
+//!   有这棵树」，把降档请求变成「树被真正释放」。
+//! - [Residency::Render]：在 Data 档**完成之后**真的产出该块的渲染分组实体
+//!   （[VoxChunkGroupRaw]，`lod: 0`，单块单组）：先从容器取树 →
+//!   [extract_raw_halo]（34³，[Neighbourhood::none] 让每块自封边，与 terrain
+//!   的面邻居缺失策略一致）→ 全空气就记 [RenderGroups] `None`（已到达、
+//!   无几何），否则 spawn 分组实体。消息顺序固定：`ChunkReached{Data}` 在前，
+//!   `ChunkReached{Render}` 在后。
+//!
+//! ## 档位语义
+//!
+//! - `None -> Data | Render`：入队 → 存档命中 / 真生成 / 已在容器，结算后发
+//!   `ChunkReached{Data}`；目标档是 Render 时再产出分组实体并发
+//!   `ChunkReached{Render}`。
+//! - `Render -> Data`：销毁分组实体 + 失效四份表现层缓存（`wrapped`、
+//!   `generated.own`、`generated.neighbors`、`neighbors.0`），**保留体素
+//!   内容**；不发 [ChunkWillUnload]、不计 `unloaded`。
+//! - `Render | Data -> None`：先销毁分组实体（若存在），再走数据卸载路径。
+//! - 重复消息幂等：同一 `(body, key)` 最多一个分组实体；`Render` 消息只在
+//!   首次产出（或首次判定全空气）时发一次。
 //!
 //! ## 每 tick 的两步
 //!
@@ -14,8 +30,8 @@
 //!    - 升档：`GenTable::enqueue` + 记入 [StreamWanted]；若块**已经在**
 //!      `VoxVolume` 里且生成态还是 `Undetermined`（地形 Startup 已生成 /
 //!      上一轮装载留下的数据），直接结算并发 [ChunkReached]，不重生成；
-//!    - 降档（`to == None`）：只有「请求还在队列里」或「块真的还在容器里」
-//!      才动作，因此重复的降档消息既不二次释放也不二次计数。
+//!    - 降档（`to == None`，或 `Render -> Data`）：只有「请求还在队列里」或
+//!      「块真的还在容器里」才动作，因此重复的降档消息既不二次释放也不二次计数。
 //! 2. [resolve_chunks]（`Wanted` 键序，每 tick 最多
 //!    [VoxelStreamConfig::max_resolve_per_tick] 个）：问
 //!    [ChunkPersistence]：`Hit` 且有整块内容 → 装树，生成器零调用；
@@ -39,13 +55,21 @@ use std::collections::BTreeMap;
 
 use bevy::prelude::*;
 use game_engine::body_key::BodyKey;
-use game_engine::identity::StableEntityIndex;
-use game_engine::presentation::voxel::WrappedBlockCache;
+use game_engine::identity::{StableEntityIndex, StableIdAllocator};
+use game_engine::presentation::voxel::{
+    extract_raw_halo, raw_halo_has_solid_interior, WrappedBlockCache, RAW_VOXELS,
+};
+use game_engine::presentation::RenderTransform;
 use game_engine::residency::{ChunkReached, GameTickSet, Residency, ResidencyChanged};
+use game_engine::spatial::Size;
 use game_engine::streaming::{ChunkPersistence, GenState, GenTable, StoreLookup};
-use game_engine::voxel::{dec_ref_recursive, ChunkKey, VoxTree, VoxVolume, VoxelInterner};
+use game_engine::voxel::{
+    dec_ref_recursive, ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelInterner,
+};
 
-use crate::static_data::voxel::DEFAULT_BIOME;
+use crate::presentation::{PresentedTransform, VoxChunkGroupRaw};
+use crate::static_data::voxel::{DEFAULT_BIOME, DEFAULT_VOXEL_SIZE};
+use crate::voxel::terrain::blocks::block_origin_meters;
 use crate::voxel::terrain::generation::WorldGenerator;
 use crate::voxel::terrain::{
     unload_chunk, TerrainConfig, TerrainGeneratedBlocks, TerrainNeighborBlocks,
@@ -88,6 +112,8 @@ pub struct StreamStats {
     pub generated: u64,
     /// 累计真正卸载的块数（重复降档消息不重复计数）。
     pub unloaded: u64,
+    /// 当前存活的分组实体数（[RenderGroups] 里 `Some` 的数量），每次增删后刷新。
+    pub render_groups: usize,
 }
 
 /// 即将卸载一个区块的**数据**（在释放之前发出，监听方还能读到内容）。
@@ -110,6 +136,15 @@ pub struct ChunkWillUnload {
 #[derive(Resource, Debug, Default)]
 pub struct StreamWanted(pub BTreeMap<(BodyKey, ChunkKey), Residency>);
 
+/// 已到达 [Residency::Render] 的块 -> 分组实体。
+///
+/// 值 `None` 表示「已判定为全空气、没有几何」——它同样代表该块**已经到达**
+/// Render 档，因此重复的 Render 请求可以直接忽略，不必重复提取 34³ halo。
+/// 只有 `Some(entity)` 才是真正存活的分组实体（`StreamStats::render_groups`
+/// 统计的就是它的数量）。
+#[derive(Resource, Debug, Default)]
+pub struct RenderGroups(pub BTreeMap<(BodyKey, ChunkKey), Option<Entity>>);
+
 /// Data 档流式加载插件。
 pub struct VoxelStreamPlugin;
 
@@ -128,6 +163,7 @@ impl Plugin for VoxelStreamPlugin {
             .init_resource::<WrappedBlockCache>()
             .init_resource::<TerrainGeneratedBlocks>()
             .init_resource::<TerrainNeighborBlocks>()
+            .init_resource::<RenderGroups>()
             .add_message::<ChunkWillUnload>()
             .add_systems(
                 FixedUpdate,
@@ -138,33 +174,55 @@ impl Plugin for VoxelStreamPlugin {
     }
 }
 
-/// 系统 1：把 [ResidencyChanged] 折成队列状态与真正的卸载。
+/// 系统 1：把 [ResidencyChanged] 折成队列状态、渲染分组与真正的卸载。
 #[allow(clippy::too_many_arguments)]
 pub fn intake_residency_changes(
+    mut commands: Commands,
     mut changes: MessageReader<ResidencyChanged>,
     mut gen: ResMut<GenTable>,
     mut wanted: ResMut<StreamWanted>,
     mut will_unload: MessageWriter<ChunkWillUnload>,
     mut reached: MessageWriter<ChunkReached>,
-    index: Option<Res<StableEntityIndex>>,
+    mut index: Option<ResMut<StableEntityIndex>>,
+    mut allocator: Option<ResMut<StableIdAllocator>>,
     mut volumes: Query<&mut VoxVolume>,
     mut interner: ResMut<VoxelInterner>,
     mut wrapped: ResMut<WrappedBlockCache>,
     mut generated: ResMut<TerrainGeneratedBlocks>,
     mut neighbors: ResMut<TerrainNeighborBlocks>,
+    mut groups: ResMut<RenderGroups>,
     mut stats: ResMut<StreamStats>,
 ) {
-    let index = index.as_deref();
-
     for change in changes.read() {
         let ResidencyChanged { body, key, from, to } = *change;
         let pair = (body, key);
 
-        if to == Residency::None {
+        // 降档：`to == None` 是真卸载；`Render -> Data` 只是渲染档清理
+        //（体素内容保留）。两者都交给 demote，由它按 from/to 分流。
+        if to == Residency::None || (from == Residency::Render && to != Residency::Render) {
             demote(
-                pair, from, to, index, &mut gen, &mut wanted, &mut will_unload, &mut volumes,
-                &mut interner, &mut wrapped, &mut generated, &mut neighbors, &mut stats,
+                pair,
+                from,
+                to,
+                &mut commands,
+                index.as_deref_mut(),
+                &mut gen,
+                &mut wanted,
+                &mut will_unload,
+                &mut volumes,
+                &mut interner,
+                &mut wrapped,
+                &mut generated,
+                &mut neighbors,
+                &mut groups,
+                &mut stats,
             );
+            continue;
+        }
+
+        // 幂等：该块已经到过 Render（有分组实体，或已判定全空气）时，
+        // 重复的 Render 请求不再入队、不再发第二条 Render 消息。
+        if to == Residency::Render && groups.0.contains_key(&pair) {
             continue;
         }
 
@@ -179,7 +237,7 @@ pub fn intake_residency_changes(
             continue;
         }
 
-        let Some(entity) = body_entity(index, body) else {
+        let Some(entity) = body_entity(index.as_deref(), body) else {
             continue;
         };
         let Ok(volume) = volumes.get(entity) else {
@@ -190,40 +248,55 @@ pub fn intake_residency_changes(
         }
 
         // 数据已在容器里：直接结算，不重生成、不查存档。
-        settle(&mut gen, pair);
-        reached.write(ChunkReached {
-            body,
-            key,
-            level: Residency::Data,
-        });
-        wanted.0.remove(&pair);
+        // 快路径同样走 finish_chunk，Render 档才会拿到分组实体。
+        let raw = extract_block_raw(&volume, &interner, key, to);
+        finish_chunk(
+            pair,
+            to,
+            raw,
+            &mut allocator,
+            index.as_deref_mut(),
+            &mut commands,
+            &mut groups,
+            &mut reached,
+            &mut gen,
+            &mut wanted,
+            &mut stats,
+        );
     }
 }
 
 /// 系统 2：按队列键序结算，最多 [VoxelStreamConfig::max_resolve_per_tick] 个。
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_chunks(
+    mut commands: Commands,
     config: Res<VoxelStreamConfig>,
     mut gen: ResMut<GenTable>,
     mut wanted: ResMut<StreamWanted>,
     persistence: Res<ChunkPersistence>,
-    index: Option<Res<StableEntityIndex>>,
+    mut index: Option<ResMut<StableEntityIndex>>,
+    mut allocator: Option<ResMut<StableIdAllocator>>,
     mut volumes: Query<&mut VoxVolume>,
     mut interner: ResMut<VoxelInterner>,
     seed: Option<Res<WorldSeed>>,
     terrain: Option<Res<TerrainConfig>>,
     mut reached: MessageWriter<ChunkReached>,
+    mut groups: ResMut<RenderGroups>,
     mut stats: ResMut<StreamStats>,
 ) {
-    let index = index.as_deref();
     let budget = config.max_resolve_per_tick;
-    let keys: Vec<(BodyKey, ChunkKey)> = wanted.0.keys().copied().take(budget).collect();
+    let keys: Vec<((BodyKey, ChunkKey), Residency)> = wanted
+        .0
+        .iter()
+        .take(budget)
+        .map(|(pair, level)| (*pair, *level))
+        .collect();
     let mut pending = 0usize;
 
-    for pair in keys {
+    for (pair, level) in keys {
         let (body, key) = pair;
 
-        let Some(entity) = body_entity(index, body) else {
+        let Some(entity) = body_entity(index.as_deref(), body) else {
             // body 没有实体就没有容器：这条请求永远无法完成，记错并出队。
             error!("stream: body {body:?} 找不到实体，放弃区块 {key:?}");
             drop_request(&mut gen, &mut wanted, pair);
@@ -238,13 +311,20 @@ pub fn resolve_chunks(
         if volume.contains_chunk(&key) {
             // 防御：队列里的块被别的路径装进去了（`insert_chunk` 覆盖会
             // debug_assert），这里只补发完成消息。
-            settle(&mut gen, pair);
-            reached.write(ChunkReached {
-                body,
-                key,
-                level: Residency::Data,
-            });
-            wanted.0.remove(&pair);
+            let raw = extract_block_raw(&volume, &interner, key, level);
+            finish_chunk(
+                pair,
+                level,
+                raw,
+                &mut allocator,
+                index.as_deref_mut(),
+                &mut commands,
+                &mut groups,
+                &mut reached,
+                &mut gen,
+                &mut wanted,
+                &mut stats,
+            );
             continue;
         }
 
@@ -260,13 +340,20 @@ pub fn resolve_chunks(
                     ) {
                         Ok(old) => {
                             release_tree(&mut interner, old);
-                            settle(&mut gen, pair);
-                            reached.write(ChunkReached {
-                                body,
-                                key,
-                                level: Residency::Data,
-                            });
-                            wanted.0.remove(&pair);
+                            let raw = extract_block_raw(&volume, &interner, key, level);
+                            finish_chunk(
+                                pair,
+                                level,
+                                raw,
+                                &mut allocator,
+                                index.as_deref_mut(),
+                                &mut commands,
+                                &mut groups,
+                                &mut reached,
+                                &mut gen,
+                                &mut wanted,
+                                &mut stats,
+                            );
                             stats.loaded_from_store += 1;
                         }
                         Err(error) => {
@@ -276,17 +363,59 @@ pub fn resolve_chunks(
                     }
                 }
                 None => {
-                    generate_into(
-                        pair, &mut volume, &mut interner, seed.as_deref(), terrain.as_deref(),
-                        &mut gen, &mut wanted, &mut reached, &mut stats,
-                    );
+                    if generate_into(
+                        pair,
+                        &mut volume,
+                        &mut interner,
+                        seed.as_deref(),
+                        terrain.as_deref(),
+                        &mut gen,
+                        &mut wanted,
+                        &mut stats,
+                    ) {
+                        let raw = extract_block_raw(&volume, &interner, key, level);
+                        finish_chunk(
+                            pair,
+                            level,
+                            raw,
+                            &mut allocator,
+                            index.as_deref_mut(),
+                            &mut commands,
+                            &mut groups,
+                            &mut reached,
+                            &mut gen,
+                            &mut wanted,
+                            &mut stats,
+                        );
+                    }
                 }
             },
             StoreLookup::Miss => {
-                generate_into(
-                    pair, &mut volume, &mut interner, seed.as_deref(), terrain.as_deref(),
-                    &mut gen, &mut wanted, &mut reached, &mut stats,
-                );
+                if generate_into(
+                    pair,
+                    &mut volume,
+                    &mut interner,
+                    seed.as_deref(),
+                    terrain.as_deref(),
+                    &mut gen,
+                    &mut wanted,
+                    &mut stats,
+                ) {
+                    let raw = extract_block_raw(&volume, &interner, key, level);
+                    finish_chunk(
+                        pair,
+                        level,
+                        raw,
+                        &mut allocator,
+                        index.as_deref_mut(),
+                        &mut commands,
+                        &mut groups,
+                        &mut reached,
+                        &mut gen,
+                        &mut wanted,
+                        &mut stats,
+                    );
+                }
             }
         }
     }
@@ -294,18 +423,21 @@ pub fn resolve_chunks(
     stats.queued = wanted.0.len();
     stats.pending = pending;
 }
-
-/// 降档处理：只有「请求还在队列里」或「块还在容器里」才动作。
+/// 降档处理：先按需清理渲染档，再按需走数据卸载。
 ///
-/// **重复消息不二次释放的判据**就在这两条：第一次降档会把队列项移除、
-/// 把树从容器里取走；第二次同样的消息两条都不成立，直接返回——不发
-/// [ChunkWillUnload]、不碰缓存、`stats.unloaded` 不涨。
+/// **重复消息不二次释放的判据**：第一次降档会把队列项移除、把树从容器里
+/// 取走；第二次同样的消息两条都不成立，直接返回——不发 [ChunkWillUnload]、
+/// 不碰缓存、`stats.unloaded` 不涨。
+///
+/// `Render -> Data` 只销毁分组实体 + 失效四份表现层缓存，体素内容原样保留，
+/// 因此**不**发卸载消息、**不**计 `unloaded`。
 #[allow(clippy::too_many_arguments)]
 fn demote(
     pair: (BodyKey, ChunkKey),
     from: Residency,
     to: Residency,
-    index: Option<&StableEntityIndex>,
+    commands: &mut Commands<'_, '_>,
+    mut index: Option<&mut StableEntityIndex>,
     gen: &mut GenTable,
     wanted: &mut StreamWanted,
     will_unload: &mut MessageWriter<ChunkWillUnload>,
@@ -314,11 +446,31 @@ fn demote(
     wrapped: &mut WrappedBlockCache,
     generated: &mut TerrainGeneratedBlocks,
     neighbors: &mut TerrainNeighborBlocks,
+    groups: &mut RenderGroups,
     stats: &mut StreamStats,
 ) {
     let (body, key) = pair;
+
+    // 1) 渲染档先退：实体销毁 + 四份表现层缓存失效（体素内容保留）。
+    if from == Residency::Render && to != Residency::Render {
+        despawn_render_group(pair, commands, groups, index.as_deref_mut(), stats);
+        wrapped.invalidate_covered(interner.inner_mut(), key);
+        generated.own.invalidate_covered(interner.inner_mut(), key);
+        generated.neighbors.invalidate_covered(interner.inner_mut(), key);
+        neighbors.0.invalidate_covered(interner.inner_mut(), key);
+    }
+
+    // 只是降渲染档（Render -> Data）：数据留在容器里，到此为止。
+    if to != Residency::None {
+        if wanted.0.remove(&pair).is_some() {
+            gen.cancel(pair);
+            let _ = gen.reset(pair);
+        }
+        return;
+    }
+
     let removed = wanted.0.remove(&pair).is_some();
-    let entity = body_entity(index, body);
+    let entity = body_entity(index.as_deref(), body);
     let present = entity
         .and_then(|entity| volumes.get(entity).ok())
         .is_some_and(|volume| volume.contains_chunk(&key));
@@ -371,7 +523,9 @@ fn demote(
     stats.unloaded += 1;
 }
 
-/// 真正跑生成器并把树装进容器（旧树释放引用）。
+/// 真正跑生成器并把树装进容器（旧树释放引用），返回是否装好。
+///
+/// 完成消息与渲染分组由调用方统一走 [finish_chunk]，这里只负责数据。
 #[allow(clippy::too_many_arguments)]
 fn generate_into(
     pair: (BodyKey, ChunkKey),
@@ -381,20 +535,44 @@ fn generate_into(
     terrain: Option<&TerrainConfig>,
     gen: &mut GenTable,
     wanted: &mut StreamWanted,
-    reached: &mut MessageWriter<ChunkReached>,
     stats: &mut StreamStats,
-) {
-    let (body, key) = pair;
+) -> bool {
+    let (_, key) = pair;
     let Some(seed) = seed else {
         // 没有种子就没有确定性世界：移除而不是无限重试。
         error!("stream: WorldSeed 资源缺失，无法生成区块 {key:?}");
         drop_request(gen, wanted, pair);
-        return;
+        return false;
     };
     let biome = terrain.map_or(DEFAULT_BIOME, |config| config.biome);
     let tree = WorldGenerator::new(*seed, biome).generate_chunk(interner.inner_mut(), key);
     let old = volume.insert_chunk(key, tree);
     release_tree(interner, old);
+    stats.generated += 1;
+    true
+}
+
+/// Data 档的**统一出口**：先发 `ChunkReached{Data}`，目标档是 Render 时
+/// 再产出分组实体、发 `ChunkReached{Render}`。
+///
+/// 四个成功路径（存档命中 / 真生成 / 已在容器快路径 / resolve 防御分支）
+/// 都必须从这里出，否则 Render 档会漏掉分组实体。
+#[allow(clippy::too_many_arguments)]
+fn finish_chunk(
+    pair: (BodyKey, ChunkKey),
+    level: Residency,
+    raw: Option<Vec<u8>>,
+    allocator: &mut Option<ResMut<'_, StableIdAllocator>>,
+    index: Option<&mut StableEntityIndex>,
+    commands: &mut Commands<'_, '_>,
+    groups: &mut RenderGroups,
+    reached: &mut MessageWriter<ChunkReached>,
+    gen: &mut GenTable,
+    wanted: &mut StreamWanted,
+    stats: &mut StreamStats,
+) {
+    let (body, key) = pair;
+    // 顺序：Data 消息在前，渲染实体在后，最后才是 Render 消息。
     settle(gen, pair);
     reached.write(ChunkReached {
         body,
@@ -402,9 +580,131 @@ fn generate_into(
         level: Residency::Data,
     });
     wanted.0.remove(&pair);
-    stats.generated += 1;
+
+    if level != Residency::Render {
+        return;
+    }
+    let Some(raw) = raw else {
+        // 树不在容器里（或已产出过）：保持 Data 档完成，不伪造 Render。
+        debug!("stream: 区块 {key:?} 没有可提取的树，跳过分组产出");
+        return;
+    };
+    match ensure_render_group(pair, &raw, allocator, index, commands, groups) {
+        Ok(true) => {
+            refresh_render_groups(groups, stats);
+            reached.write(ChunkReached {
+                body,
+                key,
+                level: Residency::Render,
+            });
+        }
+        Ok(false) => debug!("stream: 区块 {key:?} 已有渲染分组，跳过重复产出"),
+        Err(error) => error!("stream: 区块 {key:?} 无法产出渲染分组：{error}"),
+    }
 }
 
+/// 从容器取树并抽 34³ 原始体素；只有目标档是 Render 才需要。
+///
+/// 无邻块时用 [Neighbourhood::none]：每块自封边，与 terrain 的面邻居缺失
+/// 策略一致。
+fn extract_block_raw(
+    volume: &VoxVolume,
+    interner: &VoxelInterner,
+    key: ChunkKey,
+    level: Residency,
+) -> Option<Vec<u8>> {
+    if level != Residency::Render {
+        return None;
+    }
+    let tree = volume.get_chunk(&key)?;
+    let raw = extract_raw_halo(
+        tree,
+        interner.inner(),
+        MeshBlock::new(key, Lod::new(0)),
+        Neighbourhood::none(),
+    );
+    debug_assert_eq!(raw.len(), RAW_VOXELS, "extract_raw_halo 必须产出 34³");
+    Some(raw)
+}
+
+/// 确保该块有渲染分组实体；返回「本次是否新产出了这个块」。
+///
+/// - 已在 [RenderGroups] 里（实体或全空气判定）→ `Ok(false)`，幂等。
+/// - 内层 32³ 全空气 → 记 `None`（已到达、无几何），`Ok(true)`。
+/// - 否则 spawn 分组实体并登记进 [StableEntityIndex]，`Ok(true)`。
+fn ensure_render_group(
+    pair: (BodyKey, ChunkKey),
+    raw: &[u8],
+    allocator: &mut Option<ResMut<'_, StableIdAllocator>>,
+    index: Option<&mut StableEntityIndex>,
+    commands: &mut Commands<'_, '_>,
+    groups: &mut RenderGroups,
+) -> Result<bool, &'static str> {
+    if groups.0.contains_key(&pair) {
+        return Ok(false);
+    }
+    let (_, key) = pair;
+    debug_assert_eq!(raw.len(), RAW_VOXELS, "extract_raw_halo 必须产出 34³");
+
+    // 全空气块：没有几何可渲染，但仍算「已到达 Render」，防止重复提取。
+    if !raw_halo_has_solid_interior(raw) {
+        groups.0.insert(pair, None);
+        return Ok(true);
+    }
+
+    let (Some(allocator), Some(index)) = (allocator.as_deref_mut(), index) else {
+        return Err("缺少 StableIdAllocator / StableEntityIndex 资源");
+    };
+    let id = allocator.allocate();
+    let position = Vec3::from_array(block_origin_meters(key, voxel_size_f32()));
+    let mut presented = PresentedTransform::default();
+    presented.set_sampled(
+        RenderTransform::from_translation(position),
+        RenderTransform::from_translation(position),
+    );
+    // 单块单组：lod 0，自封边；掩码 0（无跨 LOD / 无邻块的裙边需求）。
+    let mut chunks = BTreeMap::new();
+    chunks.insert(key, (raw.to_vec(), 0u8));
+    let entity = commands
+        .spawn((
+            id,
+            VoxChunkGroupRaw { lod: 0, chunks },
+            Transform::from_translation(position),
+            Size(None),
+            presented,
+        ))
+        .id();
+    index.insert(id, entity);
+    groups.0.insert(pair, Some(entity));
+    Ok(true)
+}
+
+/// 销毁该块的分组实体并清掉 [RenderGroups] 里的记录（幂等）。
+fn despawn_render_group(
+    pair: (BodyKey, ChunkKey),
+    commands: &mut Commands<'_, '_>,
+    groups: &mut RenderGroups,
+    index: Option<&mut StableEntityIndex>,
+    stats: &mut StreamStats,
+) {
+    if let Some(Some(entity)) = groups.0.remove(&pair) {
+        if let Some(index) = index {
+            index.remove_by_entity(entity);
+        }
+        commands.entity(entity).despawn();
+    }
+    refresh_render_groups(groups, stats);
+}
+
+/// 把 `stats.render_groups` 刷成存活分组实体数。
+fn refresh_render_groups(groups: &RenderGroups, stats: &mut StreamStats) {
+    stats.render_groups = groups.0.values().filter(|slot| slot.is_some()).count();
+}
+
+/// 单个体素边长（米），与 terrain 分组使用的尺度一致。
+fn voxel_size_f32() -> f32 {
+    DEFAULT_VOXEL_SIZE.to_num::<f32>()
+}
 /// 把 `GenTable` 从任意工作态干净地结算回 `Idle`。
 ///
 /// `finish` 只接受 `Running`，所以固定先 `begin` 再 `finish`；
@@ -607,6 +907,52 @@ mod tests {
                 self.app.world().resource::<VoxelInterner>().inner(),
                 self.volume().get_chunk(key).expect("块必须已装进容器"),
             )
+        }
+
+        /// 一条任意 `from -> to` 的驻留变化（Render 档测试用）。
+        fn request(&mut self, key: ChunkKey, from: Residency, to: Residency) {
+            self.app.world_mut().write_message(ResidencyChanged {
+                body: self.body,
+                key,
+                from,
+                to,
+            });
+        }
+
+        fn upgrade_to_render(&mut self, key: ChunkKey) {
+            self.request(key, Residency::None, Residency::Render);
+        }
+
+        fn render_groups(&self) -> &RenderGroups {
+            self.app.world().resource::<RenderGroups>()
+        }
+
+        /// 世界里的分组实体（按实体 id 升序，断言与迭代顺序无关）。
+        fn group_entities(&mut self) -> Vec<Entity> {
+            let mut query = self
+                .app
+                .world_mut()
+                .query_filtered::<Entity, With<VoxChunkGroupRaw>>();
+            let world = self.app.world();
+            let mut out: Vec<Entity> = query.iter(world).collect();
+            out.sort();
+            out
+        }
+
+        fn group_payload(&self, entity: Entity) -> VoxChunkGroupRaw {
+            self.app
+                .world()
+                .entity(entity)
+                .get::<VoxChunkGroupRaw>()
+                .expect("分组实体必须带 VoxChunkGroupRaw")
+                .clone()
+        }
+
+        fn render_messages(&mut self) -> Vec<ChunkReached> {
+            self.reached()
+                .into_iter()
+                .filter(|message| message.level == Residency::Render)
+                .collect()
         }
     }
 
@@ -814,5 +1160,213 @@ mod tests {
         assert_eq!(harness.content_hash(&key), first_hash);
         assert_eq!(harness.stats().generated, 2);
         assert_eq!(harness.stats().unloaded, 1);
+    }
+
+    // ---- Render 档：分组实体的产出 / 幂等 / 降档 / 重载 ----
+
+    #[test]
+    fn render_request_creates_group_entity_and_reports_render() {
+        let key = chunk_key(10, 0, 1);
+        let (bytes, expected) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Hit(Some(bytes))]);
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+
+        assert_eq!(
+            harness.reached(),
+            vec![
+                ChunkReached {
+                    body: harness.body,
+                    key,
+                    level: Residency::Data,
+                },
+                ChunkReached {
+                    body: harness.body,
+                    key,
+                    level: Residency::Render,
+                },
+            ],
+            "同一块必须先发 Data、再发 Render"
+        );
+        assert_eq!(harness.content_hash(&key), expected, "Data 档必须真的装上存档内容");
+
+        let entities = harness.group_entities();
+        assert_eq!(entities.len(), 1, "必须恰好产出一个分组实体");
+        let raw = harness.group_payload(entities[0]);
+        assert_eq!(raw.lod, 0);
+        assert_eq!(raw.chunks.len(), 1, "单块单组：分组里只能有该块");
+        let (payload, mask) = raw.chunks.get(&key).expect("分组必须恰含该 key");
+        assert_eq!(payload.len(), RAW_VOXELS);
+        assert!(raw_halo_has_solid_interior(payload), "有几何的块才该 spawn");
+        assert_eq!(*mask, 0, "自封边、无跨 LOD 裙边，掩码为 0");
+        assert_eq!(harness.stats().render_groups, 1);
+    }
+
+    #[test]
+    fn data_only_request_creates_no_render_entity() {
+        let key = chunk_key(11, 0, 1);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert_eq!(
+            harness.reached(),
+            vec![ChunkReached {
+                body: harness.body,
+                key,
+                level: Residency::Data,
+            }]
+        );
+        assert!(harness.group_entities().is_empty(), "Data 档不得 spawn 分组实体");
+        assert!(harness.render_groups().0.is_empty());
+        assert_eq!(harness.stats().render_groups, 0);
+    }
+
+    #[test]
+    fn render_is_idempotent() {
+        let key = chunk_key(12, 0, 1);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+        assert_eq!(harness.group_entities().len(), 1);
+        assert_eq!(harness.render_messages().len(), 1);
+
+        // 第二条相同的 Render 消息：既不 spawn 第二个实体，也不重发 Render。
+        harness.upgrade_to_render(key);
+        harness.tick();
+        assert_eq!(harness.group_entities().len(), 1, "同一块只能有一个分组实体");
+        assert!(harness.render_messages().is_empty(), "重复消息不得重复发 Render");
+        assert_eq!(harness.stats().render_groups, 1);
+        assert_eq!(harness.stats().generated, 1, "幂等请求不得触发第二次生成");
+    }
+
+    #[test]
+    fn render_to_data_keeps_voxels_and_drops_entity() {
+        let key = chunk_key(13, 0, 1);
+        let (_, expected) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+        let entities = harness.group_entities();
+        assert_eq!(entities.len(), 1);
+        let _ = harness.reached();
+
+        harness.request(key, Residency::Render, Residency::Data);
+        harness.tick();
+
+        assert!(harness.group_entities().is_empty(), "分组实体必须销毁");
+        assert!(harness.render_groups().0.is_empty(), "表现层记录必须清掉");
+        assert!(
+            harness.app.world().get_entity(entities[0]).is_err(),
+            "实体必须真的 despawn"
+        );
+        assert!(harness.volume().contains_chunk(&key), "体素内容必须保留");
+        assert_eq!(harness.content_hash(&key), expected);
+        assert!(harness.will_unload().is_empty(), "降渲染档不得发卸载消息");
+        assert_eq!(harness.stats().unloaded, 0);
+        assert_eq!(harness.stats().render_groups, 0);
+        assert_eq!(harness.stats().generated, 1, "降渲染档不得重生成");
+    }
+
+    #[test]
+    fn render_to_none_despawns_and_frees() {
+        let key = chunk_key(14, 0, 1);
+        let mut harness = harness(vec![Answer::Miss]);
+        let baseline = harness.alive_nodes();
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+        assert!(harness.alive_nodes() > baseline, "Render 档必须真的装进体素树");
+        let entities = harness.group_entities();
+        assert_eq!(entities.len(), 1);
+        let _ = harness.reached();
+
+        harness.request(key, Residency::Render, Residency::None);
+        harness.tick();
+
+        assert!(harness.group_entities().is_empty());
+        assert!(harness.app.world().get_entity(entities[0]).is_err());
+        assert!(!harness.volume().contains_chunk(&key), "块必须被卸载");
+        assert_eq!(harness.alive_nodes(), baseline, "节点引用必须回基线");
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.stats().render_groups, 0);
+        let unloads = harness.will_unload();
+        assert_eq!(unloads.len(), 1);
+        assert_eq!(unloads[0].from, Residency::Render);
+        assert_eq!(unloads[0].to, Residency::None);
+    }
+
+    #[test]
+    fn render_then_reload_recreates_entity() {
+        let key = chunk_key(15, 0, 1);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+        let first_entity = harness.group_entities()[0];
+        let first = harness
+            .group_payload(first_entity)
+            .chunks
+            .get(&key)
+            .cloned()
+            .expect("分组必须恰含该 key");
+        let _ = harness.reached();
+
+        harness.request(key, Residency::Render, Residency::None);
+        harness.tick();
+        assert!(harness.group_entities().is_empty());
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+        let entities = harness.group_entities();
+        assert_eq!(entities.len(), 1, "重新到达 Render 必须重建分组实体");
+        let second = harness
+            .group_payload(entities[0])
+            .chunks
+            .get(&key)
+            .cloned()
+            .expect("分组必须恰含该 key");
+        assert_eq!(first, second, "重载后的载荷必须逐字节相同");
+        assert_eq!(harness.stats().render_groups, 1);
+        assert_eq!(harness.stats().generated, 2);
+        assert_eq!(harness.stats().unloaded, 1);
+        assert_eq!(harness.render_messages().len(), 1);
+    }
+
+    #[test]
+    fn render_payload_matches_direct_extraction() {
+        let key = chunk_key(16, 0, 1);
+        let (bytes, _) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Hit(Some(bytes))]);
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+
+        let entity = harness.group_entities()[0];
+        let payload = harness
+            .group_payload(entity)
+            .chunks
+            .get(&key)
+            .expect("分组必须恰含该 key")
+            .0
+            .clone();
+
+        // 独立路径：同一份体素内容 + 同样的 Neighbourhood::none()。
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let tree = WorldGenerator::new(WorldSeed(SEED), DEFAULT_BIOME)
+            .generate_chunk(interner.inner_mut(), key);
+        let expected = extract_raw_halo(
+            &tree,
+            interner.inner(),
+            MeshBlock::new(key, Lod::new(0)),
+            Neighbourhood::none(),
+        );
+
+        assert_eq!(payload.len(), RAW_VOXELS);
+        assert_eq!(payload, expected, "分组载荷必须与独立提取逐字节相等");
     }
 }
