@@ -98,6 +98,16 @@ impl SaveError {
         }
     }
 
+    /// 构造一个**语义层**错误：不落在具体字节偏移上（offset 记 0）。
+    ///
+    /// 采集 / 落盘编排（如 game-core 的 `world::save`）拿不到私有字段，也不该
+    /// 伪造字节偏移；统一用本入口报告「世界里缺了什么 / 哪里自相矛盾」。
+    /// 路径用字段全路径或逻辑位置（如 `capture.body[4v1]`）。
+    #[must_use]
+    pub fn semantic(path: impl Into<String>, kind: SaveErrorKind) -> Self {
+        Self::new(path, 0, kind)
+    }
+
     /// 字段全路径（容器 + 记录下标 + 字段名）。
     #[must_use]
     pub fn path(&self) -> &str {
