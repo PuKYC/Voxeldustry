@@ -6,6 +6,7 @@
 //!
 //! 数值表在 crate::static_data::voxel（WorldTables）；体素插件在 crate::voxel。
 
+pub mod chunk;
 pub mod island;
 pub mod load;
 pub mod rng;
@@ -13,6 +14,10 @@ pub mod save;
 pub mod save_plugin;
 pub mod seed;
 
+pub use chunk::{
+    region_of, region_origin, RegionIndex, RegionKey, WorldChunkConfig, WorldChunkLoaded,
+    WorldChunkPlugin, WorldChunkSet, WorldChunkUnloading,
+};
 pub use island::{Biome, Island, IslandId, IslandRegistry};
 pub use load::{load_world, LoadStats, LoadedWorld};
 pub use rng::WorldRng;
