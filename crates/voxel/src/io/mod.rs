@@ -20,7 +20,7 @@ pub mod export;
 pub mod import;
 
 pub use export::{export_tree, export_volume};
-pub use import::{import_tree, import_volume};
+pub use import::{clone_tree_into, import_tree, import_tree_into, import_volume};
 
 /// 格式魔数（8 字节，含结尾 NUL）。
 pub const MAGIC: [u8; 8] = *b"VOXELIO\0";

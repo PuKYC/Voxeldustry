@@ -92,7 +92,7 @@ const INDEX_MASK: u64 = 0xFFFF_FFFF;
 /// assert!(!branch_id.has_child(1)); // Check if child at index 1 exists
 /// ```
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(u64);
 
 impl From<BlockId> for u64 {
