@@ -54,6 +54,12 @@ pub struct LoadStats {
     pub bodies: usize,
     /// 读到的 ChunkRecord 数（含 content = None 的记录）。
     pub chunks: usize,
+    /// 因 generator_version 不匹配而**丢弃内容**、但保留实体记录的块数。
+    ///
+    /// 这些块没有装进 [VoxVolume]，但记录与实体保留；下次被请求时由生成
+    /// 路径重新生成，而不是把旧地形当成新地形。content = None 的块本来就要
+    /// 生成，不算 stale。
+    pub stale_chunks: usize,
     /// 应用成功的 EntityRecord 数。
     pub entities: usize,
     /// meta 里没有对应 body 的孤儿 region 文件数（按 region 键去重）。
@@ -69,23 +75,36 @@ pub struct LoadedWorld {
     pub stats: LoadStats,
 }
 
-/// 从 paths 读一个世界。
+/// 从 paths 读一个世界；generator_version 是当前生成器的版本号。
 ///
 /// 返回 Ok(None) 表示磁盘上没有 world.meta（新世界，调用方走生成器），
 /// 此时 world 一点都不会被改动。其余错误都表示存档损坏或世界缺资源，
 /// 且阶段一（只读校验）的错误保证 world 未被改动。
-pub fn load_world(world: &mut World, paths: &SavePaths) -> Result<Option<LoadedWorld>, SaveError> {
+///
+/// # 生成器版本过滤
+///
+/// [ChunkRecord](game_engine::streaming::ChunkRecord) 的 content 只对写入它的
+/// 生成器版本有效。版本不等的块在**装载阶段**只丢弃内容（计入
+/// [LoadStats::stale_chunks]），**保留记录里的实体**：实体是玩家造的东西，
+/// 与地形版本无关。body 照建，内容留空，下次请求时走生成路径重新生成——
+/// 不会把旧地形当成新地形，也不会因为版本不同就把块永久判死。
+/// content = None 的块本来就要生成，不算 stale。
+pub fn load_world(
+    world: &mut World,
+    paths: &SavePaths,
+    generator_version: u32,
+) -> Result<Option<LoadedWorld>, SaveError> {
     let Some(meta) = read_world_meta(paths)? else {
         return Ok(None);
     };
 
     // 阶段一：只读文件 + 全部校验；这一步不碰 world。
-    let plan = build_plan(world, paths, meta)?;
+    let plan = build_plan(world, paths, meta, generator_version)?;
 
     // 阶段二：先确认所有必需资源都在，再开始写世界。
     require_resources(world)?;
     let body_entities = spawn_plan_bodies(world, &plan)?;
-    install_plan_chunks(world, &plan, &body_entities)?;
+    let stale_chunks = install_plan_chunks(world, &plan, &body_entities, generator_version)?;
     let entities = apply_plan_entities(world, &plan)?;
 
     world
@@ -98,6 +117,7 @@ pub fn load_world(world: &mut World, paths: &SavePaths) -> Result<Option<LoadedW
         stats: LoadStats {
             bodies: plan.bodies.len(),
             chunks: plan.chunk_count,
+            stale_chunks,
             entities,
             orphan_regions: plan.orphan_regions,
         },
@@ -119,7 +139,12 @@ struct BodyPlan {
     regions: Vec<RegionFile>,
 }
 
-fn build_plan(world: &World, paths: &SavePaths, meta: WorldMeta) -> Result<Plan, SaveError> {
+fn build_plan(
+    world: &World,
+    paths: &SavePaths,
+    meta: WorldMeta,
+    generator_version: u32,
+) -> Result<Plan, SaveError> {
     validate_meta(&meta)?;
 
     let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
@@ -212,8 +237,9 @@ fn build_plan(world: &World, paths: &SavePaths, meta: WorldMeta) -> Result<Plan,
     }
 
     // 块内容与实体负载也要在阶段一解码：否则 stage 2 装到一半才发现坏数据，
-    // 世界已经被改。
-    validate_contents(&bodies, content_budget(world))?;
+    // 世界已经被改。旧版本的内容不会被安装，所以也不在此解码：它本来就要丢弃，
+    // 没有理由让一段无法解码的旧内容把整份存档判成坏档。
+    validate_contents(&bodies, content_budget(world), generator_version)?;
     validate_entities(world, &bodies)?;
     let orphan_regions = count_orphan_regions(paths, &meta)?;
 
@@ -348,7 +374,13 @@ fn region_anchor(body: BodyKey, region: ChunkKey) -> Result<ChunkKey, SaveError>
 }
 
 /// 阶段一：用临时 interner / volume 解码每一块内容，解完立刻释放，不占整世界内存。
-fn validate_contents(bodies: &[BodyPlan], budget: usize) -> Result<(), SaveError> {
+///
+/// 版本不匹配的块跳过解码：它们的 content 不会被安装，只保留记录与实体。
+fn validate_contents(
+    bodies: &[BodyPlan],
+    budget: usize,
+    generator_version: u32,
+) -> Result<(), SaveError> {
     let mut interner = VoxelInterner::new(budget.max(1));
     let mut volume = VoxVolume::new(FixedPoint::from_bits(1));
 
@@ -358,6 +390,9 @@ fn validate_contents(bodies: &[BodyPlan], budget: usize) -> Result<(), SaveError
                 let Some(bytes) = chunk.content.as_deref() else {
                     continue;
                 };
+                if chunk.generator_version != generator_version {
+                    continue;
+                }
                 let old = install_chunk(&mut volume, *key, bytes, interner.inner_mut())?;
                 if let Some(old) = old {
                     dec_ref_recursive(interner.inner_mut(), &old.get_root_id());
@@ -499,12 +534,18 @@ fn spawn_body(world: &mut World, key: BodyKey, record: &BodyRecord) -> Result<En
 }
 
 /// 阶段二：按 region / 块键升序装块；content = None 的块不装，留给生成器。
+///
+/// 返回因生成器版本不匹配而丢弃内容的块数（[LoadStats::stale_chunks]）。
+/// 版本过滤只在装载阶段做，不在 resolve 阶段硬拒绝：记录仍留在存档里，
+/// 下次请求走正常的生成路径，旧块因此能自我修复。
 fn install_plan_chunks(
     world: &mut World,
     plan: &Plan,
     body_entities: &BTreeMap<BodyKey, Entity>,
-) -> Result<(), SaveError> {
+    generator_version: u32,
+) -> Result<usize, SaveError> {
     world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
+        let mut stale = 0usize;
         for body in &plan.bodies {
             let entity = body_entities.get(&body.key).copied().ok_or_else(|| {
                 body_error(
@@ -521,6 +562,12 @@ fn install_plan_chunks(
                     let Some(bytes) = chunk.content.as_deref() else {
                         continue;
                     };
+                    // 版本不等的旧内容不能装：否则生成器改版后旧地形会被当成新地形。
+                    // 只丢内容、不丢记录与实体（实体是玩家造的东西）。
+                    if chunk.generator_version != generator_version {
+                        stale += 1;
+                        continue;
+                    }
                     let mut entity_mut = world.entity_mut(entity);
                     let mut volume = entity_mut.get_mut::<VoxVolume>().ok_or_else(|| {
                         body_error(
@@ -539,7 +586,7 @@ fn install_plan_chunks(
                 }
             }
         }
-        Ok::<(), SaveError>(())
+        Ok::<usize, SaveError>(stale)
     })
 }
 
@@ -901,7 +948,7 @@ mod tests {
             .resource_mut::<PersistRegistry>()
             .register::<TestMarker>()
             .expect("注册测试组件");
-        let result = load_world(&mut loaded, &paths)
+        let result = load_world(&mut loaded, &paths, GENERATOR_VERSION)
             .expect("读档成功")
             .expect("world.meta 存在");
 
@@ -911,6 +958,7 @@ mod tests {
             LoadStats {
                 bodies: 1,
                 chunks: 2,
+                stale_chunks: 0,
                 entities: 1,
                 orphan_regions: 0,
             }
@@ -973,7 +1021,7 @@ mod tests {
         world.spawn(StableEntityId(9));
         let before = world.iter_entities().count();
 
-        let loaded = load_world(&mut world, &paths).expect("没有 meta 不是错误");
+        let loaded = load_world(&mut world, &paths, 1).expect("没有 meta 不是错误");
 
         assert!(loaded.is_none());
         assert_eq!(world.iter_entities().count(), before, "世界实体数不变");
@@ -1021,7 +1069,7 @@ mod tests {
             .resource_mut::<PersistRegistry>()
             .register::<TestMarker>()
             .expect("注册测试组件");
-        let result = load_world(&mut loaded, &paths)
+        let result = load_world(&mut loaded, &paths, 1)
             .expect("读档成功")
             .expect("world.meta 存在");
 
@@ -1053,6 +1101,79 @@ mod tests {
     }
 
     #[test]
+    fn load_drops_content_when_generator_version_differs() {
+        // 存档是版本 1 的生成器写的；用版本 2 读，旧地形必须被丢弃。
+        let mut source = test_world(7);
+        let (_, body_key) = spawn_island_with_chunks(
+            &mut source,
+            Vec3F::ZERO,
+            true,
+            BiomeId(2),
+            &[ChunkKey::new(0, 0, 0)],
+        );
+        let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+        let dir = TempDir::new("stale_version");
+        let paths = SavePaths::new(dir.path());
+        write_capture(&paths, &capture).expect("落盘成功");
+
+        let mut loaded = test_world(1);
+        let result = load_world(&mut loaded, &paths, 2)
+            .expect("版本不匹配不是错误")
+            .expect("world.meta 存在");
+
+        // 记录还在（chunks 照计），只是内容被丢；实体阶段照常恢复。
+        assert_eq!(result.stats.chunks, 1);
+        assert_eq!(result.stats.stale_chunks, 1);
+
+        let loaded_body = loaded
+            .resource::<StableEntityIndex>()
+            .entity(body_key.stable_id())
+            .expect("body 实体必须保留");
+        assert_eq!(
+            loaded
+                .get::<VoxVolume>(loaded_body)
+                .expect("body 必须有 VoxVolume")
+                .chunk_count(),
+            0,
+            "旧版本内容不能被装进卷"
+        );
+    }
+
+    #[test]
+    fn load_keeps_content_when_generator_version_matches() {
+        let mut source = test_world(8);
+        let (_, body_key) = spawn_island_with_chunks(
+            &mut source,
+            Vec3F::ZERO,
+            true,
+            BiomeId(2),
+            &[ChunkKey::new(0, 0, 0)],
+        );
+        let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+        let dir = TempDir::new("fresh_version");
+        let paths = SavePaths::new(dir.path());
+        write_capture(&paths, &capture).expect("落盘成功");
+
+        let mut loaded = test_world(1);
+        let result = load_world(&mut loaded, &paths, 1)
+            .expect("读档成功")
+            .expect("world.meta 存在");
+
+        assert_eq!(result.stats.stale_chunks, 0);
+        let loaded_body = loaded
+            .resource::<StableEntityIndex>()
+            .entity(body_key.stable_id())
+            .expect("body 实体必须存在");
+        assert_eq!(
+            loaded
+                .get::<VoxVolume>(loaded_body)
+                .expect("body 必须有 VoxVolume")
+                .chunk_count(),
+            1
+        );
+    }
+
+    #[test]
     fn load_restores_allocator_and_never_reuses_loaded_ids() {
         let mut source = test_world(3);
         let (_, body_key) = spawn_island_with_chunks(
@@ -1069,7 +1190,7 @@ mod tests {
         write_capture(&paths, &capture).expect("落盘成功");
 
         let mut loaded = test_world(1);
-        load_world(&mut loaded, &paths)
+        load_world(&mut loaded, &paths, 1)
             .expect("读档成功")
             .expect("world.meta 存在");
 
@@ -1117,7 +1238,7 @@ mod tests {
         let islands_before = world.resource::<IslandRegistry>().len();
         let next_before = world.resource::<StableIdAllocator>().next_id();
 
-        let err = load_world(&mut world, &paths).expect_err("截断的 region 必须报错");
+        let err = load_world(&mut world, &paths, 1).expect_err("截断的 region 必须报错");
         assert!(!err.path().is_empty());
 
         assert_eq!(
@@ -1176,10 +1297,10 @@ mod tests {
 
         let mut first = test_world(1);
         let mut second = test_world(2);
-        let first_result = load_world(&mut first, &paths)
+        let first_result = load_world(&mut first, &paths, 2)
             .expect("第一次读档")
             .expect("world.meta 存在");
-        let second_result = load_world(&mut second, &paths)
+        let second_result = load_world(&mut second, &paths, 2)
             .expect("第二次读档")
             .expect("world.meta 存在");
 
@@ -1220,7 +1341,7 @@ mod tests {
         std::fs::write(&tmp, b"garbage").expect("写 tmp");
 
         let mut loaded = test_world(1);
-        let result = load_world(&mut loaded, &paths)
+        let result = load_world(&mut loaded, &paths, 1)
             .expect("孤儿 region 不是错误")
             .expect("world.meta 存在");
 

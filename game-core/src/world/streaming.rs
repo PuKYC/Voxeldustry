@@ -84,7 +84,7 @@ use game_engine::save::{PersistPlugin, SaveConfig, SavePaths, SavePlugin, SaveSt
 use crate::input::control::LocalPlayer;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
-use crate::voxel::stream::VoxelStreamPlugin;
+use crate::voxel::stream::{VoxelStreamConfig, VoxelStreamPlugin};
 use crate::voxel::terrain::{attach_terrain_body, TerrainStats};
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
@@ -195,13 +195,17 @@ fn bootstrap_streaming_world(world: &mut World) {
     let save_root = world.get_resource::<SaveRoot>().map(|root| root.0.clone());
     if let Some(root) = save_root {
         let paths = SavePaths::new(root);
-        match load_world(world, &paths) {
+        // 生成器版本的唯一来源是流式层配置。这里是 exclusive &mut World，
+        // 先把值拷出来再传，免得 load_world 的 &mut 借用与资源借用重叠。
+        let generator_version = world.resource::<VoxelStreamConfig>().generator_version;
+        match load_world(world, &paths, generator_version) {
             Ok(Some(loaded)) => {
                 info!(
-                    "world: 读档完成（tick={} bodies={} chunks={} entities={} orphan_regions={}），跳过空地形",
+                    "world: 读档完成（tick={} bodies={} chunks={} stale_chunks={} entities={} orphan_regions={}），跳过空地形",
                     loaded.world_tick,
                     loaded.stats.bodies,
                     loaded.stats.chunks,
+                    loaded.stats.stale_chunks,
                     loaded.stats.entities,
                     loaded.stats.orphan_regions,
                 );
@@ -366,6 +370,7 @@ mod tests {
     use crate::input::control::LocalPlayer;
     use crate::voxel::stream::{
         ChunkEntities, ChunkWillUnload, PendingUnloads, RenderGroups, StreamStats,
+        VoxelStreamConfig,
     };
     use crate::voxel::terrain::{
         TerrainConfig, TerrainGroups, TerrainMode, TerrainPlugin, TerrainStats,
@@ -582,6 +587,50 @@ mod tests {
                 "岛屿注册表必须只有存档里的地形这一个岛"
             );
         }
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+    }
+
+    #[test]
+    fn streaming_boot_with_bumped_version_starts_empty() {
+        let dir = TempDir::new("boot_version_bump");
+        let saved_body = boot_and_save_one_chunk(dir.path());
+
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        // 必须在第一次 update（即 Startup）之前生效：读档在 bootstrap 系统里
+        // 用这个资源决定是否安装块内容。
+        app.insert_resource(VoxelStreamConfig {
+            generator_version: 2,
+            ..VoxelStreamConfig::default()
+        });
+        app.update();
+
+        // 旧版本的块内容被丢弃，但记录/实体还在，所以仍只有一个地形体。
+        let volume = only_volume(&mut app);
+        assert_eq!(
+            volume.chunk_count(),
+            0,
+            "版本不匹配的旧内容不能在启动时被安装"
+        );
+
+        {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<Entity, With<VoxVolume>>();
+            let entities: Vec<Entity> = query.iter(world).collect();
+            assert_eq!(entities.len(), 1, "世界里仍应恰有一个地形体素实体");
+            assert_eq!(
+                world.get::<StableEntityId>(entities[0]).copied(),
+                Some(saved_body),
+                "实体记录必须保留（丢的是内容不是记录）"
+            );
+            assert_eq!(
+                world.resource::<IslandRegistry>().len(),
+                1,
+                "岛屿注册表仍只有存档里的地形这一个岛"
+            );
+        }
+
         app.world_mut()
             .resource_mut::<SaveStore>()
             .shutdown_worker();

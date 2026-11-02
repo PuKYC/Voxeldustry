@@ -50,7 +50,7 @@
 //!
 //!     app.add_plugins(SavePlugin { config: SaveConfig { root, ..Default::default() } });
 //!     app.add_plugins(WorldSavePlugin {
-//!         config: WorldSaveConfig { generator_version: 1, autosave_interval_ticks: Some(600) },
+//!         config: WorldSaveConfig { autosave_interval_ticks: Some(600) },
 //!     });
 //!
 //! WorldSavePlugin 依赖 SaveConfig / SaveStore（game-engine 的 SavePlugin 注册）
@@ -68,6 +68,7 @@ use bevy::prelude::*;
 use game_engine::residency::GameTickSet;
 use game_engine::save::{SaveConfig, SavePaths, SaveSet, SaveStore};
 
+use crate::voxel::stream::VoxelStreamConfig;
 use crate::world::save::{capture_world, write_capture};
 
 /// SaveNow 前落盘屏障的超时：正常 flush 是亚毫秒级，5s 已经意味着磁盘或后台
@@ -86,10 +87,12 @@ const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct SaveRoot(pub PathBuf);
 
 /// 世界存盘配置（由装配方插入，也可作为 [WorldSavePlugin] 的构造参数）。
+///
+/// 生成器版本**不在这里**：它只有一个来源
+/// [VoxelStreamConfig::generator_version]。存档插件与流式卸载落盘共用同一个值，
+/// 磁盘上同一个块才不会出现两个互相矛盾的版本号。
 #[derive(Resource, Clone, Debug, PartialEq, Eq)]
 pub struct WorldSaveConfig {
-    /// 写进每个 ChunkRecord.generator_version 的生成器版本号。
-    pub generator_version: u32,
     /// 自动存档周期（tick）；None = 关闭。Some(0) / Some(1) = 每个 tick。
     ///
     /// tick 来自 [SaveStore::tick]（每个 FixedUpdate +1，首 tick 为 1），
@@ -100,7 +103,6 @@ pub struct WorldSaveConfig {
 impl Default for WorldSaveConfig {
     fn default() -> Self {
         Self {
-            generator_version: 1,
             autosave_interval_ticks: None,
         }
     }
@@ -241,6 +243,20 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
         return;
     }
 
+    // 生成器版本只认流式层配置：卸载落盘（voxel::stream）也读同一个资源，
+    // 两条写路径才不会给同一块写出两个版本号。缺配置时**不能**用默认值兜底：
+    // 写错版本号会让下次读档把旧地形当成新地形，比不写更糟。
+    let generator_version = world
+        .get_resource::<VoxelStreamConfig>()
+        .map(|config| config.generator_version);
+    let Some(generator_version) = generator_version else {
+        record_error(
+            world,
+            "世界存档缺少 VoxelStreamConfig：无法确定生成器版本",
+        );
+        return;
+    };
+
     refresh_paths(world);
 
     // 落盘屏障：先让流式层把脏块交给后台并等在途写结束，否则后台那条
@@ -272,7 +288,7 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
         return;
     }
 
-    match capture_world(world, tick, config.generator_version) {
+    match capture_world(world, tick, generator_version) {
         Ok(capture) => {
             let written = {
                 let paths = world.resource::<WorldSavePaths>();
@@ -328,10 +344,12 @@ mod tests {
 
     use crate::static_data::voxel::BiomeId;
     use crate::voxel::body::spawn_island_entity;
+    use crate::voxel::stream::VoxelStreamConfig;
     use crate::voxel::GameVoxelPlugin;
     use crate::world::{load_world, IslandRegistry, WorldPlugin, WorldSeed};
 
-    const GENERATOR_VERSION: u32 = 7;
+    /// 与 [VoxelStreamConfig] 的默认版本一致；SaveNow 只认这个资源。
+    const GENERATOR_VERSION: u32 = 1;
 
     /// std::env::temp_dir 下的唯一子目录；Drop 时整棵删掉（与 world::save 测试一致）。
     struct TempDir {
@@ -373,6 +391,9 @@ mod tests {
         app.add_plugins(PersistPlugin);
         app.add_plugins(WorldPlugin);
         app.add_plugins(GameVoxelPlugin);
+        // SaveNow 的生成器版本只从流式层配置读；测试里显式给出，缺配置的用例
+        // 自己 remove_resource。
+        app.init_resource::<VoxelStreamConfig>();
         // 先装引擎存档插件：WorldSavePlugin::build 才能拿到 root。
         app.add_plugins(SavePlugin {
             config: SaveConfig {
@@ -382,7 +403,6 @@ mod tests {
         });
         app.add_plugins(WorldSavePlugin {
             config: WorldSaveConfig {
-                generator_version: GENERATOR_VERSION,
                 autosave_interval_ticks: autosave,
             },
         });
@@ -466,7 +486,7 @@ mod tests {
 
         // 用 load_world 回读，再采集一次：meta 与 region 都必须和原世界一致。
         let mut loaded = bare_world(0);
-        let info = load_world(&mut loaded, &paths)
+        let info = load_world(&mut loaded, &paths, GENERATOR_VERSION)
             .expect("读档成功")
             .expect("world.meta 必须存在");
         assert_eq!(info.world_tick, 1);
@@ -476,6 +496,58 @@ mod tests {
         let recaptured = capture_world(&mut loaded, 1, GENERATOR_VERSION).expect("回读世界可采集");
         assert_eq!(recaptured.meta, expected.meta, "回读后 meta 必须一致");
         assert_eq!(recaptured.regions, expected.regions, "回读后块内容必须一致");
+    }
+
+    #[test]
+    fn save_now_uses_streaming_generator_version() {
+        let dir = TempDir::new("stream_version");
+        let mut app = test_app(dir.path(), None);
+        // 与默认版本区分开：SaveNow 必须读这个资源，而不是某个写死的值。
+        app.insert_resource(VoxelStreamConfig {
+            generator_version: 7,
+            ..VoxelStreamConfig::default()
+        });
+        let (body, chunk) = spawn_island_with_chunk(app.world_mut());
+
+        app.world_mut().write_message(SaveNow);
+        tick(&mut app);
+
+        let paths = SavePaths::new(dir.path());
+        let file = read_region(&paths, body, chunk)
+            .expect("读 region")
+            .expect("region 必须落盘");
+        assert_eq!(
+            file.chunks
+                .get(&chunk)
+                .expect("块记录必须存在")
+                .generator_version,
+            7,
+            "SaveNow 必须采用 VoxelStreamConfig 的版本"
+        );
+    }
+
+    #[test]
+    fn save_now_without_streaming_config_reports_error() {
+        let dir = TempDir::new("missing_stream_config");
+        let mut app = test_app(dir.path(), None);
+        app.world_mut().remove_resource::<VoxelStreamConfig>();
+        spawn_island_with_chunk(app.world_mut());
+
+        app.world_mut().write_message(SaveNow);
+        tick(&mut app);
+
+        // 不允许默认值兜底：没有版本号就报错、不落盘。
+        let status = app.world().resource::<WorldSaveStatus>();
+        assert_eq!(status.saves, 0);
+        let error = status
+            .last_error
+            .as_deref()
+            .expect("缺配置必须留下 last_error");
+        assert!(
+            error.contains("VoxelStreamConfig"),
+            "last_error 要写清缺的是哪个资源：{error}"
+        );
+        assert!(!SavePaths::new(dir.path()).world_meta().exists());
     }
 
     #[test]
@@ -655,11 +727,18 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![stable.0], "实体必须只出现在它自己的块里");
         assert!(record.content.is_some(), "有体素的块必须带 content");
-        assert_eq!(record.generator_version, GENERATOR_VERSION);
+        let saved_version = app
+            .world()
+            .resource::<VoxelStreamConfig>()
+            .generator_version;
+        assert_eq!(
+            record.generator_version, saved_version,
+            "落盘版本必须等于 SaveNow 读取的 VoxelStreamConfig"
+        );
 
         // 回读：实体与体素都要恢复到同一个 body / chunk。
         let mut loaded = bare_world(0);
-        load_world(&mut loaded, &paths)
+        load_world(&mut loaded, &paths, GENERATOR_VERSION)
             .expect("读档成功")
             .expect("world.meta 必须存在");
         let loaded_entity = loaded
