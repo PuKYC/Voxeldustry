@@ -6,17 +6,18 @@
 //!   不阻塞、不做 IO**，返回 `Hit` / `Miss` / `Pending`（§7）；
 //! - 真正的磁盘读写在**一条** `std::thread` 里（不是 `IoTaskPool`），请求/结果都走
 //!   `crossbeam_channel`；`stop` 通道 + `Drop` 里 join，退出时不留 detached 线程；
-//! - [`SaveSet::Flush`] 推进 tick、按预算把内存缓冲交给后台；[`SaveSet::Poll`] 按
+//! - [`SaveSet::Flush`] 推进 tick、按预算把内存缓冲（写或删除）交给后台；[`SaveSet::Poll`] 按
 //!   `(BodyKey, ChunkKey)` 键序应用结果、处理读超时、发 [`SaveFailed`] / [`SaveSucceeded`]。
 //!
 //! # 读优先级（§7）
 //!
-//! **内存缓冲 > `.recovered` > 主文件 > `Miss`**：
+//! **内存缓冲 > 墓碑 → `Miss` > `.recovered` > 主文件 > `Miss`**：
 //!
 //! - 缓冲命中直接 `Hit`，不发 IO（卸载后立刻重载能读到最新内容）；
 //! - 没有缓冲、没有在途读 → 登记在途、把读请求塞进队列、返回 `Pending`；
 //! - 后台结果回来 → 放进 `ready`，下一次 `lookup` 交付 `Hit`（一次性交付）；
 //! - 本会话已知 `Miss` 的块直接 `Miss`，直到该块被 [`SaveStore::write`] 写过（§7）；
+//! - 墓碑命中也直接 `Miss`：删除过的块在落盘前就不能再把旧内容交回去；
 //! - 超过 `read_timeout_ticks` 还没结果 → `Poll` 里转 `Miss` + `SaveFailed`。
 //!
 //! # 写（§5.1）
@@ -24,6 +25,12 @@
 //! [`SaveStore::write`] 只进内存缓冲（同键覆盖、最新赢）；`Flush` 按
 //! `write_budget_per_tick` 把脏块交给后台线程，后台做**整 region 读改写** + 原子写。
 //! **写成功前缓冲不丢**：写失败保留缓冲并重新标脏，下一次 `Flush` 重试。
+//!
+//! # 删除（墓碑）
+//!
+//! [`SaveStore::delete`] 把块标成“不应再有记录”：`lookup` 立即 `Miss`，`Flush` 时
+//! 后台读 region、移除该块并把整 region 原子写回；region 因此变空就直接删文件。
+//! 删除与写入共用预算、FIFO 队列与失败重试路径，细节见 [`SaveStore`] 的删除语义。
 //!
 //! # 语义边界
 //!
@@ -44,7 +51,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use ::voxel::ChunkKey;
 
-use super::store::{read_region, write_region, SavePaths};
+use super::store::{read_region, remove_region, write_region, SavePaths};
 use super::RegionFile;
 use crate::body_key::BodyKey;
 use crate::residency::GameTickSet;
@@ -61,7 +68,7 @@ pub const POLL_APPLY_BUDGET: usize = 64;
 
 /// 默认读超时（tick）：§7 的 300 tick ≈ 5 s。
 pub const DEFAULT_READ_TIMEOUT_TICKS: u64 = 300;
-/// 默认每 tick 写预算（块数）。
+/// 默认每 tick 写/删预算（块数）。
 pub const DEFAULT_WRITE_BUDGET_PER_TICK: usize = 8;
 /// 默认自动 Flush 周期（tick）：1 = 每 tick 都发。
 ///
@@ -195,6 +202,8 @@ pub struct SaveStats {
     pub known_misses: usize,
     /// 后台已回、还没被 `lookup` 取走的命中数。
     pub ready_hits: usize,
+    /// 已标记删除、还没确认落盘的块数（墓碑）。
+    pub tombstones: usize,
 }
 
 // ───────────────────────────── SaveStore ─────────────────────────────
@@ -202,6 +211,24 @@ pub struct SaveStats {
 /// 存档资源：内存缓冲 + 在途状态 + 后台 IO 线程句柄。
 ///
 /// 作为 `Resource` 插入；[`ChunkStore`] 的 `lookup` 可以给流式层直接同步调用。
+///
+/// # 删除语义（墓碑）
+///
+/// [`SaveStore::delete`] 表示“这个块不应再有记录”（例如区块卸载时内容与实体都空）。
+/// 它只改内存：从缓冲移除、记一条墓碑、标脏，`lookup` 立即返回 `Miss`；磁盘删除
+/// 与其他写入一样**只在 Flush 时**发生（同一条后台队列、同一个预算），因此不阻塞
+/// 卸载 tick，也天然按 FIFO 排在此前对该块的写之后。
+///
+/// 后台删除会读旧 region 并移除该块：
+///
+/// - 块本来就不在 region（或 region 文件不存在）→ 什么都不写，避免为每个未编辑
+///   块制造一次写放大；
+/// - region 因此变空 → 删除 region 文件（主文件与 `.recovered` 都删，否则读路径
+///   会从 `.recovered` 把旧内容读回来）；
+/// - 其余情况 → 原子重写该 region。
+///
+/// 读失败或删除文件失败时墓碑保留、块重新标脏，下一次 Flush 重试；成功（含
+/// no-op）才清墓碑。删除成功同样发 [`SaveSucceeded`]（`chunk` 指向该块）。
 #[derive(Resource)]
 pub struct SaveStore {
     config: SaveConfig,
@@ -281,6 +308,7 @@ impl SaveStore {
             in_flight_reads: state.in_flight_reads.len(),
             known_misses: state.misses.len(),
             ready_hits: state.ready.len(),
+            tombstones: state.tombstones.len(),
         }
     }
 
@@ -318,6 +346,7 @@ impl SaveStore {
             .wrapping_add(1);
         state.versions.insert(id, version);
         state.buffer.insert(id, record);
+        state.tombstones.remove(&id);
         state.dirty.insert(id);
         // 最新写入压过在途读：旧磁盘内容不能再回来（迟到的结果靠 epoch 丢弃）。
         state.in_flight_reads.remove(&id);
@@ -326,15 +355,47 @@ impl SaveStore {
         Ok(())
     }
 
+    /// 标记一个块“不应再有记录”（卸载空块时调用）。
+    ///
+    /// 只改内存状态：从缓冲移除、记墓碑、标脏，`lookup` 从此返回 `Miss`。
+    /// 真正的磁盘删除发生在 [`SaveStore::flush`] / `Flush` 系统里，与写入共用
+    /// 队列和预算；失败时墓碑保留，下一次 Flush 重试（见类型级文档的删除语义）。
+    ///
+    /// 返回 `Result` 与 [`SaveStore::write`] 对称，调用方可以对两者用同一套
+    /// `Err` → warn 处理；目前没有会失败的校验。
+    pub fn delete(&self, body: BodyKey, key: ChunkKey) -> Result<(), RecordError> {
+        let id = (body, key);
+        let mut state = self.state();
+        let version = state
+            .versions
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        // 版本 +1：在途的旧写/旧读因此作废，迟到的成功不会清掉墓碑。
+        state.versions.insert(id, version);
+        state.buffer.remove(&id);
+        state.tombstones.insert(id);
+        state.dirty.insert(id);
+        state.in_flight_reads.remove(&id);
+        state.ready.remove(&id);
+        state.misses.insert(id);
+        Ok(())
+    }
+
     /// `ChunkStore::lookup` 的实现（§7）。
     ///
-    /// 只查内存、不阻塞：缓冲 → 已回结果 → 已知 Miss → 在途 → 新请求。
+    /// 只查内存、不阻塞：缓冲 → 墓碑 → 已回结果 → 已知 Miss → 在途 → 新请求。
     pub fn lookup(&self, body: BodyKey, key: ChunkKey) -> StoreLookup {
         let id = (body, key);
         let mut state = self.state();
 
         if let Some(record) = state.buffer.get(&id) {
             return StoreLookup::Hit(record.clone());
+        }
+        // 墓碑优先于任何缓存：删除过、还没落盘的块也不能把旧内容交回去。
+        if state.tombstones.contains(&id) {
+            return StoreLookup::Miss;
         }
         // 磁盘命中是一次性交付：记录交给调用方，不在内存里留副本。
         if let Some(record) = state.ready.remove(&id) {
@@ -378,9 +439,10 @@ impl SaveStore {
         }
     }
 
-    /// 立刻按 `write_budget_per_tick` 把脏块交给后台线程（不受 Flush 周期限制）。
+    /// 立刻按 `write_budget_per_tick` 把脏块（写或删除）交给后台线程
+    ///（不受 Flush 周期限制）。
     ///
-    /// 返回实际发出的块数。
+    /// 返回实际发出的块数（删除也算一条）。
     pub fn flush(&self) -> usize {
         let Some(worker) = &self.worker else {
             return 0;
@@ -394,17 +456,25 @@ impl SaveStore {
             .collect();
         let mut sent = 0;
         for id in ids {
-            let Some(record) = state.buffer.get(&id).cloned() else {
+            let version = state.versions.get(&id).copied().unwrap_or(0);
+            let job = if let Some(record) = state.buffer.get(&id).cloned() {
+                WorkerJob::Write(WriteRequest {
+                    body: id.0,
+                    key: id.1,
+                    record,
+                    version,
+                })
+            } else if state.tombstones.contains(&id) {
+                WorkerJob::Delete(DeleteRequest {
+                    body: id.0,
+                    key: id.1,
+                    version,
+                })
+            } else {
+                // 既没有内容也没有墓碑：脏标记是残留，清掉即可。
                 state.dirty.remove(&id);
                 continue;
             };
-            let version = state.versions.get(&id).copied().unwrap_or(0);
-            let job = WorkerJob::Write(WriteRequest {
-                body: id.0,
-                key: id.1,
-                record,
-                version,
-            });
             if worker.jobs.send(job).is_err() {
                 // 后台已退出：保留 dirty，等下次（或调用方重新建 store）。
                 break;
@@ -495,7 +565,9 @@ struct StoreState {
     versions: BTreeMap<ChunkId, u64>,
     /// 内存缓冲：最新内容，写盘确认前一直在。
     buffer: BTreeMap<ChunkId, ChunkRecord>,
-    /// 待交给后台的块。
+    /// 墓碑：该块不应再有记录，等 Flush 把删除落到磁盘（与 buffer 互斥）。
+    tombstones: BTreeSet<ChunkId>,
+    /// 待交给后台的块（写或删）。
     dirty: BTreeSet<ChunkId>,
     /// 已交给后台的写：块 → 发送时的版本。
     in_flight_writes: BTreeMap<ChunkId, u64>,
@@ -552,7 +624,10 @@ fn apply_read(state: &mut StoreState, result: ReadResult, report: &mut PollRepor
     report.applied.push(id);
 }
 
-/// 写结果：成功才丢缓冲；失败保留最新内容并重新标脏，下一次 Flush 重试。
+/// 写/删除结果：成功才丢缓冲或墓碑；失败保留最新意图并重新标脏，下次 Flush 重试。
+///
+/// 删除复用 `WriteResult`：`Ok` 表示磁盘已不需要这条记录（含“本来就没有”的
+/// no-op），`Failed` 表示没读成或没删成，墓碑必须留着。
 fn apply_write(state: &mut StoreState, result: WriteResult, report: &mut PollReport) {
     let id = (result.body, result.key);
     if state.in_flight_writes.get(&id) == Some(&result.version) {
@@ -560,9 +635,10 @@ fn apply_write(state: &mut StoreState, result: WriteResult, report: &mut PollRep
     }
     match result.outcome {
         WriteOutcome::Ok { path } => {
-            // 期间没有更新的写 → 缓冲已落盘，可以丢；否则保留最新内容。
+            // 期间没有更新的写/删 → 目标状态已落盘，可以丢；否则保留最新意图。
             if state.versions.get(&id).copied() == Some(result.version) {
                 state.buffer.remove(&id);
+                state.tombstones.remove(&id);
                 state.versions.remove(&id);
                 state.dirty.remove(&id);
             }
@@ -659,7 +735,7 @@ impl Drop for WorkerThread {
     }
 }
 
-/// 后台线程主体：一条线程顺序处理读、写、stop。
+/// 后台线程主体：一条线程顺序处理读、写、删、stop。
 fn worker_loop(
     root: PathBuf,
     jobs: Receiver<WorkerJob>,
@@ -686,6 +762,9 @@ fn worker_loop(
                 }
                 Ok(WorkerJob::Write(request)) => {
                     !deliver(&results, WorkerResult::Write(run_write(&paths, request)))
+                }
+                Ok(WorkerJob::Delete(request)) => {
+                    !deliver(&results, WorkerResult::Write(run_delete(&paths, request)))
                 }
                 // 主线程 drop 了发送端：退出。
                 Err(_) => true,
@@ -751,11 +830,77 @@ fn run_write(paths: &SavePaths, request: WriteRequest) -> WriteResult {
     }
 }
 
+/// 后台删除：整 region 读改写；该块本来就不在文件里时**不写盘**（避免写放大）。
+///
+/// 读失败不能当成“块不在”：那会让墓碑假成功、旧记录在下次读时复活。失败原样
+/// 带回，主线程保留墓碑与 dirty，下一次 Flush 重试。
+///
+/// 删除后 region 变空 → 删掉 region 文件（[remove_region] 连 `.recovered` 一起删）；
+/// 否则把移除该块后的整 region 原子写回（§9：v1 不做增量写）。
+fn run_delete(paths: &SavePaths, request: DeleteRequest) -> WriteResult {
+    let path = paths.region(request.body, request.key);
+    let mut region = match read_region(paths, request.body, request.key) {
+        Ok(Some(region)) => region,
+        // region 文件不存在 = 磁盘上本来就没这条记录，删除是 no-op。
+        Ok(None) => {
+            return WriteResult {
+                body: request.body,
+                key: request.key,
+                version: request.version,
+                outcome: WriteOutcome::Ok { path },
+            };
+        }
+        Err(error) => {
+            return WriteResult {
+                body: request.body,
+                key: request.key,
+                version: request.version,
+                outcome: WriteOutcome::Failed {
+                    path,
+                    reason: error.to_string(),
+                },
+            };
+        }
+    };
+    if region.chunks.remove(&request.key).is_none() {
+        return WriteResult {
+            body: request.body,
+            key: request.key,
+            version: request.version,
+            outcome: WriteOutcome::Ok { path },
+        };
+    }
+    let outcome = if region.chunks.is_empty() {
+        match remove_region(paths, request.body, request.key) {
+            Ok(written) => WriteOutcome::Ok { path: written },
+            Err(error) => WriteOutcome::Failed {
+                path,
+                reason: error.to_string(),
+            },
+        }
+    } else {
+        match write_region(paths, request.body, request.key, &region) {
+            Ok(written) => WriteOutcome::Ok { path: written },
+            Err(error) => WriteOutcome::Failed {
+                path,
+                reason: error.to_string(),
+            },
+        }
+    };
+    WriteResult {
+        body: request.body,
+        key: request.key,
+        version: request.version,
+        outcome,
+    }
+}
+
 // ───────────────────────────── 消息类型（线程间） ─────────────────────────────
 
 enum WorkerJob {
     Read(ReadRequest),
     Write(WriteRequest),
+    Delete(DeleteRequest),
 }
 
 struct ReadRequest {
@@ -771,8 +916,16 @@ struct WriteRequest {
     version: u64,
 }
 
+/// 删除请求：只带定位与版本；磁盘上的旧记录由后台读出来再删。
+struct DeleteRequest {
+    body: BodyKey,
+    key: ChunkKey,
+    version: u64,
+}
+
 enum WorkerResult {
     Read(ReadResult),
+    /// 写与删除共用：都是“把这个块的目标状态落到磁盘”。
     Write(WriteResult),
 }
 
@@ -1171,6 +1324,189 @@ mod tests {
         assert_eq!(store.lookup(b, second_key), StoreLookup::Pending);
         pump(&store);
         assert_eq!(store.lookup(b, second_key), StoreLookup::Hit(record(2)));
+    }
+
+    #[test]
+    fn delete_removes_buffered_record_before_flush() {
+        let dir = TempDir::new("delete-buffer");
+        let b = body(6);
+        let k = key(0, 0, 0);
+        let store = SaveStore::new(config(&dir));
+
+        store.write(b, k, record(1)).expect("写缓冲");
+        assert_eq!(store.lookup(b, k), StoreLookup::Hit(record(1)));
+
+        store.delete(b, k).expect("标删除");
+        assert_eq!(store.stats().buffered, 0, "delete 必须把记录移出缓冲");
+        assert_eq!(store.stats().tombstones, 1);
+        assert_eq!(store.stats().dirty, 1, "删除要等 Flush 才落盘");
+        assert_eq!(
+            store.lookup(b, k),
+            StoreLookup::Miss,
+            "删除落盘前也不许交回旧内容"
+        );
+
+        // 磁盘上本来就没有这块：这次删除是 no-op，不得产生文件。
+        assert_eq!(store.flush(), 1);
+        let report = pump(&store);
+        assert_eq!(report.successes.len(), 1);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(store.stats().tombstones, 0, "成功后才清墓碑");
+        assert_eq!(store.lookup(b, k), StoreLookup::Miss);
+        assert!(
+            !SavePaths::new(dir.path()).region(b, k).exists(),
+            "no-op 删除不得创建 region 文件"
+        );
+    }
+
+    #[test]
+    fn delete_missing_region_is_noop() {
+        let dir = TempDir::new("delete-noop");
+        let b = body(7);
+        let k = key(1, 2, 3);
+        let paths = SavePaths::new(dir.path());
+        let store = SaveStore::new(config(&dir));
+
+        store.delete(b, k).expect("标删除");
+        assert_eq!(store.lookup(b, k), StoreLookup::Miss);
+        assert_eq!(store.flush(), 1);
+        let report = pump(&store);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(store.stats().tombstones, 0);
+        assert_eq!(read_region(&paths, b, k).expect("读 region"), None);
+        assert!(
+            !paths.body_dir(b).exists(),
+            "no-op 删除不应创建 body 目录"
+        );
+    }
+
+    #[test]
+    fn delete_after_flush_removes_from_disk() {
+        let dir = TempDir::new("delete-disk");
+        let b = body(8);
+        let k = key(0, 0, 0);
+        let paths = SavePaths::new(dir.path());
+        let config = config(&dir);
+
+        {
+            let store = SaveStore::new(config.clone());
+            store.write(b, k, record(4)).expect("写缓冲");
+            assert_eq!(store.flush(), 1);
+            let report = pump(&store);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert!(paths.region(b, k).is_file(), "旧记录必须先在磁盘上");
+        }
+
+        {
+            let store = SaveStore::new(config.clone());
+            store.delete(b, k).expect("标删除");
+            assert_eq!(store.lookup(b, k), StoreLookup::Miss);
+            assert_eq!(store.flush(), 1);
+            let report = pump(&store);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(store.stats().tombstones, 0);
+            assert!(!paths.region(b, k).exists(), "region 变空必须删文件");
+        }
+
+        // 重启 store：新的会话不能再从磁盘读回旧记录。
+        let store = SaveStore::new(config);
+        assert_eq!(store.lookup(b, k), StoreLookup::Pending, "重启后要真的读盘");
+        let report = pump(&store);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(store.lookup(b, k), StoreLookup::Miss, "旧记录不得复活");
+    }
+
+    #[test]
+    fn tombstone_survives_failed_region_read() {
+        let dir = TempDir::new("delete-read-fail");
+        let b = body(9);
+        let k = key(0, 0, 0);
+        let paths = SavePaths::new(dir.path());
+        let store = SaveStore::new(config(&dir));
+
+        store.write(b, k, record(6)).expect("写缓冲");
+        assert_eq!(store.flush(), 1);
+        let report = pump(&store);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+        // 弄坏主文件：下一轮删除读不出 region，必须失败而不是假成功。
+        let path = paths.region(b, k);
+        let mut bytes = fs::read(&path).expect("读主文件");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(&path, &bytes).expect("写坏主文件");
+
+        store.delete(b, k).expect("标删除");
+        assert_eq!(store.lookup(b, k), StoreLookup::Miss);
+        assert_eq!(store.flush(), 1);
+        let report = pump(&store);
+        assert_eq!(report.failures.len(), 1, "读失败必须报 SaveFailed");
+        assert_eq!(report.failures[0].chunk, Some((b, k)));
+        assert_eq!(report.failures[0].path, path);
+        assert_eq!(store.stats().tombstones, 1, "失败后墓碑必须留着");
+        assert_eq!(store.stats().dirty, 1, "失败后重新标脏等重试");
+        assert_eq!(
+            store.lookup(b, k),
+            StoreLookup::Miss,
+            "读失败期间也不许交回旧内容"
+        );
+        assert!(path.is_file(), "删除没成功，文件不能被删");
+
+        // 手动清掉坏文件后重试：磁盘上已经没有这块，no-op 成功、清墓碑。
+        fs::remove_file(&path).expect("删掉坏文件");
+        assert_eq!(store.flush(), 1);
+        let report = pump(&store);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(store.stats().tombstones, 0, "重试成功后才清墓碑");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_keeps_other_chunks_in_region() {
+        let dir = TempDir::new("delete-keep");
+        let b = body(10);
+        let keep = key(0, 0, 0);
+        let drop = key(1, 0, 0); // 同一 region：删除走整文件读改写
+        let paths = SavePaths::new(dir.path());
+        let config = config(&dir);
+
+        {
+            let store = SaveStore::new(config.clone());
+            store.write(b, keep, record(1)).expect("写 keep");
+            store.write(b, drop, record(2)).expect("写 drop");
+            assert_eq!(store.flush(), 2);
+            let mut successes = 0;
+            while successes < 2 {
+                successes += pump(&store).successes.len();
+            }
+            assert!(paths.region(b, keep).is_file());
+        }
+
+        {
+            let store = SaveStore::new(config.clone());
+            store.delete(b, drop).expect("标删除");
+            assert_eq!(store.flush(), 1);
+            let report = pump(&store);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(store.stats().tombstones, 0);
+        }
+
+        // region 里还有别的块：文件必须保留，且只少了被删的那块。
+        let region = read_region(&paths, b, keep)
+            .expect("读 region")
+            .expect("region 还在");
+        assert_eq!(region.chunk_count(), 1);
+        assert_eq!(region.chunks.get(&keep), Some(&record(1)));
+        assert!(!region.chunks.contains_key(&drop));
+
+        // 重启后 keep 仍在、drop 已 Miss。
+        let store = SaveStore::new(config);
+        assert_eq!(store.lookup(b, keep), StoreLookup::Pending);
+        pump(&store);
+        assert_eq!(store.lookup(b, keep), StoreLookup::Hit(record(1)));
+        assert_eq!(store.lookup(b, drop), StoreLookup::Pending);
+        pump(&store);
+        assert_eq!(store.lookup(b, drop), StoreLookup::Miss);
     }
 
     #[test]

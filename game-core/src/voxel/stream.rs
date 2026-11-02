@@ -572,8 +572,9 @@ fn demote(
 ///   不改 pending，释放阶段照常执行；
 /// - 每 tick 至多 [capture] 一次实体快照，失败只 `warn!`，本 tick 不写盘，
 ///   但**不阻断**释放；
-/// - 空块（content 与 entities 都空）跳过：[ChunkRecord::validate] 会拒绝全空；
-/// - [SaveStore::write] 的 `Err` 只 `warn!`，同样不阻断释放。
+/// - 空块（content 与 entities 都空）不写记录，改为删除该块的旧记录：磁盘上可能
+///   还留着上一次的 `ChunkRecord`，静默跳过会让旧内容在重载后复活；
+/// - [SaveStore::write] / [SaveStore::delete] 的 `Err` 只 `warn!`，同样不阻断释放。
 pub fn persist_pending_unloads(world: &mut World) {
     let has_pending = world
         .get_resource::<PendingUnloads>()
@@ -623,7 +624,12 @@ pub fn persist_pending_unloads(world: &mut World) {
             .and_then(|volume| export_chunk(volume, *key, interner.inner()));
         let entities = snapshot.for_chunk(*body, *key).to_vec();
         if content.is_none() && entities.is_empty() {
-            // 空块：没有整块内容、也没有 Persist 实体，validate 会拒绝全空记录。
+            // 空块：既没有整块内容也没有 Persist 实体，validate 会拒绝全空记录。
+            // 不能静默跳过：磁盘上可能还有这块的旧记录，必须显式删除，否则重载后
+            // 旧内容会复活。删除与写入一样只在 Flush 落盘，这里只标墓碑。
+            if let Err(error) = store.delete(*body, *key) {
+                warn!("stream: 卸载落盘删除空区块 {key:?} 失败（不阻断释放）：{error:?}");
+            }
             continue;
         }
         let record = ChunkRecord {
@@ -1823,6 +1829,63 @@ mod tests {
             read_back(&harness, dir.path(), key),
             None,
             "空块不得在存档里留下记录"
+        );
+    }
+
+    #[test]
+    fn unload_air_chunk_deletes_existing_record() {
+        let dir = TempDir::new("unload-air-delete");
+        let key = chunk_key(25, 0, 25);
+        // 读档走 ScriptedStore：Pending 保证卸载时块里没有树（= 空内容）。
+        let mut harness = harness(vec![Answer::Pending]);
+        attach_save_store(&mut harness, dir.path());
+
+        // 预置一条磁盘旧记录，模拟上一次卸载/编辑留下的内容。
+        {
+            let store = harness.app.world().resource::<SaveStore>();
+            store
+                .write(
+                    harness.body,
+                    key,
+                    ChunkRecord {
+                        generator_version: 1,
+                        content: Some(vec![7; 4]),
+                        proposals: Vec::new(),
+                        entities: Vec::new(),
+                    },
+                )
+                .expect("预写旧记录");
+        }
+        flush_store(&harness);
+        let paths = SavePaths::new(dir.path());
+        assert!(
+            paths.region(harness.body, key).is_file(),
+            "旧记录必须先在磁盘上"
+        );
+
+        harness.upgrade(key);
+        harness.tick();
+        assert!(!harness.volume().contains_chunk(&key), "Pending 不得装块");
+
+        harness.demote(key);
+        harness.tick();
+
+        assert_eq!(harness.stats().unloaded, 1);
+        {
+            let store = harness.app.world().resource::<SaveStore>();
+            assert_eq!(store.stats().buffered, 0, "空块不得写记录");
+            assert_eq!(store.stats().tombstones, 1, "空块必须标删除");
+            assert_eq!(store.lookup(harness.body, key), StoreLookup::Miss);
+        }
+
+        flush_store(&harness);
+        assert!(
+            read_back(&harness, dir.path(), key).is_none(),
+            "卸载空块必须删掉磁盘上的旧记录"
+        );
+        assert!(
+            !paths.region(harness.body, key).exists(),
+            "region 变空后文件必须删除"
         );
     }
 

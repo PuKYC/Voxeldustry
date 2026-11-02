@@ -436,6 +436,36 @@ pub fn write_region(
     write_encoded(paths, &paths.region(body, key), &bytes)
 }
 
+/// 删除一个已经被清空的 region 文件，返回主文件路径。
+///
+/// 只在墓碑落盘、且删除该块后 `chunks` 为空时调用：这个 region 不再有任何记录，
+/// 留着空文件只会让下一次读多一次 IO。`.recovered` 是读路径的首选，只删主文件
+/// 会让旧内容在下次读取时“复活”，所以两份都删；`.corrupt` 是读失败的原始字节
+/// 备份，按 §5.3 保留不动。
+///
+/// 文件不存在不算错（可能已被另一个 store 删掉），其余 IO 失败带阶段返回，
+/// 调用方保留墓碑下次重试。成功后 fsync 父目录，让删除本身持久化。
+pub(crate) fn remove_region(
+    paths: &SavePaths,
+    body: BodyKey,
+    key: ChunkKey,
+) -> Result<PathBuf, SaveError> {
+    let main = paths.region(body, key);
+    let recovered = paths.recovered(&main);
+    for file in [&main, &recovered] {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_error(fs_atomic::STAGE_REMOVE, file, err)),
+        }
+    }
+    let dir = paths.body_dir(body);
+    if dir.is_dir() {
+        fs_atomic::sync_dir(&dir)?;
+    }
+    Ok(main)
+}
+
 /// 原子写 `world.meta`，返回实际写到的路径（§5.1 的世界级顺序：meta 最后写）。
 pub fn write_world_meta(paths: &SavePaths, meta: &WorldMeta) -> Result<PathBuf, SaveError> {
     let bytes = encode_world_meta(meta)?;

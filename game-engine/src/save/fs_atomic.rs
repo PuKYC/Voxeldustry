@@ -97,7 +97,7 @@ fn create_tmp(tmp: &Path) -> Result<File, SaveError> {
 }
 
 /// 打开父目录并 `sync_all()`，让 rename 项持久化（§5.1 第 4 步）。
-fn sync_dir(dir: &Path) -> Result<(), SaveError> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), SaveError> {
     let handle = File::open(dir).map_err(|err| io_error(STAGE_OPEN, dir, err))?;
     handle
         .sync_all()
