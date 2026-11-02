@@ -21,7 +21,7 @@ pub use dock::DockRecord;
 pub use lod::{lod_for_distance, LodPolicy, VoxelLodConfig, MAX_LOD};
 pub use pick::{pick_nearest, raycast_volume, VolumeHit, VoxelPickHit, VoxelRay};
 pub use stream::{
-    ChunkWillUnload, RenderGroups, StreamStats, StreamWanted, VoxelStreamConfig,
+    ChunkWillUnload, PendingUnloads, RenderGroups, StreamStats, StreamWanted, VoxelStreamConfig,
     VoxelStreamPlugin,
 };
 
