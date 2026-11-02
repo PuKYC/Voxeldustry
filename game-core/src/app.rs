@@ -13,7 +13,7 @@ use crate::presentation::voxel_mesh::VoxelMeshRefreshPlugin;
 use crate::presentation::{register_synced_components, PresentationPlugin};
 use crate::spec::CoreSpec;
 use crate::static_data::StaticDataPlugin;
-use crate::voxel::terrain::TerrainPlugin;
+use crate::voxel::terrain::{TerrainMode, TerrainPlugin};
 use crate::voxel::GameVoxelPlugin;
 use crate::world::WorldPlugin;
 use game_engine::aoi::AoIPlugin;
@@ -47,6 +47,11 @@ impl GameModule<CoreSpec> for CoreGame {
         app.add_plugins(WorldPlugin);
         app.add_plugins(GameVoxelPlugin);
         app.add_plugins(TerrainPlugin);
+        // 流式地形：只有装配方显式选了 TerrainMode::Streaming 才接整条管线。
+        // Eager（默认）什么都不加，旧路径行为零变化（测试也直接调 CoreGame::build）。
+        if app.world().get_resource::<TerrainMode>().copied() == Some(TerrainMode::Streaming) {
+            app.add_plugins(crate::world::StreamingWorldPlugin);
+        }
         // 脏块 -> RawVoxelGroups：编辑后同一渲染帧更新可见几何。
         app.add_plugins(VoxelMeshRefreshPlugin);
         // 预测 / 回滚绑定（单人：全部 Predicted、delay 0、无重演）。

@@ -60,6 +60,8 @@
 //! 配置好的根目录；即使顺序反了，系统第一次真正存档前也会按 SaveConfig::root
 //! 重建 [WorldSavePaths]（只在根目录变化时重建，不丢本会话的 .recovered 状态）。
 
+use std::path::PathBuf;
+
 use bevy::ecs::message::MessageCursor;
 use bevy::prelude::*;
 
@@ -71,6 +73,17 @@ use crate::world::save::{capture_world, write_capture};
 /// SaveNow 前落盘屏障的超时：正常 flush 是亚毫秒级，5s 已经意味着磁盘或后台
 /// 线程异常；宁可本次存档失败并报错，也不要把主线程无限卡在存档上。
 const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 装配方显式给出的世界存档根目录。
+///
+/// 存档根目录属于「部署 / 会话选择」，不是世界状态，所以不塞进
+/// [WorldSaveConfig]（后者是世界语义配置）。[StreamingWorldPlugin] 只在**看到
+/// 本资源**时才装 [SavePlugin] / [WorldSavePlugin]；没有它就保持 `ChunkPersistence`
+/// 的默认 `NoStore`——流式层照常装卸，只是不落盘（headless / 单测）。
+///
+/// [StreamingWorldPlugin]: crate::world::StreamingWorldPlugin
+#[derive(Resource, Debug, Clone)]
+pub struct SaveRoot(pub PathBuf);
 
 /// 世界存盘配置（由装配方插入，也可作为 [WorldSavePlugin] 的构造参数）。
 #[derive(Resource, Clone, Debug, PartialEq, Eq)]

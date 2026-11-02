@@ -132,6 +132,19 @@ impl Default for TerrainConfig {
     }
 }
 
+/// 地形装配模式。缺省 [TerrainMode::Eager]（保持现有行为）。
+///
+/// 由装配方在 add_plugins(TerrainPlugin) **之前** 插入；不插入等价于 Eager，
+/// 所以既有装配（含直接调用 CoreGame::build 的测试）行为零变化。
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainMode {
+    /// 急切：Startup 生成全部块 + 全部渲染组（旧路径）。
+    #[default]
+    Eager,
+    /// 流式：只建**空**体素容器 + 正式 body 身份；块与渲染组交给驻留/流式管线。
+    Streaming,
+}
+
 /// 地形插件（独立）：依赖 [GameVoxelPlugin]；装配方先插入 [TerrainConfig] 才注册系统。
 pub struct TerrainPlugin;
 
@@ -142,7 +155,13 @@ impl Plugin for TerrainPlugin {
             "TerrainPlugin 依赖 GameVoxelPlugin"
         );
         if app.world().get_resource::<TerrainConfig>().is_some() {
-            register_systems(app);
+            // 缺省 Eager：旧装配不需要知道 TerrainMode 的存在，行为与以前完全一致。
+            let mode = app
+                .world()
+                .get_resource::<TerrainMode>()
+                .copied()
+                .unwrap_or_default();
+            register_systems(app, mode);
         }
     }
 }
@@ -150,9 +169,12 @@ impl Plugin for TerrainPlugin {
 /// 注册地形生成系统与运行期资源：由 [TerrainPlugin]
 /// 在 `TerrainConfig` 资源存在时调用。
 ///
-/// 只做两件事：挂 `Startup` 生成系统、初始化实体索引 / 统计资源；体素数据
-/// 本身只以组件存在（生成时把 `VoxVolume` spawn 到实体上）。
-pub(crate) fn register_systems(app: &mut App) {
+/// 两条路径共享全部资源初始化，只在 Startup 生成系统与 Update 流式系统上分流：
+/// - [TerrainMode::Eager]：Startup 生成全部块 + 全部组，Update 继续跑旧 LOD 重划分；
+/// - [TerrainMode::Streaming]：Startup 只建空容器（块由驻留/流式管线装），
+///   **不**注册 `stream_terrain_lod`——它和流式层会同时读写同一批块缓存，
+///   造成「旧系统把流式装进来的块又覆盖/回滚」的竞态。
+pub(crate) fn register_systems(app: &mut App, mode: TerrainMode) {
     app.init_resource::<TerrainGroups>()
         // 地形根实体要成为正式 island body（StableEntityId + IslandRegistry 条目），
         // 所以本插件保证注册表存在；WorldPlugin 已经 init 过时这里是 no-op。
@@ -165,21 +187,38 @@ pub(crate) fn register_systems(app: &mut App) {
         .init_resource::<TerrainStats>()
         .init_resource::<VoxelLodConfig>()
         .init_resource::<VoxelLodObserver>()
-        .init_resource::<TerrainStreamState>()
-        // 观察者写入者在 FixedUpdate；流式重划分放 Update 以便同 tick 看到新位置。
-        // build_terrain 用 Commands 生成地形根实体；紧随其后的 exclusive system
-        // 会在运行前 flush 这些命令，因此能拿到那个实体（见 attach_terrain_body）。
-        .add_systems(Startup, (build_terrain, attach_terrain_body).chain())
-        // 编辑后包装缓存必须失效：否则下一次 LOD 流式重划分会用旧树重新
-        // extract，把玩家刚改的方块「回滚」掉。脏集由 mesh 刷新系统消费，
-        // 所以这里只 peek，并且必须排在那之前。
-        .add_systems(
-            Update,
-            invalidate_stale_terrain_caches
-                .before(crate::presentation::voxel_mesh::refresh_dirty_voxel_meshes)
-                .before(stream_terrain_lod),
-        )
-        .add_systems(Update, stream_terrain_lod);
+        .init_resource::<TerrainStreamState>();
+
+    // 编辑后包装缓存必须失效：否则下一次 LOD 流式重划分（或流式层重提取）
+    // 会用旧树重新 extract，把玩家刚改的方块「回滚」掉。脏集由 mesh 刷新
+    // 系统消费，所以这里只 peek，并且必须排在那之前。
+    // 每个模式**只注册一次**（重复注册会让同一系统每帧跑两遍）。
+    match mode {
+        TerrainMode::Eager => {
+            // 观察者写入者在 FixedUpdate；流式重划分放 Update 以便同 tick 看到新位置。
+            // build_terrain 用 Commands 生成地形根实体；紧随其后的 exclusive system
+            // 会在运行前 flush 这些命令，因此能拿到那个实体（见 attach_terrain_body）。
+            app.add_systems(Startup, (build_terrain, attach_terrain_body).chain())
+                .add_systems(
+                    Update,
+                    invalidate_stale_terrain_caches
+                        .before(crate::presentation::voxel_mesh::refresh_dirty_voxel_meshes)
+                        .before(stream_terrain_lod),
+                )
+                .add_systems(Update, stream_terrain_lod);
+        }
+        TerrainMode::Streaming => {
+            // 只建空容器：块与渲染组由 GameTickSet::Streaming 按真实请求产生。
+            // 不注册 stream_terrain_lod：它和流式层会同时读写同一批块缓存，
+            // 造成「旧系统把流式装进来的块又覆盖/回滚」的竞态。
+            app.add_systems(Startup, (build_empty_terrain, attach_terrain_body).chain())
+                .add_systems(
+                    Update,
+                    invalidate_stale_terrain_caches
+                        .before(crate::presentation::voxel_mesh::refresh_dirty_voxel_meshes),
+                );
+        }
+    }
 }
 
 /// 把 `key` 在 terrain 四份块缓存里覆盖的条目全部失效（所有 LOD）。
@@ -810,6 +849,26 @@ fn apply_group_diff(
             stats.lod_groups[lod] += 1;
         }
     }
+}
+
+/// Streaming 模式的 Startup：只出**空**体素容器与正式 body 身份，不生成任何块。
+///
+/// 与 [build_terrain] 的 spawn 形状保持一致（physics 时同样挂 `VoxelCollider`），
+/// 后续 `attach_terrain_body` 不区分模式，直接把该实体升级成 island body。
+/// 块与渲染组交给驻留 / 流式管线：没有 Real/Observer 请求时容器就保持空。
+///
+/// [TerrainStats] 显式归零（而不是依赖 `init_resource` 的默认值）：统计是消费者
+/// 读取的「当前地形规模」，切到流式模式后必须从 0 开始，不能残留任何生成口径。
+fn build_empty_terrain(mut commands: Commands, mut stats: ResMut<TerrainStats>) {
+    *stats = TerrainStats::default();
+    let volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+    // physics：与 build_terrain 的 spawn 形状一致，让空地形也派生 avian 碰撞体；
+    // 块内容到达后由体素/物理层按脏块更新。
+    #[cfg(feature = "physics")]
+    commands.spawn((volume, game_engine::voxel::VoxelCollider));
+    #[cfg(not(feature = "physics"))]
+    commands.spawn(volume);
+    debug!("terrain: streaming 模式只建空体素容器，块交给驻留/流式管线");
 }
 
 #[allow(clippy::too_many_arguments)]
