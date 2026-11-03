@@ -107,6 +107,12 @@ use crate::world::save_plugin::{SaveRoot, WorldSaveConfig, WorldSavePlugin};
 use crate::world::seed::WorldSeed;
 use crate::world::IslandRegistry;
 
+/// 流式世界的生产自动存档周期（按 [SaveStore] 的固定 tick 计，60 Hz 下 30 s）。
+///
+/// 这里存的是 **tick 数** 而不是时长：改 `fixed_hz`（Time<Fixed>）会同步改变
+/// 实际秒数。生产默认开启自动存档，崩服最多丢一个周期内的编辑。
+pub const STREAMING_AUTOSAVE_TICKS: u64 = 1800;
+
 /// 本地玩家作为流式观察者的参数。
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamingPlayerConfig {
@@ -193,21 +199,39 @@ impl Plugin for StreamingWorldPlugin {
         let Some(root) = save_root else {
             return;
         };
-        if app.world().contains_resource::<SaveStore>() {
-            // 已经有存档层（上层或测试自己装的）：再装一遍会重复注册系统与
-            // 后台线程，直接跳过。
-            debug!("StreamingWorldPlugin：已有 SaveStore，跳过 SavePlugin / WorldSavePlugin");
+        // 两部分分开判断：重复装 SavePlugin 会重复注册系统与后台线程；重复装
+        // WorldSavePlugin 会同时跑两套存档系统。只判断 SaveStore 的话，
+        //「上层自己装了存档层、却没装世界存档」会让世界存档被静默关掉。
+        let has_save_layer =
+            app.world().contains_resource::<SaveStore>() || app.is_plugin_added::<SavePlugin>();
+        let has_world_save = app.is_plugin_added::<WorldSavePlugin>();
+        if has_save_layer && has_world_save {
+            debug!("StreamingWorldPlugin：已有存档层与世界存档插件，跳过重复装配");
             return;
         }
-        app.add_plugins(SavePlugin {
-            config: SaveConfig {
-                root,
-                ..SaveConfig::default()
-            },
-        });
-        app.add_plugins(WorldSavePlugin {
-            config: WorldSaveConfig::default(),
-        });
+        // 生产默认开自动存档：崩服最多丢一个周期内的编辑。WorldSavePlugin::build
+        // 会把自己的 config 插入成资源、覆盖已有值，所以必须在 add_plugins 之前
+        // 先读上层可能插入的 WorldSaveConfig，再原样传回去（允许上层覆盖默认值）。
+        let save_config = app
+            .world()
+            .get_resource::<WorldSaveConfig>()
+            .cloned()
+            .unwrap_or(WorldSaveConfig {
+                autosave_interval_ticks: Some(STREAMING_AUTOSAVE_TICKS),
+            });
+        if !has_save_layer {
+            app.add_plugins(SavePlugin {
+                config: SaveConfig {
+                    root,
+                    ..SaveConfig::default()
+                },
+            });
+        }
+        if !has_world_save {
+            app.add_plugins(WorldSavePlugin {
+                config: save_config,
+            });
+        }
     }
 }
 
@@ -420,7 +444,9 @@ mod tests {
         TerrainConfig, TerrainGroups, TerrainMode, TerrainPlugin, TerrainStats,
     };
     use crate::world::chunk::RegionIndex;
-    use crate::world::save_plugin::{SaveNow, SaveRoot, WorldSavePaths, WorldSaveStatus};
+    use crate::world::save_plugin::{
+        SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSaveStatus,
+    };
     use crate::world::{IslandRegistry, WorldPlugin};
 
     /// std::env::temp_dir 下的唯一子目录；Drop 时整棵删掉（与 world::save_plugin
@@ -870,6 +896,94 @@ mod tests {
             .resource_mut::<SaveStore>()
             .shutdown_worker();
         assert!(!app.world().resource::<SaveStore>().has_worker());
+    }
+
+    /// 上层只装了存档层（没有世界存档插件）时，世界存档仍必须补上：
+    /// 否则退出/自动存档被静默关掉，编辑只在卸载时才落盘。
+    #[test]
+    fn streaming_install_adds_world_save_when_only_store_exists() {
+        let dir = TempDir::new("save_store_only");
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.add_plugins(GameVoxelPlugin);
+        app.insert_resource(SaveRoot(dir.path().to_path_buf()));
+        app.add_plugins(SavePlugin {
+            config: SaveConfig {
+                root: dir.path().to_path_buf(),
+                ..SaveConfig::default()
+            },
+        });
+        assert!(!app.is_plugin_added::<WorldSavePlugin>());
+
+        app.add_plugins(StreamingWorldPlugin);
+
+        assert!(
+            app.is_plugin_added::<WorldSavePlugin>(),
+            "已有存档层但缺世界存档插件时，必须补装 WorldSavePlugin"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<WorldSaveConfig>()
+                .autosave_interval_ticks,
+            Some(STREAMING_AUTOSAVE_TICKS)
+        );
+
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+    }
+
+    #[test]
+    fn streaming_install_enables_autosave() {
+        let dir = TempDir::new("autosave_default");
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.add_plugins(GameVoxelPlugin);
+        app.insert_resource(SaveRoot(dir.path().to_path_buf()));
+        app.add_plugins(StreamingWorldPlugin);
+
+        assert_eq!(
+            app.world()
+                .resource::<WorldSaveConfig>()
+                .autosave_interval_ticks,
+            Some(STREAMING_AUTOSAVE_TICKS),
+            "生产装配必须默认开启自动存档"
+        );
+
+        // 显式停后台线程：App drop 前把 worker join 掉，避免测试进程漏线程。
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+    }
+
+    #[test]
+    fn streaming_install_keeps_custom_autosave_config() {
+        let dir = TempDir::new("autosave_custom");
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.add_plugins(GameVoxelPlugin);
+        app.insert_resource(SaveRoot(dir.path().to_path_buf()));
+        // 上层显式给出的配置必须先于插件 build 进入世界。
+        app.insert_resource(WorldSaveConfig {
+            autosave_interval_ticks: Some(7),
+        });
+        app.add_plugins(StreamingWorldPlugin);
+
+        assert_eq!(
+            app.world()
+                .resource::<WorldSaveConfig>()
+                .autosave_interval_ticks,
+            Some(7),
+            "上层显式配置必须优先于生产默认值"
+        );
+
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
     }
 
     #[derive(Resource, Default)]

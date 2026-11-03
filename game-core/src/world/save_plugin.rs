@@ -65,6 +65,7 @@ use std::path::PathBuf;
 use bevy::ecs::message::MessageCursor;
 use bevy::prelude::*;
 
+use game_engine::backend::BackendShutdown;
 use game_engine::residency::GameTickSet;
 use game_engine::save::{SaveConfig, SavePaths, SaveSet, SaveStore};
 
@@ -174,6 +175,10 @@ impl Plugin for WorldSavePlugin {
                     .in_set(GameTickSet::Save)
                     .after(SaveSet::Poll),
             );
+
+        // 退出存档与 FixedUpdate 无关：runner 退出前只补跑一帧 update，
+        // FixedUpdate 可能一步都不走，所以必须挂在每帧必跑的 Last 上。
+        app.add_systems(Last, save_on_shutdown);
     }
 }
 
@@ -241,6 +246,15 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
         return;
     }
 
+    perform_save(world, tick);
+}
+
+/// 真正执行一次全量存档（调用方已经把门控 / tick 判完）。
+///
+/// 顺序固定：生成器版本检查 -> 刷新路径 -> [SaveStore::quiesce] 屏障 ->
+/// [capture_world] 采集 -> [write_capture] 落盘 -> 记账。失败只记
+/// [WorldSaveStatus::last_error]，不 panic、不前进 saves / last_world_tick。
+fn perform_save(world: &mut World, tick: u64) {
     // 生成器版本只认流式层配置：卸载落盘（voxel::stream）也读同一个资源，
     // 两条写路径才不会给同一块写出两个版本号。缺配置时**不能**用默认值兜底：
     // 写错版本号会让下次读档把旧地形当成新地形，比不写更糟。
@@ -298,6 +312,37 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
     }
 }
 
+/// exclusive 退出存档系统：消费 [BackendShutdown] 并做一次全量快照。
+///
+/// # 为什么放在 `Last`
+///
+/// runner 收到 Shutdown 后只保证再跑**一帧** `App::update()`；`FixedUpdate`
+/// 依赖累计时间，这一帧可能一步都不走，[save_now_system] 就不会被调度。
+/// `Last` 是主调度每帧必跑的最后一段，正好承接「退出前最后一次落盘」。
+///
+/// # 为什么用 `remove_resource`
+///
+/// 标记必须是一次性的：读走但不移除，会让同一帧后续的 `Last` 系统或之后
+/// 任何一次 `update()` 重复存档。移除即消费，不需要额外清理路径。
+///
+/// # 代价
+///
+/// 退出保存必然是一次**全量快照**，且包含 [SaveStore::quiesce] 屏障：主线程
+/// 会阻塞到在途 region 写结束（最长 [QUIESCE_TIMEOUT]），与 SaveNow 相同。
+pub fn save_on_shutdown(world: &mut World) {
+    if world.remove_resource::<BackendShutdown>().is_none() {
+        return;
+    }
+    let Some(tick) = world.get_resource::<SaveStore>().map(SaveStore::tick) else {
+        record_error(
+            world,
+            "缺少 SaveStore 资源（game-engine 的 SavePlugin 未装配）",
+        );
+        return;
+    };
+    perform_save(world, tick);
+}
+
 fn record_success(world: &mut World, tick: u64) {
     if let Some(mut status) = world.get_resource_mut::<WorldSaveStatus>() {
         status.saves += 1;
@@ -323,6 +368,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use game_engine::backend::BackendShutdown;
     use game_engine::body_key::BodyKey;
     use game_engine::identity::{
         StableEntityId, StableEntityIndex, StableIdAllocator, StableIdPlugin,
@@ -855,5 +901,38 @@ mod tests {
         let store = app.world().resource::<SaveStore>();
         assert_eq!(store.committed_version(body, pending), None);
         assert!(store.dirty_count() > 0, "失败的块要留脏，等后续 Flush 重试");
+    }
+
+    #[test]
+    fn shutdown_triggers_one_save_and_clears_marker() {
+        let dir = TempDir::new("shutdown");
+        let mut app = test_app(dir.path(), None);
+        let (body, chunk) = spawn_island_with_chunk(app.world_mut());
+
+        // 模拟 runner 的退出分支：插标记后补跑一帧 update，退出存档挂在 Last。
+        app.world_mut().insert_resource(BackendShutdown);
+        app.update();
+
+        let paths = SavePaths::new(dir.path());
+        let status = app.world().resource::<WorldSaveStatus>();
+        assert_eq!(status.saves, 1, "退出标记必须触发一次存档");
+        assert!(paths.world_meta().exists(), "退出存档必须写 world.meta");
+        assert!(
+            paths.region(body, chunk).exists(),
+            "已标编辑的块必须落盘：{:?}",
+            paths.region(body, chunk)
+        );
+        assert!(
+            app.world().get_resource::<BackendShutdown>().is_none(),
+            "退出标记必须被移除（一次性）"
+        );
+
+        // 同一标记不能触发第二次：后续 update 的 Last 只看到标记已不在。
+        app.update();
+        assert_eq!(
+            app.world().resource::<WorldSaveStatus>().saves,
+            1,
+            "退出标记已消费，第二次 update 不能再存"
+        );
     }
 }

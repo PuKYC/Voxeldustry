@@ -53,6 +53,14 @@ pub enum BevyControlMsg {
     Custom(String),
 }
 
+/// 退出存档标记：runner 收到 [BevyControlMsg::Shutdown] 后插入本资源，
+/// 再跑**最后一帧** `App::update()`，让世界层把「已装块」落盘。
+///
+/// runner 自己不存盘：存盘属于世界语义，由 game-core 的 WorldSavePlugin 在
+/// `Last` 里消费本资源并移除它（一次性触发，见 `save_on_shutdown`）。
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct BackendShutdown;
+
 /// Bevy -> Godot 的生命周期与状态反馈。
 #[derive(Debug, Clone)]
 pub enum BevyLifecycleMsg {
@@ -193,6 +201,11 @@ pub fn run_headless<S: GameSpec, M: GameModule<S>>(
             }
 
             if exit_requested {
+                // 退出前补跑一帧：世界层（game-core 的 WorldSavePlugin）只有在这一帧
+                // 的 Last 里才有机会把「已装块」落盘。FixedUpdate 依赖累计时间，
+                // 这一帧可能一步都不走，所以退出保存不能挂在 FixedUpdate 上。
+                app.insert_resource(BackendShutdown);
+                app.update();
                 break;
             }
 
