@@ -1,14 +1,15 @@
 //! 子块级脏标记：记录「哪个 body 的哪些体素变了」的纯世界状态。
 //!
 //! 本模块是纯世界数据：`VoxelBox`（块内整数体素范围）+ `DirtyChunk`（body +
-//! 块坐标 + 编辑范围）+ `VoxelDirtySet`（按 `(body, ChunkKey)` 升序的脏集合），
+//! 块坐标 + 编辑范围）+ `VoxelDirtySet`（按 `(body, ChunkKey)` 升序的脏集合，
+//! 外加一个「改过的块」集合供卸载落盘判定是否要存整块内容），
 //! 由世界层的 `apply_voxel_changes` 写入。把脏集变成 mesh 重建计划的
 //! `rebuild_plan` 属于表现层网格规划（见 `crate::presentation::voxel::plan`），
 //! 世界层不反向依赖它。
 //!
 //! 确定性：所有会决定顺序的容器都是 BTreeMap / 排序 Vec。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
 use voxel::store::ChunkKey;
@@ -71,6 +72,13 @@ pub struct DirtyChunk {
 #[derive(Resource, Default)]
 pub struct VoxelDirtySet {
     dirty: BTreeMap<(Option<BodyKey>, ChunkKey), VoxelBox>,
+    /// 自载入以来被**实际写入过**的块（卸载落盘的判据）。
+    ///
+    /// 与 [Self::dirty] 分离：dirty 是「等网格刷新」的瞬态集合，渲染系统
+    /// take_edits 之后就被清空；edited 必须活到块卸载落盘之后，否则「这块改过、
+    /// 要把内容存下来」的判据会在两 tick 之间丢失。所以同一 mark_edited_for
+    /// 写入两处，take_edits 只清 dirty。
+    edited: BTreeSet<(Option<BodyKey>, ChunkKey)>,
 }
 
 impl VoxelDirtySet {
@@ -90,6 +98,40 @@ impl VoxelDirtySet {
             .entry((body, key))
             .and_modify(|b| *b = b.union(edited))
             .or_insert(edited);
+        self.edited.insert((body, key));
+    }
+
+    /// body 的 key 是否被实际写入过（与 [Self::is_dirty_for] 不同：
+    /// take_edits 之后仍然为真，直到 [Self::forget_edited] 或 [Self::clear]）。
+    ///
+    /// 这是「卸载时该不该把整块内容写进存档」的唯一判据：没改过的块重载时可以
+    /// 由生成器逐字节重算，存内容只会增加写放大。
+    #[must_use]
+    pub fn is_edited_for(&self, body: Option<BodyKey>, key: &ChunkKey) -> bool {
+        self.edited.contains(&(body, *key))
+    }
+
+    /// 忘记 (body, key) 的编辑状态：块已经离开内存（释放或整体丢弃）。
+    ///
+    /// **不要**在「内容刚落盘」时调它。落盘只说明磁盘跟上了内存，块里的内容
+    /// 依然不等于生成器输出；此时清掉标记，下一次 SaveNow 采集就会把这块当成
+    /// 未编辑、写出 content=None，覆盖掉磁盘上已经存好的编辑内容。
+    ///
+    /// 只清 edited，不动 dirty：网格刷新与落盘是两条独立的消费路径。
+    pub fn forget_edited(&mut self, body: Option<BodyKey>, key: ChunkKey) {
+        self.edited.remove(&(body, key));
+    }
+
+    /// 编辑集条目数（观测量 / 测试用）。
+    #[must_use]
+    pub fn edited_len(&self) -> usize {
+        self.edited.len()
+    }
+
+    /// 编辑集的只读快照（按 body、再按 ChunkKey 升序）。
+    #[must_use]
+    pub fn edited_keys(&self) -> Vec<(Option<BodyKey>, ChunkKey)> {
+        self.edited.iter().copied().collect()
     }
 
     /// 旧语义入口：body 为 `None` 的部分范围标脏。
@@ -136,9 +178,10 @@ impl VoxelDirtySet {
         self.dirty.is_empty()
     }
 
-    /// 清空。
+    /// 清空脏集合与编辑集（整体丢弃世界内容时用，例如重建地形）。
     pub fn clear(&mut self) {
         self.dirty.clear();
+        self.edited.clear();
     }
 
     /// 取出全部编辑（`None` body 在前，其后按 body、再按 ChunkKey 升序）并清空。
@@ -192,6 +235,53 @@ mod tests {
                 max: [32; 3]
             }
         );
+    }
+
+    /// 编辑集与脏集合分离：take_edits 清 dirty，但「改过」的事实要留到落盘。
+    #[test]
+    fn edited_set_survives_take_edits_until_persisted() {
+        let key = chunk_key(3, 0, -1);
+        let mut dirty = VoxelDirtySet::new();
+        dirty.mark_edited_for(body(9), key, VoxelBox::of_voxel([1, 1, 1]));
+        assert!(dirty.is_edited_for(body(9), &key));
+
+        let edits = dirty.take_edits();
+        assert_eq!(edits.len(), 1);
+        assert!(dirty.is_empty(), "dirty 已被网格刷新消费");
+        assert!(
+            dirty.is_edited_for(body(9), &key),
+            "take_edits 不能清掉「这块改过」的事实，否则卸载时会漏存内容"
+        );
+        assert_eq!(dirty.edited_len(), 1);
+
+        dirty.forget_edited(body(9), key);
+        assert!(!dirty.is_edited_for(body(9), &key));
+        assert_eq!(dirty.edited_len(), 0);
+    }
+
+    /// 编辑集按 (body, ChunkKey) 升序，且 None body 在前（确定性 L3）。
+    #[test]
+    fn edited_keys_are_ordered_and_body_scoped() {
+        let mut dirty = VoxelDirtySet::new();
+        dirty.mark_edited_for(body(2), chunk_key(1, 0, 0), VoxelBox::FULL);
+        dirty.mark_edited_for(None, chunk_key(9, 0, 0), VoxelBox::FULL);
+        dirty.mark_edited_for(body(1), chunk_key(-1, 0, 0), VoxelBox::FULL);
+
+        assert_eq!(
+            dirty.edited_keys(),
+            vec![
+                (None, chunk_key(9, 0, 0)),
+                (body(1), chunk_key(-1, 0, 0)),
+                (body(2), chunk_key(1, 0, 0)),
+            ]
+        );
+        assert!(
+            !dirty.is_edited_for(body(2), &chunk_key(9, 0, 0)),
+            "同一 ChunkKey 在不同 body 上互不影响"
+        );
+
+        dirty.clear();
+        assert_eq!(dirty.edited_len(), 0, "clear 必须同时清空编辑集");
     }
 
     /// 同 key（同 body）重复标记取并集；take_edits / peek_edits 按 ChunkKey 升序。

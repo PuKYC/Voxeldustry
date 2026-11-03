@@ -96,10 +96,10 @@ use crate::input::control::LocalPlayer;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
 use crate::voxel::stream::{VoxelStreamConfig, VoxelStreamPlugin};
+use crate::voxel::terrain::{attach_terrain_body, TerrainConfig, TerrainStats};
 use crate::voxel::{
     FeaturePlugin, TreeFeature, WorldFeature, WorldFeatureAppExt, WorldFeatureRegistry,
 };
-use crate::voxel::terrain::{attach_terrain_body, TerrainConfig, TerrainStats};
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
 use crate::world::load::load_world;
@@ -255,7 +255,10 @@ fn bootstrap_streaming_world(world: &mut World) {
     // 生成（stream.rs）、世界物体、存档 meta.seed 读的却是 WorldSeed，不同步的话
     // 同一个配置在两种模式下会长出两个不同的世界，而 TerrainConfig.seed 被静默忽略。
     // 读档路径已在上面 return，存档里的种子优先，绝不会被这里覆盖。
-    if let Some(seed) = world.get_resource::<TerrainConfig>().map(|config| config.seed) {
+    if let Some(seed) = world
+        .get_resource::<TerrainConfig>()
+        .map(|config| config.seed)
+    {
         if world.resource::<WorldSeed>().0 != seed {
             info!("world: 新世界种子 {seed:#x}（来自 TerrainConfig.seed）");
             world.insert_resource(WorldSeed(seed));
@@ -404,7 +407,8 @@ mod tests {
     use game_engine::save::{SavePaths, SaveStore};
     use game_engine::streaming::{ChunkPersistence, GenTable, StoreLookup};
     use game_engine::voxel::{
-        chunk_key, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelInterner, CHUNK_DEPTH,
+        chunk_key, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelBox, VoxelDirtySet,
+        VoxelInterner, CHUNK_DEPTH,
     };
 
     use crate::input::control::LocalPlayer;
@@ -571,6 +575,12 @@ mod tests {
                 .get_mut::<VoxVolume>(entity)
                 .expect("地形体必须带 VoxVolume")
                 .insert_chunk(chunk, tree);
+            // 夹具绕过 set_voxel_for 直接插块，补标编辑后 SaveNow 才会写 content。
+            world.resource_mut::<VoxelDirtySet>().mark_edited_for(
+                Some(BodyKey::from(body)),
+                chunk,
+                VoxelBox::FULL,
+            );
             body
         };
 

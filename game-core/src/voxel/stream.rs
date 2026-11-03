@@ -137,7 +137,8 @@ use game_engine::streaming::{
     ChunkPersistence, ChunkRecord, GenState, GenTable, ProposalRecord, StoreLookup,
 };
 use game_engine::voxel::{
-    dec_ref_recursive, ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelInterner,
+    dec_ref_recursive, ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelBox,
+    VoxelDirtySet, VoxelInterner,
 };
 
 use crate::presentation::{PresentedTransform, RenderGroupBody, VoxChunkGroupRaw};
@@ -365,13 +366,15 @@ impl Plugin for VoxelStreamPlugin {
 ///
 /// Bevy 0.19 的系统参数上限是 16 个，[advance_proposals] / [settle_chunks] 需要的
 /// 资源超过这个数，所以把总是成对出现的 [StagedChunks] / [ProposalCache] 折成
-/// 一个参数。
+/// 一个参数；[VoxelDirtySet] 也随包带上，避免再多占一个参数位。
 #[derive(SystemParam)]
 pub struct Staging<'w> {
     /// 已生成、待裁决的块。
     pub staged: ResMut<'w, StagedChunks>,
     /// 提案缓存（邻居门的输入）。
     pub cache: ResMut<'w, ProposalCache>,
+    /// 编辑标记：存档命中装块成功后要把该块记成已编辑。
+    pub dirty: Option<ResMut<'w, VoxelDirtySet>>,
 }
 
 /// 世界侧的只读输入：种子、地形配置、feature 注册表。
@@ -638,6 +641,11 @@ pub fn advance_proposals(
                         ) {
                             Ok(old) => {
                                 release_tree(&mut interner, old);
+                                // 磁盘内容就是权威编辑结果：标成已编辑，下一次卸载
+                                // 必须继续写 content，不能当未编辑块删成墓碑。
+                                if let Some(dirty) = staging.dirty.as_mut() {
+                                    dirty.mark_edited_for(Some(body), key, VoxelBox::FULL);
+                                }
                                 // 装块成功后才发；生成路径与空实体不发。
                                 if !entities.is_empty() {
                                     entities_out.write(ChunkEntities {
@@ -1068,15 +1076,22 @@ pub fn persist_pending_unloads(world: &mut World) {
             return;
         };
         let index = world.get_resource::<StableEntityIndex>();
+        // 缺失时按「已编辑」处理（fail-safe）：宁可多存一份内容，也不静默丢编辑。
+        let dirty = world.get_resource::<VoxelDirtySet>();
 
         for ((body, key), entry) in pending.0.iter_mut() {
             if entry.version.is_some() {
                 // 已经提交过：等确认，不要每 tick 重写。
                 continue;
             }
-            let content = body_entity(index, *body)
-                .and_then(|entity| world.get::<VoxVolume>(entity))
-                .and_then(|volume| export_chunk(volume, *key, interner.inner()));
+            let edited = dirty.is_none_or(|dirty| dirty.is_edited_for(Some(*body), key));
+            let content = if edited {
+                body_entity(index, *body)
+                    .and_then(|entity| world.get::<VoxVolume>(entity))
+                    .and_then(|volume| export_chunk(volume, *key, interner.inner()))
+            } else {
+                None
+            };
             let entities = snapshot.for_chunk(*body, *key).to_vec();
             let empty = content.is_none() && entities.is_empty();
             let result = if empty {
@@ -1207,6 +1222,10 @@ fn release_unloaded_chunk(world: &mut World, body: BodyKey, key: ChunkKey, from:
     }
     let _ = world.resource_mut::<GenTable>().reset((body, key));
     world.resource_mut::<StreamStats>().unloaded += 1;
+    // 块已离开内存，编辑标记不再需要；缺资源就跳过（下一次写入会重新标）。
+    if let Some(mut dirty) = world.get_resource_mut::<VoxelDirtySet>() {
+        dirty.forget_edited(Some(body), key);
+    }
 }
 
 /// 从 body 的容器里取树并按旧顺序失效四份缓存，返回是否真的取回了树。
@@ -1519,12 +1538,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use bevy::prelude::*;
-    use game_engine::identity::{StableIdPlugin, StableIdWorldExt};
+    use game_engine::identity::{StableEntityId, StableIdPlugin, StableIdWorldExt};
+    use game_engine::math::FixedPoint;
     use game_engine::presentation::voxel::raw_halo_has_solid_interior;
     use game_engine::residency::ChunkAnchor;
     use game_engine::save::{
-        export_chunk, read_region, EntityRecord, OpaqueComponents, Persist, PersistComponent,
-        PersistRegistry, SaveConfig, SavePaths, SaveStore, StableTypeId,
+        export_chunk, read_region, write_world_meta, AttachTag, BodyKind as SaveBodyKind,
+        BodyRecord, EntityRecord, OpaqueComponents, Persist, PersistComponent, PersistRegistry,
+        SaveConfig, SavePaths, SaveStore, StableTypeId, WorldMeta,
     };
     use game_engine::streaming::{ChunkRecord, ChunkStore, StoreLookup};
     use game_engine::voxel::{
@@ -1535,6 +1556,7 @@ mod tests {
     use super::*;
     use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
     use crate::voxel::{ChunkSink, ProposalSpec, WorldFeature};
+    use crate::world::IslandRegistry;
 
     /// 测试世界种子：与 `WorldSeed` 资源、`generated_bytes` 保持一致。
     const SEED: u64 = 0x00C0_FFEE;
@@ -1682,6 +1704,15 @@ mod tests {
                 from: Residency::Data,
                 to: Residency::None,
             });
+        }
+
+        /// 模拟玩家/系统真的写过该块：生产路径由 `set_voxel_for` 标记。
+        /// 没标过的块在卸载/存档时只有墓碑语义，内容交给生成器重算。
+        fn mark_edited(&mut self, key: ChunkKey) {
+            self.app
+                .world_mut()
+                .resource_mut::<VoxelDirtySet>()
+                .mark_edited_for(Some(self.body), key, VoxelBox::FULL);
         }
 
         fn reached(&mut self) -> Vec<ChunkReached> {
@@ -2421,6 +2452,7 @@ mod tests {
         harness.upgrade(key);
         resolve_with_store(&mut harness, key);
         assert!(harness.volume().contains_chunk(&key));
+        harness.mark_edited(key);
 
         harness.demote(key);
         harness.tick();
@@ -2482,6 +2514,7 @@ mod tests {
 
         harness.upgrade(key);
         resolve_with_store(&mut harness, key);
+        harness.mark_edited(key);
         harness.demote(key);
         harness.tick();
 
@@ -2503,6 +2536,233 @@ mod tests {
         assert_eq!(record.entities.len(), 1, "该块只应有一条实体记录");
         assert_eq!(record.entities[0].stable_entity_id, entity_id.0);
         assert_eq!(record.entities[0].stable_type_id, 7);
+    }
+
+    #[test]
+    fn unedited_chunk_unload_writes_no_content() {
+        let dir = TempDir::new("unload-unedited");
+        let key = chunk_key(32, 0, 32);
+        let (_, expected_hash) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        resolve_with_store(&mut harness, key);
+        assert!(harness.volume().contains_chunk(&key));
+        assert!(
+            !harness
+                .app
+                .world()
+                .resource::<VoxelDirtySet>()
+                .is_edited_for(Some(harness.body), &key),
+            "生成器装进来的块默认不算已编辑"
+        );
+
+        // 不标编辑：卸载时没有可写的 content，空实体 → 墓碑。
+        harness.demote(key);
+        harness.tick();
+        flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key), "确认落盘后才释放");
+        assert_eq!(harness.stats().unloaded, 1);
+        let paths = SavePaths::new(dir.path());
+        assert!(
+            !paths.region(harness.body, key).exists(),
+            "未编辑且无实体的块不得留下 region 文件"
+        );
+        assert_eq!(
+            read_region(&paths, harness.body, key).expect("读回 region 失败"),
+            None,
+            "墓碑删除后 region 里不该有该块"
+        );
+        assert_eq!(read_back(&harness, dir.path(), key), None);
+
+        // 再请求：内容交给生成器逐字节重算，与第一次一致。
+        harness.upgrade(key);
+        resolve_with_store(&mut harness, key);
+        assert_eq!(harness.content_hash(&key), expected_hash);
+        assert_eq!(harness.stats().generated, 2);
+        assert_eq!(harness.stats().loaded_from_store, 0);
+    }
+
+    #[test]
+    fn edited_chunk_unload_keeps_content() {
+        let dir = TempDir::new("unload-edited");
+        let key = chunk_key(33, 0, 33);
+        let (expected, expected_hash) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness.upgrade(key);
+        resolve_with_store(&mut harness, key);
+        harness.mark_edited(key);
+
+        harness.demote(key);
+        harness.tick();
+        flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key));
+        let record = read_back(&harness, dir.path(), key).expect("已编辑块必须落盘");
+        assert_eq!(record.content.as_deref(), Some(expected.as_slice()));
+        assert!(record.entities.is_empty());
+
+        // 重新请求：从存档装回同一份字节，不再走生成器。
+        harness.upgrade(key);
+        resolve_with_store(&mut harness, key);
+        assert!(harness.volume().contains_chunk(&key));
+        assert_eq!(harness.content_hash(&key), expected_hash);
+        assert_eq!(harness.stats().loaded_from_store, 1);
+        assert_eq!(harness.stats().generated, 1);
+    }
+
+    #[test]
+    fn store_hit_marks_edited_so_content_survives_next_unload() {
+        let dir = TempDir::new("unload-hit-edited");
+        let key = chunk_key(34, 0, 34);
+        let (bytes, expected_hash) = solid_bytes(201);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        harness
+            .app
+            .world()
+            .resource::<SaveStore>()
+            .write(
+                harness.body,
+                key,
+                ChunkRecord {
+                    generator_version: 1,
+                    content: Some(bytes.clone()),
+                    proposals: Vec::new(),
+                    entities: Vec::new(),
+                },
+            )
+            .expect("预写存档记录");
+        flush_store(&harness);
+
+        harness.upgrade(key);
+        resolve_with_store(&mut harness, key);
+        assert_eq!(
+            harness.content_hash(&key),
+            expected_hash,
+            "必须装的是磁盘内容"
+        );
+        assert!(
+            harness
+                .app
+                .world()
+                .resource::<VoxelDirtySet>()
+                .is_edited_for(Some(harness.body), &key),
+            "存档命中的块必须标成已编辑"
+        );
+
+        harness.demote(key);
+        harness.tick();
+        flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key));
+        let record = read_back(&harness, dir.path(), key).expect("记录必须仍在");
+        assert_eq!(
+            record.content.as_deref(),
+            Some(bytes.as_slice()),
+            "下一次卸载不得把存档内容当未编辑删成墓碑"
+        );
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .resource::<SaveStore>()
+                .stats()
+                .tombstones,
+            0,
+            "不得走墓碑删除"
+        );
+    }
+
+    #[test]
+    fn entity_only_record_survives_unedited_unload() {
+        let dir = TempDir::new("unload-entity-only");
+        let key = chunk_key(35, 0, 35);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        let body = harness.body;
+        let (_, entity_id) = harness.app.world_mut().spawn_stable((
+            TestMarker(5),
+            Persist {
+                prototype_type_id: 7,
+            },
+            ChunkAnchor::new(body, key),
+        ));
+
+        harness.upgrade(key);
+        resolve_with_store(&mut harness, key);
+        // 不标编辑：内容可以丢，实体必须留。
+        harness.demote(key);
+        harness.tick();
+        flush_store(&harness);
+        harness.tick();
+
+        assert!(!harness.volume().contains_chunk(&key));
+        let record = read_back(&harness, dir.path(), key).expect("实体记录必须留在存档里");
+        assert_eq!(record.content, None, "未编辑块不得写 content");
+        assert_eq!(record.entities.len(), 1);
+        assert_eq!(record.entities[0].stable_entity_id, entity_id.0);
+        assert_eq!(record.entities[0].stable_type_id, 7);
+
+        // 造一份最小 meta，再用读档路径证明实体确实被恢复。
+        let mut meta = WorldMeta {
+            seed: SEED,
+            world_tick: 0,
+            next_stable_entity_id: body.as_u64().max(entity_id.0) + 1,
+            bodies: BTreeMap::new(),
+        };
+        meta.bodies.insert(
+            body,
+            BodyRecord {
+                id: body,
+                kind: SaveBodyKind::Island,
+                attach: AttachTag::Free,
+                biome: 0,
+                anchored: 0,
+                voxel_size: FixedPoint::from_num(1).to_bits(),
+                drift: [0; 3],
+                attach_to: BodyKey::INVALID,
+            },
+        );
+        let paths = SavePaths::new(dir.path());
+        write_world_meta(&paths, &meta).expect("写 meta");
+
+        let mut loaded = World::new();
+        loaded.insert_resource(WorldSeed(SEED));
+        loaded.insert_resource(IslandRegistry::new());
+        loaded.insert_resource(StableIdAllocator::default());
+        loaded.insert_resource(StableEntityIndex::default());
+        loaded.insert_resource(VoxelInterner::new(4 * 1024 * 1024));
+        loaded.insert_resource(VoxelDirtySet::default());
+        let mut registry = PersistRegistry::new();
+        registry.register::<TestMarker>().expect("注册测试组件");
+        loaded.insert_resource(registry);
+        loaded.insert_resource(OpaqueComponents::default());
+
+        let result = crate::world::load::load_world(&mut loaded, &paths, 1)
+            .expect("读档必须成功")
+            .expect("meta 存在时必须返回 LoadedWorld");
+        assert_eq!(result.stats.entities, 1, "实体记录必须被恢复");
+
+        let mut query = loaded.query::<(&StableEntityId, &TestMarker)>();
+        let restored: Vec<(StableEntityId, TestMarker)> = query
+            .iter(&loaded)
+            .map(|(id, marker)| (*id, *marker))
+            .collect();
+        assert_eq!(
+            restored,
+            vec![(entity_id, TestMarker(5))],
+            "恢复的实体必须保留稳定 ID 与组件负载"
+        );
     }
 
     #[test]
@@ -2541,6 +2801,7 @@ mod tests {
 
         harness.upgrade(key);
         resolve_with_store(&mut harness, key);
+        harness.mark_edited(key);
         let _ = harness.reached();
 
         harness.demote(key);
@@ -2711,6 +2972,7 @@ mod tests {
         harness.upgrade(key);
         resolve_with_store(&mut harness, key);
         assert!(harness.volume().contains_chunk(&key));
+        harness.mark_edited(key);
 
         harness.demote(key);
         harness.tick();

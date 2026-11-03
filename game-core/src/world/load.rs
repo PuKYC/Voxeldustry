@@ -27,7 +27,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use bevy::prelude::{Entity, Resource, World};
+use bevy::prelude::{warn, Entity, Resource, World};
 
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
@@ -39,7 +39,7 @@ use game_engine::save::{
     WorldMeta, REGION_SIZE,
 };
 use game_engine::voxel::{
-    dec_ref_recursive, Attachment, ChunkKey, VoxVolume, VoxelInterner,
+    dec_ref_recursive, Attachment, ChunkKey, VoxVolume, VoxelBox, VoxelDirtySet, VoxelInterner,
     DEFAULT_INTERNER_BUDGET_BYTES,
 };
 
@@ -369,7 +369,11 @@ fn region_anchor(body: BodyKey, region: ChunkKey) -> Result<ChunkKey, SaveError>
         )
     })?;
     let anchor = ChunkKey::new(x, y, z);
-    debug_assert_eq!(region_of(anchor), region, "region 锚点块键必须落回本 region");
+    debug_assert_eq!(
+        region_of(anchor),
+        region,
+        "region 锚点块键必须落回本 region"
+    );
     Ok(anchor)
 }
 
@@ -505,9 +509,10 @@ fn spawn_body(world: &mut World, key: BodyKey, record: &BodyRecord) -> Result<En
                 FixedPoint::from_bits(record.drift[1]),
                 FixedPoint::from_bits(record.drift[2]),
             );
-            world
-                .resource_mut::<IslandRegistry>()
-                .insert(IslandId(key.as_u64()), Island::new(drift, anchored, BiomeId(record.biome)));
+            world.resource_mut::<IslandRegistry>().insert(
+                IslandId(key.as_u64()),
+                Island::new(drift, anchored, BiomeId(record.biome)),
+            );
             entity
         }
         BodyKind::Ship => world.spawn((id, Body::ship(), ShipTag, volume)).id(),
@@ -526,9 +531,7 @@ fn spawn_body(world: &mut World, key: BodyKey, record: &BodyRecord) -> Result<En
             .id(),
     };
 
-    world
-        .resource_mut::<StableEntityIndex>()
-        .insert(id, entity);
+    world.resource_mut::<StableEntityIndex>().insert(id, entity);
 
     Ok(entity)
 }
@@ -544,6 +547,12 @@ fn install_plan_chunks(
     body_entities: &BTreeMap<BodyKey, Entity>,
     generator_version: u32,
 ) -> Result<usize, SaveError> {
+    // 读档装回的内容 != 生成器输出，必须记成已编辑；否则下一次卸载会把它删成
+    // 墓碑，玩家改过的地形就丢了。资源缺失只在函数入口 warn 一次。
+    let has_dirty = world.get_resource::<VoxelDirtySet>().is_some();
+    if !has_dirty {
+        warn!("load: 缺少 VoxelDirtySet 资源，读档装回的区块不会被标记为已编辑");
+    }
     world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
         let mut stale = 0usize;
         for body in &plan.bodies {
@@ -568,20 +577,27 @@ fn install_plan_chunks(
                         stale += 1;
                         continue;
                     }
-                    let mut entity_mut = world.entity_mut(entity);
-                    let mut volume = entity_mut.get_mut::<VoxVolume>().ok_or_else(|| {
-                        body_error(
-                            body.key,
-                            SaveErrorKind::Missing {
-                                what: "VoxVolume component for loaded body",
-                                id: body.key.as_u64(),
-                            },
-                        )
-                    })?;
-                    let old = install_chunk(&mut volume, *key, bytes, interner.inner_mut())?;
-                    if let Some(old) = old {
-                        // VoxTree 没有 Drop，旧树必须显式减引用。
-                        dec_ref_recursive(interner.inner_mut(), &old.get_root_id());
+                    {
+                        let mut entity_mut = world.entity_mut(entity);
+                        let mut volume = entity_mut.get_mut::<VoxVolume>().ok_or_else(|| {
+                            body_error(
+                                body.key,
+                                SaveErrorKind::Missing {
+                                    what: "VoxVolume component for loaded body",
+                                    id: body.key.as_u64(),
+                                },
+                            )
+                        })?;
+                        let old = install_chunk(&mut volume, *key, bytes, interner.inner_mut())?;
+                        if let Some(old) = old {
+                            // VoxTree 没有 Drop，旧树必须显式减引用。
+                            dec_ref_recursive(interner.inner_mut(), &old.get_root_id());
+                        }
+                    }
+                    if has_dirty {
+                        if let Some(mut dirty) = world.get_resource_mut::<VoxelDirtySet>() {
+                            dirty.mark_edited_for(Some(body.key), *key, VoxelBox::FULL);
+                        }
                     }
                 }
             }
@@ -853,7 +869,12 @@ mod tests {
         let (entity, island_id) = spawn_island_entity(world, drift, anchored, biome);
         let mut volume = VoxVolume::new(FixedPoint::from_num(1));
         for (index, chunk) in chunks.iter().enumerate() {
-            insert_filled_chunk(world, &mut volume, *chunk, u8::try_from(index + 1).unwrap_or(1));
+            insert_filled_chunk(
+                world,
+                &mut volume,
+                *chunk,
+                u8::try_from(index + 1).unwrap_or(1),
+            );
         }
         world.entity_mut(entity).insert(volume);
         (entity, BodyKey::from(island_id))
@@ -911,8 +932,7 @@ mod tests {
             FixedPoint::from_num(-4),
             FixedPoint::from_num(5),
         );
-        let (body_entity, island_id) =
-            spawn_island_entity(&mut source, drift, true, BiomeId(3));
+        let (body_entity, island_id) = spawn_island_entity(&mut source, drift, true, BiomeId(3));
         let body_key = BodyKey::from(island_id);
 
         let chunk_a = ChunkKey::new(0, 0, 0);
@@ -1026,6 +1046,53 @@ mod tests {
         assert!(loaded.is_none());
         assert_eq!(world.iter_entities().count(), before, "世界实体数不变");
         assert_eq!(world.resource::<StableIdAllocator>().next_id(), 1);
+    }
+
+    #[test]
+    fn loaded_content_is_marked_edited() {
+        const VERSION: u32 = 1;
+        let mut source = test_world(0xED17);
+        let drift = Vec3F::new(
+            FixedPoint::from_num(0),
+            FixedPoint::from_num(0),
+            FixedPoint::from_num(0),
+        );
+        let chunk_a = ChunkKey::new(0, 0, 0);
+        let chunk_b = ChunkKey::new(1, 0, 0);
+        let (_, body_key) =
+            spawn_island_with_chunks(&mut source, drift, false, BiomeId(0), &[chunk_a, chunk_b]);
+
+        let dir = TempDir::new("loaded_edited");
+        let paths = SavePaths::new(dir.path());
+        let capture = capture_world(&mut source, 1, VERSION).expect("采集成功");
+        write_capture(&paths, &capture).expect("落盘成功");
+
+        let mut loaded = test_world(0xED17);
+        loaded.insert_resource(VoxelDirtySet::default());
+        let result = load_world(&mut loaded, &paths, VERSION)
+            .expect("读档成功")
+            .expect("world.meta 存在");
+        assert_eq!(result.stats.chunks, 2);
+
+        let dirty = loaded.resource::<VoxelDirtySet>();
+        assert!(
+            dirty.is_edited_for(Some(body_key), &chunk_a),
+            "装回的块必须标成已编辑"
+        );
+        assert!(
+            dirty.is_edited_for(Some(body_key), &chunk_b),
+            "装回的块必须标成已编辑"
+        );
+        assert_eq!(dirty.edited_len(), 2, "只标记真正装回内容的块");
+        assert_eq!(
+            dirty.edited_keys(),
+            vec![(Some(body_key), chunk_a), (Some(body_key), chunk_b)],
+            "edited 集合必须按 BTreeSet 升序（确定性）"
+        );
+        assert!(
+            !dirty.is_edited_for(Some(body_key), &ChunkKey::new(2, 0, 0)),
+            "没有记录的块不得被标"
+        );
     }
 
     #[test]
@@ -1306,8 +1373,16 @@ mod tests {
 
         assert_eq!(first_result, second_result);
         assert_eq!(body_ids(&first), body_ids(&second), "body 键集合必须相等");
-        assert_eq!(chunk_hashes(&first), chunk_hashes(&second), "块内容哈希必须相等");
-        assert_eq!(stable_ids(&first), stable_ids(&second), "实体 ID 集合必须相等");
+        assert_eq!(
+            chunk_hashes(&first),
+            chunk_hashes(&second),
+            "块内容哈希必须相等"
+        );
+        assert_eq!(
+            stable_ids(&first),
+            stable_ids(&second),
+            "实体 ID 集合必须相等"
+        );
         assert_eq!(
             first.resource::<IslandRegistry>().len(),
             second.resource::<IslandRegistry>().len()
@@ -1345,7 +1420,10 @@ mod tests {
             .expect("孤儿 region 不是错误")
             .expect("world.meta 存在");
 
-        assert_eq!(result.stats.orphan_regions, 1, "主文件与 recovered 只算一个");
+        assert_eq!(
+            result.stats.orphan_regions, 1,
+            "主文件与 recovered 只算一个"
+        );
         assert_eq!(result.stats.bodies, 1);
         assert_eq!(result.stats.chunks, 1);
         assert!(orphan_region.exists(), "孤儿 region 不能被删");

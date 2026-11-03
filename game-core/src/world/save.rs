@@ -40,7 +40,7 @@ use game_engine::save::{
     write_world_meta, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord,
     OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths, WorldMeta,
 };
-use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelInterner};
+use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelDirtySet, VoxelInterner};
 
 use crate::voxel::body::{Body, BodyKind};
 use crate::world::{IslandId, IslandRegistry, WorldSeed};
@@ -93,6 +93,9 @@ pub fn capture_world(
     let interner = world
         .get_resource::<VoxelInterner>()
         .ok_or_else(|| missing_resource("VoxelInterner"))?;
+    // 可选资源：缺失时按「已编辑」处理（fail-safe，宁可多存也不静默丢编辑）。
+    // 生产装配里 `VoxelPlugin` 一定注册它；只有直接搭 World 的单测才可能没有。
+    let dirty = world.get_resource::<VoxelDirtySet>();
     let seed = world
         .get_resource::<WorldSeed>()
         .ok_or_else(|| missing_resource("WorldSeed"))?
@@ -172,7 +175,13 @@ pub fn capture_world(
         }
 
         for chunk_key in chunk_keys {
-            let content = export_chunk(volume, chunk_key, interner.inner());
+            // 只有玩家实际写过的块才导出内容；未编辑块由生成器按种子重算。
+            let edited = dirty.is_none_or(|dirty| dirty.is_edited_for(Some(*body_key), &chunk_key));
+            let content = if edited {
+                export_chunk(volume, chunk_key, interner.inner())
+            } else {
+                None
+            };
             let entities = snapshot.for_chunk(*body_key, chunk_key).to_vec();
             // 空记录不得写入（§3.1）：没有体素内容也没有实体就整条丢掉。
             if content.is_none() && entities.is_empty() {
@@ -356,14 +365,7 @@ fn body_record(
                     },
                 ));
             }
-            (
-                SaveBodyKind::Structure,
-                tag,
-                target,
-                0,
-                0,
-                [0_i64; 3],
-            )
+            (SaveBodyKind::Structure, tag, target, 0, 0, [0_i64; 3])
         }
         BodyKind::Automaton => (
             SaveBodyKind::Automaton,
@@ -399,7 +401,7 @@ mod tests {
     use game_engine::math::{FixedPoint, Vec3F};
     use game_engine::residency::ChunkAnchor;
     use game_engine::save::{read_region, read_world_meta, Persist};
-    use game_engine::voxel::{MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH};
+    use game_engine::voxel::{MaxDepth, VoxOpsBulkWrite, VoxTree, VoxelBox, CHUNK_DEPTH};
 
     use crate::static_data::voxel::BiomeId;
     use crate::voxel::body::spawn_island_entity;
@@ -470,7 +472,12 @@ mod tests {
         let (entity, island_id) = spawn_island_entity(world, drift, anchored, biome);
         let mut volume = VoxVolume::new(FixedPoint::from_num(1));
         for (index, chunk) in chunks.iter().enumerate() {
-            insert_filled_chunk(world, &mut volume, *chunk, u8::try_from(index + 1).unwrap_or(1));
+            insert_filled_chunk(
+                world,
+                &mut volume,
+                *chunk,
+                u8::try_from(index + 1).unwrap_or(1),
+            );
         }
         world.entity_mut(entity).insert(volume);
         (entity, BodyKey::from(island_id))
@@ -545,7 +552,11 @@ mod tests {
         assert_eq!(capture.meta.next_stable_entity_id, 103, "岛 + 2 个实体");
         assert_eq!(capture.meta.bodies.len(), 1);
 
-        let record = capture.meta.bodies.get(&body_key).expect("岛 body 必须在表里");
+        let record = capture
+            .meta
+            .bodies
+            .get(&body_key)
+            .expect("岛 body 必须在表里");
         assert_eq!(record.id, body_key);
         assert_eq!(record.kind, SaveBodyKind::Island);
         // §2：只有 Structure 可以 attach_tag != Free，岛写 Free（raw 编码会拒绝 World）。
@@ -566,7 +577,11 @@ mod tests {
             .get(&(body_key, region_of(chunk_a)))
             .expect("region 必须存在");
         let keys: Vec<ChunkKey> = region.chunks.keys().copied().collect();
-        assert_eq!(keys, vec![chunk_a, chunk_b, chunk_c], "空块不出现、块键升序");
+        assert_eq!(
+            keys,
+            vec![chunk_a, chunk_b, chunk_c],
+            "空块不出现、块键升序"
+        );
 
         let a = region.chunks.get(&chunk_a).expect("chunk_a");
         assert_eq!(a.generator_version, GENERATOR_VERSION);
@@ -583,6 +598,61 @@ mod tests {
         assert!(c.content.is_none(), "块不在 volume 里就没有 content");
         assert_eq!(c.entities.len(), 1);
         assert_eq!(c.entities[0].stable_entity_id, entity_in_c.0);
+    }
+
+    #[test]
+    fn capture_world_writes_content_only_for_edited_chunks() {
+        let mut world = test_world(0xE11);
+        world.insert_resource(VoxelDirtySet::default());
+
+        let edited = ChunkKey::new(0, 0, 0);
+        let unedited = ChunkKey::new(1, 0, 0);
+        // 两块都真的在 volume 里，只有 edited 标过编辑。
+        let (_, body_key) = spawn_island_with_chunks(
+            &mut world,
+            Vec3F::new(
+                FixedPoint::from_num(0),
+                FixedPoint::from_num(0),
+                FixedPoint::from_num(0),
+            ),
+            false,
+            BiomeId(0),
+            &[edited, unedited],
+        );
+        world.resource_mut::<VoxelDirtySet>().mark_edited_for(
+            Some(body_key),
+            edited,
+            VoxelBox::FULL,
+        );
+
+        let capture = capture_world(&mut world, 7, 1).expect("采集必须成功");
+
+        let region = capture
+            .regions
+            .values()
+            .next()
+            .expect("已编辑块必须产生 region");
+        assert_eq!(
+            region.chunks.keys().copied().collect::<Vec<_>>(),
+            vec![edited],
+            "未编辑块不得产生记录（BTreeMap 升序）"
+        );
+        assert!(
+            region.chunks[&edited].content.is_some(),
+            "已编辑块必须带 content"
+        );
+        assert!(region.chunks[&edited].entities.is_empty(), "测试块没有实体");
+        assert!(
+            capture
+                .regions
+                .values()
+                .all(|region| !region.chunks.contains_key(&unedited)),
+            "未编辑且无实体的块不得写进任何 region"
+        );
+        assert_eq!(
+            capture.meta.bodies.keys().copied().collect::<Vec<_>>(),
+            vec![body_key]
+        );
     }
 
     #[test]
@@ -646,7 +716,11 @@ mod tests {
         let mut world = test_world(0xABCD);
         let (_, body_key) = spawn_island_with_chunks(
             &mut world,
-            Vec3F::new(FixedPoint::from_num(1), FixedPoint::from_num(1), FixedPoint::from_num(1)),
+            Vec3F::new(
+                FixedPoint::from_num(1),
+                FixedPoint::from_num(1),
+                FixedPoint::from_num(1),
+            ),
             true,
             BiomeId(2),
             &[ChunkKey::new(0, 0, 0), ChunkKey::new(4, 0, 0)],
@@ -702,13 +776,8 @@ mod tests {
         let chunk_a = ChunkKey::new(0, 0, 0);
         let chunk_b = ChunkKey::new(1, 0, 0); // 与 A 同 region
         let mut world = test_world(0xC0FFEE);
-        let (_, body_key) = spawn_island_with_chunks(
-            &mut world,
-            Vec3F::ZERO,
-            true,
-            BiomeId(1),
-            &[chunk_a],
-        );
+        let (_, body_key) =
+            spawn_island_with_chunks(&mut world, Vec3F::ZERO, true, BiomeId(1), &[chunk_a]);
         let capture = capture_world(&mut world, 3, 1).expect("采集成功");
         let captured_a = capture.regions[&(body_key, region_of(chunk_a))].chunks[&chunk_a].clone();
 
@@ -743,13 +812,8 @@ mod tests {
     fn write_capture_replaces_record_when_capture_has_same_chunk() {
         let chunk_a = ChunkKey::new(0, 0, 0);
         let mut world = test_world(0xBEEF);
-        let (_, body_key) = spawn_island_with_chunks(
-            &mut world,
-            Vec3F::ZERO,
-            true,
-            BiomeId(1),
-            &[chunk_a],
-        );
+        let (_, body_key) =
+            spawn_island_with_chunks(&mut world, Vec3F::ZERO, true, BiomeId(1), &[chunk_a]);
         let capture = capture_world(&mut world, 4, 1).expect("采集成功");
         let captured_a = capture.regions[&(body_key, region_of(chunk_a))].chunks[&chunk_a].clone();
 
@@ -780,13 +844,8 @@ mod tests {
     fn write_capture_creates_region_when_missing() {
         let chunk_a = ChunkKey::new(0, 0, 0);
         let mut world = test_world(0x1234);
-        let (_, body_key) = spawn_island_with_chunks(
-            &mut world,
-            Vec3F::ZERO,
-            true,
-            BiomeId(1),
-            &[chunk_a],
-        );
+        let (_, body_key) =
+            spawn_island_with_chunks(&mut world, Vec3F::ZERO, true, BiomeId(1), &[chunk_a]);
         let capture = capture_world(&mut world, 5, 1).expect("采集成功");
         let dir = TempDir::new("merge_new");
         let paths = SavePaths::new(dir.path());
@@ -861,13 +920,8 @@ mod tests {
     #[test]
     fn body_kinds_map_to_kind_and_attach_tags() {
         let mut world = test_world(1);
-        let (_, island_key) = spawn_island_with_chunks(
-            &mut world,
-            Vec3F::ZERO,
-            true,
-            BiomeId(0),
-            &[ChunkKey::ZERO],
-        );
+        let (_, island_key) =
+            spawn_island_with_chunks(&mut world, Vec3F::ZERO, true, BiomeId(0), &[ChunkKey::ZERO]);
 
         let structure_stable = world.resource_mut::<StableIdAllocator>().allocate();
         world.spawn((

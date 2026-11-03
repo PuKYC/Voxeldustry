@@ -198,12 +198,10 @@ fn refresh_paths(world: &mut World) {
         .map(|config| config.root.clone());
     let root = match configured {
         Some(root) => root,
-        None => world
-            .get_resource::<WorldSavePaths>()
-            .map_or_else(
-                || SaveConfig::default().root,
-                |paths| paths.0.root().to_path_buf(),
-            ),
+        None => world.get_resource::<WorldSavePaths>().map_or_else(
+            || SaveConfig::default().root,
+            |paths| paths.0.root().to_path_buf(),
+        ),
     };
     let stale = world
         .get_resource::<WorldSavePaths>()
@@ -250,10 +248,7 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
         .get_resource::<VoxelStreamConfig>()
         .map(|config| config.generator_version);
     let Some(generator_version) = generator_version else {
-        record_error(
-            world,
-            "世界存档缺少 VoxelStreamConfig：无法确定生成器版本",
-        );
+        record_error(world, "世界存档缺少 VoxelStreamConfig：无法确定生成器版本");
         return;
     };
 
@@ -339,7 +334,8 @@ mod tests {
         PersistPlugin, PersistRegistry, SavePlugin,
     };
     use game_engine::voxel::{
-        ChunkKey, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelInterner, CHUNK_DEPTH,
+        ChunkKey, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelBox, VoxelDirtySet,
+        VoxelInterner, CHUNK_DEPTH,
     };
 
     use crate::static_data::voxel::BiomeId;
@@ -445,7 +441,13 @@ mod tests {
         let mut volume = VoxVolume::new(FixedPoint::from_num(1));
         insert_filled_chunk(world, &mut volume, chunk, 1);
         world.entity_mut(entity).insert(volume);
-        (BodyKey::from(island_id), chunk)
+        let body = BodyKey::from(island_id);
+        // 夹具直接往 volume 塞块，绕过了 set_voxel_for；这里补标编辑，
+        // 让 capture 把它当作玩家改过的内容（否则按新语义只写入墓碑）。
+        world
+            .resource_mut::<VoxelDirtySet>()
+            .mark_edited_for(Some(body), chunk, VoxelBox::FULL);
+        (body, chunk)
     }
 
     #[test]
@@ -686,9 +688,7 @@ mod tests {
         );
         assert!(!paths.world_meta().exists(), "采集失败时不能写 world.meta");
         assert!(
-            !paths
-                .body_dir(BodyKey::new(StableEntityId(1)))
-                .exists(),
+            !paths.body_dir(BodyKey::new(StableEntityId(1))).exists(),
             "采集失败时不该建 body 目录"
         );
     }
@@ -720,11 +720,7 @@ mod tests {
             .expect("读 region")
             .expect("region 文件必须存在");
         let record = file.chunks.get(&chunk).expect("块记录必须存在");
-        let ids: Vec<u64> = record
-            .entities
-            .iter()
-            .map(|e| e.stable_entity_id)
-            .collect();
+        let ids: Vec<u64> = record.entities.iter().map(|e| e.stable_entity_id).collect();
         assert_eq!(ids, vec![stable.0], "实体必须只出现在它自己的块里");
         assert!(record.content.is_some(), "有体素的块必须带 content");
         let saved_version = app
@@ -858,9 +854,6 @@ mod tests {
         );
         let store = app.world().resource::<SaveStore>();
         assert_eq!(store.committed_version(body, pending), None);
-        assert!(
-            store.dirty_count() > 0,
-            "失败的块要留脏，等后续 Flush 重试"
-        );
+        assert!(store.dirty_count() > 0, "失败的块要留脏，等后续 Flush 重试");
     }
 }
