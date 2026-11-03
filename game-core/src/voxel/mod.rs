@@ -20,7 +20,8 @@ pub mod terrain;
 pub use body::{AutomatonTag, Body, BodyKind, IslandTag, ShipTag, StructureTag};
 pub use dock::DockRecord;
 pub use feature::{
-    arbitrate, tie_break, FeatureError, ProposalSpec, WorldFeature, WorldFeatureRegistry,
+    arbitrate, realize_chunk, tie_break, ChunkSink, FeatureError, ProposalSpec, WorldFeature,
+    WorldFeatureRegistry,
 };
 pub use lod::{lod_for_distance, LodPolicy, VoxelLodConfig, MAX_LOD};
 pub use pick::{pick_nearest, raycast_volume, VolumeHit, VoxelPickHit, VoxelRay};

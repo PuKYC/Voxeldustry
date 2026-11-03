@@ -2,8 +2,9 @@
 //!
 //! 对应《体素流式_实现文档》§5（trait、优先级、影响集）与 §6（裁决）：
 //! 把「世界物体」编译成 [`ProposalRecord`]，再按全序规则淘汰重叠者。
-//! 本文件只有**纯函数与数据**：不写体素、不接 `stream.rs`、不碰存档、
-//! 不注册 `Plugin`。27 块并集的收集、状态机推进与 `realize` 都留给后续阶段。
+//! 本文件只有**纯函数与数据**：不接 `stream.rs`、不碰存档、不注册
+//! `Plugin`。27 块并集的收集、状态机推进与跨块调度留给后续阶段；本文件的
+//! `realize` 只写调用方指定的一个块。
 //!
 //! ## 确定性（L3）
 //!
@@ -26,18 +27,27 @@
 //! 相交判定用提案的**原始 bounds**，不是裁剪到本块之后的包围盒——裁剪会让
 //! 同一棵跨界的树在两侧看到不同形状，结论自然不同。
 //!
+//! ## 落地（realize）
+//!
+//! [`ChunkSink`] 是 feature 唯一的写入口：世界坐标先减去块原点，落在
+//! `0..32` 之外就静默丢弃。跨界提案在每个相交块里各 `realize` 一次，每次只写
+//! 本块那一段，块与块之间没有共享写入，所以裁决全序在块内可复现。
+//! [`realize_chunk`] 只处理与本块相交的赢家，并按 `(feature_type, seq)` 升序
+//! 调用：同一块内的写入顺序与传入顺序无关。
+//!
 //! ## 范围外（下一步）
 //!
 //! - 27 块并集的收集与缓存（[`arbitrate`] 只接收收集好的切片）；
-//! - `settle` 状态机接线、`bounds ∩ 本块` 的体素写入（realize）；
+//! - `settle` 状态机接线与 27 块并集的 realize 调度；
 //! - 提案落盘 / 读档重算、`FeaturePlugin` 与 `App::register_world_feature`；
 //! - 提案密度统计（提案数 / 保留数）。
 
 use std::collections::BTreeMap;
 
+use bevy::math::IVec3;
 use game_engine::save::splitmix64;
 use game_engine::streaming::{ProposalRecord, MAX_PROPOSAL_EXTENT};
-use game_engine::voxel::ChunkKey;
+use game_engine::voxel::{chunk_voxels_per_axis, ChunkKey, VoxInterner, VoxOpsWrite, VoxTree};
 
 /// 一条待框架盖章的提案：feature 只给几何与优先级，类型 ID / 序号 / tie_break 由框架填。
 ///
@@ -56,6 +66,68 @@ pub struct ProposalSpec {
     pub priority: i32,
 }
 
+/// 一个区块的写入窗口：feature 只能通过它把体素写进当前块。
+///
+/// 越界写入（world 坐标落在本块 `0..32` 之外）**静默忽略并返回 false**：跨界
+/// 提案在每一侧都只写自己那一段，写入永远是局部的——这是裁决全序的前提。
+///
+/// `tree` / `interner` 必须是同一个区块的树与同一个 interner（调用方责任），
+/// 本类型不做检测。
+pub struct ChunkSink<'a> {
+    tree: &'a mut VoxTree<u8>,
+    interner: &'a mut VoxInterner<u8>,
+    origin: [i32; 3],
+}
+
+impl<'a> ChunkSink<'a> {
+    /// tree/interner 必须是本块的树与同一个 interner；origin 是本块的体素原点。
+    pub fn new(
+        tree: &'a mut VoxTree<u8>,
+        interner: &'a mut VoxInterner<u8>,
+        origin: [i32; 3],
+    ) -> Self {
+        Self {
+            tree,
+            interner,
+            origin,
+        }
+    }
+
+    /// 本块的体素原点（= `ChunkKey × 32`）。
+    #[must_use]
+    pub fn origin(&self) -> [i32; 3] {
+        self.origin
+    }
+
+    /// 块内坐标写入；越界忽略返回 false。
+    pub fn set_local(&mut self, local: [i32; 3], value: u8) -> bool {
+        let extent = chunk_voxels_per_axis();
+        if !(0..3).all(|axis| (0..extent).contains(&local[axis])) {
+            return false;
+        }
+        self.tree.set(
+            self.interner,
+            IVec3::new(local[0], local[1], local[2]),
+            value,
+        )
+    }
+
+    /// 世界（体素）坐标写入；不在本块返回 false。
+    pub fn set_world(&mut self, world: [i32; 3], value: u8) -> bool {
+        let extent = i64::from(chunk_voxels_per_axis());
+        let mut local = [0_i32; 3];
+        for axis in 0..3 {
+            // 用 i64 做减法：极端坐标下 i32 会溢出。
+            let offset = i64::from(world[axis]) - i64::from(self.origin[axis]);
+            if offset < 0 || offset >= extent {
+                return false;
+            }
+            local[axis] = offset as i32;
+        }
+        self.set_local(local, value)
+    }
+}
+
 /// 一种世界物体（树、石、建筑……）的纯提案函数。
 ///
 /// 契约：纯函数——只读 `(seed, owner)`，不读邻居、不读世界、不写任何状态；
@@ -72,6 +144,15 @@ pub trait WorldFeature: Send + Sync + 'static {
     /// 返回 Vec 的下标就是提案的 `seq`，所以同一份返回值里顺序即身份：
     /// 不要用非确定顺序（例如遍历 `HashMap`）来生成它。
     fn propose(&self, seed: u64, owner: ChunkKey) -> Vec<ProposalSpec>;
+
+    /// 把裁决后保留的一条提案写进当前块；只写落在 sink 内（本块）的体素。
+    ///
+    /// 同一提案会在它覆盖的每个块里各调用一次，每次只写本块那一段。
+    /// 越界写入由 [`ChunkSink`] 丢弃，feature 不需要自己裁剪。
+    ///
+    /// 没有默认实现：注册一个新类型却忘了落地，应该在编译期就暴露，而不是
+    /// 静默地什么都不写。
+    fn realize(&self, seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>);
 }
 
 /// 类型擦除后的提案函数。
@@ -82,11 +163,18 @@ pub trait WorldFeature: Send + Sync + 'static {
 trait ErasedFeature: Send + Sync + 'static {
     /// 与 [`WorldFeature::propose`] 完全同义，只是去掉了关联常量。
     fn propose(&self, seed: u64, owner: ChunkKey) -> Vec<ProposalSpec>;
+
+    /// 与 [`WorldFeature::realize`] 完全同义，只是去掉了关联常量。
+    fn realize(&self, seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>);
 }
 
 impl<F: WorldFeature> ErasedFeature for F {
     fn propose(&self, seed: u64, owner: ChunkKey) -> Vec<ProposalSpec> {
         WorldFeature::propose(self, seed, owner)
+    }
+
+    fn realize(&self, seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>) {
+        WorldFeature::realize(self, seed, proposal, sink)
     }
 }
 
@@ -280,6 +368,64 @@ fn bounds_overlap(a: &ProposalRecord, b: &ProposalRecord) -> bool {
     })
 }
 
+/// 把裁决后的赢家写进一个区块；返回真正落地的提案数。
+///
+/// - 只处理 `bounds` 与本块相交的提案（相交判定与 [`arbitrate`] 一致，用原始
+///   bounds）；
+/// - 按 `(feature_type, seq)` 升序调用，保证同一块内写入顺序确定；
+/// - 类型 ID 未注册 → `Err(FeatureError::UnknownType(id))`（不跳过、不猜）；
+/// - `tree` 必须是本块的树（由调用方保证）。
+///
+/// 跨界提案会在它覆盖的每个块里各被调用一次，每次只写落进本块的那一段。
+pub fn realize_chunk(
+    registry: &WorldFeatureRegistry,
+    seed: u64,
+    chunk: ChunkKey,
+    winners: &[ProposalRecord],
+    tree: &mut VoxTree<u8>,
+    interner: &mut VoxInterner<u8>,
+) -> Result<usize, FeatureError> {
+    let extent = i64::from(chunk_voxels_per_axis());
+    let mut origin = [0_i32; 3];
+    for (axis, coordinate) in [chunk.x, chunk.y, chunk.z].into_iter().enumerate() {
+        // 先用 i64 乘：i32 直接乘 32 会在区块坐标较大时溢出。
+        let world = i64::from(coordinate) * extent;
+        origin[axis] =
+            i32::try_from(world).map_err(|_| FeatureError::ChunkOriginOverflow { chunk })?;
+    }
+
+    // 本块覆盖的世界坐标区间是半开的 [min, max)。
+    let mut chunk_min = [0_i64; 3];
+    let mut chunk_max = [0_i64; 3];
+    for axis in 0..3 {
+        chunk_min[axis] = i64::from(origin[axis]);
+        chunk_max[axis] = chunk_min[axis] + extent;
+    }
+
+    let mut pending: Vec<&ProposalRecord> = winners
+        .iter()
+        .filter(|proposal| {
+            (0..3).all(|axis| {
+                i64::from(proposal.bounds_min[axis]) < chunk_max[axis]
+                    && i64::from(proposal.bounds_max[axis]) > chunk_min[axis]
+            })
+        })
+        .collect();
+    pending.sort_by_key(|proposal| (proposal.feature_type, proposal.seq));
+
+    let mut sink = ChunkSink::new(tree, interner, origin);
+    let mut realized = 0;
+    for proposal in pending {
+        let feature = registry
+            .features
+            .get(&proposal.feature_type)
+            .ok_or(FeatureError::UnknownType(proposal.feature_type))?;
+        feature.realize(seed, proposal, &mut sink);
+        realized += 1;
+    }
+    Ok(realized)
+}
+
 /// 提案 / 注册阶段拒绝的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeatureError {
@@ -301,6 +447,13 @@ pub enum FeatureError {
         /// 具体原因（中文，可直接展示）。
         reason: &'static str,
     },
+    /// 裁决结果里出现了一个没有注册的类型 ID。
+    UnknownType(u16),
+    /// 区块坐标换算成 i32 体素原点时溢出。
+    ChunkOriginOverflow {
+        /// 出错的区块。
+        chunk: ChunkKey,
+    },
 }
 
 impl std::fmt::Display for FeatureError {
@@ -319,6 +472,12 @@ impl std::fmt::Display for FeatureError {
                 f,
                 "提案包围盒非法（类型 {feature_type}，序号 {seq}）：{reason}"
             ),
+            Self::UnknownType(id) => write!(f, "裁决结果里的类型 ID 未注册：{id}"),
+            Self::ChunkOriginOverflow { chunk } => write!(
+                f,
+                "区块 ({}, {}, {}) 的体素原点超出 i32 范围",
+                chunk.x, chunk.y, chunk.z
+            ),
         }
     }
 }
@@ -328,6 +487,7 @@ impl std::error::Error for FeatureError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use game_engine::voxel::{chunk_content_hash, MaxDepth, VoxOpsRead, CHUNK_DEPTH};
 
     /// 与 `CHUNK` 对齐的区块边长（crates/voxel 的 `CHUNK_DEPTH`，测试只用来算假原点）。
     const CHUNK: i32 = 32;
@@ -390,6 +550,8 @@ mod tests {
                 spec([base[0] + 20, base[1] + 4, base[2] + 4], 2, 90),
             ]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 假 feature：每个区块一条高优先级石头提案。
@@ -403,6 +565,8 @@ mod tests {
             let base = chunk_origin(owner);
             vec![spec([base[0] + 16, base[1] + 8, base[2] + 8], 4, 200)]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 非法：类型 ID 0。
@@ -415,6 +579,8 @@ mod tests {
         fn propose(&self, _seed: u64, _owner: ChunkKey) -> Vec<ProposalSpec> {
             Vec::new()
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 非法：单轴 `min == max`（空包围盒）。
@@ -432,6 +598,8 @@ mod tests {
                 priority: 0,
             }]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 非法：单轴 `min > max`。
@@ -449,6 +617,8 @@ mod tests {
                 priority: 0,
             }]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 非法：跨度 97，超过 `MAX_PROPOSAL_EXTENT`。
@@ -461,6 +631,8 @@ mod tests {
         fn propose(&self, _seed: u64, _owner: ChunkKey) -> Vec<ProposalSpec> {
             vec![spec([0, 0, 0], 97, 0)]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 合法上界：跨度正好 96。
@@ -473,6 +645,8 @@ mod tests {
         fn propose(&self, _seed: u64, _owner: ChunkKey) -> Vec<ProposalSpec> {
             vec![spec([0, 0, 0], MAX_PROPOSAL_EXTENT, 0)]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 非法：原点正好等于上界。
@@ -490,6 +664,8 @@ mod tests {
                 priority: 0,
             }]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     /// 非法：原点小于下界。
@@ -507,6 +683,8 @@ mod tests {
                 priority: 0,
             }]
         }
+
+        fn realize(&self, _seed: u64, _proposal: &ProposalRecord, _sink: &mut ChunkSink<'_>) {}
     }
 
     #[test]
@@ -742,5 +920,343 @@ mod tests {
         assert_eq!(from_a, from_b);
         assert_eq!(from_a.len(), 1);
         assert_eq!(from_a[0].feature_type, 7);
+    }
+
+    // ---- 落地（realize） ----
+
+    /// 把 proposal 的包围盒逐个体素写进 sink；越界由 sink 丢弃。
+    fn fill_bounds(proposal: &ProposalRecord, sink: &mut ChunkSink<'_>, value: u8) {
+        for x in proposal.bounds_min[0]..proposal.bounds_max[0] {
+            for y in proposal.bounds_min[1]..proposal.bounds_max[1] {
+                for z in proposal.bounds_min[2]..proposal.bounds_max[2] {
+                    sink.set_world([x, y, z], value);
+                }
+            }
+        }
+    }
+
+    /// 假 feature：把自己包围盒内的体素全部写成 7。
+    #[derive(Default)]
+    struct BlobFeature;
+
+    impl WorldFeature for BlobFeature {
+        const TYPE_ID: u16 = 21;
+
+        fn propose(&self, _seed: u64, _owner: ChunkKey) -> Vec<ProposalSpec> {
+            Vec::new()
+        }
+
+        fn realize(&self, _seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>) {
+            fill_bounds(proposal, sink, 7);
+        }
+    }
+
+    /// 假 feature：写 `1 + seq`，用来验证 seq 顺序。
+    #[derive(Default)]
+    struct SeqValueFeature;
+
+    impl WorldFeature for SeqValueFeature {
+        const TYPE_ID: u16 = 22;
+
+        fn propose(&self, _seed: u64, _owner: ChunkKey) -> Vec<ProposalSpec> {
+            Vec::new()
+        }
+
+        fn realize(&self, _seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>) {
+            fill_bounds(proposal, sink, 1 + (proposal.seq as u8));
+        }
+    }
+
+    /// 假 feature：把自己包围盒内的体素全部写成 9。
+    #[derive(Default)]
+    struct OverlayFeature;
+
+    impl WorldFeature for OverlayFeature {
+        const TYPE_ID: u16 = 30;
+
+        fn propose(&self, _seed: u64, _owner: ChunkKey) -> Vec<ProposalSpec> {
+            Vec::new()
+        }
+
+        fn realize(&self, _seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>) {
+            fill_bounds(proposal, sink, 9);
+        }
+    }
+
+    fn test_registry() -> WorldFeatureRegistry {
+        let mut registry = WorldFeatureRegistry::default();
+        registry.register::<BlobFeature>().unwrap();
+        registry.register::<SeqValueFeature>().unwrap();
+        registry.register::<OverlayFeature>().unwrap();
+        registry
+    }
+
+    fn empty_tree_and_interner() -> (VoxTree<u8>, VoxInterner<u8>) {
+        (
+            VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH)),
+            VoxInterner::<u8>::with_memory_budget(2 * 1024 * 1024),
+        )
+    }
+
+    #[test]
+    fn sink_ignores_out_of_chunk_writes() {
+        let (mut tree, mut interner) = empty_tree_and_interner();
+        let before = chunk_content_hash(&interner, &tree);
+
+        {
+            let mut sink = ChunkSink::new(&mut tree, &mut interner, [0, 0, 0]);
+            assert_eq!(sink.origin(), [0, 0, 0]);
+            assert!(!sink.set_local([32, 0, 0], 7));
+            assert!(!sink.set_local([0, 32, 0], 7));
+            assert!(!sink.set_local([0, 0, 32], 7));
+            assert!(!sink.set_local([-1, 0, 0], 7));
+            assert!(!sink.set_world([32, 0, 0], 7));
+            assert!(!sink.set_world([-1, 0, 0], 7));
+        }
+
+        assert_eq!(chunk_content_hash(&interner, &tree), before);
+        assert_eq!(tree.get(&interner, IVec3::new(0, 0, 0)).unwrap_or(0), 0);
+
+        {
+            let mut sink = ChunkSink::new(&mut tree, &mut interner, [0, 0, 0]);
+            assert!(sink.set_local([1, 2, 3], 7));
+            assert!(sink.set_world([4, 5, 6], 8));
+        }
+        assert_eq!(tree.get(&interner, IVec3::new(1, 2, 3)), Some(7));
+        assert_eq!(tree.get(&interner, IVec3::new(4, 5, 6)), Some(8));
+    }
+
+    #[test]
+    fn realize_chunk_writes_only_intersecting_part() {
+        let registry = test_registry();
+        // x 方向跨界：左块写 28..32，右块写 32..36（块内 0..4）。
+        let winner = record(BlobFeature::TYPE_ID, 0, 10, 0, [28, 0, 0], [36, 4, 4]);
+
+        let (mut left, mut left_interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(0, 0, 0),
+                &[winner.clone()],
+                &mut left,
+                &mut left_interner,
+            ),
+            Ok(1)
+        );
+        for x in 28..32 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    assert_eq!(left.get(&left_interner, IVec3::new(x, y, z)), Some(7));
+                }
+            }
+        }
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    assert_eq!(
+                        left.get(&left_interner, IVec3::new(x, y, z)).unwrap_or(0),
+                        0
+                    );
+                }
+            }
+        }
+
+        let (mut right, mut right_interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(1, 0, 0),
+                &[winner],
+                &mut right,
+                &mut right_interner,
+            ),
+            Ok(1)
+        );
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    assert_eq!(right.get(&right_interner, IVec3::new(x, y, z)), Some(7));
+                }
+            }
+        }
+        for x in 4..8 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    assert_eq!(
+                        right.get(&right_interner, IVec3::new(x, y, z)).unwrap_or(0),
+                        0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn realize_chunk_skips_non_intersecting_winners() {
+        let registry = test_registry();
+        let (mut tree, mut interner) = empty_tree_and_interner();
+        assert!(tree.set(&mut interner, IVec3::new(5, 5, 5), 3));
+        let before = chunk_content_hash(&interner, &tree);
+
+        // 完全落在 x=64 之后，与本块（0..32）不相交。
+        let winner = record(BlobFeature::TYPE_ID, 0, 10, 0, [64, 0, 0], [68, 4, 4]);
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(0, 0, 0),
+                &[winner],
+                &mut tree,
+                &mut interner,
+            ),
+            Ok(0)
+        );
+        assert_eq!(chunk_content_hash(&interner, &tree), before);
+        assert_eq!(tree.get(&interner, IVec3::new(5, 5, 5)), Some(3));
+    }
+
+    #[test]
+    fn realize_chunk_rejects_unknown_type() {
+        let registry = test_registry();
+        let (mut tree, mut interner) = empty_tree_and_interner();
+        let before = chunk_content_hash(&interner, &tree);
+
+        let winner = record(999, 0, 10, 0, [0, 0, 0], [2, 2, 2]);
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(0, 0, 0),
+                &[winner],
+                &mut tree,
+                &mut interner,
+            ),
+            Err(FeatureError::UnknownType(999))
+        );
+        assert_eq!(chunk_content_hash(&interner, &tree), before);
+        assert_eq!(
+            FeatureError::UnknownType(999).to_string(),
+            "裁决结果里的类型 ID 未注册：999"
+        );
+    }
+
+    #[test]
+    fn realize_chunk_is_deterministic() {
+        let registry = test_registry();
+        let winners = vec![
+            record(BlobFeature::TYPE_ID, 0, 10, 0, [4, 4, 4], [6, 6, 6]),
+            record(SeqValueFeature::TYPE_ID, 0, 10, 0, [8, 8, 8], [10, 10, 10]),
+        ];
+
+        let (mut tree, mut interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                7,
+                ChunkKey::new(0, 0, 0),
+                &winners,
+                &mut tree,
+                &mut interner
+            ),
+            Ok(2)
+        );
+        let first = chunk_content_hash(&interner, &tree);
+
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                7,
+                ChunkKey::new(0, 0, 0),
+                &winners,
+                &mut tree,
+                &mut interner
+            ),
+            Ok(2)
+        );
+        assert_eq!(chunk_content_hash(&interner, &tree), first);
+
+        let (mut fresh, mut fresh_interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                7,
+                ChunkKey::new(0, 0, 0),
+                &winners,
+                &mut fresh,
+                &mut fresh_interner
+            ),
+            Ok(2)
+        );
+        assert_eq!(chunk_content_hash(&fresh_interner, &fresh), first);
+    }
+
+    #[test]
+    fn realize_chunk_orders_by_type_and_seq() {
+        let registry = test_registry();
+
+        // 类型顺序：21 先于 30，所以 30 的 9 覆盖 21 的 7。
+        let blob = record(BlobFeature::TYPE_ID, 0, 10, 0, [0, 0, 0], [4, 4, 4]);
+        let overlay = record(OverlayFeature::TYPE_ID, 0, 10, 0, [0, 0, 0], [4, 4, 4]);
+
+        let (mut tree, mut interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(0, 0, 0),
+                &[overlay.clone(), blob.clone()],
+                &mut tree,
+                &mut interner,
+            ),
+            Ok(2)
+        );
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    assert_eq!(tree.get(&interner, IVec3::new(x, y, z)), Some(9));
+                }
+            }
+        }
+        let from_reversed = chunk_content_hash(&interner, &tree);
+
+        let (mut other, mut other_interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(0, 0, 0),
+                &[blob, overlay],
+                &mut other,
+                &mut other_interner,
+            ),
+            Ok(2)
+        );
+        assert_eq!(chunk_content_hash(&other_interner, &other), from_reversed);
+
+        // seq 顺序：同一个类型里 seq 大的后写，seq=1 的 2 覆盖 seq=0 的 1。
+        let seq0 = record(SeqValueFeature::TYPE_ID, 0, 10, 0, [0, 0, 0], [2, 2, 2]);
+        let seq1 = record(SeqValueFeature::TYPE_ID, 1, 10, 0, [0, 0, 0], [2, 2, 2]);
+
+        let (mut seq_tree, mut seq_interner) = empty_tree_and_interner();
+        assert_eq!(
+            realize_chunk(
+                &registry,
+                1,
+                ChunkKey::new(0, 0, 0),
+                &[seq1, seq0],
+                &mut seq_tree,
+                &mut seq_interner,
+            ),
+            Ok(2)
+        );
+        for x in 0..2 {
+            for y in 0..2 {
+                for z in 0..2 {
+                    assert_eq!(seq_tree.get(&seq_interner, IVec3::new(x, y, z)), Some(2));
+                }
+            }
+        }
     }
 }
