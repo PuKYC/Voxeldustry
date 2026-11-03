@@ -2,9 +2,10 @@
 //!
 //! 对应《体素流式_实现文档》§5（trait、优先级、影响集）与 §6（裁决）：
 //! 把「世界物体」编译成 [`ProposalRecord`]，再按全序规则淘汰重叠者。
-//! 本文件只有**纯函数与数据**：不接 `stream.rs`、不碰存档、不注册
-//! `Plugin`。27 块并集的收集、状态机推进与跨块调度留给后续阶段；本文件的
-//! `realize` 只写调用方指定的一个块。
+//! 本文件主体是**纯函数与数据**：不接 `stream.rs`、不碰存档。末尾提供
+//! [`FeaturePlugin`] / [`WorldFeatureAppExt`] 两个装配入口（不依赖具体物体）。
+//! 27 块并集的收集、状态机推进与跨块调度留给后续阶段；本文件的 `realize`
+//! 只写调用方指定的一个块。
 //!
 //! ## 确定性（L3）
 //!
@@ -39,7 +40,7 @@
 //!
 //! - 27 块并集的收集与缓存（[`arbitrate`] 只接收收集好的切片）；
 //! - `settle` 状态机接线与 27 块并集的 realize 调度；
-//! - 提案落盘 / 读档重算、`FeaturePlugin` 与 `App::register_world_feature`；
+//! - 提案落盘 / 读档重算；
 //! - 提案密度统计（提案数 / 保留数）。
 
 use std::collections::BTreeMap;
@@ -487,10 +488,48 @@ impl std::fmt::Display for FeatureError {
 
 impl std::error::Error for FeatureError {}
 
+/// 世界物体注册表插件：以空资源插入 [`WorldFeatureRegistry`]。
+///
+/// 只做资源初始化；具体物体由 [`WorldFeatureAppExt::register_world_feature`]
+/// 注册。重复 add 同一个插件由 Bevy 拒绝，这里不再额外判重。
+pub struct FeaturePlugin;
+
+impl bevy::prelude::Plugin for FeaturePlugin {
+    fn build(&self, app: &mut bevy::prelude::App) {
+        app.init_resource::<WorldFeatureRegistry>();
+    }
+}
+
+/// `App` 上的世界物体注册扩展。
+pub trait WorldFeatureAppExt {
+    /// 注册一种世界物体。
+    ///
+    /// 类型 ID 为 0 或与已注册类型重复时直接 `panic!`（消息带
+    /// [`FeatureError`] 的 Display）：注册表是配置，配错应当当场暴露，
+    /// 而不是静默丢掉这个类型。
+    fn register_world_feature<F: WorldFeature + Default>(&mut self) -> &mut Self;
+}
+
+impl WorldFeatureAppExt for bevy::prelude::App {
+    fn register_world_feature<F: WorldFeature + Default>(&mut self) -> &mut Self {
+        self.init_resource::<WorldFeatureRegistry>();
+        self.world_mut()
+            .resource_mut::<WorldFeatureRegistry>()
+            .register::<F>()
+            .unwrap_or_else(|error| {
+                panic!("注册世界物体失败（TYPE_ID = {}）：{error}", F::TYPE_ID)
+            });
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::prelude::App;
     use game_engine::voxel::{chunk_content_hash, MaxDepth, VoxOpsRead, CHUNK_DEPTH};
+
+    use crate::voxel::features::TreeFeature;
 
     /// 与 `CHUNK` 对齐的区块边长（crates/voxel 的 `CHUNK_DEPTH`，测试只用来算假原点）。
     const CHUNK: i32 = 32;
@@ -1261,5 +1300,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn feature_plugin_init_resource() {
+        let mut app = App::new();
+        app.add_plugins(FeaturePlugin);
+
+        let registry = app
+            .world()
+            .get_resource::<WorldFeatureRegistry>()
+            .expect("FeaturePlugin 必须初始化 WorldFeatureRegistry");
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.type_ids().is_empty());
+    }
+
+    #[test]
+    fn register_world_feature_extension() {
+        let mut app = App::new();
+        app.register_world_feature::<TreeFeature>();
+        {
+            let registry = app.world().resource::<WorldFeatureRegistry>();
+            assert_eq!(registry.len(), 1);
+            assert!(registry.contains(TreeFeature::TYPE_ID));
+            assert_eq!(registry.type_ids(), vec![TreeFeature::TYPE_ID]);
+        }
+
+        // 重复注册是配置错误：直接 panic，且不覆盖已注册的实例。
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app.register_world_feature::<TreeFeature>();
+        }));
+        assert!(duplicate.is_err(), "重复注册同一个 feature 必须 panic");
+        assert_eq!(
+            app.world().resource::<WorldFeatureRegistry>().len(),
+            1,
+            "panic 后注册表不能被破坏"
+        );
     }
 }
