@@ -45,6 +45,10 @@
 //! 已有 SaveStore（例如测试或上层已经装过 SavePlugin）时跳过，避免重复注册
 //! 系统与后台线程。读档 / 落盘依赖的 PersistPlugin 则由本插件无条件补装
 //! （判重），所以即使没有 SaveRoot，读档所需的 PersistRegistry 也在。
+//! 装了 SavePlugin 后，流式层的读路径直接用 SaveStore（见 `voxel::stream`
+//! 的「持久化来源」）：卸载后重新请求的块从磁盘 / 内存缓冲装回，而不是重新
+//! 生成；ChunkPersistence 只在没有 SaveStore 时（headless / 单测 / 测试注入）
+//! 才被查询。
 //!
 //! ## 装配前提
 //!

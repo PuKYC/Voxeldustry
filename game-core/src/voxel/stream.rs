@@ -57,10 +57,10 @@
 //!    `GenTable::reset`、`stats.unloaded`）；未确认的条目留在表里，下一 tick
 //!    再看。
 //! 4. [resolve_chunks]（`Wanted` 键序，每 tick 最多
-//!    [VoxelStreamConfig::max_resolve_per_tick] 个）：问
-//!    [ChunkPersistence]：`Hit` 且有整块内容 → 装树，生成器零调用；
-//!    `Hit` 无内容 / `Miss` → 真正跑 [WorldGenerator]；`Pending` → 留在队列，
-//!    下一 tick 再问。
+//!    [VoxelStreamConfig::max_resolve_per_tick] 个）：问存档（见下节
+//!    「持久化来源」）：`Hit` 且有整块内容且版本匹配 → 装树，生成器零调用；
+//!    `Hit` 无内容 / 版本不匹配 / `Miss` → 真正跑 [WorldGenerator]；
+//!    `Pending` → 留在队列，下一 tick 再问。
 //!
 //! ## 实体恢复
 //!
@@ -68,6 +68,23 @@
 //! [ChunkEntities]（生成路径、空实体、intake 的「块已在容器」快路径都不发——
 //! 启动期的实体已由 `load_world` 应用）。真正的重建由 `WorldChunkPlugin` 的
 //! Lifecycle 阶段消费这条消息完成，流式层只负责把记录递过去。
+//!
+//! ## 持久化来源
+//!
+//! 读路径有两个可能的来源，[resolve_chunks] 按下面的优先级选：
+//!
+//! 1. [SaveStore](game_engine::save::SaveStore)（生产）：`StreamingWorldPlugin`
+//!    在有 `SaveRoot` 时安装 `SavePlugin`，落盘（[persist_pending_unloads]）
+//!    与读档（本系统）都走同一个 store。只要这个资源存在就**只用它**；
+//! 2. [ChunkPersistence]（注入点）：没有 [SaveStore] 时才查它，默认是
+//!    `NoStore`（永远 `Miss`），保证流式层脱离存档也能单独运行。
+//!
+//! 为什么真实存档优先：`ChunkPersistence` 是测试 / 替换用的注入点，生产装配
+//! 里它一直是默认的 `NoStore`。历史上这里只查注入点，卸载时内容确实写进了
+//! [SaveStore]，同一会话里重新请求却 `Miss` → 重新生成，玩家编辑被地形覆盖，
+//! 下一次卸载又把生成结果写回去，永久盖掉磁盘上的编辑。两者同时存在时以真实
+//! 磁盘为准，测试替身就不能挡住生产读路径；要覆盖存档读路径的测试应该直接写
+//! [SaveStore]，而不是指望注入点优先。
 //!
 //! ## 依赖
 //!
@@ -118,9 +135,13 @@ pub struct VoxelStreamConfig {
     pub max_resolve_per_tick: usize,
     /// 生成器版本（按块记录在 [ChunkRecord](game_engine::streaming::ChunkRecord) 里）。
     ///
-    /// 它只影响**提案**能否复用（规格 §6.2），不决定整块内容能否安装：
-    /// 存档 `content` 永远以存档为准。本轮没有提案管线，所以这个字段只由
-    /// 装配方写入、由存档层读取。
+    /// 读路径用它做运行期过滤：`Hit` 记录的版本与这里不一致时，旧整块内容
+    /// 不再可信，**不装**、改走生成路径。版本不匹配 = 地形生成器换代，是发布
+    /// 新地形时的正常现象，不是错误。
+    ///
+    /// 它不决定**实体**是否恢复：实体是玩家造的，与地形版本无关。它也仍然
+    /// 只影响提案能否复用（规格 §6.2）；本轮没有提案管线，这个字段由装配方
+    /// 写入、由存档层读取。
     pub generator_version: u32,
 }
 
@@ -374,6 +395,7 @@ pub fn resolve_chunks(
     config: Res<VoxelStreamConfig>,
     mut gen: ResMut<GenTable>,
     mut wanted: ResMut<StreamWanted>,
+    save_store: Option<Res<SaveStore>>,
     persistence: Res<ChunkPersistence>,
     mut index: Option<ResMut<StableEntityIndex>>,
     mut allocator: Option<ResMut<StableIdAllocator>>,
@@ -394,6 +416,15 @@ pub fn resolve_chunks(
         .map(|(pair, level)| (*pair, *level))
         .collect();
     let mut pending = 0usize;
+
+    // 生产装配里落盘就是 SaveStore，ChunkPersistence 是测试 / 替换用的注入点；
+    // 两者同时存在时以真实磁盘为准，免得测试替身把生产读路径挡住（见模块文档
+    // 「持久化来源」）。SaveStore::lookup 是固有方法，优先于同名的 trait 方法，
+    // 不会递归。
+    let lookup = |body: BodyKey, key: ChunkKey| match save_store.as_deref() {
+        Some(store) => store.lookup(body, key),
+        None => persistence.lookup(body, key),
+    };
 
     for (pair, level) in keys {
         let (body, key) = pair;
@@ -430,9 +461,51 @@ pub fn resolve_chunks(
             continue;
         }
 
-        match persistence.lookup(body, key) {
+        match lookup(body, key) {
             StoreLookup::Pending => pending += 1,
             StoreLookup::Hit(record) => {
+                // 运行期版本过滤。`load_world` 只在启动读档时按
+                // `generator_version` 丢弃旧块；这里从磁盘 / 内存缓冲读回来的
+                // 记录没有经过那一步，必须在装块之前再比一次，否则旧地形会
+                // 盖掉当前版本的地表。
+                //
+                // 只丢**内容**、不丢**实体**：实体是玩家造的，与地形生成器
+                // 版本无关。启动读档时实体已经恢复过，这里再发 ChunkEntities
+                // 会让消费方二次 apply；所以 stale 分支既不 install_chunk，
+                // 也不发 ChunkEntities，直接按「没有可用内容」重新生成。
+                // 版本不匹配是发布新地形时的正常现象，不是错误，只记 debug。
+                if record.generator_version != config.generator_version {
+                    debug!(
+                        "stream: 区块 {key:?} 存档版本 {} 与当前生成器版本 {} 不一致，重新生成",
+                        record.generator_version, config.generator_version
+                    );
+                    if generate_into(
+                        pair,
+                        &mut volume,
+                        &mut interner,
+                        seed.as_deref(),
+                        terrain.as_deref(),
+                        &mut gen,
+                        &mut wanted,
+                        &mut stats,
+                    ) {
+                        let raw = extract_block_raw(&volume, &interner, key, level);
+                        finish_chunk(
+                            pair,
+                            level,
+                            raw,
+                            &mut allocator,
+                            index.as_deref_mut(),
+                            &mut commands,
+                            &mut groups,
+                            &mut reached,
+                            &mut gen,
+                            &mut wanted,
+                            &mut stats,
+                        );
+                    }
+                    continue;
+                }
                 let ChunkRecord {
                     content, entities, ..
                 } = record;
@@ -1083,7 +1156,9 @@ mod tests {
         PersistRegistry, SaveConfig, SavePaths, SaveStore, StableTypeId,
     };
     use game_engine::streaming::{ChunkRecord, ChunkStore, StoreLookup};
-    use game_engine::voxel::{chunk_content_hash, chunk_key};
+    use game_engine::voxel::{
+        chunk_content_hash, chunk_key, MaxDepth, VoxOpsBulkWrite, CHUNK_DEPTH,
+    };
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -1181,6 +1256,26 @@ mod tests {
             .generate_chunk(interner.inner_mut(), key);
         volume.insert_chunk(key, tree);
         let bytes = export_chunk(&volume, key, interner.inner()).expect("生成的块必须能导出");
+        let hash = chunk_content_hash(
+            interner.inner(),
+            volume.get_chunk(&key).expect("块在容器里"),
+        );
+        (bytes, hash)
+    }
+
+    /// 一份「只含实心块」的存档内容：value 不同内容就不同，与地形生成器的
+    /// 产出也一定不同——用来一眼区分「装进来的是注入内容」还是「走了生成器」。
+    ///
+    /// 用独立 interner 构造并导出，拿到的是自包含字节；解出来装进 harness 的
+    /// interner 后，内容哈希与这里算的一致（哈希只看体素，不看块坐标）。
+    fn solid_bytes(value: u8) -> (Vec<u8>, u64) {
+        let key = chunk_key(0, 0, 0);
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let mut volume = VoxVolume::with_capacity(DEFAULT_VOXEL_SIZE, 1);
+        let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+        tree.fill(interner.inner_mut(), value);
+        volume.insert_chunk(key, tree);
+        let bytes = export_chunk(&volume, key, interner.inner()).expect("实心块必须能导出");
         let hash = chunk_content_hash(
             interner.inner(),
             volume.get_chunk(&key).expect("块在容器里"),
@@ -1379,6 +1474,25 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("SaveStore 在 1000 次轮询内没有写完");
+    }
+
+    /// 真实 SaveStore 的首次查询必然先返回 Pending：空 store 也要先发一次
+    /// 后台读才知道是 Miss。生产里 SavePlugin 的 Poll 系统每 tick 收结果；
+    /// 测试没有装那个插件，所以这里手动 poll，并把 tick 推进到块真的进容器。
+    ///
+    /// 旧测试假设「请求后一 tick 就生成」，接上 SaveStore 后不再成立（异步读
+    /// 至少多一 tick），这里统一处理，避免每个测试各写一遍轮询。
+    fn resolve_with_store(harness: &mut Harness, key: ChunkKey) {
+        for _ in 0..1000 {
+            harness.tick();
+            if harness.volume().contains_chunk(&key) {
+                return;
+            }
+            let store = harness.app.world().resource::<SaveStore>();
+            store.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("块 {key:?} 在 1000 次 tick 内没有装进容器");
     }
 
     /// 从磁盘读回该 body 的 region，再取出目标块的记录。
@@ -1811,7 +1925,7 @@ mod tests {
         attach_save_store(&mut harness, dir.path());
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
         assert!(harness.volume().contains_chunk(&key));
 
         harness.demote(key);
@@ -1870,7 +1984,7 @@ mod tests {
         ));
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
         harness.demote(key);
         harness.tick();
 
@@ -1924,7 +2038,7 @@ mod tests {
         attach_save_store(&mut harness, dir.path());
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
         let _ = harness.reached();
 
         harness.demote(key);
@@ -2088,7 +2202,7 @@ mod tests {
         attach_save_store(&mut harness, dir.path());
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
         assert!(harness.volume().contains_chunk(&key));
 
         harness.demote(key);
@@ -2138,7 +2252,7 @@ mod tests {
         attach_save_store(&mut harness, dir.path());
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
         let generated_after_load = harness.stats().generated;
 
         harness.demote(key);
@@ -2177,7 +2291,7 @@ mod tests {
         attach_save_store(&mut harness, dir.path());
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
 
         harness.demote(key);
         harness.tick();
@@ -2213,7 +2327,7 @@ mod tests {
         attach_save_store(&mut harness, dir.path());
 
         harness.upgrade(key);
-        harness.tick();
+        resolve_with_store(&mut harness, key);
 
         // 用目录占住 region 文件路径：后台写必然失败。
         let region = SavePaths::new(dir.path()).region(harness.body, key);
@@ -2404,5 +2518,153 @@ mod tests {
             harness.chunk_entities().is_empty(),
             "生成路径不得发 ChunkEntities"
         );
+    }
+
+    /// 版本不一致的存档内容必须被丢掉：重生成，不装旧块，也不补发实体。
+    ///
+    /// 这条测试盯的是「发布新地形」后的运行期路径：磁盘上还留着旧版本记录，
+    /// 若直接 install，旧地表会盖掉新生成器的结果。
+    #[test]
+    fn stale_record_is_regenerated_not_installed() {
+        let key = chunk_key(5, 0, 5);
+        // 注入内容与生成器产出必须可区分：实心块 vs 地形。
+        let (injected, injected_hash) = solid_bytes(200);
+        let (_, generated_hash) = generated_bytes(key);
+        let entities = vec![EntityRecord {
+            stable_entity_id: 7,
+            stable_type_id: 11,
+            payload: vec![1, 2, 3],
+        }];
+        let record = ChunkRecord {
+            // 当前 VoxelStreamConfig::generator_version 是 1，这里给 2。
+            generator_version: 2,
+            content: Some(injected),
+            proposals: Vec::new(),
+            entities,
+        };
+        let mut harness = harness(vec![Answer::Record(record)]);
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert_eq!(harness.stats().loaded_from_store, 0, "stale 记录不得计入命中");
+        assert_eq!(harness.stats().generated, 1, "必须走生成路径");
+        assert_eq!(harness.content_hash(&key), generated_hash, "块内容应是生成器产出");
+        assert_ne!(harness.content_hash(&key), injected_hash, "不得装上注入的旧内容");
+        assert!(
+            harness.chunk_entities().is_empty(),
+            "stale 分支不得发 ChunkEntities（实体已由启动读档恢复，重复发会二次 apply）"
+        );
+        assert_eq!(harness.reached().len(), 1, "块仍要正常完成");
+    }
+
+    /// 版本一致的记录行为不变：装块、计数、发实体。
+    #[test]
+    fn matching_record_is_installed() {
+        let key = chunk_key(6, 0, 6);
+        let (bytes, injected_hash) = solid_bytes(200);
+        let entities = vec![EntityRecord {
+            stable_entity_id: 7,
+            stable_type_id: 11,
+            payload: vec![1, 2, 3],
+        }];
+        let record = ChunkRecord {
+            generator_version: 1,
+            content: Some(bytes),
+            proposals: Vec::new(),
+            entities: entities.clone(),
+        };
+        let mut harness = harness(vec![Answer::Record(record)]);
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert_eq!(harness.stats().loaded_from_store, 1);
+        assert_eq!(harness.stats().generated, 0);
+        assert_eq!(harness.content_hash(&key), injected_hash, "应装存档内容");
+        let emitted = harness.chunk_entities();
+        assert_eq!(emitted.len(), 1, "版本一致时照旧发一条 ChunkEntities");
+        assert_eq!(emitted[0].body, harness.body);
+        assert_eq!(emitted[0].key, key);
+        assert_eq!(emitted[0].entities, entities);
+    }
+
+    /// 两者同时存在时，读路径以真实 SaveStore 为准，测试替身不许挡路。
+    ///
+    /// 走完整链路：写入真 store → flush 确认落盘（buffer 被清掉）→ 第一次
+    /// resolve 只能拿到 Pending 并发起后台读 → poll 等到 ready → 下一次
+    /// resolve 装磁盘内容。这样才真正验证「优先读 SaveStore」，而不是只验证
+    /// 内存缓冲。
+    #[test]
+    fn resolve_prefers_save_store_over_scripted_store() {
+        let root = TempDir::new("prefer-save-store");
+        let key = chunk_key(7, 0, 7);
+        let (scripted, scripted_hash) = solid_bytes(9);
+        let (real, real_hash) = solid_bytes(200);
+        assert_ne!(scripted_hash, real_hash, "两份内容必须不同才有判别力");
+
+        // 假存档给一个「明显不同」的答案；若读路径错误地用了它，哈希会对上。
+        let mut harness = harness(vec![Answer::Hit(Some(scripted))]);
+        attach_save_store(&mut harness, root.path());
+
+        // 写入真 store 并确认落盘。落盘后 apply_write 会清掉内存缓冲，之后
+        // 的 lookup 必须走后台读，正好覆盖生产里的「卸载后再请求」。
+        {
+            let store = harness.app.world().resource::<SaveStore>();
+            store
+                .write(
+                    harness.body,
+                    key,
+                    ChunkRecord {
+                        generator_version: 1,
+                        content: Some(real),
+                        proposals: Vec::new(),
+                        entities: Vec::new(),
+                    },
+                )
+                .expect("写入 SaveStore 缓冲");
+            store.flush();
+        }
+        flush_store(&harness);
+        {
+            let store = harness.app.world().resource::<SaveStore>();
+            assert!(
+                store.is_committed(harness.body, key, 1),
+                "前置条件：记录必须已确认落盘"
+            );
+            assert_eq!(store.stats().buffered, 0, "落盘后内存缓冲应已清空");
+        }
+
+        // 第一次 resolve：磁盘命中要等后台读，先 Pending。
+        harness.upgrade(key);
+        harness.tick();
+        assert_eq!(harness.stats().pending, 1, "首次查询应等后台读");
+        assert_eq!(harness.stats().loaded_from_store, 0);
+
+        // 轮询后台结果直到记录进入 ready（没有 SavePlugin 的 Poll 系统，手动推进）。
+        let ready = {
+            let store = harness.app.world().resource::<SaveStore>();
+            let mut ready = false;
+            for _ in 0..1000 {
+                store.poll();
+                if store.stats().ready_hits > 0 {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            ready
+        };
+        assert!(ready, "SaveStore 没有把磁盘记录读回 ready 队列");
+
+        // 第二次 resolve：从 ready 交付，装的是磁盘内容。
+        harness.tick();
+        assert_eq!(harness.stats().loaded_from_store, 1);
+        assert_eq!(harness.stats().generated, 0);
+        assert_eq!(harness.content_hash(&key), real_hash, "应装真 store 的内容");
+        assert_ne!(harness.content_hash(&key), scripted_hash, "假存档的答案不得被用");
+
+        let mut store = harness.app.world_mut().resource_mut::<SaveStore>();
+        store.shutdown_worker();
     }
 }
