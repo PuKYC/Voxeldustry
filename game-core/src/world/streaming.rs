@@ -99,11 +99,12 @@ use crate::voxel::stream::{VoxelStreamConfig, VoxelStreamPlugin};
 use crate::voxel::{
     FeaturePlugin, TreeFeature, WorldFeature, WorldFeatureAppExt, WorldFeatureRegistry,
 };
-use crate::voxel::terrain::{attach_terrain_body, TerrainStats};
+use crate::voxel::terrain::{attach_terrain_body, TerrainConfig, TerrainStats};
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
 use crate::world::load::load_world;
 use crate::world::save_plugin::{SaveRoot, WorldSaveConfig, WorldSavePlugin};
+use crate::world::seed::WorldSeed;
 use crate::world::IslandRegistry;
 
 /// 本地玩家作为流式观察者的参数。
@@ -247,6 +248,17 @@ fn bootstrap_streaming_world(world: &mut World) {
             Err(error) => {
                 error!("world: 读档失败，按新世界启动：{error}");
             }
+        }
+    }
+
+    // 新世界的种子取自 TerrainConfig.seed：Eager 模式用它生成地形，流式模式的
+    // 生成（stream.rs）、世界物体、存档 meta.seed 读的却是 WorldSeed，不同步的话
+    // 同一个配置在两种模式下会长出两个不同的世界，而 TerrainConfig.seed 被静默忽略。
+    // 读档路径已在上面 return，存档里的种子优先，绝不会被这里覆盖。
+    if let Some(seed) = world.get_resource::<TerrainConfig>().map(|config| config.seed) {
+        if world.resource::<WorldSeed>().0 != seed {
+            info!("world: 新世界种子 {seed:#x}（来自 TerrainConfig.seed）");
+            world.insert_resource(WorldSeed(seed));
         }
     }
 
@@ -580,6 +592,50 @@ mod tests {
             .resource_mut::<SaveStore>()
             .shutdown_worker();
         body
+    }
+
+    #[test]
+    fn streaming_boot_seeds_new_world_from_terrain_config() {
+        let mut app = terrain_app(Some(TerrainMode::Streaming), true);
+        app.insert_resource(TerrainConfig {
+            seed: 0x5EED,
+            ..TerrainConfig::default()
+        });
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<WorldSeed>().0,
+            0x5EED,
+            "新世界的种子必须来自 TerrainConfig.seed，否则流式生成与配置脱节"
+        );
+    }
+
+    #[test]
+    fn streaming_boot_keeps_saved_seed_over_config() {
+        let dir = TempDir::new("boot_seed");
+        // 第一 App 用默认 TerrainConfig.seed（0xC0FF_EE）落盘，meta.seed 记的就是它。
+        let saved_seed = terrain_app(Some(TerrainMode::Streaming), false)
+            .world()
+            .resource::<TerrainConfig>()
+            .seed;
+        boot_and_save_one_chunk(dir.path());
+
+        // 第二次启动故意换个配置种子：存档里的 seed 必须优先。
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        app.insert_resource(TerrainConfig {
+            seed: 0x1234,
+            ..TerrainConfig::default()
+        });
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<WorldSeed>().0,
+            saved_seed,
+            "读档时 WorldSeed 必须来自 world.meta，不能被 TerrainConfig.seed 覆盖"
+        );
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
     }
 
     #[test]
