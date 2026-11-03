@@ -96,12 +96,28 @@
 //! ## 顺序与确定性
 //!
 //! 队列是 [BTreeMap]：键序 = `(BodyKey, ChunkKey)` 升序，预算裁剪按同一顺序，
-//! 不依赖哈希/墙钟。`GenTable` 只承担调度轴（`enqueue` / `begin` /
-//! `finish` / `cancel` / `reset`）；内容态（`Determined`）留给提案/裁决管线，
-//! 本轮不写它。
+//! 不依赖哈希/墙钟。`GenTable` 的两条轴分工明确：调度轴（`enqueue` / `begin` /
+//! `finish` / `cancel` / `reset`）由流式系统维护；内容态（`Unloaded` /
+//! `Undetermined` / `Determined`）由 [advance_proposals] 与 [settle_chunks]
+//! 推进。[finish_chunk] 是所有「数据已进容器」路径的统一出口，它负责把内容态
+//! 定稿成 `Determined`。
+//!
+//! ## 两段流水线
+//!
+//! 生成不再「一 tick 一次到位」，而是按文档 §6/§7 分两段推进：
+//!
+//! 1. [advance_proposals]：只跑地形生成器 + 本块提案，把 `(基础地形树, 提案)`
+//!    压进 [StagedChunks]（树**还没**进 [VoxVolume]），内容态推到 `Undetermined`；
+//! 2. [settle_chunks]（下一次运行才消费，见 [StagedChunk::observed]）：26 邻提案门
+//!    → 全序裁决 → `realize` 落体素 → 装容器 → [finish_chunk] 推 `Determined`。
+//!
+//! 暂存的树不在容器里，所以降档时**直接丢弃**（见 [demote]），不走
+//! [PendingUnloads] 落盘——内容还没定稿，没有可落盘的东西（文档 §8）。
+//! `VoxTree` 没有 `Drop`：每条失败/丢弃路径都必须 [release_tree]。
 
 use std::collections::BTreeMap;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityIndex, StableIdAllocator};
@@ -112,7 +128,9 @@ use game_engine::save::{
     capture, export_chunk, EntityRecord, OpaqueComponents, PersistRegistry, SaveStore,
 };
 use game_engine::spatial::Size;
-use game_engine::streaming::{ChunkPersistence, ChunkRecord, GenState, GenTable, StoreLookup};
+use game_engine::streaming::{
+    ChunkPersistence, ChunkRecord, GenState, GenTable, ProposalRecord, StoreLookup,
+};
 use game_engine::voxel::{
     dec_ref_recursive, ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelInterner,
 };
@@ -124,6 +142,7 @@ use crate::voxel::terrain::generation::WorldGenerator;
 use crate::voxel::terrain::{
     unload_chunk, TerrainConfig, TerrainGeneratedBlocks, TerrainNeighborBlocks,
 };
+use crate::voxel::{arbitrate, realize_chunk, WorldFeatureRegistry};
 use crate::world::WorldSeed;
 
 /// 流式加载配置。
@@ -153,7 +172,7 @@ impl Default for VoxelStreamConfig {
     }
 }
 
-/// 流式加载统计（每 tick 由 [resolve_chunks] 刷新）。
+/// 流式加载统计（每 tick 由 [advance_proposals] / [settle_chunks] 刷新）。
 #[derive(Resource, Debug, Default, PartialEq, Eq)]
 pub struct StreamStats {
     /// 当前等待结算的区块数（[StreamWanted] 长度）。
@@ -162,8 +181,11 @@ pub struct StreamStats {
     pub pending: usize,
     /// 累计从存档装树的块数。
     pub loaded_from_store: u64,
-    /// 累计生成器产出的块数。
+    /// 累计生成器产出的块数（进 [StagedChunks] 的那些；存档命中不算）。
     pub generated: u64,
+    /// 累计把内容态推进到 `Undetermined` 的块数（[StagedChunks] 的累计入口数，
+    /// 卸载后重新暂存会再计一次）。
+    pub proposed: u64,
     /// 累计真正卸载的块数（重复降档消息不重复计数）。
     pub unloaded: u64,
     /// 当前还没落盘确认的待卸载块数（[PendingUnloads] 长度），
@@ -171,6 +193,9 @@ pub struct StreamStats {
     pub pending_unloads: usize,
     /// 当前存活的分组实体数（[RenderGroups] 的长度），每次增删后刷新。
     pub render_groups: usize,
+    /// 当前已算好提案、还没裁决进容器的块数（[StagedChunks] 长度），
+    /// 每次 [advance_proposals] / [settle_chunks] 跑完刷新。
+    pub staged: usize,
 }
 
 /// 即将卸载一个区块的**数据**（在**落盘确认之后、释放之前**发出）。
@@ -251,6 +276,45 @@ pub struct PendingUnloads(pub BTreeMap<(BodyKey, ChunkKey), PendingUnload>);
 #[derive(Resource, Debug, Default)]
 pub struct RenderGroups(pub BTreeMap<(BodyKey, ChunkKey), Entity>);
 
+/// 已算好提案、尚未裁决进容器的区块：基础地形树 + 本块提案。
+///
+/// 由 [advance_proposals] 写入，由 [settle_chunks] 取走并裁决。树在这里**还没**
+/// 进 [VoxVolume]，所以降档时直接丢弃（见 [demote]），不进 [PendingUnloads]、
+/// 也不落盘——内容还没定稿（文档 §8）。
+#[derive(Resource, Debug, Default)]
+pub struct StagedChunks(pub BTreeMap<(BodyKey, ChunkKey), StagedChunk>);
+
+/// 一个已暂存、待裁决的区块。
+pub struct StagedChunk {
+    /// 基础地形树（生成器产出，feature 还没写进来），尚未进 [VoxVolume]。
+    pub tree: VoxTree<u8>,
+    /// 已盖章、已排序的本块提案（[WorldFeatureRegistry::propose_chunk] 的结果）。
+    pub proposals: Vec<ProposalRecord>,
+    /// [settle_chunks] 是否已经「看见」过这个暂存块。第一次看见只置位、不裁决，
+    /// 下一次运行才真正结算：同一条 chain 里 advance 在前、settle 在后，若没有
+    /// 这一步，本 tick 刚暂存的块会被同 tick 立刻结算，`Undetermined` 这个中间态
+    /// 就永远观察不到，降档/取消也就没有可取消的窗口。
+    pub observed: bool,
+}
+
+impl std::fmt::Debug for StagedChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedChunk")
+            .field("proposals", &self.proposals.len())
+            .field("observed", &self.observed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 提案缓存：邻居门的输入。纯函数、可随时补算。
+///
+/// 键是 `(body, chunk)`，值是 [WorldFeatureRegistry::propose_chunk] 为该块产出的
+/// 提案（已按 `(feature_type, seq)` 排序，可直接当 union 的稳定顺序用）。
+/// [advance_proposals] 写自己的块，[settle_chunks] 现算 26 邻并补齐；降档与真正
+/// 卸载时清掉对应键。
+#[derive(Resource, Debug, Default)]
+pub struct ProposalCache(pub BTreeMap<(BodyKey, ChunkKey), Vec<ProposalRecord>>);
+
 /// Data 档流式加载插件。
 pub struct VoxelStreamPlugin;
 
@@ -271,6 +335,8 @@ impl Plugin for VoxelStreamPlugin {
             .init_resource::<TerrainNeighborBlocks>()
             .init_resource::<RenderGroups>()
             .init_resource::<PendingUnloads>()
+            .init_resource::<StagedChunks>()
+            .init_resource::<ProposalCache>()
             .add_message::<ChunkWillUnload>()
             .add_message::<ChunkEntities>()
             .add_systems(
@@ -279,12 +345,41 @@ impl Plugin for VoxelStreamPlugin {
                     intake_residency_changes,
                     persist_pending_unloads,
                     release_pending_unloads,
-                    resolve_chunks,
+                    advance_proposals,
+                    settle_chunks,
                 )
                     .chain()
                     .in_set(GameTickSet::Streaming),
             );
     }
+}
+
+/// 暂存侧资源的打包。
+///
+/// Bevy 0.19 的系统参数上限是 16 个，[advance_proposals] / [settle_chunks] 需要的
+/// 资源超过这个数，所以把总是成对出现的 [StagedChunks] / [ProposalCache] 折成
+/// 一个参数。
+#[derive(SystemParam)]
+pub struct Staging<'w> {
+    /// 已生成、待裁决的块。
+    pub staged: ResMut<'w, StagedChunks>,
+    /// 提案缓存（邻居门的输入）。
+    pub cache: ResMut<'w, ProposalCache>,
+}
+
+/// 世界侧的只读输入：种子、地形配置、feature 注册表。
+///
+/// 三者都是可选的：缺 [WorldSeed] 时生成路径报错并放弃请求；缺 [TerrainConfig]
+/// 用 [DEFAULT_BIOME]；缺 [WorldFeatureRegistry] 表示「世界里没有物体」，提案恒为
+/// 空——这也是本轮不注册任何具体 feature 的装配方式。
+#[derive(SystemParam)]
+pub struct WorldInputs<'w> {
+    /// 世界种子（区块内容与提案都从它派生）。
+    pub seed: Option<Res<'w, WorldSeed>>,
+    /// 地形配置（只有 `biome` 参与生成）。
+    pub terrain: Option<Res<'w, TerrainConfig>>,
+    /// 物体注册表；缺失 = 没有物体 = 提案为空、`realize` 跳过。
+    pub registry: Option<Res<'w, WorldFeatureRegistry>>,
 }
 
 /// 系统 1：把 [ResidencyChanged] 折成队列状态、渲染分组与真正的卸载。
@@ -304,6 +399,7 @@ pub fn intake_residency_changes(
     mut generated: ResMut<TerrainGeneratedBlocks>,
     mut neighbors: ResMut<TerrainNeighborBlocks>,
     mut groups: ResMut<RenderGroups>,
+    mut staging: Staging,
     mut stats: ResMut<StreamStats>,
 ) {
     for change in changes.read() {
@@ -333,6 +429,8 @@ pub fn intake_residency_changes(
                 &mut generated,
                 &mut neighbors,
                 &mut groups,
+                &mut staging.staged,
+                &mut staging.cache,
                 &mut stats,
             );
             continue;
@@ -393,11 +491,20 @@ pub fn intake_residency_changes(
             &mut stats,
         );
     }
+
+    stats.staged = staging.staged.0.len();
 }
 
-/// 系统 2：按队列键序结算，最多 [VoxelStreamConfig::max_resolve_per_tick] 个。
+/// 系统 4：把排队块推进到「未确定」——生成基础地形 + 本块提案，暂存起来。
+///
+/// 这一段**不**进容器、不发 [ChunkReached]、也不给 `wanted` 出队：块只是从
+/// 「什么都没有」变成「地形有了、提案盖章了」，内容态推进到
+/// [GenState::Undetermined]，真正的定稿留给下一次运行的 [settle_chunks]。
+///
+/// 存档命中且带整块内容的记录仍然一步到位（装块 → [finish_chunk] →
+/// `Determined`）：磁盘上的内容本来就是定稿，不必再走提案环。
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_chunks(
+pub fn advance_proposals(
     mut commands: Commands,
     config: Res<VoxelStreamConfig>,
     mut gen: ResMut<GenTable>,
@@ -408,17 +515,21 @@ pub fn resolve_chunks(
     mut allocator: Option<ResMut<StableIdAllocator>>,
     mut volumes: Query<&mut VoxVolume>,
     mut interner: ResMut<VoxelInterner>,
-    seed: Option<Res<WorldSeed>>,
-    terrain: Option<Res<TerrainConfig>>,
+    world: WorldInputs,
     mut reached: MessageWriter<ChunkReached>,
     mut entities_out: MessageWriter<ChunkEntities>,
     mut groups: ResMut<RenderGroups>,
+    mut staging: Staging,
     mut stats: ResMut<StreamStats>,
 ) {
     let budget = config.max_resolve_per_tick;
+    // 跳过已经暂存的块：它们的树与提案已在 [StagedChunks] 里，再生成一次只会
+    // 白烧一棵树、还会把 `observed` 重置成 false（`wanted` 要到 settle 才出队，
+    // 不跳过就永远结算不了）。
     let keys: Vec<((BodyKey, ChunkKey), Residency)> = wanted
         .0
         .iter()
+        .filter(|(pair, _)| !staging.staged.0.contains_key(pair))
         .take(budget)
         .map(|(pair, level)| (*pair, *level))
         .collect();
@@ -486,31 +597,16 @@ pub fn resolve_chunks(
                         "stream: 区块 {key:?} 存档版本 {} 与当前生成器版本 {} 不一致，重新生成",
                         record.generator_version, config.generator_version
                     );
-                    if generate_into(
+                    stage_chunk(
                         pair,
-                        &mut volume,
-                        &mut interner,
-                        seed.as_deref(),
-                        terrain.as_deref(),
                         &mut gen,
                         &mut wanted,
+                        &mut staging.staged,
+                        &mut staging.cache,
+                        &mut interner,
+                        &world,
                         &mut stats,
-                    ) {
-                        let raw = extract_block_raw(&volume, &interner, key, level);
-                        finish_chunk(
-                            pair,
-                            level,
-                            raw,
-                            &mut allocator,
-                            index.as_deref_mut(),
-                            &mut commands,
-                            &mut groups,
-                            &mut reached,
-                            &mut gen,
-                            &mut wanted,
-                            &mut stats,
-                        );
-                    }
+                    );
                     continue;
                 }
                 let ChunkRecord {
@@ -556,68 +652,255 @@ pub fn resolve_chunks(
                             }
                         }
                     }
-                    None => {
-                        if generate_into(
-                            pair,
-                            &mut volume,
-                            &mut interner,
-                            seed.as_deref(),
-                            terrain.as_deref(),
-                            &mut gen,
-                            &mut wanted,
-                            &mut stats,
-                        ) {
-                            let raw = extract_block_raw(&volume, &interner, key, level);
-                            finish_chunk(
-                                pair,
-                                level,
-                                raw,
-                                &mut allocator,
-                                index.as_deref_mut(),
-                                &mut commands,
-                                &mut groups,
-                                &mut reached,
-                                &mut gen,
-                                &mut wanted,
-                                &mut stats,
-                            );
-                        }
-                    }
-                }
-            }
-            StoreLookup::Miss => {
-                if generate_into(
-                    pair,
-                    &mut volume,
-                    &mut interner,
-                    seed.as_deref(),
-                    terrain.as_deref(),
-                    &mut gen,
-                    &mut wanted,
-                    &mut stats,
-                ) {
-                    let raw = extract_block_raw(&volume, &interner, key, level);
-                    finish_chunk(
+                    // 记录存在但没有整块内容（旧版本只写了实体 / 内容被清掉）：
+                    // 与 Miss 同样走生成 + 提案，不装空块。
+                    None => stage_chunk(
                         pair,
-                        level,
-                        raw,
-                        &mut allocator,
-                        index.as_deref_mut(),
-                        &mut commands,
-                        &mut groups,
-                        &mut reached,
                         &mut gen,
                         &mut wanted,
+                        &mut staging.staged,
+                        &mut staging.cache,
+                        &mut interner,
+                        &world,
                         &mut stats,
-                    );
+                    ),
                 }
             }
+            // 没有可用内容：本地生成基础地形 + 本块提案，压进暂存区。
+            // 内容态推到 `Undetermined`，容器与 `ChunkReached` 都不动。
+            StoreLookup::Miss => stage_chunk(
+                pair,
+                &mut gen,
+                &mut wanted,
+                &mut staging.staged,
+                &mut staging.cache,
+                &mut interner,
+                &world,
+                &mut stats,
+            ),
         }
     }
 
     stats.queued = wanted.0.len();
     stats.pending = pending;
+    stats.staged = staging.staged.0.len();
 }
+
+/// 系统 5：结算暂存块——26 邻提案门 → 全序裁决 → realize 落体素 → 装容器 → 定稿。
+///
+/// 只处理**上一次运行**就已经暂存的块（[StagedChunk::observed]）：同一条 chain
+/// 里 [advance_proposals] 在前、本系统在后，没有这一步的话，本 tick 刚暂存的块会
+/// 被同 tick 立刻结算，`Undetermined` 这个中间态就没人观察得到，降档/取消也就
+/// 没有可撤销的窗口。
+///
+/// 邻居门是「提案环」的惰性实现：提案是纯函数，现算即满足「所有可能与本块重叠
+/// 的提案都已存在」，本轮不排 tick 等待。
+#[allow(clippy::too_many_arguments)]
+pub fn settle_chunks(
+    mut commands: Commands,
+    config: Res<VoxelStreamConfig>,
+    mut gen: ResMut<GenTable>,
+    mut wanted: ResMut<StreamWanted>,
+    mut index: Option<ResMut<StableEntityIndex>>,
+    mut allocator: Option<ResMut<StableIdAllocator>>,
+    mut volumes: Query<&mut VoxVolume>,
+    mut interner: ResMut<VoxelInterner>,
+    world: WorldInputs,
+    mut groups: ResMut<RenderGroups>,
+    mut reached: MessageWriter<ChunkReached>,
+    mut staging: Staging,
+    mut stats: ResMut<StreamStats>,
+) {
+    let budget = config.max_resolve_per_tick;
+
+    // 先把所有暂存块标成「看见过」，再挑出上一次就已标记的来结算。
+    let mut ready: Vec<(BodyKey, ChunkKey)> = Vec::new();
+    for (pair, chunk) in staging.staged.0.iter_mut() {
+        if chunk.observed {
+            ready.push(*pair);
+        } else {
+            chunk.observed = true;
+        }
+    }
+    ready.truncate(budget);
+
+    'settle: for pair in ready {
+        let (body, key) = pair;
+        let Some(staged_chunk) = staging.staged.0.remove(&pair) else {
+            continue;
+        };
+        let StagedChunk {
+            tree, proposals, ..
+        } = staged_chunk;
+
+        let Some(entity) = body_entity(index.as_deref(), body) else {
+            error!("stream: body {body:?} 找不到实体，放弃区块 {key:?}");
+            fail_staged(
+                pair,
+                tree,
+                &mut interner,
+                &mut gen,
+                &mut wanted,
+                &mut staging,
+            );
+            continue 'settle;
+        };
+        let Ok(mut volume) = volumes.get_mut(entity) else {
+            error!("stream: 实体 {entity:?} 没有 VoxVolume，放弃区块 {key:?}");
+            fail_staged(
+                pair,
+                tree,
+                &mut interner,
+                &mut gen,
+                &mut wanted,
+                &mut staging,
+            );
+            continue 'settle;
+        };
+
+        // 邻居门：26 个邻块，逐轴 -1/0/+1，(0,0,0) 跳过，按邻键升序拼。
+        let mut neighbours: Vec<ChunkKey> = Vec::with_capacity(26);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    neighbours.push(ChunkKey::new(key.x + dx, key.y + dy, key.z + dz));
+                }
+            }
+        }
+        neighbours.sort();
+
+        let mut union = proposals;
+        for neighbour in neighbours {
+            let neighbour_pair = (body, neighbour);
+            if !staging.cache.0.contains_key(&neighbour_pair) {
+                let computed = match (world.registry.as_deref(), world.seed.as_deref()) {
+                    (Some(registry), Some(seed)) => {
+                        match registry.propose_chunk(seed.0, neighbour) {
+                            Ok(computed) => computed,
+                            Err(error) => {
+                                error!(
+                                    "stream: 邻块 {neighbour:?} 提案失败，放弃区块 {key:?}：{error}"
+                                );
+                                fail_staged(
+                                    pair,
+                                    tree,
+                                    &mut interner,
+                                    &mut gen,
+                                    &mut wanted,
+                                    &mut staging,
+                                );
+                                continue 'settle;
+                            }
+                        }
+                    }
+                    // 有注册表却没有种子：提案不可复现，按错误放弃。
+                    (Some(_), None) => {
+                        error!("stream: WorldSeed 资源缺失，算不出邻块 {neighbour:?} 的提案");
+                        fail_staged(
+                            pair,
+                            tree,
+                            &mut interner,
+                            &mut gen,
+                            &mut wanted,
+                            &mut staging,
+                        );
+                        continue 'settle;
+                    }
+                    // 没有注册表 = 没有物体：邻块提案是空，
+                    // cache 里也记成空，省掉后续重复判断。
+                    (None, _) => Vec::new(),
+                };
+                staging.cache.0.insert(neighbour_pair, computed);
+            }
+            if let Some(cached) = staging.cache.0.get(&neighbour_pair) {
+                union.extend(cached.iter().copied());
+            }
+        }
+
+        let winners = arbitrate(&union);
+
+        // 没有注册表 = 没有物体：winners 必为空，realize 直接跳过。
+        let mut tree = tree;
+        if let Some(registry) = world.registry.as_deref() {
+            let Some(seed) = world.seed.as_deref() else {
+                error!("stream: WorldSeed 资源缺失，无法 realize 区块 {key:?}");
+                fail_staged(
+                    pair,
+                    tree,
+                    &mut interner,
+                    &mut gen,
+                    &mut wanted,
+                    &mut staging,
+                );
+                continue 'settle;
+            };
+            if let Err(error) = realize_chunk(
+                registry,
+                seed.0,
+                key,
+                &winners,
+                &mut tree,
+                interner.inner_mut(),
+            ) {
+                error!("stream: 区块 {key:?} realize 失败，放弃：{error}");
+                fail_staged(
+                    pair,
+                    tree,
+                    &mut interner,
+                    &mut gen,
+                    &mut wanted,
+                    &mut staging,
+                );
+                continue 'settle;
+            }
+        }
+
+        // 装容器：防御式先取旧树（insert_chunk 覆盖会 debug_assert!）。
+        let old = volume.take_chunk_raw(&key);
+        volume.insert_chunk(key, tree);
+        release_tree(&mut interner, old);
+
+        let level = wanted.0.get(&pair).copied().unwrap_or(Residency::Data);
+        let raw = extract_block_raw(&volume, &interner, key, level);
+        finish_chunk(
+            pair,
+            level,
+            raw,
+            &mut allocator,
+            index.as_deref_mut(),
+            &mut commands,
+            &mut groups,
+            &mut reached,
+            &mut gen,
+            &mut wanted,
+            &mut stats,
+        );
+    }
+
+    stats.queued = wanted.0.len();
+    stats.staged = staging.staged.0.len();
+}
+
+/// 结算失败的统一出口：清缓存、释放暂存树、放弃请求。
+///
+/// `VoxTree` 没有 `Drop`，所有「暂存块不能落地」的路径都必须走这里，
+/// 否则每失败一次就泄漏一棵树的节点。
+fn fail_staged(
+    pair: (BodyKey, ChunkKey),
+    tree: VoxTree<u8>,
+    interner: &mut VoxelInterner,
+    gen: &mut GenTable,
+    wanted: &mut StreamWanted,
+    staging: &mut Staging,
+) {
+    staging.cache.0.remove(&pair);
+    release_tree(interner, Some(tree));
+    drop_request(gen, wanted, pair);
+}
+
 /// 降档处理：先按需清理渲染档，再把数据卸载**登记**进 [PendingUnloads]。
 ///
 /// **重复消息不二次释放的判据**：第一次降档会把队列项移除、把
@@ -645,6 +928,8 @@ fn demote(
     generated: &mut TerrainGeneratedBlocks,
     neighbors: &mut TerrainNeighborBlocks,
     groups: &mut RenderGroups,
+    staged: &mut StagedChunks,
+    cache: &mut ProposalCache,
     stats: &mut StreamStats,
 ) {
     let (body, key) = pair;
@@ -668,6 +953,16 @@ fn demote(
         }
         return;
     }
+
+    // 暂存块还没进容器、内容也没定稿：直接丢弃，**不**进 [PendingUnloads]、
+    // 不落盘（文档 §8：降档时半成品不能进容器）。
+    if let Some(chunk) = staged.0.remove(&pair) {
+        release_tree(interner, Some(chunk.tree));
+        cache.0.remove(&pair);
+        drop_request(gen, wanted, pair);
+        return;
+    }
+    cache.0.remove(&pair);
 
     let removed = wanted.0.remove(&pair).is_some();
     let entity = body_entity(index.as_deref(), body);
@@ -875,6 +1170,19 @@ pub fn release_pending_unloads(world: &mut World) {
 
 /// 释放单个已登记卸载的区块（exclusive 版本，语义与旧 demote 收尾一致）。
 fn release_unloaded_chunk(world: &mut World, body: BodyKey, key: ChunkKey, from: Residency) {
+    // 防御：暂存块在 demote 时已经丢弃，这里再清一次，避免异常路径残留树。
+    let pair = (body, key);
+    let orphan = world
+        .get_resource_mut::<StagedChunks>()
+        .and_then(|mut staged| staged.0.remove(&pair));
+    if let Some(chunk) = orphan {
+        let mut interner = world.resource_mut::<VoxelInterner>();
+        release_tree(&mut interner, Some(chunk.tree));
+    }
+    if let Some(mut cache) = world.get_resource_mut::<ProposalCache>() {
+        cache.0.remove(&pair);
+    }
+
     let entity = body_entity(world.get_resource::<StableEntityIndex>(), body);
     let freed = release_chunk_from_volume(world, entity, key);
     if !freed {
@@ -939,33 +1247,66 @@ fn release_chunk_from_volume(world: &mut World, entity: Option<Entity>, key: Chu
     })
 }
 
-/// 真正跑生成器并把树装进容器（旧树释放引用），返回是否装好。
+/// 生成基础地形 + 本块提案，压进暂存区，并把内容态推到 `Undetermined`。
 ///
-/// 完成消息与渲染分组由调用方统一走 [finish_chunk]，这里只负责数据。
+/// 树**不进**容器（那是 [settle_chunks] 的事），也不发 [ChunkReached]。失败
+///（缺 [WorldSeed]、提案出错）时立刻 [release_tree] + [drop_request]：`VoxTree`
+/// 没有 `Drop`，漏一条路径就是泄漏节点。
 #[allow(clippy::too_many_arguments)]
-fn generate_into(
+fn stage_chunk(
     pair: (BodyKey, ChunkKey),
-    volume: &mut VoxVolume,
-    interner: &mut VoxelInterner,
-    seed: Option<&WorldSeed>,
-    terrain: Option<&TerrainConfig>,
     gen: &mut GenTable,
     wanted: &mut StreamWanted,
+    staged: &mut StagedChunks,
+    cache: &mut ProposalCache,
+    interner: &mut VoxelInterner,
+    world: &WorldInputs,
     stats: &mut StreamStats,
-) -> bool {
-    let (_, key) = pair;
-    let Some(seed) = seed else {
+) {
+    let (body, key) = pair;
+    let Some(seed) = world.seed.as_deref() else {
         // 没有种子就没有确定性世界：移除而不是无限重试。
         error!("stream: WorldSeed 资源缺失，无法生成区块 {key:?}");
         drop_request(gen, wanted, pair);
-        return false;
+        return;
     };
-    let biome = terrain.map_or(DEFAULT_BIOME, |config| config.biome);
+    let biome = world
+        .terrain
+        .as_deref()
+        .map_or(DEFAULT_BIOME, |config| config.biome);
     let tree = WorldGenerator::new(*seed, biome).generate_chunk(interner.inner_mut(), key);
-    let old = volume.insert_chunk(key, tree);
-    release_tree(interner, old);
     stats.generated += 1;
-    true
+
+    let proposals = match world.registry.as_deref() {
+        Some(registry) => match registry.propose_chunk(seed.0, key) {
+            Ok(proposals) => proposals,
+            Err(error) => {
+                error!("stream: 区块 {key:?} 提案失败，放弃：{error}");
+                release_tree(interner, Some(tree));
+                drop_request(gen, wanted, pair);
+                return;
+            }
+        },
+        // 没有注册表 = 世界里没有物体 = 提案为空（本轮就是这种装配）。
+        None => Vec::new(),
+    };
+    // 缓存是邻居门的输入：先写自己的，等 settle 现算 26 邻时再补齐邻键。
+    cache.0.insert(pair, proposals.clone());
+    staged.0.insert(
+        pair,
+        StagedChunk {
+            tree,
+            proposals,
+            observed: false,
+        },
+    );
+    if let Err(error) = gen.advance(pair, GenState::Undetermined) {
+        debug!("stream: advance({body:?}, {key:?}) 被拒绝：{error:?}");
+    }
+    // 调度态收敛回 Idle：真正的工作已经做完，别让后续系统看到一个没关的 Running。
+    let _ = gen.begin(pair);
+    let _ = gen.finish(pair);
+    stats.proposed += 1;
 }
 
 /// Data 档的**统一出口**：先发 `ChunkReached{Data}`，目标档是 Render 时
@@ -1119,13 +1460,19 @@ fn refresh_render_groups(groups: &RenderGroups, stats: &mut StreamStats) {
 fn voxel_size_f32() -> f32 {
     DEFAULT_VOXEL_SIZE.to_num::<f32>()
 }
-/// 把 `GenTable` 从任意工作态干净地结算回 `Idle`。
+/// 把 `GenTable` 从任意工作态干净地结算回 `Idle`，并把内容态**定稿**。
 ///
 /// `finish` 只接受 `Running`，所以固定先 `begin` 再 `finish`；
 /// 两个结果都容忍（`Idle` / `Running` 都能收敛）。
+///
+/// 内容态在这里推进到 [GenState::Determined]：所有「数据已进容器」的路径都从
+/// [finish_chunk] 出去，所以这是内容定稿的唯一出口。`Unloaded -> Determined`
+/// 与 `Undetermined -> Determined` 都是文档允许的跳级；已经是 `Determined`
+/// 时 `advance` 返回 `Ok(false)`，忽略即可。
 fn settle(gen: &mut GenTable, pair: (BodyKey, ChunkKey)) {
     let _ = gen.begin(pair);
     let _ = gen.finish(pair);
+    let _ = gen.advance(pair, GenState::Determined);
 }
 
 /// 放弃一个请求：取消 → 复位调度态 → 出队（失败路径统一走这里，不重试）。
@@ -1165,12 +1512,13 @@ mod tests {
     };
     use game_engine::streaming::{ChunkRecord, ChunkStore, StoreLookup};
     use game_engine::voxel::{
-        chunk_content_hash, chunk_key, MaxDepth, VoxOpsBulkWrite, CHUNK_DEPTH,
+        chunk_content_hash, chunk_key, MaxDepth, VoxOpsBulkWrite, VoxOpsRead, CHUNK_DEPTH,
     };
     use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
+    use crate::voxel::{ChunkSink, ProposalSpec, WorldFeature};
 
     /// 测试世界种子：与 `WorldSeed` 资源、`generated_bytes` 保持一致。
     const SEED: u64 = 0x00C0_FFEE;
@@ -1294,6 +1642,12 @@ mod tests {
     impl Harness {
         fn tick(&mut self) {
             self.app.world_mut().run_schedule(FixedUpdate);
+        }
+
+        /// 跑两个 tick：第一个只推进（提案 + 暂存），第二个才裁决落体。
+        fn settle_all(&mut self) {
+            self.tick();
+            self.tick();
         }
 
         fn upgrade(&mut self, key: ChunkKey) {
@@ -1543,10 +1897,10 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
 
         let reached = harness.reached();
-        assert_eq!(reached.len(), 1);
+        assert_eq!(reached.len(), 1, "两段流水线只允许一条到达消息");
         assert_eq!(reached[0].key, key);
         assert_eq!(reached[0].level, Residency::Data);
         // 与直接调用生成器的哈希逐位一致：走的是同一条确定性生成路径。
@@ -1680,15 +2034,24 @@ mod tests {
         harness.upgrade(first);
         harness.upgrade(second);
         harness.upgrade(third);
+
+        // 预算同时管推进与结算：第一个 tick 只能暂存一个块，结算从下一 tick 开始。
+        harness.tick();
+        assert!(harness.reached().is_empty(), "第一 tick 只提议案，不落体");
+        assert_eq!(harness.stats().proposed, 1, "推进预算按块计");
+        assert_eq!(harness.stats().staged, 1);
+
         for expected in [first, second, third] {
             harness.tick();
             let reached = harness.reached();
-            assert_eq!(reached.len(), 1, "每 tick 恰好推进一个块");
+            assert_eq!(reached.len(), 1, "每 tick 恰好结算一个块");
             assert_eq!(reached[0].key, expected, "按队列键序结算");
         }
 
         assert_eq!(harness.stats().queued, 0);
         assert_eq!(harness.stats().generated, 3);
+        assert_eq!(harness.stats().proposed, 3);
+        assert_eq!(harness.stats().staged, 0);
         assert!(harness.volume().contains_chunk(&first));
         assert!(harness.volume().contains_chunk(&second));
         assert!(harness.volume().contains_chunk(&third));
@@ -1701,7 +2064,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
         let first_hash = harness.content_hash(&key);
         assert_eq!(first_hash, expected);
 
@@ -1710,7 +2073,7 @@ mod tests {
         assert!(!harness.volume().contains_chunk(&key));
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
         assert_eq!(harness.content_hash(&key), first_hash);
         assert_eq!(harness.stats().generated, 2);
         assert_eq!(harness.stats().unloaded, 1);
@@ -1827,7 +2190,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
 
         assert_eq!(
             harness.reached(),
@@ -1851,7 +2214,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade_to_render(key);
-        harness.tick();
+        harness.settle_all();
         assert_eq!(harness.group_entities().len(), 1);
         assert_eq!(harness.render_messages().len(), 1);
 
@@ -1878,7 +2241,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade_to_render(key);
-        harness.tick();
+        harness.settle_all();
         let entities = harness.group_entities();
         assert_eq!(entities.len(), 1);
         let _ = harness.reached();
@@ -1907,7 +2270,7 @@ mod tests {
         let baseline = harness.alive_nodes();
 
         harness.upgrade_to_render(key);
-        harness.tick();
+        harness.settle_all();
         assert!(
             harness.alive_nodes() > baseline,
             "Render 档必须真的装进体素树"
@@ -1937,7 +2300,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade_to_render(key);
-        harness.tick();
+        harness.settle_all();
         let first_entity = harness.group_entities()[0];
         let first = harness
             .group_payload(first_entity)
@@ -1952,7 +2315,7 @@ mod tests {
         assert!(harness.group_entities().is_empty());
 
         harness.upgrade_to_render(key);
-        harness.tick();
+        harness.settle_all();
         let entities = harness.group_entities();
         assert_eq!(entities.len(), 1, "重新到达 Render 必须重建分组实体");
         let second = harness
@@ -2103,7 +2466,7 @@ mod tests {
         let baseline = harness.alive_nodes();
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
         assert!(harness.alive_nodes() > baseline, "请求必须先真的装进体素树");
 
         harness.demote(key);
@@ -2620,7 +2983,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Miss]);
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
 
         assert!(harness.volume().contains_chunk(&key));
         assert_eq!(harness.stats().generated, 1);
@@ -2655,7 +3018,7 @@ mod tests {
         let mut harness = harness(vec![Answer::Record(record)]);
 
         harness.upgrade(key);
-        harness.tick();
+        harness.settle_all();
 
         assert_eq!(
             harness.stats().loaded_from_store,
@@ -2792,5 +3155,326 @@ mod tests {
 
         let mut store = harness.app.world_mut().resource_mut::<SaveStore>();
         store.shutdown_worker();
+    }
+
+    // ---- 两段流水线：提案 → 邻门 → 裁决 → realise ----
+
+    /// 区块的体素原点（测试只覆盖小坐标，不会溢出）。
+    fn chunk_origin(key: ChunkKey) -> [i32; 3] {
+        let extent = game_engine::voxel::chunk_voxels_per_axis();
+        [key.x * extent, key.y * extent, key.z * extent]
+    }
+
+    /// 在标准 harness 上装一个世界物体注册表。
+    fn harness_with_registry(answers: Vec<Answer>, registry: WorldFeatureRegistry) -> Harness {
+        let mut harness = harness(answers);
+        harness.app.insert_resource(registry);
+        harness
+    }
+
+    const TREE_BLOCK: u8 = 7;
+    const CROSS_BLOCK: u8 = 9;
+
+    /// 测试物体：每个区块原点附近长一根 1×3×1 的柱子。
+    #[derive(Default)]
+    struct TreeFeature;
+
+    impl WorldFeature for TreeFeature {
+        const TYPE_ID: u16 = 7;
+
+        fn propose(&self, _seed: u64, owner: ChunkKey) -> Vec<ProposalSpec> {
+            let base = chunk_origin(owner);
+            vec![ProposalSpec {
+                origin: [base[0] + 8, base[1] + 8, base[2] + 8],
+                bounds_min: [base[0] + 8, base[1] + 8, base[2] + 8],
+                bounds_max: [base[0] + 9, base[1] + 11, base[2] + 9],
+                priority: 0,
+            }]
+        }
+
+        fn realize(&self, _seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>) {
+            for y in proposal.bounds_min[1]..proposal.bounds_max[1] {
+                sink.set_world([proposal.origin[0], y, proposal.origin[2]], TREE_BLOCK);
+            }
+        }
+    }
+
+    /// 测试物体：只在 (0,0,0) 里提出一条跨到 +x 邻块的提案。
+    #[derive(Default)]
+    struct CrossFeature;
+
+    impl WorldFeature for CrossFeature {
+        const TYPE_ID: u16 = 8;
+
+        fn propose(&self, _seed: u64, owner: ChunkKey) -> Vec<ProposalSpec> {
+            if owner != chunk_key(0, 0, 0) {
+                return Vec::new();
+            }
+            vec![ProposalSpec {
+                origin: [30, 0, 0],
+                bounds_min: [30, 0, 0],
+                bounds_max: [34, 3, 1],
+                priority: 0,
+            }]
+        }
+
+        fn realize(&self, _seed: u64, proposal: &ProposalRecord, sink: &mut ChunkSink<'_>) {
+            for x in proposal.bounds_min[0]..proposal.bounds_max[0] {
+                for y in proposal.bounds_min[1]..proposal.bounds_max[1] {
+                    for z in proposal.bounds_min[2]..proposal.bounds_max[2] {
+                        sink.set_world([x, y, z], CROSS_BLOCK);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn miss_stages_then_settles_in_two_ticks() {
+        let key = chunk_key(9, 0, 2);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert_eq!(harness.stats().proposed, 1, "第一 tick 只提案");
+        assert_eq!(harness.stats().staged, 1);
+        assert!(!harness.volume().contains_chunk(&key), "暂存块不得进容器");
+        assert!(harness.reached().is_empty(), "暂存块不得发到达消息");
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .resource::<GenTable>()
+                .gen_state((harness.body, key)),
+            GenState::Undetermined
+        );
+        assert!(harness
+            .app
+            .world()
+            .resource::<StagedChunks>()
+            .0
+            .contains_key(&(harness.body, key)));
+
+        harness.tick();
+
+        assert_eq!(harness.stats().staged, 0);
+        assert!(harness.volume().contains_chunk(&key));
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .resource::<GenTable>()
+                .gen_state((harness.body, key)),
+            GenState::Determined
+        );
+        assert_eq!(
+            harness.reached(),
+            vec![ChunkReached {
+                body: harness.body,
+                key,
+                level: Residency::Data,
+            }]
+        );
+    }
+
+    #[test]
+    fn feature_is_realized_into_settled_chunk() {
+        let key = chunk_key(11, 0, 3);
+        let mut registry = WorldFeatureRegistry::default();
+        registry.register::<TreeFeature>().expect("注册测试物体");
+        let mut harness = harness_with_registry(vec![Answer::Miss], registry);
+
+        harness.upgrade(key);
+        harness.settle_all();
+
+        let world = harness.app.world();
+        let interner = world.resource::<VoxelInterner>();
+        let volume = world
+            .entity(harness.entity)
+            .get::<VoxVolume>()
+            .expect("body 必须带容器");
+        let tree = volume.get_chunk(&key).expect("块必须已装进容器");
+        for y in 8..11 {
+            assert_eq!(
+                tree.get(interner.inner(), IVec3::new(8, y, 8)),
+                Some(TREE_BLOCK),
+                "裁决后的 realise 必须把 feature 的体素写进树"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_chunk_feature_writes_both_sides() {
+        let left = chunk_key(0, 0, 0);
+        let right = chunk_key(1, 0, 0);
+        let mut registry = WorldFeatureRegistry::default();
+        registry.register::<CrossFeature>().expect("注册跨块物体");
+        let mut harness = harness_with_registry(vec![Answer::Miss], registry);
+
+        harness.upgrade(left);
+        harness.upgrade(right);
+        harness.settle_all();
+
+        assert!(harness.volume().contains_chunk(&left));
+        assert!(harness.volume().contains_chunk(&right));
+
+        let world = harness.app.world();
+        let interner = world.resource::<VoxelInterner>();
+        let volume = world
+            .entity(harness.entity)
+            .get::<VoxVolume>()
+            .expect("body 必须带容器");
+        let left_tree = volume.get_chunk(&left).expect("左块必须在容器里");
+        let right_tree = volume.get_chunk(&right).expect("右块必须在容器里");
+
+        for (x, y, z) in [(30, 0, 0), (30, 1, 0), (31, 2, 0)] {
+            assert_eq!(
+                left_tree.get(interner.inner(), IVec3::new(x, y, z)),
+                Some(CROSS_BLOCK),
+                "左块必须写上自己那一段"
+            );
+        }
+        for (x, y, z) in [(0, 0, 0), (0, 1, 0), (1, 2, 0)] {
+            assert_eq!(
+                right_tree.get(interner.inner(), IVec3::new(x, y, z)),
+                Some(CROSS_BLOCK),
+                "右块必须写上自己那一段（世界坐标减去本块原点）"
+            );
+        }
+        assert_ne!(
+            left_tree.get(interner.inner(), IVec3::new(0, 0, 0)),
+            Some(CROSS_BLOCK),
+            "左块不该出现邻块那段"
+        );
+        assert_ne!(
+            right_tree.get(interner.inner(), IVec3::new(30, 0, 0)),
+            Some(CROSS_BLOCK),
+            "右块不该出现左块那段"
+        );
+    }
+
+    #[test]
+    fn neighbour_proposals_are_computed_on_demand() {
+        let key = chunk_key(12, 0, 3);
+        let mut registry = WorldFeatureRegistry::default();
+        registry.register::<TreeFeature>().expect("注册测试物体");
+        let mut harness = harness_with_registry(vec![Answer::Miss], registry);
+
+        harness.upgrade(key);
+        harness.settle_all();
+
+        let mut neighbours = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    neighbours.push(chunk_key(key.x + dx, key.y + dy, key.z + dz));
+                }
+            }
+        }
+
+        let body = harness.body;
+        let world = harness.app.world();
+        let registry = world.resource::<WorldFeatureRegistry>();
+        let cache = world.resource::<ProposalCache>();
+        for neighbour in &neighbours {
+            let expected = registry
+                .propose_chunk(SEED, *neighbour)
+                .expect("邻块提案必须可算");
+            assert_eq!(
+                cache.0.get(&(body, *neighbour)),
+                Some(&expected),
+                "邻块 {neighbour:?} 的提案必须按需补齐"
+            );
+        }
+        assert_eq!(cache.0.len(), 27, "自身 + 26 邻");
+    }
+
+    #[test]
+    fn unload_before_settle_releases_staged_tree() {
+        let key = chunk_key(13, 0, 3);
+        let mut harness = harness(vec![Answer::Miss]);
+        let baseline = harness.alive_nodes();
+
+        harness.upgrade(key);
+        harness.tick();
+        assert_eq!(harness.stats().staged, 1);
+        assert!(harness.alive_nodes() > baseline, "暂存树必须先真的生成出来");
+
+        harness.demote(key);
+        harness.tick();
+
+        let pair = (harness.body, key);
+        assert!(
+            harness.app.world().resource::<StagedChunks>().0.is_empty(),
+            "降档必须丢弃暂存块"
+        );
+        assert!(harness
+            .app
+            .world()
+            .resource::<ProposalCache>()
+            .0
+            .get(&pair)
+            .is_none());
+        assert_eq!(
+            harness.alive_nodes(),
+            baseline,
+            "暂存树必须被释放，不能泄漏节点"
+        );
+        assert!(
+            harness.will_unload().is_empty(),
+            "未定稿的块不走落盘/卸载消息"
+        );
+        assert!(!harness.volume().contains_chunk(&key));
+    }
+
+    #[test]
+    fn store_hit_still_settles_without_propose() {
+        let dir = TempDir::new("store-hit-settles");
+        let key = chunk_key(21, 0, 21);
+        let (bytes, expected) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Miss]);
+        attach_save_store(&mut harness, dir.path());
+
+        // 预写一条 content=Some 的记录并留在写缓冲里：lookup 会同步命中它。
+        {
+            let store = harness.app.world().resource::<SaveStore>();
+            store
+                .write(
+                    harness.body,
+                    key,
+                    ChunkRecord {
+                        generator_version: 1,
+                        content: Some(bytes),
+                        proposals: Vec::new(),
+                        entities: Vec::new(),
+                    },
+                )
+                .expect("写入 SaveStore 写缓冲");
+        }
+
+        harness.upgrade(key);
+        harness.tick();
+
+        assert!(
+            harness.volume().contains_chunk(&key),
+            "命中存档必须一 tick 装块"
+        );
+        assert_eq!(harness.content_hash(&key), expected);
+        assert_eq!(harness.stats().loaded_from_store, 1);
+        assert_eq!(harness.stats().proposed, 0, "命中存档不得走提案路径");
+        assert_eq!(harness.stats().generated, 0);
+        assert_eq!(harness.stats().staged, 0);
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .resource::<GenTable>()
+                .gen_state((harness.body, key)),
+            GenState::Determined
+        );
     }
 }

@@ -182,7 +182,10 @@ impl<F: WorldFeature> ErasedFeature for F {
 ///
 /// 键是 [`WorldFeature::TYPE_ID`]，遍历顺序只由 ID 升序决定：Mod 加载顺序、
 /// 注册顺序都不影响结果。
-#[derive(Default)]
+///
+/// 作为 Bevy 资源插入世界（`insert_resource(WorldFeatureRegistry::default())`）：
+/// 没有它时流式层把「世界里没有物体」处理成提案恒为空。
+#[derive(Default, bevy::prelude::Resource)]
 pub struct WorldFeatureRegistry {
     features: BTreeMap<u16, Box<dyn ErasedFeature>>,
 }
