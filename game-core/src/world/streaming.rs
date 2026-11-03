@@ -74,6 +74,13 @@
 //! [ChunkAnchor] 由 [Observer] 的 `#[require(ChunkAnchor)]` 自动补，本插件
 //! 不手写锚点。`IslandRegistry` 不是恰好一个岛时每个玩家只 warn 一次并
 //! 跳过，避免把玩家锚到错误的体上。
+//!
+//! ## 世界物体（feature）
+//!
+//! 本插件补装 [FeaturePlugin]（判重）并注册 [TreeFeature]。注册前用
+//! [WorldFeatureRegistry::contains] 判重：`register_world_feature` 撞同一
+//! TYPE_ID 会 panic，而树是「世界的默认内容」，重复装配属于调用方错误。
+//! 也可由上层先装 FeaturePlugin 并注册自己的物体，本插件只补默认那一棵。
 
 use std::collections::BTreeSet;
 
@@ -89,6 +96,9 @@ use crate::input::control::LocalPlayer;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
 use crate::voxel::stream::{VoxelStreamConfig, VoxelStreamPlugin};
+use crate::voxel::{
+    FeaturePlugin, TreeFeature, WorldFeature, WorldFeatureAppExt, WorldFeatureRegistry,
+};
 use crate::voxel::terrain::{attach_terrain_body, TerrainStats};
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
@@ -139,6 +149,20 @@ impl Plugin for StreamingWorldPlugin {
         app.add_plugins(ResidencyPlugin::default());
         app.add_plugins(VoxelStreamPlugin);
         app.add_plugins(WorldChunkPlugin);
+
+        // 世界物体：先补插件（判重，重复添加只是再 init 一次资源也无害），
+        // 再按 TYPE_ID 判重后注册默认的树。上层若已注册同 ID 的自定义物体，
+        // 这里不会撞 panic。
+        if !app.is_plugin_added::<FeaturePlugin>() {
+            app.add_plugins(FeaturePlugin);
+        }
+        if !app
+            .world()
+            .resource::<WorldFeatureRegistry>()
+            .contains(TreeFeature::TYPE_ID)
+        {
+            app.register_world_feature::<TreeFeature>();
+        }
 
         configure_tick_sets(app);
 
@@ -729,6 +753,31 @@ mod tests {
             StoreLookup::Miss,
             "默认 ChunkPersistence 必须是 Miss"
         );
+
+        // 世界物体：默认注册了那棵树，注册表必须带它的 TYPE_ID。
+        let features = world.resource::<WorldFeatureRegistry>();
+        assert!(
+            features.contains(TreeFeature::TYPE_ID),
+            "StreamingWorldPlugin 应注册默认的 TreeFeature"
+        );
+        assert_eq!(features.len(), 1, "默认只注册树一个世界物体");
+    }
+
+    #[test]
+    fn streaming_world_plugin_does_not_reregister_tree() {
+        // 上层先装 FeaturePlugin 并注册树，本插件再加一次不能 panic
+        // （register_world_feature 撞 TYPE_ID 会 panic，所以必须先判重）。
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(StableIdPlugin);
+        app.add_plugins(GameVoxelPlugin);
+        app.add_plugins(FeaturePlugin);
+        app.register_world_feature::<TreeFeature>();
+        app.add_plugins(StreamingWorldPlugin);
+
+        let features = app.world().resource::<WorldFeatureRegistry>();
+        assert_eq!(features.len(), 1);
+        assert!(features.contains(TreeFeature::TYPE_ID));
     }
 
     #[test]
