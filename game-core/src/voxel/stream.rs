@@ -34,6 +34,9 @@
 //!
 //! 卸载拆成**同 tick 顺序执行**的三段，保证数据**确认**写出去之后才释放：
 //!
+//! 0. [report_memory_pressure]：把 [VoxInterner](game_engine::voxel::VoxelInterner)
+//!    的 `alive_nodes` / `capacity` 覆盖写进 [MemoryPressure]，供驻留层判断
+//!    是否扣下升级（本插件只写、不读）。放在链首，同 tick 的后续系统看到最新值。
 //! 1. [intake_residency_changes]：消费 [ResidencyChanged]。
 //!    - 升档：先撤销同 pair 的 [PendingUnloads] 登记（复活；树还在容器里，
 //!      绝不释放、绝不再发卸载消息），再 `GenTable::enqueue` + 记入
@@ -123,7 +126,9 @@ use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityIndex, StableIdAllocator};
 use game_engine::presentation::voxel::{extract_raw_halo, WrappedBlockCache, RAW_VOXELS};
 use game_engine::presentation::RenderTransform;
-use game_engine::residency::{ChunkReached, GameTickSet, Residency, ResidencyChanged};
+use game_engine::residency::{
+    ChunkReached, GameTickSet, MemoryPressure, Residency, ResidencyChanged,
+};
 use game_engine::save::{
     capture, export_chunk, EntityRecord, OpaqueComponents, PersistRegistry, SaveStore,
 };
@@ -337,11 +342,13 @@ impl Plugin for VoxelStreamPlugin {
             .init_resource::<PendingUnloads>()
             .init_resource::<StagedChunks>()
             .init_resource::<ProposalCache>()
+            .init_resource::<MemoryPressure>()
             .add_message::<ChunkWillUnload>()
             .add_message::<ChunkEntities>()
             .add_systems(
                 FixedUpdate,
                 (
+                    report_memory_pressure,
                     intake_residency_changes,
                     persist_pending_unloads,
                     release_pending_unloads,
@@ -380,6 +387,15 @@ pub struct WorldInputs<'w> {
     pub terrain: Option<Res<'w, TerrainConfig>>,
     /// 物体注册表；缺失 = 没有物体 = 提案为空、`realize` 跳过。
     pub registry: Option<Res<'w, WorldFeatureRegistry>>,
+}
+
+/// 系统 0：把体素节点池的已用 / 容量写进 [MemoryPressure]。
+///
+/// 覆盖写（不是累加）：每 tick 都是一份完整快照。驻留层的 `Resolve` 在
+/// 上一 tick 就会读到它（`GameTickSet::Residency` 排在 `Streaming` 之前），
+/// 本 tick 的值留给下一 tick 用；放在链首是为了让同 tick 后续系统也看到最新值。
+pub fn report_memory_pressure(interner: Res<VoxelInterner>, mut pressure: ResMut<MemoryPressure>) {
+    *pressure = MemoryPressure::new(interner.inner().alive_nodes(), interner.capacity());
 }
 
 /// 系统 1：把 [ResidencyChanged] 折成队列状态、渲染分组与真正的卸载。
@@ -2017,6 +2033,36 @@ mod tests {
         assert!(harness.will_unload().is_empty());
         assert_eq!(harness.alive_nodes(), baseline);
         assert_eq!(harness.stats().unloaded, 1);
+    }
+
+    #[test]
+    fn streaming_reports_memory_pressure() {
+        let key = chunk_key(7, 0, 7);
+        let (bytes, _) = generated_bytes(key);
+        let mut harness = harness(vec![Answer::Hit(Some(bytes))]);
+
+        // 每 tick 覆盖写一份快照：容量来自 interner，必须 > 0。
+        harness.tick();
+        let empty = *harness.app.world().resource::<MemoryPressure>();
+        assert!(empty.capacity_nodes > 0, "容量必须来自 interner：{empty:?}");
+        assert_eq!(empty.capacity_nodes as usize, {
+            harness.app.world().resource::<VoxelInterner>().capacity()
+        });
+
+        harness.upgrade(key);
+        harness.tick();
+        assert!(harness.volume().contains_chunk(&key));
+        // 报告系统排在装载之前，所以装载结果要下一 tick 才写进压力快照。
+        harness.tick();
+
+        let loaded = *harness.app.world().resource::<MemoryPressure>();
+        assert_eq!(loaded.capacity_nodes, empty.capacity_nodes);
+        assert!(loaded.used_nodes > 0, "装载后已用节点必须 > 0：{loaded:?}");
+        assert!(
+            loaded.used_nodes <= loaded.capacity_nodes,
+            "已用不应超过容量：{loaded:?}"
+        );
+        assert!(loaded.fill_percent() <= 100, "填充率是百分比：{loaded:?}");
     }
 
     #[test]

@@ -40,6 +40,21 @@ impl Harness {
         })
     }
 
+    /// 带内存软上限的装配；[`MemoryPressure`] 由各测试按需插入（缺失 = 无压力）。
+    fn with_soft_limit(grace: u64, limit: Option<u32>) -> Self {
+        Self::new(ResidencyConfig {
+            demote_grace_ticks: grace,
+            memory_soft_limit: limit,
+        })
+    }
+
+    /// 覆盖写入（或插入）本 tick 的内存压力快照。
+    fn set_pressure(&mut self, used: usize, capacity: usize) {
+        self.app
+            .world_mut()
+            .insert_resource(MemoryPressure::new(used, capacity));
+    }
+
     fn tick(&mut self) {
         self.app.world_mut().run_schedule(FixedUpdate);
         self.app.world_mut().flush();
@@ -795,5 +810,129 @@ fn multiple_sources_take_max_and_are_independent() {
     harness.app.world_mut().resource_mut::<PinRequests>().unpin_all(1, 1);
     harness.tick();
     assert_eq!(harness.table().target(body(103), key(0, 0, 0)), Residency::None);
+}
+
+// ───────────────────────────── 内存压力 ─────────────────────────────
+
+#[test]
+fn pressure_blocks_upgrade_and_counts() {
+    let mut harness = Harness::with_soft_limit(5, Some(80));
+    harness.set_pressure(90, 100);
+    harness.spawn_real(70, pos_voxels(0, 0, 0));
+
+    harness.tick();
+
+    // 目标档位不变、没有升级消息，只把这次升级记进统计。
+    assert_eq!(harness.table().target(body(70), key(0, 0, 0)), Residency::None);
+    assert!(harness.take_changes().is_empty());
+    assert_eq!(harness.stats().deferred_upgrades, 1);
+
+    // 压力仍在：下一 tick 再记一次（槽位被重新标脏，不会卡死）。
+    harness.tick();
+    assert_eq!(harness.stats().deferred_upgrades, 2);
+    assert_eq!(harness.table().target(body(70), key(0, 0, 0)), Residency::None);
+}
+
+#[test]
+fn upgrade_resumes_after_pressure_clears() {
+    let mut harness = Harness::with_soft_limit(5, Some(80));
+    harness.set_pressure(90, 100);
+    harness.spawn_real(71, pos_voxels(0, 0, 0));
+
+    harness.tick();
+    assert_eq!(harness.table().target(body(71), key(0, 0, 0)), Residency::None);
+    assert!(harness.take_changes().is_empty());
+    assert_eq!(harness.stats().deferred_upgrades, 1);
+
+    // 压力消失：被扣下的升级在下一 tick 自动兑现。
+    harness.set_pressure(10, 100);
+    harness.tick();
+
+    assert_eq!(harness.table().target(body(71), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.take_changes(),
+        vec![ResidencyChanged {
+            body: body(71),
+            key: key(0, 0, 0),
+            from: Residency::None,
+            to: Residency::Data,
+        }]
+    );
+    assert_eq!(harness.stats().deferred_upgrades, 1, "兑现本身不再计数");
+}
+
+#[test]
+fn demotion_is_not_blocked_by_pressure() {
+    let mut harness = Harness::with_soft_limit(0, Some(80));
+    {
+        let mut pins = harness.app.world_mut().resource_mut::<PinRequests>();
+        pins.pin(9, 3, body(74), key(0, 0, 0), Residency::Render);
+    }
+
+    // 先在无压力下升到 Render。
+    harness.tick();
+    assert_eq!(
+        harness.table().target(body(74), key(0, 0, 0)),
+        Residency::Render
+    );
+    assert_eq!(harness.take_changes().len(), 1);
+
+    // 请求消失 + 压力很高 + 防抖到期（grace = 0）：仍然降级。
+    harness.set_pressure(90, 100);
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<PinRequests>()
+        .unpin_all(9, 3);
+    harness.tick();
+
+    assert_eq!(harness.table().target(body(74), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.take_changes(),
+        vec![ResidencyChanged {
+            body: body(74),
+            key: key(0, 0, 0),
+            from: Residency::Render,
+            to: Residency::Data,
+        }]
+    );
+    assert_eq!(harness.stats().deferred_upgrades, 0, "压力不阻止降级");
+}
+
+#[test]
+fn no_pressure_resource_keeps_upgrading() {
+    // 上限配了但资源缺失 = 没有压力来源，照常立即升级。
+    let mut harness = Harness::with_soft_limit(5, Some(1));
+    harness.spawn_real(75, pos_voxels(0, 0, 0));
+
+    harness.tick();
+
+    assert_eq!(harness.table().target(body(75), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.take_changes(),
+        vec![ResidencyChanged {
+            body: body(75),
+            key: key(0, 0, 0),
+            from: Residency::None,
+            to: Residency::Data,
+        }]
+    );
+    assert_eq!(harness.stats().deferred_upgrades, 0);
+}
+
+#[test]
+fn fill_percent_is_saturating() {
+    // 默认（0 / 0）按 0 处理，不做除法。
+    assert_eq!(MemoryPressure::default().fill_percent(), 0);
+    assert_eq!(MemoryPressure::new(0, 0).fill_percent(), 0);
+    assert!(!MemoryPressure::new(0, 0).is_over(1), "容量 0 的填充率是 0");
+    assert_eq!(MemoryPressure::new(50, 100).fill_percent(), 50);
+    // 向下取整：2 / 3 = 66.66% -> 66。
+    assert_eq!(MemoryPressure::new(2, 3).fill_percent(), 66);
+    // usize::MAX -> u64 饱和乘 100 -> 夹到 100（不会回绕成小数字）。
+    assert_eq!(MemoryPressure::new(usize::MAX, 1).fill_percent(), 100);
+    assert!(MemoryPressure::new(usize::MAX, 1).is_over(100));
+    assert!(!MemoryPressure::new(79, 100).is_over(80));
+    assert!(MemoryPressure::new(80, 100).is_over(80));
 }
 

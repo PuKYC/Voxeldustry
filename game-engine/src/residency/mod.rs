@@ -587,8 +587,13 @@ pub struct ResidencyConfig {
     pub demote_grace_ticks: u64,
     /// 内存软上限（已用容量百分比 0–100；`None` = 不限制）。
     ///
-    /// 预留：等流式插件落地 `MemoryPressure`（见实现文档 `10）后接入
-    /// `Resolve` 的「只记录、不兑现」逻辑；当前没有压力来源，不会扣下升级。
+    /// 压力来源是流式插件每 tick 写入的 [`MemoryPressure`]：其
+    /// [`MemoryPressure::fill_percent`] `>=` 本上限时，
+    /// [`ResidencySet::Resolve`] 对升级「只记录、不兑现」——不改 `target`、
+    /// 不发 [`ResidencyChanged`]，只累加 [`ResidencyStats::deferred_upgrades`]。
+    ///
+    /// **只扣升级、不催降级**：降级仍按 `demote_grace_ticks` 防抖正常推进；
+    /// 压力消失后下一 tick 自动恢复兑现被扣下的升级。
     pub memory_soft_limit: Option<u32>,
 }
 
@@ -611,10 +616,61 @@ pub struct ResidencyStats {
     pub data_chunks: usize,
     /// 目标档位为 `Render` 的区块数。
     pub render_chunks: usize,
-    /// 因内存压力被扣下的升级次数（累计；当前没有压力来源，恒为 0）。
+    /// 因内存压力被扣下的升级次数（累计）。
+    ///
+    /// 压力源是流式插件写入的 [`MemoryPressure`]：填充率 `>=`
+    /// [`ResidencyConfig::memory_soft_limit`] 时，升级只记录、不兑现，
+    /// 每扣下一次就在本计数上 +1。只扣升级、不催降级；压力消失后自动恢复。
     pub deferred_upgrades: u64,
     /// 当前挂着 [`AwaitingChunks`] 的 `Real` 实体数。
     pub awaiting_entities: usize,
+}
+
+/// 体素节点池的内存压力快照（流式层每 tick 写入，驻留层只读）。
+///
+/// 由 `VoxelStreamPlugin` 的 `report_memory_pressure` 每 tick 根据
+/// [`VoxInterner`](crate::voxel::VoxInterner) 的 `alive_nodes` / `capacity`
+/// 覆盖写入。[`ResidencySet::Resolve`] 用 [`fill_percent`](Self::fill_percent)
+/// 与 [`ResidencyConfig::memory_soft_limit`] 比较：超限时升级只记录、不兑现
+/// （详见 [`ResidencyStats::deferred_upgrades`]）。
+///
+/// 资源缺失视为「没有压力」：未装配流式层的宿主（或驻留单测）不插它也能正常升级。
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPressure {
+    /// 已用节点数。
+    pub used_nodes: u64,
+    /// 节点池容量。
+    pub capacity_nodes: u64,
+}
+
+impl MemoryPressure {
+    /// 用 `usize` 指标构造（`usize` → `u64` 饱和转换）。
+    #[must_use]
+    pub fn new(used: usize, capacity: usize) -> Self {
+        Self {
+            used_nodes: u64::try_from(used).unwrap_or(u64::MAX),
+            capacity_nodes: u64::try_from(capacity).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// 已用容量百分比：`used * 100 / capacity` **向下取整**。
+    ///
+    /// 容量为 0 时返回 0（不做除法）。乘法用饱和运算，结果再夹到 100，
+    /// 保证返回值恒在 0–100（与 [`ResidencyConfig::memory_soft_limit`] 同量纲）。
+    #[must_use]
+    pub fn fill_percent(&self) -> u32 {
+        if self.capacity_nodes == 0 {
+            return 0;
+        }
+        let percent = self.used_nodes.saturating_mul(100) / self.capacity_nodes;
+        percent.min(100) as u32
+    }
+
+    /// 填充率是否达到（`>=`）给定上限。
+    #[must_use]
+    pub fn is_over(&self, limit_percent: u32) -> bool {
+        self.fill_percent() >= limit_percent
+    }
 }
 
 // ───────────────────────────── 消息 ─────────────────────────────

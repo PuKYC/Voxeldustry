@@ -11,9 +11,9 @@ use bevy::prelude::*;
 use super::Observer as ObserverTag;
 use super::{
     body_key_for, chunk_of, observer_chunks, AwaitingChunks, BodyRef, ChunkAnchor, ChunkReached,
-    GameTickSet, LogicPos, PathCorridor, PinRequests, Real, RequestSource, Residency,
-    ResidencyChanged, ResidencyConfig, ResidencySet, ResidencyStats, ResidencyTable, UnsavedEditClear,
-    UnsavedEditMark, WorkSites,
+    GameTickSet, LogicPos, MemoryPressure, PathCorridor, PinRequests, Real, RequestSource,
+    Residency, ResidencyChanged, ResidencyConfig, ResidencySet, ResidencyStats, ResidencyTable,
+    UnsavedEditClear, UnsavedEditMark, WorkSites,
 };
 use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
@@ -316,12 +316,23 @@ fn observer_snapshot(
 /// 防抖计时锚点是 last_requested_tick：只要「当前 target 档位仍被请求」
 /// （desired >= target）就每 tick 刷新；降级成功后再重置为当 tick，
 /// 于是 Render -> Data -> None 每一档都重新计时。
+///
+/// 内存压力（[`MemoryPressure`]，流式层每 tick 写入）只影响**升级**：
+/// `memory_soft_limit` 已配置且填充率超限时，升级只记录、不兑现。降级
+/// 与同档刷新照旧；压力消失后被扣下的升级在下一 tick 自动兑现。
 fn resolve_levels(
     mut table: ResMut<ResidencyTable>,
     config: Res<ResidencyConfig>,
     mut stats: ResMut<ResidencyStats>,
+    pressure: Option<Res<MemoryPressure>>,
 ) {
     let tick = table.tick;
+
+    // 压力在整轮 Resolve 里是同一个快照，循环外算一次即可。
+    let blocked = match (config.memory_soft_limit, pressure.as_deref()) {
+        (Some(limit), Some(p)) => p.is_over(limit),
+        _ => false,
+    };
 
     // 1) 仍在被需求的槽位刷新防抖计时（O(槽位数)，不做全量请求扫描）。
     for slot in table.slots.values_mut() {
@@ -342,6 +353,8 @@ fn resolve_levels(
         let mut change = None;
         // 降级没走完（防抖未到期，或只降了一档还不够）时，下一 tick 继续看这个槽位。
         let mut pending_demotion = false;
+        // 升级被内存压力扣下时同样要重新标脏，否则槽位不会再被评估。
+        let mut blocked_upgrade = false;
         {
             let Some(slot) = table.slots.get_mut(&key) else {
                 continue;
@@ -354,10 +367,18 @@ fn resolve_levels(
                 .unwrap_or(Residency::None);
 
             if desired > slot.target {
-                // 升级：立即兑现。内存压力接入后在这里改为「只记录、不兑现」。
-                change = Some((slot.target, desired));
-                slot.target = desired;
-                slot.last_requested_tick = tick;
+                if blocked {
+                    // 内存压力：只记录、不兑现。target 保持原值、不发
+                    // ResidencyChanged；把槽位重新标脏，压力消失后的下一
+                    // tick 才会再评估它（代价是压力期间每 tick 记一次）。
+                    stats.deferred_upgrades = stats.deferred_upgrades.saturating_add(1);
+                    blocked_upgrade = true;
+                } else {
+                    // 升级：立即兑现。
+                    change = Some((slot.target, desired));
+                    slot.target = desired;
+                    slot.last_requested_tick = tick;
+                }
             } else if desired < slot.target {
                 let grace = config.demote_grace_ticks;
                 if tick.saturating_sub(slot.last_requested_tick) >= grace {
@@ -376,7 +397,7 @@ fn resolve_levels(
                 }
             }
         }
-        if pending_demotion {
+        if pending_demotion || blocked_upgrade {
             table.dirty.insert(key);
         }
         if let Some((from, to)) = change {
