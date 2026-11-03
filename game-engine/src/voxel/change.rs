@@ -2,6 +2,9 @@
 use bevy::prelude::*;
 use voxel::store::{ChunkKey, VoxOpsWrite};
 
+use crate::body_key::BodyKey;
+use crate::identity::StableEntityId;
+
 use super::dirty::{VoxelBox, VoxelDirtySet};
 use super::interner::VoxelInterner;
 use super::key::chunk_voxels_per_axis;
@@ -88,10 +91,14 @@ pub enum VoxelSet {
 ///
 /// 这是世界层唯一需要的「单点写入 + 标脏」封装；`VoxTree::set` 本身已经
 /// 有结构共享 / interner 去重，本函数只做 chunk 映射与脏标记，不复制节点。
-pub fn set_voxel(
+///
+/// `body` 为 `None` 表示无 body 归属（旧调用 / 临时实体），脏标记落在
+/// bodyless 桶，不会与真实 body 的同名 ChunkKey 合并。
+pub fn set_voxel_for(
     volume: &mut VoxVolume,
     interner: &mut VoxelInterner,
     dirty: &mut VoxelDirtySet,
+    body: Option<BodyKey>,
     voxel: [i32; 3],
     value: u8,
 ) -> Result<bool, ChunkKey> {
@@ -116,26 +123,48 @@ pub fn set_voxel(
     );
     let changed = tree.set(interner.inner_mut(), local_ivec, value);
     if changed {
-        dirty.mark_edited(key, VoxelBox::of_voxel(local));
+        dirty.mark_edited_for(body, key, VoxelBox::of_voxel(local));
     }
     Ok(changed)
 }
 
+/// 旧入口：body 为 `None` 的单点写入，签名与语义不变。
+///
+/// 等价于 `set_voxel_for(volume, interner, dirty, None, voxel, value)`；
+/// 现有调用点（plan / tests / benches）无需改动。
+pub fn set_voxel(
+    volume: &mut VoxVolume,
+    interner: &mut VoxelInterner,
+    dirty: &mut VoxelDirtySet,
+    voxel: [i32; 3],
+    value: u8,
+) -> Result<bool, ChunkKey> {
+    set_voxel_for(volume, interner, dirty, None, voxel, value)
+}
+
 /// 把每实体 VoxelChangeBuffer 应用到它的 VoxVolume 并标脏。
 ///
-/// 查询 `(&mut VoxVolume, &mut VoxelChangeBuffer)` 天然保证「有体素组件才有效」。
-/// 目标子块不存在：跳过 + `warn!` + `debug_assert!`。
+/// 查询 `(&mut VoxVolume, &mut VoxelChangeBuffer, Option<&StableEntityId>)`：
+/// 前两者天然保证「有体素组件才有效」；能拿到 `StableEntityId` 就把
+/// `body = Some(BodyKey::from(*id))` 写进脏条目，拿不到（旧测试、临时实体）
+/// 则 body 为 `None`。目标子块不存在：跳过 + `warn!` + `debug_assert!`。
 pub fn apply_voxel_changes(
     mut interner: ResMut<VoxelInterner>,
     mut dirty: ResMut<VoxelDirtySet>,
-    mut query: Query<(&mut VoxVolume, &mut VoxelChangeBuffer)>,
+    mut query: Query<(
+        &mut VoxVolume,
+        &mut VoxelChangeBuffer,
+        Option<&StableEntityId>,
+    )>,
 ) {
-    for (mut volume, mut buffer) in &mut query {
+    for (mut volume, mut buffer, id) in &mut query {
+        let body = id.map(|id| BodyKey::from(*id));
         for edit in buffer.drain() {
-            match set_voxel(
+            match set_voxel_for(
                 &mut volume,
                 &mut interner,
                 &mut dirty,
+                body,
                 edit.voxel,
                 edit.value,
             ) {
@@ -155,6 +184,7 @@ pub fn apply_voxel_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::StableEntityId;
     use crate::math::FixedPoint;
     use ::voxel::store::{MaxDepth, VoxOpsRead, VoxOpsState, VoxTree, CHUNK_DEPTH};
 
@@ -338,5 +368,92 @@ mod tests {
             baseline,
             "写空再写回必须复用同一批去重节点"
         );
+    }
+
+    /// 应用系统必须把实体的 StableEntityId 带进脏条目。
+    #[test]
+    fn apply_voxel_changes_marks_body_from_stable_id() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(VoxelInterner::new(1024 * 1024))
+            .init_resource::<VoxelDirtySet>()
+            .add_systems(Update, apply_voxel_changes);
+
+        let key = ChunkKey::new(0, 0, 0);
+        let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+        volume.insert_chunk(key, VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH)));
+        let mut buffer = VoxelChangeBuffer::new();
+        buffer.push([5, 6, 7], 9);
+        let id = StableEntityId(11);
+        app.world_mut().spawn((volume, buffer, id));
+
+        app.update();
+
+        let dirty = app.world().resource::<VoxelDirtySet>();
+        assert_eq!(dirty.len(), 1);
+        let edits = dirty.peek_edits();
+        assert_eq!(edits[0].body, Some(BodyKey::from(id)));
+        assert!(dirty.is_dirty_for(Some(BodyKey::from(id)), &key));
+        assert!(!dirty.is_dirty_for(None, &key));
+    }
+
+    /// 没有 StableEntityId 的实体（旧测试 / 临时实体）标 body None。
+    #[test]
+    fn apply_voxel_changes_without_stable_id_marks_bodyless() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(VoxelInterner::new(1024 * 1024))
+            .init_resource::<VoxelDirtySet>()
+            .add_systems(Update, apply_voxel_changes);
+
+        let key = ChunkKey::new(0, 0, 0);
+        let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+        volume.insert_chunk(key, VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH)));
+        let mut buffer = VoxelChangeBuffer::new();
+        buffer.push([5, 6, 7], 9);
+        app.world_mut().spawn((volume, buffer));
+
+        app.update();
+
+        let dirty = app.world().resource::<VoxelDirtySet>();
+        assert_eq!(dirty.len(), 1);
+        let edits = dirty.peek_edits();
+        assert_eq!(edits[0].body, None, "缺 StableEntityId 必须是 bodyless");
+        assert_eq!(edits[0].key, key);
+        assert!(dirty.is_dirty_for(None, &key));
+    }
+
+    /// 两个 body 各自有同一 ChunkKey 的块：apply 后必须留下两条脏条目。
+    #[test]
+    fn two_bodies_same_local_key_produce_two_entries() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(VoxelInterner::new(1024 * 1024))
+            .init_resource::<VoxelDirtySet>()
+            .add_systems(Update, apply_voxel_changes);
+
+        let key = ChunkKey::new(0, 0, 0);
+        let spawn_body = |app: &mut App, id: u64, voxel: [i32; 3]| {
+            let mut volume = VoxVolume::new(FixedPoint::from_num(1));
+            volume.insert_chunk(key, VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH)));
+            let mut buffer = VoxelChangeBuffer::new();
+            buffer.push(voxel, 9);
+            app.world_mut().spawn((volume, buffer, StableEntityId(id)));
+        };
+        // 故意让稳定 ID 与 spawn 顺序相反，验证输出按 body 升序而非实体序。
+        spawn_body(&mut app, 2, [5, 6, 7]);
+        spawn_body(&mut app, 1, [1, 2, 3]);
+
+        app.update();
+
+        let dirty = app.world().resource::<VoxelDirtySet>();
+        assert_eq!(dirty.len(), 2, "同 key 不同 body 必须是两条");
+        let edits = dirty.peek_edits();
+        assert_eq!(edits[0].body, Some(BodyKey::from(StableEntityId(1))));
+        assert_eq!(edits[0].key, key);
+        assert_eq!(edits[0].edited, VoxelBox::of_voxel([1, 2, 3]));
+        assert_eq!(edits[1].body, Some(BodyKey::from(StableEntityId(2))));
+        assert_eq!(edits[1].key, key);
+        assert_eq!(edits[1].edited, VoxelBox::of_voxel([5, 6, 7]));
     }
 }

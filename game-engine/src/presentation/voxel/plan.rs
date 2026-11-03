@@ -203,6 +203,7 @@ mod tests {
     fn plan_interior_edit_has_no_face_blocks() {
         let key = chunk_key(0, 0, 0);
         let edits = [DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox {
                 min: [8, 8, 8],
@@ -222,6 +223,7 @@ mod tests {
     fn plan_corner_edit_marks_opposite_faces() {
         let key = chunk_key(0, 0, 0);
         let edits = [DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox {
                 min: [31, 31, 31],
@@ -252,6 +254,7 @@ mod tests {
     fn plan_single_pos_x_edit_marks_x_neg_face() {
         let key = chunk_key(0, 0, 0);
         let edits = [DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox {
                 min: [31, 8, 8],
@@ -273,6 +276,7 @@ mod tests {
     fn plan_lod1_edit_reaches_block_face() {
         let key = chunk_key(1, 0, 0);
         let edits = [DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox {
                 min: [30, 8, 8],
@@ -291,6 +295,7 @@ mod tests {
         // band 相对全局块边界：同一编辑若落在覆盖块内层（chunk 0 的 x∈[30,32)），
         // 距离块面 64 还有 32 体素，不应标 +X 邻块。
         let inner = [DirtyChunk {
+            body: None,
             key: chunk_key(0, 0, 0),
             edited: VoxelBox {
                 min: [30, 8, 8],

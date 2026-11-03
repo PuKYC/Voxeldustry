@@ -487,6 +487,7 @@ fn assert_plan_covers_changes(keys: &[ChunkKey], ekey: ChunkKey, eb: VoxelBox) {
 
     let plan = rebuild_plan(
         &[DirtyChunk {
+            body: None,
             key: ekey,
             edited: eb,
         }],
