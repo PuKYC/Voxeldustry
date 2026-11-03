@@ -103,7 +103,7 @@ use crate::voxel::{
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
 use crate::world::load::load_world;
-use crate::world::save_plugin::{SaveRoot, WorldSaveConfig, WorldSavePlugin};
+use crate::world::save_plugin::{OrphanPolicy, SaveRoot, WorldSaveConfig, WorldSavePlugin};
 use crate::world::seed::WorldSeed;
 use crate::world::IslandRegistry;
 
@@ -235,6 +235,25 @@ impl Plugin for StreamingWorldPlugin {
     }
 }
 
+/// 读档成功后的孤儿 region 回收（[OrphanPolicy::Delete] 才真的删）。
+///
+/// 失败只 warn：清理失败不该把一个已经读好的世界判成启动失败。
+fn reclaim_after_load(world: &World, paths: &SavePaths) {
+    if world.get_resource::<OrphanPolicy>().copied().unwrap_or_default() != OrphanPolicy::Delete {
+        return;
+    }
+    match crate::world::load::reclaim_orphan_regions(paths) {
+        Ok(stats) if stats.bodies > 0 => {
+            info!(
+                "world: 回收孤儿 body {} 个、region {} 个",
+                stats.bodies, stats.regions
+            );
+        }
+        Ok(_) => debug!("world: 没有孤儿 region"),
+        Err(error) => warn!("world: 孤儿 region 回收失败：{error}"),
+    }
+}
+
 /// Streaming 模式的 Startup 引导：有存档就读档，没有就建空地形体。
 ///
 /// 读档成功时**直接 return**：世界里已经有存档恢复出来的 body / 块，不能再
@@ -262,6 +281,9 @@ fn bootstrap_streaming_world(world: &mut World) {
                     loaded.stats.entities,
                     loaded.stats.orphan_regions,
                 );
+                // 孤儿回收放在读档成功之后：坏档旁边可能还有能手工抢救的目录，
+                // 读不动就什么都别删。默认策略是 Keep，删除必须显式开启。
+                reclaim_after_load(world, &paths);
                 // 有档不生成：load_world 已经把 body 与块装回世界，这里必须结束，
                 // 不能再落到下面的空容器分支。
                 return;
@@ -445,7 +467,7 @@ mod tests {
     };
     use crate::world::chunk::RegionIndex;
     use crate::world::save_plugin::{
-        SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSaveStatus,
+        OrphanPolicy, SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSaveStatus,
     };
     use crate::world::{IslandRegistry, WorldPlugin};
 
@@ -707,6 +729,58 @@ mod tests {
                 "岛屿注册表必须只有存档里的地形这一个岛"
             );
         }
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+    }
+
+    /// 在存档根下造一个 meta 里没有的 body 目录（模拟崩溃残留 / WipeWorld 之前的旧档）。
+    fn plant_orphan_body(root: &Path, id: u64) -> PathBuf {
+        let dir = SavePaths::new(root).body_dir(BodyKey::new(StableEntityId(id)));
+        std::fs::create_dir_all(&dir).expect("创建孤儿目录");
+        std::fs::write(dir.join("region_0_0_0"), b"junk").expect("写孤儿 region");
+        dir
+    }
+
+    #[test]
+    fn orphan_body_dir_survives_default_policy() {
+        let dir = TempDir::new("orphan_keep");
+        let saved = boot_and_save_one_chunk(dir.path());
+        let orphan = plant_orphan_body(dir.path(), saved.0 + 100);
+
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        app.update();
+
+        assert!(
+            orphan.exists(),
+            "默认策略是 Keep：删除玩家数据必须由装配方显式开启"
+        );
+        assert!(
+            SavePaths::new(dir.path()).body_dir(BodyKey::from(saved)).exists(),
+            "存档里活着的 body 目录当然也要在"
+        );
+        app.world_mut()
+            .resource_mut::<SaveStore>()
+            .shutdown_worker();
+    }
+
+    #[test]
+    fn orphan_policy_delete_reclaims_after_successful_load() {
+        let dir = TempDir::new("orphan_delete");
+        let saved = boot_and_save_one_chunk(dir.path());
+        let orphan = plant_orphan_body(dir.path(), saved.0 + 100);
+
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        // Startups 在第一次 update 才跑，build 之后再插也来得及。
+        app.insert_resource(OrphanPolicy::Delete);
+        app.update();
+
+        assert!(!orphan.exists(), "Delete 策略下孤儿 body 目录必须被回收");
+        assert!(
+            SavePaths::new(dir.path()).body_dir(BodyKey::from(saved)).exists(),
+            "回收只能删 meta 里没有的 body，活着的 body 一个文件都不能丢"
+        );
+        assert_eq!(only_volume(&mut app).chunk_count(), 1, "读档本身不受影响");
         app.world_mut()
             .resource_mut::<SaveStore>()
             .shutdown_worker();

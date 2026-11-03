@@ -34,9 +34,9 @@ use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator
 use game_engine::math::{FixedPoint, Vec3F};
 use game_engine::residency::ChunkAnchor;
 use game_engine::save::{
-    install_chunk, read_region, read_world_meta, region_of, regions_on_disk, AttachTag, BodyKind,
-    BodyRecord, OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths,
-    WorldMeta, REGION_SIZE,
+    install_chunk, read_region, read_world_meta, reclaim_orphans, region_of, regions_on_disk,
+    AttachTag, BodyKind, BodyRecord, OpaqueComponents, PersistRegistry, ReclaimStats, RegionFile,
+    SaveError, SaveErrorKind, SavePaths, WorldMeta, REGION_SIZE,
 };
 use game_engine::voxel::{
     dec_ref_recursive, Attachment, ChunkKey, VoxVolume, VoxelBox, VoxelDirtySet, VoxelInterner,
@@ -122,6 +122,21 @@ pub fn load_world(
             orphan_regions: plan.orphan_regions,
         },
     }))
+}
+
+/// 回收孤儿 region：删掉 `world.meta.bodies` 里没有的 body 目录。
+///
+/// 只在读档**成功之后**由 [StreamingWorldPlugin](crate::world::StreamingWorldPlugin)
+/// 按 [OrphanPolicy](crate::world::OrphanPolicy) 调用：读档失败时一份坏档旁边可能
+/// 还有可以手工抢救的目录，这时候不该做破坏性操作。
+///
+/// 这里重新读一次 world.meta（几十字节），换取 [load_world] 签名不变——
+/// 它的 14 个调用点没有理由为一个清理策略多传一个参数。
+pub fn reclaim_orphan_regions(paths: &SavePaths) -> Result<ReclaimStats, SaveError> {
+    let Some(meta) = read_world_meta(paths)? else {
+        return Ok(ReclaimStats::default());
+    };
+    reclaim_orphans(paths, &meta)
 }
 
 /// 阶段一的产物：全部已解码、已校验的数据。

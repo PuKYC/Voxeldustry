@@ -126,6 +126,25 @@ pub struct WorldSaveStatus {
     pub last_error: Option<String>,
 }
 
+/// 孤儿 region 的处理策略，读档成功后生效。
+///
+/// 「孤儿」= 磁盘上有 `<root>/<id>/` 目录，但 `world.meta.bodies` 里没有这个
+/// body：崩溃中断、`WipeWorld`、换存档、手工拷档都会留下它们。它们不影响读档
+/// 正确性（`LoadStats::orphan_regions` 只计数），但会让存档树越积越大。
+///
+/// 默认是 [OrphanPolicy::Keep]：删除玩家数据不可逆，必须由装配方显式选择。
+/// 选 [OrphanPolicy::Delete] 时，读档**成功之后**立刻回收：目录里的 region 文件
+/// 连同 `.tmp` / `.corrupt` / `.recovered` 一起删，随后删掉空目录。
+/// 读档失败不回收——宁可留垃圾，也不要在一份读不动的存档上做破坏性操作。
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OrphanPolicy {
+    /// 只统计，不动磁盘（默认）。
+    #[default]
+    Keep,
+    /// 读档成功后删除 meta 里没有的 body 目录。
+    Delete,
+}
+
 /// 本插件自己持有的 [SavePaths]（SavePaths 不是 Clone，不从 SaveStore 取）。
 ///
 /// 以 SaveConfig::root 构造；SaveConfig 在 build 时还没出现（装配顺序反了）
@@ -165,6 +184,9 @@ impl Plugin for WorldSavePlugin {
 
         app.insert_resource(self.config.clone())
             .init_resource::<WorldSaveStatus>()
+            // 装配方可以用 insert_resource(OrphanPolicy::Delete) 覆盖；这里 init
+            // 一次保证读档引导读得到默认值（Keep）。
+            .init_resource::<OrphanPolicy>()
             .insert_resource(WorldSavePaths(SavePaths::new(root)))
             .add_message::<SaveNow>()
             // 排在 SaveSet::Poll 之后：先让 Flush 推进 tick、Poll 回收后台结果，

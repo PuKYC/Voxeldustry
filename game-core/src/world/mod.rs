@@ -24,7 +24,8 @@ pub use load::{load_world, LoadStats, LoadedWorld};
 pub use rng::WorldRng;
 pub use save::{capture_world, write_capture, WorldCapture};
 pub use save_plugin::{
-    SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSavePlugin, WorldSaveStatus,
+    OrphanPolicy, SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSavePlugin,
+    WorldSaveStatus,
 };
 pub use seed::WorldSeed;
 pub use streaming::StreamingWorldPlugin;
