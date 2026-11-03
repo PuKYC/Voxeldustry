@@ -53,7 +53,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use ::voxel::ChunkKey;
 
-use super::store::{read_region, remove_region, write_region, SavePaths};
+use super::store::{prune_empty_body_dir, read_region, remove_region, write_region, SavePaths};
 use super::RegionFile;
 use crate::body_key::BodyKey;
 use crate::residency::GameTickSet;
@@ -989,6 +989,8 @@ fn run_delete(paths: &SavePaths, request: DeleteRequest) -> WriteResult {
         Ok(Some(region)) => region,
         // region 文件不存在 = 磁盘上本来就没这条记录，删除是 no-op。
         Ok(None) => {
+            // 目录可能在上一次删除后变空：region 已经不在了，顺手清掉。
+            prune_after_delete(paths, request.body);
             return WriteResult {
                 body: request.body,
                 key: request.key,
@@ -1009,6 +1011,8 @@ fn run_delete(paths: &SavePaths, request: DeleteRequest) -> WriteResult {
         }
     };
     if region.chunks.remove(&request.key).is_none() {
+        // 同上：文件里本来就没这块，删除是 no-op，但目录可能是空的。
+        prune_after_delete(paths, request.body);
         return WriteResult {
             body: request.body,
             key: request.key,
@@ -1018,7 +1022,11 @@ fn run_delete(paths: &SavePaths, request: DeleteRequest) -> WriteResult {
     }
     let outcome = if region.chunks.is_empty() {
         match remove_region(paths, request.body, request.key) {
-            Ok(written) => WriteOutcome::Ok { path: written },
+            Ok(written) => {
+                // 最后一个 region 文件也没了：body 目录已经空了，顺手删掉。
+                prune_after_delete(paths, request.body);
+                WriteOutcome::Ok { path: written }
+            }
             Err(error) => WriteOutcome::Failed {
                 path,
                 reason: error.to_string(),
@@ -1038,6 +1046,18 @@ fn run_delete(paths: &SavePaths, request: DeleteRequest) -> WriteResult {
         key: request.key,
         version: request.version,
         outcome,
+    }
+}
+
+/// 删除成功后的空目录清理：失败只告警，绝不能把删除本身判成失败。
+///
+/// region 记录已经正确删掉了（或磁盘上本来就没有），重试这次删除只会重复无效工作，
+/// 还会让 tombstone / dirty 永远清不掉；而空目录本身无害——[`write_atomic`] 每次
+/// 写入都会 `create_dir_all`（fs_atomic.rs:115），下一次删除或下次存档也会再尝试
+/// 清理。所以这里只 `warn!` 一次，按删除成功返回。
+fn prune_after_delete(paths: &SavePaths, body: BodyKey) {
+    if let Err(error) = prune_empty_body_dir(paths, body) {
+        warn!("save: 清理空 body 目录失败（忽略，删除已成功）：{error}");
     }
 }
 
@@ -1695,6 +1715,38 @@ mod tests {
         let report = pump(&store);
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(store.lookup(b, k), StoreLookup::Miss, "旧记录不得复活");
+    }
+
+    #[test]
+    fn delete_that_empties_region_removes_body_dir() {
+        let dir = TempDir::new("delete-empty-dir");
+        let b = body(14);
+        let k = key(0, 0, 0);
+        let paths = SavePaths::new(dir.path());
+        let config = config(&dir);
+
+        {
+            let store = SaveStore::new(config.clone());
+            store.write(b, k, record(3)).expect("写缓冲");
+            assert_eq!(store.flush(), 1);
+            let report = pump(&store);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert!(paths.body_dir(b).is_dir(), "写完必须有 body 目录");
+        }
+
+        {
+            let store = SaveStore::new(config);
+            store.delete(b, k).expect("标删除");
+            assert_eq!(store.flush(), 1);
+            let report = pump(&store);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+        }
+
+        assert!(!paths.region(b, k).exists(), "region 空后文件必须删");
+        assert!(
+            !paths.body_dir(b).exists(),
+            "最后一个 region 删掉后 body 目录也要收回"
+        );
     }
 
     #[test]

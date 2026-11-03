@@ -56,6 +56,7 @@ use super::format::{
 use super::fs_atomic::{self, io_error};
 use super::{SaveError, SaveErrorKind};
 use crate::body_key::BodyKey;
+use crate::identity::StableEntityId;
 
 pub use super::fs_atomic::write_atomic;
 
@@ -411,6 +412,164 @@ pub fn regions_on_disk(paths: &SavePaths, body: BodyKey) -> Result<Vec<ChunkKey>
     Ok(regions.into_iter().collect())
 }
 
+/// 一次回收删掉的东西。用于日志与测试断言。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReclaimStats {
+    /// 处理掉的 body 目录数（每个 [`reclaim_body`] 计 1）。
+    ///
+    /// 正常情况下目录会被删掉；若删完文件后目录又被并发写入、暂时删不掉，
+    /// 仍计 1 且不报错（下一次回收会继续清）。
+    pub bodies: usize,
+    /// 删掉的 region 键数，**按目录里数出来的键去重**：同一个 region 的主文件与
+    /// `.recovered` 只算一个；`.tmp` / `.corrupt` 以及其它非 region 文件照样会被
+    /// 删掉，但不贡献计数（它们不是任何一个 region 的当前数据）。
+    pub regions: usize,
+}
+
+/// 列出存档根目录下**不在** `meta.bodies` 里的 body 目录（按 body ID 升序）。
+///
+/// 孤儿目录是崩溃（body 记录还没写进 `world.meta`，region 已经落盘）、
+/// `WipeWorld`（清空 body 表但没删目录）或换存档（复用同一个 root）之后的正常
+/// 残留，不是损坏。本函数只枚举，**不删任何东西**；删不删、什么时候删由调用方
+/// 决定（[`reclaim_orphans`] 是“全清”的那条路）。
+///
+/// 只认目录，且目录名必须能 `parse::<u64>()` 成 body ID。规范名是无符号十进制、
+/// 无前导零（见 [`SavePaths::body_dir`]），但 `parse` 会接受 `007` 这类前导零
+/// 写法并按 7 处理：它们指向的是同一个 body，没必要为了写法差异把目录永远留着。
+/// 其它名字（`world.meta` 这类文件、`backup` 目录）静默跳过——它们不归存档
+/// 布局管，报错只会让启动流程卡在一个无关文件上。
+///
+/// 根目录不存在 = 还没有任何存档，返回空列表；其它 IO 错误带阶段返回。
+pub fn orphan_bodies(paths: &SavePaths, meta: &WorldMeta) -> Result<Vec<BodyKey>, SaveError> {
+    let root = paths.root();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(io_error(fs_atomic::STAGE_READ, root, err)),
+    };
+
+    // BTreeSet：去重（`007` 与 `7` 同一 body）并按 BodyKey（= u64）升序输出。
+    let mut orphans = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error(fs_atomic::STAGE_READ, root, err))?;
+        let path = entry.path();
+        // 只认目录：`world.meta`、`.corrupt` 之类的普通文件直接跳过。
+        let file_type = entry
+            .file_type()
+            .map_err(|err| io_error(fs_atomic::STAGE_READ, &path, err))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(id) = name.parse::<u64>() else {
+            continue;
+        };
+        let body = BodyKey::new(StableEntityId(id));
+        if meta.bodies.contains_key(&body) {
+            continue;
+        }
+        orphans.insert(body);
+    }
+    Ok(orphans.into_iter().collect())
+}
+
+/// 回收一个 body 目录：删掉目录里的全部文件，空了再把目录也删掉。
+///
+/// 这个目录整体属于一个 `world.meta` 里不存在的 body（见 [`orphan_bodies`]），
+/// 所以删除范围是**目录里的所有普通文件**，包括 `.tmp` 与 `.corrupt`。`.corrupt`
+/// 的取证价值只在 body 仍然存在、玩家还可能被告知“这一块坏了”时成立；孤儿目录里
+/// 留着它只会让目录永远删不掉。
+///
+/// 顺序是**先列出、先统计，再做任何删除**：目录里出现子目录属于布局违规（规格只
+/// 允许平铺的 region 文件），直接返回语义错误且一个文件都不删；否则删到一半才发现
+/// 会留下半清理状态。统计的 `regions` 是“目录里数出来的 region 键数”，不是删成功
+/// 的文件数——删除一旦失败就 `Err` 返回，调用方按整次回收失败处理，不需要部分
+/// 成功的计数。
+///
+/// 删完后目录为空才 `remove_dir` 并 fsync 根目录；若还有残余（并发写入）不报错，
+/// 目录留在原地下一次再清。目录不存在 = 已经没有可回收的东西，返回全 0。
+pub fn reclaim_body(paths: &SavePaths, body: BodyKey) -> Result<ReclaimStats, SaveError> {
+    let dir = paths.body_dir(body);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ReclaimStats::default()),
+        Err(err) => return Err(io_error(fs_atomic::STAGE_READ, &dir, err)),
+    };
+
+    // 第一遍只收集：子目录要在动手前就发现，避免删到一半才报错。
+    let mut files = Vec::new();
+    let mut regions = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error(fs_atomic::STAGE_READ, &dir, err))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| io_error(fs_atomic::STAGE_READ, &path, err))?;
+        if file_type.is_dir() {
+            return Err(SaveError::semantic(
+                path.display().to_string(),
+                SaveErrorKind::InvalidValue {
+                    what: "orphan body dir contains a subdirectory",
+                    value: 0,
+                },
+            ));
+        }
+        // 主文件与 .recovered 解析出同一个键，BTreeSet 自动去重；.tmp/.corrupt 解析
+        // 不出键，不计数（但下面照样删）。
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(key) = parse_region_file_name(name) {
+                regions.insert(key);
+            }
+        }
+        files.push(path);
+    }
+
+    // 第二遍才是删除。并发的“别人已经删了”不算错（与 remove_region 一致）。
+    for file in &files {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_error(fs_atomic::STAGE_REMOVE, file, err)),
+        }
+    }
+
+    // 再看一次：真的空了才删目录；有残余不报错，下一次回收接着清。
+    let empty = match std::fs::read_dir(&dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+        Err(err) => return Err(io_error(fs_atomic::STAGE_READ, &dir, err)),
+    };
+    if empty {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_error(fs_atomic::STAGE_REMOVE, &dir, err)),
+        }
+        fs_atomic::sync_dir(paths.root())?;
+    }
+
+    Ok(ReclaimStats {
+        bodies: 1,
+        regions: regions.len(),
+    })
+}
+
+/// 回收**所有**孤儿 body 目录（[`orphan_bodies`] 的判定 + 逐个 [`reclaim_body`]）。
+///
+/// 统计按 body 累加。任何一个目录回收失败都整体返回 `Err`：宁可让调用方看到
+/// “这次没清完”，也不要把半清理状态当成成功。
+pub fn reclaim_orphans(paths: &SavePaths, meta: &WorldMeta) -> Result<ReclaimStats, SaveError> {
+    let mut total = ReclaimStats::default();
+    for body in orphan_bodies(paths, meta)? {
+        let stats = reclaim_body(paths, body)?;
+        total.bodies += stats.bodies;
+        total.regions += stats.regions;
+    }
+    Ok(total)
+}
+
 /// 原子写一个 region 文件，返回**实际**写到的路径（可能是 `.recovered`）。
 ///
 /// 顺序：先编码（内存里完整字节），再按 [`SavePaths::write_target`] 选目标，
@@ -466,6 +625,37 @@ pub(crate) fn remove_region(
     Ok(main)
 }
 
+/// 删除一个空的 body 目录，返回是否真的删掉了。
+///
+/// 空目录本身无害：[`write_atomic`] 每次写入都会 `create_dir_all`（fs_atomic.rs:115），
+/// 所以删不删都不影响正确性。这里清它只是免得存档树里堆一堆“region 删光了、
+/// 目录还在”的空壳，人工排查时误以为这个 body 还占着盘。
+///
+/// 只有目录确实为空才 `remove_dir` 并 fsync 根目录；非空（还有别的 region，或
+/// `.tmp` / `.corrupt` 残留）原样保留、返回 `false`。目录不存在同样返回
+/// `false`——没有东西可删，也不算失败。
+pub(crate) fn prune_empty_body_dir(paths: &SavePaths, body: BodyKey) -> Result<bool, SaveError> {
+    let dir = paths.body_dir(body);
+    let mut entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io_error(fs_atomic::STAGE_READ, &dir, err)),
+    };
+    if entries.next().is_some() {
+        return Ok(false);
+    }
+    match std::fs::remove_dir(&dir) {
+        Ok(()) => {}
+        // 并发：目录已经不在了，目的已经达到，不报错。
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        // 并发：读完之后又有人写入，目录不再为空，留给下一次。
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(false),
+        Err(err) => return Err(io_error(fs_atomic::STAGE_REMOVE, &dir, err)),
+    }
+    fs_atomic::sync_dir(paths.root())?;
+    Ok(true)
+}
+
 /// 原子写 `world.meta`，返回实际写到的路径（§5.1 的世界级顺序：meta 最后写）。
 pub fn write_world_meta(paths: &SavePaths, meta: &WorldMeta) -> Result<PathBuf, SaveError> {
     let bytes = encode_world_meta(meta)?;
@@ -491,6 +681,7 @@ mod tests {
 
     use crate::identity::StableEntityId;
     use crate::save::codec::encode_region;
+    use crate::save::{AttachTag, BodyKind, BodyRecord};
     use crate::streaming::ChunkRecord;
 
     use super::*;
@@ -536,6 +727,32 @@ mod tests {
 
     fn key(x: i32, y: i32, z: i32) -> ChunkKey {
         ChunkKey::new(x, y, z)
+    }
+
+    /// 只含给定 body 的 meta；其余字段与本组测试无关，填最小值。
+    fn meta_with(bodies: &[BodyKey]) -> WorldMeta {
+        let mut table = BTreeMap::new();
+        for body in bodies {
+            table.insert(
+                *body,
+                BodyRecord {
+                    id: *body,
+                    kind: BodyKind::Island,
+                    attach: AttachTag::World,
+                    biome: 0,
+                    anchored: 0,
+                    voxel_size: 1,
+                    drift: [0; 3],
+                    attach_to: BodyKey::INVALID,
+                },
+            );
+        }
+        WorldMeta {
+            seed: 0,
+            world_tick: 0,
+            next_stable_entity_id: 0,
+            bodies: table,
+        }
     }
 
     /// 带一块 `content` 的 region；`marker` 让不同版本字节不同。
@@ -1035,5 +1252,160 @@ mod tests {
                 "{name}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn orphan_bodies_finds_unknown_dirs() {
+        let dir = TempDir::new("orphans-find");
+        let paths = dir.paths();
+        let kept = body(5);
+        // 故意按 20 / 3 的顺序写，断言输出按 body ID 升序。
+        let orphan_high = body(20);
+        let orphan_low = body(3);
+        write_region(&paths, kept, key(0, 0, 0), &region(1)).expect("写 kept");
+        write_region(&paths, orphan_high, key(0, 0, 0), &region(2)).expect("写 20");
+        write_region(&paths, orphan_low, key(0, 0, 0), &region(3)).expect("写 3");
+
+        assert_eq!(
+            orphan_bodies(&paths, &meta_with(&[kept])).expect("枚举孤儿"),
+            vec![orphan_low, orphan_high],
+            "只返回 meta 里没有的目录，且按 ID 升序"
+        );
+    }
+
+    #[test]
+    fn orphan_bodies_skips_non_numeric_and_files() {
+        let dir = TempDir::new("orphans-skip");
+        let paths = dir.paths();
+        fs::create_dir_all(dir.path().join("backup")).expect("建 backup 目录");
+        fs::create_dir_all(dir.path().join("007")).expect("建前导零目录");
+        fs::write(paths.world_meta(), b"not a real meta").expect("写 world.meta 文件");
+        write_region(&paths, body(7), key(0, 0, 0), &region(1)).expect("写 body 7");
+
+        // 前导零 007 被 parse 成 7：与 7 目录是同一个 body，去重后只出现一次。
+        // backup / world.meta 不是数字目录，静默跳过。
+        assert_eq!(
+            orphan_bodies(&paths, &meta_with(&[])).expect("枚举孤儿"),
+            vec![body(7)]
+        );
+
+        // 7 已经在 body 表里时，007 也不算孤儿（同一个 body）。
+        assert!(orphan_bodies(&paths, &meta_with(&[body(7)]))
+            .expect("枚举孤儿")
+            .is_empty());
+    }
+
+    #[test]
+    fn reclaim_body_deletes_everything_and_dir() {
+        let dir = TempDir::new("reclaim-all");
+        let paths = dir.paths();
+        let b = body(3);
+        let main = write_region(&paths, b, key(0, 0, 0), &region(1)).expect("写主文件");
+        let second =
+            write_region(&paths, b, key(8, 0, 0), &RegionFile::default()).expect("写第二个 region");
+        // 主文件 + .recovered 同键：regions 只算一个；.tmp / .corrupt 不计数但照样删。
+        fs::write(paths.recovered(&main), b"stale recovered").expect("写 .recovered");
+        fs::write(paths.tmp(&main), b"tmp").expect("写 .tmp");
+        fs::write(paths.corrupt(&main), b"corrupt").expect("写 .corrupt");
+
+        let stats = reclaim_body(&paths, b).expect("回收 body");
+
+        assert_eq!(
+            stats,
+            ReclaimStats {
+                bodies: 1,
+                regions: 2,
+            }
+        );
+        assert!(!paths.body_dir(b).exists(), "跑干净后目录必须删掉");
+        assert!(!main.exists() && !second.exists(), "region 文件必须全删");
+    }
+
+    #[test]
+    fn reclaim_body_missing_dir_is_noop() {
+        let dir = TempDir::new("reclaim-missing");
+        let paths = dir.paths();
+
+        let stats = reclaim_body(&paths, body(99)).expect("缺目录不是错误");
+
+        assert_eq!(stats, ReclaimStats::default());
+        assert!(!paths.body_dir(body(99)).exists(), "不能凭空建目录");
+    }
+
+    #[test]
+    fn reclaim_body_rejects_subdirectory() {
+        let dir = TempDir::new("reclaim-subdir");
+        let paths = dir.paths();
+        let b = body(4);
+        let main = write_region(&paths, b, key(0, 0, 0), &region(1)).expect("写主文件");
+        fs::create_dir_all(paths.body_dir(b).join("nested")).expect("建子目录");
+
+        let err = reclaim_body(&paths, b).expect_err("子目录必须报错");
+
+        assert!(
+            matches!(
+                err.kind(),
+                SaveErrorKind::InvalidValue { what, .. }
+                    if *what == "orphan body dir contains a subdirectory"
+            ),
+            "{err}"
+        );
+        assert!(main.is_file(), "先校验后删：主文件必须还在");
+        assert_eq!(
+            read_region(&paths, b, key(0, 0, 0))
+                .expect("读")
+                .expect("命中"),
+            region(1),
+            "不能删掉一半才报错"
+        );
+    }
+
+    #[test]
+    fn reclaim_orphans_keeps_meta_bodies() {
+        let dir = TempDir::new("reclaim-orphans");
+        let paths = dir.paths();
+        let kept = body(5);
+        let orphan = body(6);
+        let kept_key = key(0, 0, 0);
+        write_region(&paths, kept, kept_key, &region(1)).expect("写 kept");
+        write_region(&paths, orphan, kept_key, &region(2)).expect("写 orphan");
+
+        let stats = reclaim_orphans(&paths, &meta_with(&[kept])).expect("回收孤儿");
+
+        assert_eq!(
+            stats,
+            ReclaimStats {
+                bodies: 1,
+                regions: 1,
+            }
+        );
+        assert!(!paths.body_dir(orphan).exists(), "孤儿目录必须删掉");
+        assert!(paths.body_dir(kept).is_dir(), "meta 里的 body 不能动");
+        assert_eq!(
+            read_region(&paths, kept, kept_key)
+                .expect("读 kept")
+                .expect("命中"),
+            region(1),
+            "meta 里的 region 必须原样可读"
+        );
+    }
+
+    #[test]
+    fn prune_empty_body_dir_only_removes_empty() {
+        let dir = TempDir::new("prune-empty");
+        let paths = dir.paths();
+        fs::create_dir_all(paths.body_dir(body(1))).expect("建空目录");
+        write_region(&paths, body(2), key(0, 0, 0), &region(1)).expect("写非空目录");
+
+        assert!(prune_empty_body_dir(&paths, body(1)).expect("删空目录"));
+        assert!(!paths.body_dir(body(1)).exists());
+
+        assert!(!prune_empty_body_dir(&paths, body(2)).expect("非空不删"));
+        assert!(paths.body_dir(body(2)).is_dir(), "非空目录必须留着");
+
+        assert!(
+            !prune_empty_body_dir(&paths, body(3)).expect("缺目录不算错"),
+            "目录不存在返回 false"
+        );
     }
 }
