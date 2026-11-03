@@ -71,7 +71,9 @@ pub use semantics::{
     OVERLAY_TAG_TABLE, SEMANTIC_DOMAINS, SOUND_TABLE, VFX_TABLE,
 };
 pub use sync::{CorePendingPresentation, CoreSyncBaseline};
-pub use voxel_mesh::{rect_corner, rect_normal, rect_scale_meters, VoxChunkGroupRaw, VoxChunkRaw};
+pub use voxel_mesh::{
+    rect_corner, rect_normal, rect_scale_meters, RenderGroupBody, VoxChunkGroupRaw, VoxChunkRaw,
+};
 
 /// 表现管线插件（引擎机制 + game-core 的收集/发布胶水）。
 pub struct PresentationPlugin;

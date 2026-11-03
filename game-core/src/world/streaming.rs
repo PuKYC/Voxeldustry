@@ -903,8 +903,10 @@ mod tests {
         let groups = world.resource::<RenderGroups>();
         assert!(!groups.0.is_empty(), "RenderGroups 不能为空");
         assert!(
-            groups.0.values().any(Option::is_some),
-            "至少一个区块应产出实际分组实体（非全空气）"
+            groups.0.values().all(|entity| world
+                .get::<crate::presentation::VoxChunkGroupRaw>(*entity)
+                .is_some()),
+            "每个到达 Render 的块都必须有存活的分组实体（全空气块也有 0 矩形载荷）"
         );
     }
 

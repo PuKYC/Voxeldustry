@@ -8,9 +8,10 @@
 //! - [Residency::Render]：在 Data 档**完成之后**真的产出该块的渲染分组实体
 //!   （[VoxChunkGroupRaw]，`lod: 0`，单块单组）：先从容器取树 →
 //!   [extract_raw_halo]（34³，[Neighbourhood::none] 让每块自封边，与 terrain
-//!   的面邻居缺失策略一致）→ 全空气就记 [RenderGroups] `None`（已到达、
-//!   无几何），否则 spawn 分组实体。消息顺序固定：`ChunkReached{Data}` 在前，
-//!   `ChunkReached{Render}` 在后。
+//!   的面邻居缺失策略一致）→ **无条件** spawn 分组实体：每个到达 Render 档的
+//!   块恒有一个分组实体，全空气块的 `chunks` 里只有一份全空气 34³ 载荷
+//!   （渲染出 0 个矩形）。理由：编辑后要能就地刷新，不能等重新加载。
+//!   消息顺序固定：`ChunkReached{Data}` 在前，`ChunkReached{Render}` 在后。
 //!
 //! ## 档位语义
 //!
@@ -26,8 +27,8 @@
 //!   才发消息并真正释放（见下）。
 //! - 卸载未确认期间的升档（复活）：把该 pair 从 [PendingUnloads] 移除，树仍
 //!   在容器里，走「已在容器」的快路径直接结算，不查存档、不重生成。
-//! - 重复消息幂等：同一 `(body, key)` 最多一个分组实体；`Render` 消息只在
-//!   首次产出（或首次判定全空气）时发一次。
+//! - 重复消息幂等：同一 `(body, key)` 最多一个分组实体（全空气块也有实体）；
+//!   `Render` 消息只在首次产出时发一次。
 //!
 //! ## 每 tick 的流水线
 //!
@@ -104,9 +105,7 @@ use std::collections::BTreeMap;
 use bevy::prelude::*;
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityIndex, StableIdAllocator};
-use game_engine::presentation::voxel::{
-    extract_raw_halo, raw_halo_has_solid_interior, WrappedBlockCache, RAW_VOXELS,
-};
+use game_engine::presentation::voxel::{extract_raw_halo, WrappedBlockCache, RAW_VOXELS};
 use game_engine::presentation::RenderTransform;
 use game_engine::residency::{ChunkReached, GameTickSet, Residency, ResidencyChanged};
 use game_engine::save::{
@@ -118,7 +117,7 @@ use game_engine::voxel::{
     dec_ref_recursive, ChunkKey, Lod, MeshBlock, Neighbourhood, VoxTree, VoxVolume, VoxelInterner,
 };
 
-use crate::presentation::{PresentedTransform, VoxChunkGroupRaw};
+use crate::presentation::{PresentedTransform, RenderGroupBody, VoxChunkGroupRaw};
 use crate::static_data::voxel::{DEFAULT_BIOME, DEFAULT_VOXEL_SIZE};
 use crate::voxel::terrain::blocks::block_origin_meters;
 use crate::voxel::terrain::generation::WorldGenerator;
@@ -170,7 +169,7 @@ pub struct StreamStats {
     /// 当前还没落盘确认的待卸载块数（[PendingUnloads] 长度），
     /// 每次 [release_pending_unloads] 跑完刷新。
     pub pending_unloads: usize,
-    /// 当前存活的分组实体数（[RenderGroups] 里 `Some` 的数量），每次增删后刷新。
+    /// 当前存活的分组实体数（[RenderGroups] 的长度），每次增删后刷新。
     pub render_groups: usize,
 }
 
@@ -242,12 +241,15 @@ pub struct PendingUnloads(pub BTreeMap<(BodyKey, ChunkKey), PendingUnload>);
 
 /// 已到达 [Residency::Render] 的块 -> 分组实体。
 ///
-/// 值 `None` 表示「已判定为全空气、没有几何」——它同样代表该块**已经到达**
-/// Render 档，因此重复的 Render 请求可以直接忽略，不必重复提取 34³ halo。
-/// 只有 `Some(entity)` 才是真正存活的分组实体（`StreamStats::render_groups`
-/// 统计的就是它的数量）。
+/// **每个到达 Render 档的块恒有一个分组实体**，全空气块也不例外：它的
+/// `chunks` 里只有一份全空气 34³ 载荷（渲染出 0 个矩形）。这样编辑后可以就地
+/// 刷新 `VoxChunkGroupRaw`，不必等块被卸载重载——否则「空块里放第一块方块」
+/// 要等下一次驻留变化才可见。
+///
+/// 键存在即代表该块**已经到达** Render 档，重复的 Render 请求可以直接忽略，
+/// 不必重复提取 34³ halo。`StreamStats::render_groups` 统计的就是这里的长度。
 #[derive(Resource, Debug, Default)]
-pub struct RenderGroups(pub BTreeMap<(BodyKey, ChunkKey), Option<Entity>>);
+pub struct RenderGroups(pub BTreeMap<(BodyKey, ChunkKey), Entity>);
 
 /// Data 档流式加载插件。
 pub struct VoxelStreamPlugin;
@@ -305,7 +307,12 @@ pub fn intake_residency_changes(
     mut stats: ResMut<StreamStats>,
 ) {
     for change in changes.read() {
-        let ResidencyChanged { body, key, from, to } = *change;
+        let ResidencyChanged {
+            body,
+            key,
+            from,
+            to,
+        } = *change;
         let pair = (body, key);
 
         // 降档：`to == None` 是真卸载；`Render -> Data` 只是渲染档清理
@@ -337,8 +344,8 @@ pub fn intake_residency_changes(
         // 就重新升 Render」的请求会被当成重复 Render 丢掉。
         let revived = pending.0.remove(&pair).is_some();
 
-        // 幂等：该块已经到过 Render（有分组实体，或已判定全空气）时，
-        // 重复的 Render 请求不再入队、不再发第二条 Render 消息。
+        // 幂等：该块已经到过 Render（恒有分组实体）时，重复的 Render 请求
+        // 不再入队、不再发第二条 Render 消息。
         if to == Residency::Render && groups.0.contains_key(&pair) {
             continue;
         }
@@ -647,7 +654,9 @@ fn demote(
         despawn_render_group(pair, commands, groups, index.as_deref_mut(), stats);
         wrapped.invalidate_covered(interner.inner_mut(), key);
         generated.own.invalidate_covered(interner.inner_mut(), key);
-        generated.neighbors.invalidate_covered(interner.inner_mut(), key);
+        generated
+            .neighbors
+            .invalidate_covered(interner.inner_mut(), key);
         neighbors.0.invalidate_covered(interner.inner_mut(), key);
     }
 
@@ -1036,9 +1045,12 @@ fn extract_block_raw(
 
 /// 确保该块有渲染分组实体；返回「本次是否新产出了这个块」。
 ///
-/// - 已在 [RenderGroups] 里（实体或全空气判定）→ `Ok(false)`，幂等。
-/// - 内层 32³ 全空气 → 记 `None`（已到达、无几何），`Ok(true)`。
+/// - 已在 [RenderGroups] 里 → `Ok(false)`，幂等。
 /// - 否则 spawn 分组实体并登记进 [StableEntityIndex]，`Ok(true)`。
+///
+/// **全空气块也 spawn**：`chunks` 里放一份全空气 34³ 载荷（渲染 0 个矩形），
+/// 并挂 [RenderGroupBody] 标出所属 body；之后在空块里放方块时，刷新系统能
+/// 直接就地更新这个实体，不必等块重新加载。
 fn ensure_render_group(
     pair: (BodyKey, ChunkKey),
     raw: &[u8],
@@ -1050,14 +1062,8 @@ fn ensure_render_group(
     if groups.0.contains_key(&pair) {
         return Ok(false);
     }
-    let (_, key) = pair;
+    let (body, key) = pair;
     debug_assert_eq!(raw.len(), RAW_VOXELS, "extract_raw_halo 必须产出 34³");
-
-    // 全空气块：没有几何可渲染，但仍算「已到达 Render」，防止重复提取。
-    if !raw_halo_has_solid_interior(raw) {
-        groups.0.insert(pair, None);
-        return Ok(true);
-    }
 
     let (Some(allocator), Some(index)) = (allocator.as_deref_mut(), index) else {
         return Err("缺少 StableIdAllocator / StableEntityIndex 资源");
@@ -1079,10 +1085,11 @@ fn ensure_render_group(
             Transform::from_translation(position),
             Size(None),
             presented,
+            RenderGroupBody(body),
         ))
         .id();
     index.insert(id, entity);
-    groups.0.insert(pair, Some(entity));
+    groups.0.insert(pair, entity);
     Ok(true)
 }
 
@@ -1094,7 +1101,7 @@ fn despawn_render_group(
     index: Option<&mut StableEntityIndex>,
     stats: &mut StreamStats,
 ) {
-    if let Some(Some(entity)) = groups.0.remove(&pair) {
+    if let Some(entity) = groups.0.remove(&pair) {
         if let Some(index) = index {
             index.remove_by_entity(entity);
         }
@@ -1105,7 +1112,7 @@ fn despawn_render_group(
 
 /// 把 `stats.render_groups` 刷成存活分组实体数。
 fn refresh_render_groups(groups: &RenderGroups, stats: &mut StreamStats) {
-    stats.render_groups = groups.0.values().filter(|slot| slot.is_some()).count();
+    stats.render_groups = groups.0.len();
 }
 
 /// 单个体素边长（米），与 terrain 分组使用的尺度一致。
@@ -1150,6 +1157,7 @@ mod tests {
 
     use bevy::prelude::*;
     use game_engine::identity::{StableIdPlugin, StableIdWorldExt};
+    use game_engine::presentation::voxel::raw_halo_has_solid_interior;
     use game_engine::residency::ChunkAnchor;
     use game_engine::save::{
         export_chunk, read_region, EntityRecord, OpaqueComponents, Persist, PersistComponent,
@@ -1238,9 +1246,9 @@ mod tests {
         app.insert_resource(ChunkPersistence(Box::new(ScriptedStore::new(answers))));
         // 只用 run_schedule 的测试也要 finish：Avian 在 Plugin::finish 注册诊断资源。
         app.finish();
-        let (entity, id) =
-            app.world_mut()
-                .spawn_stable(VoxVolume::with_capacity(DEFAULT_VOXEL_SIZE, 4));
+        let (entity, id) = app
+            .world_mut()
+            .spawn_stable(VoxVolume::with_capacity(DEFAULT_VOXEL_SIZE, 4));
         Harness {
             app,
             entity,
@@ -1735,7 +1743,11 @@ mod tests {
             ],
             "同一块必须先发 Data、再发 Render"
         );
-        assert_eq!(harness.content_hash(&key), expected, "Data 档必须真的装上存档内容");
+        assert_eq!(
+            harness.content_hash(&key),
+            expected,
+            "Data 档必须真的装上存档内容"
+        );
 
         let entities = harness.group_entities();
         assert_eq!(entities.len(), 1, "必须恰好产出一个分组实体");
@@ -1744,9 +1756,69 @@ mod tests {
         assert_eq!(raw.chunks.len(), 1, "单块单组：分组里只能有该块");
         let (payload, mask) = raw.chunks.get(&key).expect("分组必须恰含该 key");
         assert_eq!(payload.len(), RAW_VOXELS);
-        assert!(raw_halo_has_solid_interior(payload), "有几何的块才该 spawn");
+        assert!(
+            raw_halo_has_solid_interior(payload),
+            "生成的块本来就该是实心地形"
+        );
         assert_eq!(*mask, 0, "自封边、无跨 LOD 裙边，掩码为 0");
         assert_eq!(harness.stats().render_groups, 1);
+    }
+
+    /// 全空气块到达 Render 档时也要有分组实体：载荷是一份全空气 34³
+    /// （渲染 0 个矩形），并挂 [RenderGroupBody] 标出所属 body。这样在空块里
+    /// 放第一块方块时可以直接就地刷新，不必等块重新加载。
+    #[test]
+    fn air_chunk_still_gets_a_group_entity() {
+        let key = chunk_key(15, 0, 1);
+        let mut harness = harness(vec![Answer::Miss]);
+
+        // 模拟地形已经把一块空树生成进容器（内容态 Undetermined）。
+        let tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
+        harness
+            .app
+            .world_mut()
+            .entity_mut(harness.entity)
+            .get_mut::<VoxVolume>()
+            .expect("body 实体必须带 VoxVolume")
+            .insert_chunk(key, tree);
+        harness
+            .app
+            .world_mut()
+            .resource_mut::<GenTable>()
+            .advance((harness.body, key), GenState::Undetermined)
+            .expect("Unloaded -> Undetermined 是合法推进");
+
+        harness.upgrade_to_render(key);
+        harness.tick();
+
+        assert_eq!(harness.stats().render_groups, 1, "空块也算一个分组");
+        let entities = harness.group_entities();
+        assert_eq!(entities.len(), 1, "全空气块也必须有一个分组实体");
+        let entity = entities[0];
+
+        let owner = harness
+            .app
+            .world()
+            .entity(entity)
+            .get::<RenderGroupBody>()
+            .copied()
+            .expect("流式分组必须带 RenderGroupBody");
+        assert_eq!(owner, RenderGroupBody(harness.body), "owner 必须是该 body");
+
+        let raw = harness.group_payload(entity);
+        assert_eq!(raw.lod, 0);
+        assert_eq!(raw.chunks.len(), 1, "全空气块也有一份 34³ 载荷");
+        let (payload, mask) = raw.chunks.get(&key).expect("分组必须恰含该 key");
+        assert_eq!(payload.len(), RAW_VOXELS);
+        assert!(
+            !raw_halo_has_solid_interior(payload),
+            "全空气载荷不得被当成实心"
+        );
+        assert_eq!(*mask, 0);
+        assert!(
+            harness.app.world().get_entity(entity).is_ok(),
+            "分组实体必须真的存在"
+        );
     }
 
     #[test]
@@ -1765,7 +1837,10 @@ mod tests {
                 level: Residency::Data,
             }]
         );
-        assert!(harness.group_entities().is_empty(), "Data 档不得 spawn 分组实体");
+        assert!(
+            harness.group_entities().is_empty(),
+            "Data 档不得 spawn 分组实体"
+        );
         assert!(harness.render_groups().0.is_empty());
         assert_eq!(harness.stats().render_groups, 0);
     }
@@ -1783,8 +1858,15 @@ mod tests {
         // 第二条相同的 Render 消息：既不 spawn 第二个实体，也不重发 Render。
         harness.upgrade_to_render(key);
         harness.tick();
-        assert_eq!(harness.group_entities().len(), 1, "同一块只能有一个分组实体");
-        assert!(harness.render_messages().is_empty(), "重复消息不得重复发 Render");
+        assert_eq!(
+            harness.group_entities().len(),
+            1,
+            "同一块只能有一个分组实体"
+        );
+        assert!(
+            harness.render_messages().is_empty(),
+            "重复消息不得重复发 Render"
+        );
         assert_eq!(harness.stats().render_groups, 1);
         assert_eq!(harness.stats().generated, 1, "幂等请求不得触发第二次生成");
     }
@@ -1826,7 +1908,10 @@ mod tests {
 
         harness.upgrade_to_render(key);
         harness.tick();
-        assert!(harness.alive_nodes() > baseline, "Render 档必须真的装进体素树");
+        assert!(
+            harness.alive_nodes() > baseline,
+            "Render 档必须真的装进体素树"
+        );
         let entities = harness.group_entities();
         assert_eq!(entities.len(), 1);
         let _ = harness.reached();
@@ -1964,7 +2049,10 @@ mod tests {
         assert_eq!(record.generator_version, 1);
         assert!(record.entities.is_empty());
         assert!(record.proposals.is_empty());
-        assert_eq!(harness.app.world().resource::<SaveStore>().stats().buffered, 0);
+        assert_eq!(
+            harness.app.world().resource::<SaveStore>().stats().buffered,
+            0
+        );
     }
 
     #[test]
@@ -2025,7 +2113,12 @@ mod tests {
         assert_eq!(harness.alive_nodes(), baseline, "节点引用必须回基线");
         assert_eq!(harness.stats().unloaded, 1);
         assert!(
-            harness.app.world().resource::<PendingUnloads>().0.is_empty(),
+            harness
+                .app
+                .world()
+                .resource::<PendingUnloads>()
+                .0
+                .is_empty(),
             "释放后 pending 必须清空"
         );
     }
@@ -2111,7 +2204,12 @@ mod tests {
             "无内容无实体的块不得写记录"
         );
         assert_eq!(
-            harness.app.world().resource::<SaveStore>().stats().tombstones,
+            harness
+                .app
+                .world()
+                .resource::<SaveStore>()
+                .stats()
+                .tombstones,
             1,
             "空块必须标删除"
         );
@@ -2220,7 +2318,11 @@ mod tests {
             1,
             "demote 后必须已经提交给存档（进内存缓冲）"
         );
-        assert_eq!(read_back(&harness, dir.path(), key), None, "还在缓冲，未落盘");
+        assert_eq!(
+            read_back(&harness, dir.path(), key),
+            None,
+            "还在缓冲，未落盘"
+        );
 
         flush_store(&harness);
         harness.tick();
@@ -2362,7 +2464,10 @@ mod tests {
             );
         }
 
-        assert!(harness.volume().contains_chunk(&key), "写盘失败时树必须保留");
+        assert!(
+            harness.volume().contains_chunk(&key),
+            "写盘失败时树必须保留"
+        );
         assert!(harness.will_unload().is_empty(), "写盘失败不得发卸载消息");
         assert_eq!(harness.stats().unloaded, 0);
         assert_eq!(harness.stats().pending_unloads, 1);
@@ -2420,7 +2525,12 @@ mod tests {
         assert_eq!(harness.stats().unloaded, 0);
         assert_eq!(harness.stats().pending_unloads, 1);
         assert_eq!(
-            harness.app.world().resource::<SaveStore>().stats().tombstones,
+            harness
+                .app
+                .world()
+                .resource::<SaveStore>()
+                .stats()
+                .tombstones,
             1,
             "空块必须标删除"
         );
@@ -2547,10 +2657,22 @@ mod tests {
         harness.upgrade(key);
         harness.tick();
 
-        assert_eq!(harness.stats().loaded_from_store, 0, "stale 记录不得计入命中");
+        assert_eq!(
+            harness.stats().loaded_from_store,
+            0,
+            "stale 记录不得计入命中"
+        );
         assert_eq!(harness.stats().generated, 1, "必须走生成路径");
-        assert_eq!(harness.content_hash(&key), generated_hash, "块内容应是生成器产出");
-        assert_ne!(harness.content_hash(&key), injected_hash, "不得装上注入的旧内容");
+        assert_eq!(
+            harness.content_hash(&key),
+            generated_hash,
+            "块内容应是生成器产出"
+        );
+        assert_ne!(
+            harness.content_hash(&key),
+            injected_hash,
+            "不得装上注入的旧内容"
+        );
         assert!(
             harness.chunk_entities().is_empty(),
             "stale 分支不得发 ChunkEntities（实体已由启动读档恢复，重复发会二次 apply）"
@@ -2662,7 +2784,11 @@ mod tests {
         assert_eq!(harness.stats().loaded_from_store, 1);
         assert_eq!(harness.stats().generated, 0);
         assert_eq!(harness.content_hash(&key), real_hash, "应装真 store 的内容");
-        assert_ne!(harness.content_hash(&key), scripted_hash, "假存档的答案不得被用");
+        assert_ne!(
+            harness.content_hash(&key),
+            scripted_hash,
+            "假存档的答案不得被用"
+        );
 
         let mut store = harness.app.world_mut().resource_mut::<SaveStore>();
         store.shutdown_worker();

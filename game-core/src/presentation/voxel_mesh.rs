@@ -28,6 +28,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
+use game_engine::body_key::BodyKey;
+use game_engine::identity::StableEntityId;
 use game_engine::presentation::voxel::{extract_raw_halo, raw_halo_has_solid_interior};
 use game_engine::voxel::{
     ChunkKey, DirtyChunk, Lod, MeshBlock, Neighbourhood, RectInstance, VoxVolume, VoxelBox,
@@ -76,6 +78,15 @@ pub struct VoxChunkGroupRaw {
     /// 块原点 -> (34³ 方块 id 缓冲, 该块跨 LOD 裙边掩码)。
     pub chunks: BTreeMap<ChunkKey, (Vec<u8>, u8)>,
 }
+
+/// 分组实体所属的 body（流式地形分组用；Eager 地形分组没有这个组件）。
+///
+/// 流式层是单块单组，分组实体上没有 [VoxVolume]（容器在 body 根实体上），
+/// 所以由这个组件把「这一组属于哪个 body」带回表现层刷新系统。Eager 地形的
+/// 分组实体不带它——那里的分组 id 是组自己的稳定 id，不是 body，不能拿它
+/// 当 body 用。
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderGroupBody(pub BodyKey);
 
 /// 一个矩形在块局部体素坐标下的 4 个角点。
 ///
@@ -145,21 +156,78 @@ impl Plugin for VoxelMeshRefreshPlugin {
 }
 
 /// 消费脏块并增量重建 `VoxChunkGroupRaw` 内受影响的块。
+///
+/// ## 三种分组形状
+///
+/// 生产里体素容器**不在**分组实体上（Eager 地形把容器放在 body 根实体上，
+/// 流式层也是单块单组），所以先解析「这一组属于哪个 body、用哪个 [VoxVolume]」，
+/// 按以下优先级：
+///
+/// 1. **合并形状**：分组实体自己带 [VoxVolume]（旧单测、`dev/gameplay_test.rs`）。
+///    直接用它的容器；body 取该实体自己的 [StableEntityId]（没有就当无 body）。
+/// 2. **流式形状**：分组实体带 [RenderGroupBody]。body 来自该组件，容器在 body
+///    根实体上——从「[VoxVolume] + [StableEntityId]」实体表里按 body 查，缺失
+///    就跳过。
+/// 3. **Eager 生产形状**：分组实体既没有容器也没有 owner（组上的
+///    [StableEntityId] 是组自己的 id，不是 body），只能反查包含关系：把组内
+///    **受影响的**块键拿去问每个 body 的容器 `contains_chunk`，恰好命中一个
+///    body 才采用；0 个跳过；多个视为歧义，跳过并 `debug!`——不猜。
+///
+/// ## 刷新范围与门控
+///
+/// - 有 body 的编辑只送给该 body 的分组（`by_body_affected[body]`）；
+/// - bodyless 编辑（`mark_edited` 旧调用）按**兼容语义**对任何分组生效；
+/// - 流式分组只刷新 `chunks` 里已经有的键：它是单块单组、组原点就是该块，
+///   把邻块补进来会在错误位置重复渲染。Eager / 合并形状保留旧行为（新变实心
+///   的邻块补进组，否则空块里放方块不可见）；
+/// - 只处理 `lod == 0`；仍用 `group_key(anchor, 0)` 做 region 门控
+///   （anchor = `chunks` 升序首个键），避免把组外的邻块塞进别的分组。
 pub fn refresh_dirty_voxel_meshes(
     mut dirty: ResMut<VoxelDirtySet>,
     interner: Res<VoxelInterner>,
-    mut groups: Query<(&VoxVolume, &mut VoxChunkGroupRaw)>,
+    volumes: Query<(&VoxVolume, &StableEntityId), Without<VoxChunkGroupRaw>>,
+    mut groups: Query<(
+        &mut VoxChunkGroupRaw,
+        Option<&VoxVolume>,
+        Option<&StableEntityId>,
+        Option<&RenderGroupBody>,
+    )>,
 ) {
     let edits = dirty.take_edits();
     if edits.is_empty() {
         return;
     }
-    let affected = affected_chunk_keys(&edits);
-    if affected.is_empty() {
-        return;
+
+    // bodyless 桶与按 body 分桶：同一个 ChunkKey 在不同 body 下是不同内容，
+    // 绝不能合并成一份受影响集合。
+    let mut bodyless: Vec<DirtyChunk> = Vec::new();
+    let mut by_body: BTreeMap<BodyKey, Vec<DirtyChunk>> = BTreeMap::new();
+    for edit in edits {
+        match edit.body {
+            Some(body) => by_body.entry(body).or_default().push(edit),
+            None => bodyless.push(edit),
+        }
     }
 
-    for (volume, mut raw) in &mut groups {
+    let bodyless_affected = affected_chunk_keys(&bodyless);
+    let by_body_affected: BTreeMap<BodyKey, BTreeSet<ChunkKey>> = by_body
+        .iter()
+        .map(|(body, edits)| (*body, affected_chunk_keys(edits)))
+        .collect();
+
+    // body 根实体表：同时带容器与稳定 id 的实体（Eager 地形根、流式 body 根）。
+    // 同名 body 重复时保留先出现者，只警告不覆盖。
+    let mut volumes_by_body: BTreeMap<BodyKey, &VoxVolume> = BTreeMap::new();
+    for (volume, id) in &volumes {
+        let body = BodyKey::from(*id);
+        if volumes_by_body.contains_key(&body) {
+            warn!("duplicate VoxVolume owner for body {body:?}; keeping the first");
+            continue;
+        }
+        volumes_by_body.insert(body, volume);
+    }
+
+    for (mut raw, own_volume, own_id, owner) in &mut groups {
         // 粗 LOD 的 raw 不是从 VoxVolume 折叠出来的，不能在这里改。
         if raw.lod != 0 {
             continue;
@@ -168,8 +236,61 @@ pub fn refresh_dirty_voxel_meshes(
             continue;
         };
         let region = group_key(anchor, 0);
-        for key in &affected {
+
+        let resolved: Option<(&VoxVolume, Option<BodyKey>)> = if let Some(volume) = own_volume {
+            // 合并形状：容器就在分组实体上。
+            Some((volume, own_id.map(|id| BodyKey::from(*id))))
+        } else if let Some(owner) = owner {
+            // 流式形状：owner 给出 body，容器在 body 根实体上。
+            volumes_by_body
+                .get(&owner.0)
+                .map(|volume| (*volume, Some(owner.0)))
+        } else {
+            // Eager 生产形状：按「组内受影响的块键」反查唯一包含它的 body。
+            let mut candidates: BTreeSet<BodyKey> = BTreeSet::new();
+            for key in raw.chunks.keys() {
+                let affected = bodyless_affected.contains(key)
+                    || by_body_affected.values().any(|set| set.contains(key));
+                if !affected {
+                    continue;
+                }
+                for (body, volume) in &volumes_by_body {
+                    if volume.contains_chunk(key) {
+                        candidates.insert(*body);
+                    }
+                }
+            }
+            let mut it = candidates.iter();
+            match (it.next().copied(), it.next()) {
+                (Some(body), None) => volumes_by_body
+                    .get(&body)
+                    .map(|volume| (*volume, Some(body))),
+                (None, _) => None,
+                (Some(_), Some(_)) => {
+                    debug!(
+                        "voxel mesh refresh skipped ambiguous group: anchor={anchor:?} candidates={candidates:?}"
+                    );
+                    None
+                }
+            }
+        };
+        let Some((volume, body)) = resolved else {
+            continue;
+        };
+
+        // 流式分组只更新组内已有的键；Eager / 合并形状可以补进新变实心的邻块。
+        let streaming = owner.is_some();
+        let mut keys = bodyless_affected.clone();
+        if let Some(body) = body {
+            if let Some(set) = by_body_affected.get(&body) {
+                keys.extend(set.iter().copied());
+            }
+        }
+        for key in &keys {
             if group_key(*key, 0) != region {
+                continue;
+            }
+            if streaming && !raw.chunks.contains_key(key) {
                 continue;
             }
             refresh_group_chunk(volume, interner.inner(), &mut raw, *key);
@@ -301,7 +422,7 @@ mod tests {
     use game_engine::presentation::voxel::{
         pack_rect, pack_rect_with_ao, raw_halo_index, unpack_ao, unpack_rect, RAW_VOXELS,
     };
-    use game_engine::voxel::{set_voxel, MaxDepth, VoxOpsWrite, VoxTree, CHUNK_DEPTH};
+    use game_engine::voxel::{set_voxel_for, MaxDepth, VoxOpsWrite, VoxTree, CHUNK_DEPTH};
 
     fn rect(
         plane: u8,
@@ -540,6 +661,7 @@ mod tests {
         app: &mut App,
         entity: Entity,
         dirty: &mut VoxelDirtySet,
+        body: Option<BodyKey>,
         voxel: [i32; 3],
         value: u8,
     ) {
@@ -548,7 +670,7 @@ mod tests {
                 let mut entity_mut = world.entity_mut(entity);
                 let mut volume = entity_mut.get_mut::<VoxVolume>().expect("volume");
                 assert_eq!(
-                    set_voxel(&mut volume, &mut interner, dirty, voxel, value),
+                    set_voxel_for(&mut volume, &mut interner, dirty, body, voxel, value),
                     Ok(true)
                 );
             });
@@ -581,7 +703,7 @@ mod tests {
             .id();
 
         let mut dirty = VoxelDirtySet::new();
-        edit_volume(&mut app, entity, &mut dirty, [5, 0, 0], 0);
+        edit_volume(&mut app, entity, &mut dirty, None, [5, 0, 0], 0);
         app.update();
 
         let raw = app
@@ -622,7 +744,7 @@ mod tests {
 
         let mut dirty = VoxelDirtySet::new();
         // chunk 1 的局部 (0,0,0) = body 体素 (32,0,0)。
-        edit_volume(&mut app, entity, &mut dirty, [32, 0, 0], GRASS_BLOCK);
+        edit_volume(&mut app, entity, &mut dirty, None, [32, 0, 0], GRASS_BLOCK);
         app.update();
 
         let raw = app
@@ -641,6 +763,7 @@ mod tests {
     fn halo_affected_keys_expand_only_on_touched_boundaries() {
         let key = ChunkKey::new(0, 0, 0);
         let center = DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox {
                 min: [1, 1, 1],
@@ -654,6 +777,7 @@ mod tests {
         );
 
         let corner = DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox {
                 min: [0, 0, 0],
@@ -666,6 +790,7 @@ mod tests {
         assert!(keys.contains(&ChunkKey::new(0, 0, 0)));
 
         let full = DirtyChunk {
+            body: None,
             key,
             edited: VoxelBox::FULL,
         };
@@ -673,6 +798,333 @@ mod tests {
             affected_chunk_keys(&[full]).len(),
             27,
             "a whole-chunk edit touches all 26 halo neighbours"
+        );
+    }
+
+    /// 生产 Eager 形状：body 根实体带容器，分组实体只有 raw（既无 volume 也
+    /// 无 owner）。刷新只能靠「组内受影响块 ∈ body 容器」反查出唯一 body。
+    #[test]
+    fn refresh_uses_separate_body_volume() {
+        let key = ChunkKey::new(0, 0, 0);
+        let mut interner = VoxelInterner::new(4 * 1024 * 1024);
+        let tree = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let raw = raw_for(&interner, &tree, key);
+        let index = raw_halo_index(6, 1, 1);
+        assert_eq!(raw[index], GRASS_BLOCK);
+
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume.insert_chunk(key, tree);
+        let mut chunks = BTreeMap::new();
+        chunks.insert(key, (raw, 0));
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+
+        let body_id = StableEntityId(41);
+        let body = app.world_mut().spawn((volume, body_id)).id();
+        // 分组实体上的 StableEntityId 是组自己的 id，不是 body。
+        let group = app
+            .world_mut()
+            .spawn((StableEntityId(77), VoxChunkGroupRaw { lod: 0, chunks }))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        edit_volume(
+            &mut app,
+            body,
+            &mut dirty,
+            Some(BodyKey::new(body_id)),
+            [5, 0, 0],
+            0,
+        );
+        app.update();
+
+        let raw = app
+            .world()
+            .entity(group)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group");
+        assert_eq!(
+            raw.chunks[&key].0[index], 0,
+            "分组没有容器 / owner 时必须通过包含关系找到 body 的 volume"
+        );
+    }
+
+    /// 两个 body 共用同一个 ChunkKey：编辑必须按 body 精确路由，不能串台。
+    #[test]
+    fn refresh_matches_edits_by_body() {
+        let key = ChunkKey::new(0, 0, 0);
+        let index = raw_halo_index(6, 1, 1);
+        let mut interner = VoxelInterner::new(8 * 1024 * 1024);
+        let tree_a = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let tree_b = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let raw_a = raw_for(&interner, &tree_a, key);
+        let raw_b = raw_for(&interner, &tree_b, key);
+        assert_eq!(raw_a[index], GRASS_BLOCK);
+        assert_eq!(raw_b[index], GRASS_BLOCK);
+
+        let mut volume_a = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume_a.insert_chunk(key, tree_a);
+        let mut volume_b = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume_b.insert_chunk(key, tree_b);
+
+        let id_a = StableEntityId(101);
+        let id_b = StableEntityId(102);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+
+        let body_a = app.world_mut().spawn((volume_a, id_a)).id();
+        app.world_mut().spawn((volume_b, id_b));
+
+        let group_a = app
+            .world_mut()
+            .spawn((
+                StableEntityId(201),
+                VoxChunkGroupRaw {
+                    lod: 0,
+                    chunks: BTreeMap::from([(key, (raw_a, 0))]),
+                },
+                RenderGroupBody(BodyKey::new(id_a)),
+            ))
+            .id();
+        let group_b = app
+            .world_mut()
+            .spawn((
+                StableEntityId(202),
+                VoxChunkGroupRaw {
+                    lod: 0,
+                    chunks: BTreeMap::from([(key, (raw_b.clone(), 0))]),
+                },
+                RenderGroupBody(BodyKey::new(id_b)),
+            ))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        edit_volume(
+            &mut app,
+            body_a,
+            &mut dirty,
+            Some(BodyKey::new(id_a)),
+            [5, 0, 0],
+            0,
+        );
+        app.update();
+
+        let group_a_raw = app
+            .world()
+            .entity(group_a)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group a");
+        let group_b_raw = app
+            .world()
+            .entity(group_b)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group b");
+        assert_eq!(
+            group_a_raw.chunks[&key].0[index], 0,
+            "A 的编辑必须刷新 A 的分组"
+        );
+        assert_eq!(group_b_raw.chunks[&key].0, raw_b, "B 的分组必须逐字节不变");
+    }
+
+    /// bodyless 编辑（旧 `mark_edited`）是兼容语义：合并形状与流式 owner 形状
+    /// 都要刷新。
+    #[test]
+    fn refresh_bodyless_edit_reaches_all_shapes() {
+        let key = ChunkKey::new(0, 0, 0);
+        let index = raw_halo_index(6, 1, 1);
+        let mut interner = VoxelInterner::new(8 * 1024 * 1024);
+        let merged_tree = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let merged_raw = raw_for(&interner, &merged_tree, key);
+        let owner_tree = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        // owner 分组先给一份全空气载荷：刷新后必须变成实心。
+        let stale = vec![0u8; RAW_VOXELS];
+
+        let mut merged_volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        merged_volume.insert_chunk(key, merged_tree);
+        let mut owner_volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        owner_volume.insert_chunk(key, owner_tree);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+
+        let merged = app
+            .world_mut()
+            .spawn((
+                merged_volume,
+                VoxChunkGroupRaw {
+                    lod: 0,
+                    chunks: BTreeMap::from([(key, (merged_raw, 0))]),
+                },
+            ))
+            .id();
+        let body_id = StableEntityId(301);
+        app.world_mut().spawn((owner_volume, body_id));
+        let owner_group = app
+            .world_mut()
+            .spawn((
+                StableEntityId(302),
+                VoxChunkGroupRaw {
+                    lod: 0,
+                    chunks: BTreeMap::from([(key, (stale, 0))]),
+                },
+                RenderGroupBody(BodyKey::new(body_id)),
+            ))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        // bodyless：只改合并形状的容器，脏标记不带 body。
+        edit_volume(&mut app, merged, &mut dirty, None, [5, 0, 0], 0);
+        app.update();
+
+        let merged_raw = app
+            .world()
+            .entity(merged)
+            .get::<VoxChunkGroupRaw>()
+            .expect("merged group");
+        assert_eq!(
+            merged_raw.chunks[&key].0[index], 0,
+            "合并形状必须被 bodyless 编辑刷新"
+        );
+        let owner_raw = app
+            .world()
+            .entity(owner_group)
+            .get::<VoxChunkGroupRaw>()
+            .expect("owner group");
+        assert_eq!(
+            owner_raw.chunks[&key].0[index], GRASS_BLOCK,
+            "bodyless 编辑按兼容语义对 owner 形状同样生效"
+        );
+    }
+
+    /// 流式分组是单块单组、组原点就是该块：即使 halo 受影响集合含邻块，也只能
+    /// 刷新组内已有的键，否则邻块会在错误位置重复渲染。
+    #[test]
+    fn streaming_group_keeps_only_its_own_chunk() {
+        let key = ChunkKey::new(1, 0, 0);
+        let neighbour = ChunkKey::new(0, 0, 0);
+        let index = raw_halo_index(1, 1, 1);
+        let mut interner = VoxelInterner::new(8 * 1024 * 1024);
+        let tree = tree_with_voxels(&mut interner, &[(IVec3::new(0, 0, 0), GRASS_BLOCK)]);
+        let raw = raw_for(&interner, &tree, key);
+        assert_eq!(raw[index], GRASS_BLOCK);
+        // 邻块必须实心，否则「不吸收邻块」的断言会因空块本就进不了组而假通过。
+        let neighbour_tree =
+            tree_with_voxels(&mut interner, &[(IVec3::new(31, 31, 31), GRASS_BLOCK)]);
+
+        let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume.insert_chunk(key, tree);
+        volume.insert_chunk(neighbour, neighbour_tree);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+
+        let body_id = StableEntityId(401);
+        let body = app.world_mut().spawn((volume, body_id)).id();
+        let group = app
+            .world_mut()
+            .spawn((
+                StableEntityId(402),
+                VoxChunkGroupRaw {
+                    lod: 0,
+                    chunks: BTreeMap::from([(key, (raw, 0))]),
+                },
+                RenderGroupBody(BodyKey::new(body_id)),
+            ))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        // chunk (1,0,0) 的局部 (0,0,0) = body 体素 (32,0,0)：贴 -x 边界，
+        // 受影响集合会含同 region 的邻块 (0,0,0)。
+        edit_volume(
+            &mut app,
+            body,
+            &mut dirty,
+            Some(BodyKey::new(body_id)),
+            [32, 0, 0],
+            0,
+        );
+        app.update();
+
+        let raw = app
+            .world()
+            .entity(group)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group");
+        assert_eq!(raw.chunks.len(), 1, "流式单块单组不得吸收邻块");
+        assert!(!raw.chunks.contains_key(&neighbour));
+        assert_eq!(
+            raw.chunks[&key].0[index], 0,
+            "组内该块的 halo 必须已就地刷新"
+        );
+    }
+
+    /// 分组既无容器也无 owner，而两个 body 都包含该键：歧义不猜，原样跳过。
+    #[test]
+    fn refresh_skips_ambiguous_body() {
+        let key = ChunkKey::new(0, 0, 0);
+        let mut interner = VoxelInterner::new(8 * 1024 * 1024);
+        let tree_a = tree_with_voxels(&mut interner, &[(IVec3::new(5, 0, 0), GRASS_BLOCK)]);
+        let tree_b = tree_with_voxels(&mut interner, &[(IVec3::new(7, 0, 0), GRASS_BLOCK)]);
+        let stale = vec![0u8; RAW_VOXELS];
+
+        let mut volume_a = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume_a.insert_chunk(key, tree_a);
+        let mut volume_b = VoxVolume::new(DEFAULT_VOXEL_SIZE);
+        volume_b.insert_chunk(key, tree_b);
+
+        let id_a = StableEntityId(501);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(interner);
+        app.init_resource::<VoxelDirtySet>();
+        app.add_plugins(VoxelMeshRefreshPlugin);
+
+        let body_a = app.world_mut().spawn((volume_a, id_a)).id();
+        app.world_mut().spawn((volume_b, StableEntityId(502)));
+        let group = app
+            .world_mut()
+            .spawn((
+                StableEntityId(503),
+                VoxChunkGroupRaw {
+                    lod: 0,
+                    chunks: BTreeMap::from([(key, (stale.clone(), 0))]),
+                },
+            ))
+            .id();
+
+        let mut dirty = VoxelDirtySet::new();
+        edit_volume(
+            &mut app,
+            body_a,
+            &mut dirty,
+            Some(BodyKey::new(id_a)),
+            [9, 0, 0],
+            GRASS_BLOCK,
+        );
+        app.update();
+
+        let raw = app
+            .world()
+            .entity(group)
+            .get::<VoxChunkGroupRaw>()
+            .expect("group");
+        assert_eq!(
+            raw.chunks[&key].0, stale,
+            "歧义分组必须原样跳过（不猜、不 panic）"
         );
     }
 }
