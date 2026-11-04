@@ -95,6 +95,18 @@ impl Writer {
     }
 }
 
+/// 拼接字段路径：`{path}.{field}`。
+///
+/// 解码与校验一律经此构造错误路径，避免调用点手写 `format!` 造成文案漂移。
+fn field_path(path: &str, field: &str) -> String {
+    format!("{path}.{field}")
+}
+
+/// 拼接带下标的字段路径：`{path}.{field}[{index}]`。
+fn indexed_path(path: &str, field: &str, index: usize) -> String {
+    format!("{path}.{field}[{index}]")
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -133,6 +145,35 @@ impl<'a> Reader<'a> {
         let start = self.pos;
         self.pos += len;
         Ok(&self.bytes[start..self.pos])
+    }
+
+    /// 按「分区路径 + 字段名」读取，内部统一拼接错误路径。
+    fn take_at(&mut self, path: &str, field: &str, len: usize) -> Result<&'a [u8], SaveError> {
+        self.take(len, &field_path(path, field))
+    }
+
+    fn read_u8_at(&mut self, path: &str, field: &str) -> Result<u8, SaveError> {
+        self.u8(&field_path(path, field))
+    }
+
+    fn read_u16_at(&mut self, path: &str, field: &str) -> Result<u16, SaveError> {
+        self.u16(&field_path(path, field))
+    }
+
+    fn read_u32_at(&mut self, path: &str, field: &str) -> Result<u32, SaveError> {
+        self.u32(&field_path(path, field))
+    }
+
+    fn read_u64_at(&mut self, path: &str, field: &str) -> Result<u64, SaveError> {
+        self.u64(&field_path(path, field))
+    }
+
+    fn read_i32_at(&mut self, path: &str, field: &str) -> Result<i32, SaveError> {
+        self.i32(&field_path(path, field))
+    }
+
+    fn read_i64_at(&mut self, path: &str, field: &str) -> Result<i64, SaveError> {
+        self.i64(&field_path(path, field))
     }
 
     fn u8(&mut self, path: &str) -> Result<u8, SaveError> {
@@ -223,7 +264,7 @@ pub fn encode_world_meta(meta: &WorldMeta) -> Result<Vec<u8>, SaveError> {
 
     for (index, (key, body)) in meta.bodies.iter().enumerate() {
         let base = usize::from(WORLD_HEADER_LEN) + index * BODY_RECORD_LEN;
-        let path = |field: &str| format!("world.meta.body[{index}].{field}");
+        let path = |field: &str| field_path(&indexed_path("world.meta", "body", index), field);
 
         if body.id != *key {
             return Err(SaveError::new(
@@ -466,7 +507,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
     let mut previous_id: Option<u64> = None;
 
     for index in 0..u32_len(body_count) {
-        let path = |field: &str| format!("world.meta.body[{index}].{field}");
+        let path = |field: &str| field_path(&indexed_path("world.meta", "body", index), field);
 
         let id_offset = reader.offset();
         let id = reader.u64(&path("id"))?;
@@ -598,7 +639,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
     for (index, body) in bodies.values().enumerate() {
         if body.attach == AttachTag::Body && !bodies.contains_key(&body.attach_to) {
             return Err(SaveError::new(
-                format!("world.meta.body[{index}].attach_to"),
+                field_path(&indexed_path("world.meta", "body", index), "attach_to"),
                 header + index * BODY_RECORD_LEN + B_ATTACH_TO,
                 SaveErrorKind::Missing {
                     what: "attach_to body",
@@ -650,10 +691,10 @@ pub fn encode_component_table(components: &[ComponentRecord]) -> Result<Vec<u8>,
 
     let mut sorted: BTreeMap<u32, &ComponentRecord> = BTreeMap::new();
     for (index, component) in components.iter().enumerate() {
-        let path = format!("component_table.component[{index}]");
+        let path = indexed_path("component_table", "component", index);
         if component.stable_type_id == 0 {
             return Err(SaveError::new(
-                format!("{path}.stable_type_id"),
+                field_path(path, "stable_type_id"),
                 0,
                 SaveErrorKind::InvalidValue {
                     what: "stable_type_id",
@@ -663,7 +704,7 @@ pub fn encode_component_table(components: &[ComponentRecord]) -> Result<Vec<u8>,
         }
         if component.payload.len() > u32_len(MAX_COMPONENT_PAYLOAD_LEN) {
             return Err(SaveError::new(
-                format!("{path}.payload_len"),
+                field_path(path, "payload_len"),
                 0,
                 SaveErrorKind::TooLarge {
                     what: "component payload_len",
@@ -674,7 +715,7 @@ pub fn encode_component_table(components: &[ComponentRecord]) -> Result<Vec<u8>,
         }
         if sorted.insert(component.stable_type_id, component).is_some() {
             return Err(SaveError::new(
-                format!("{path}.stable_type_id"),
+                field_path(path, "stable_type_id"),
                 0,
                 SaveErrorKind::Duplicate {
                     what: "component stable_type_id",
@@ -721,13 +762,13 @@ fn decode_component_table_at(
 
     let mut reader = Reader::new(bytes, base);
 
-    let count = usize::from(reader.u16(&format!("{path}.component_count"))?);
+    let count = usize::from(reader.read_u16_at(path, "component_count")?);
 
     let reserved_offset = reader.offset();
-    let reserved = reader.u16(&format!("{path}.reserved"))?;
+    let reserved = reader.read_u16_at(path, "reserved")?;
     if reserved != 0 {
         return Err(SaveError::new(
-            format!("{path}.reserved"),
+            field_path(path, "reserved"),
             reserved_offset,
             SaveErrorKind::NonZeroReserved {
                 value: u64::from(reserved),
@@ -738,7 +779,7 @@ fn decode_component_table_at(
     // 每条组件至少 8 B（ID + 长度），先按上限判断，避免按不可信 count 预分配。
     if count > reader.remaining() / 8 {
         return Err(SaveError::new(
-            format!("{path}.component_count"),
+            field_path(path, "component_count"),
             reader.offset(),
             SaveErrorKind::Truncated {
                 need: count.saturating_mul(8),
@@ -749,13 +790,13 @@ fn decode_component_table_at(
 
     let mut components: Vec<ComponentRecord> = Vec::with_capacity(count);
     for index in 0..count {
-        let cpath = format!("{path}.component[{index}]");
+        let cpath = indexed_path(path, "component", index);
 
         let id_offset = reader.offset();
-        let stable_type_id = reader.u32(&format!("{cpath}.stable_type_id"))?;
+        let stable_type_id = reader.read_u32_at(&cpath, "stable_type_id")?;
         if stable_type_id == 0 {
             return Err(SaveError::new(
-                format!("{cpath}.stable_type_id"),
+                field_path(&cpath, "stable_type_id"),
                 id_offset,
                 SaveErrorKind::InvalidValue {
                     what: "stable_type_id",
@@ -765,10 +806,10 @@ fn decode_component_table_at(
         }
 
         let len_offset = reader.offset();
-        let payload_len = reader.u32(&format!("{cpath}.payload_len"))?;
+        let payload_len = reader.read_u32_at(&cpath, "payload_len")?;
         if payload_len > MAX_COMPONENT_PAYLOAD_LEN {
             return Err(SaveError::new(
-                format!("{cpath}.payload_len"),
+                field_path(&cpath, "payload_len"),
                 len_offset,
                 SaveErrorKind::TooLarge {
                     what: "component payload_len",
@@ -778,7 +819,7 @@ fn decode_component_table_at(
             ));
         }
         let payload = reader
-            .take(u32_len(payload_len), &format!("{cpath}.payload"))?
+            .take_at(&cpath, "payload", u32_len(payload_len))?
             .to_vec();
 
         if let Some(previous) = components.last().map(|component| component.stable_type_id) {
@@ -796,7 +837,7 @@ fn decode_component_table_at(
                     }
                 };
                 return Err(SaveError::new(
-                    format!("{cpath}.stable_type_id"),
+                    field_path(&cpath, "stable_type_id"),
                     id_offset,
                     kind,
                 ));
@@ -811,7 +852,7 @@ fn decode_component_table_at(
 
     if reader.remaining() != 0 {
         return Err(SaveError::new(
-            format!("{path}.trailing"),
+            field_path(path, "trailing"),
             reader.offset(),
             SaveErrorKind::TrailingBytes {
                 extra: reader.remaining(),
@@ -833,10 +874,10 @@ fn canonical_proposals(
 ) -> Result<BTreeMap<(u16, u32), ProposalRecord>, SaveError> {
     let mut proposals: BTreeMap<(u16, u32), ProposalRecord> = BTreeMap::new();
     for (index, proposal) in record.proposals.iter().enumerate() {
-        let ppath = format!("{path}.proposal[{index}]");
+        let ppath = indexed_path(path, "proposal", index);
         if let Some(axis) = proposal.invalid_axis() {
             return Err(SaveError::new(
-                format!("{ppath}.bounds"),
+                field_path(&ppath, "bounds"),
                 start,
                 SaveErrorKind::InvalidBounds { index, axis },
             ));
@@ -844,7 +885,7 @@ fn canonical_proposals(
         let key = (proposal.feature_type, proposal.seq);
         if proposals.insert(key, *proposal).is_some() {
             return Err(SaveError::new(
-                format!("{ppath}.seq"),
+                field_path(&ppath, "seq"),
                 start,
                 SaveErrorKind::Duplicate {
                     what: "proposal (feature_type, seq)",
@@ -864,10 +905,10 @@ fn canonical_entities<'a>(
 ) -> Result<BTreeMap<u64, &'a EntityRecord>, SaveError> {
     let mut entities: BTreeMap<u64, &EntityRecord> = BTreeMap::new();
     for (index, entity) in record.entities.iter().enumerate() {
-        let epath = format!("{path}.entity[{index}]");
+        let epath = indexed_path(path, "entity", index);
         if entity.stable_type_id == 0 {
             return Err(SaveError::new(
-                format!("{epath}.stable_type_id"),
+                field_path(&epath, "stable_type_id"),
                 start,
                 SaveErrorKind::InvalidValue {
                     what: "stable_type_id",
@@ -877,7 +918,7 @@ fn canonical_entities<'a>(
         }
         if entity.payload.len() > u32::MAX as usize {
             return Err(SaveError::new(
-                format!("{epath}.payload_len"),
+                field_path(&epath, "payload_len"),
                 start,
                 SaveErrorKind::TooLarge {
                     what: "entity payload_len",
@@ -887,11 +928,11 @@ fn canonical_entities<'a>(
             ));
         }
         // payload 原字节写回，但外层框必须自洽（§4.1）。校验结果丢弃。
-        decode_component_table_at(&entity.payload, &format!("{epath}.payload"), start)?;
+        decode_component_table_at(&entity.payload, &field_path(&epath, "payload"), start)?;
 
         if entities.insert(entity.stable_entity_id, entity).is_some() {
             return Err(SaveError::new(
-                format!("{epath}.stable_entity_id"),
+                field_path(&epath, "stable_entity_id"),
                 start,
                 SaveErrorKind::Duplicate {
                     what: "entity id in chunk",
@@ -901,7 +942,7 @@ fn canonical_entities<'a>(
         }
         if !seen_entities.insert(entity.stable_entity_id) {
             return Err(SaveError::new(
-                format!("{epath}.stable_entity_id"),
+                field_path(&epath, "stable_entity_id"),
                 start,
                 SaveErrorKind::Duplicate {
                     what: "entity id in region",
@@ -930,7 +971,7 @@ fn encode_record(
     }
     if record.content.is_some() && !record.proposals.is_empty() {
         return Err(SaveError::new(
-            format!("{path}.proposal_count"),
+            field_path(path, "proposal_count"),
             start,
             SaveErrorKind::InvalidCombination {
                 what: "content with proposals",
@@ -949,7 +990,7 @@ fn encode_record(
     if let Some(content) = &record.content {
         let content_len = u32::try_from(content.len()).map_err(|_| {
             SaveError::new(
-                format!("{path}.content_len"),
+                field_path(path, "content_len"),
                 start,
                 SaveErrorKind::TooLarge {
                     what: "content_len",
@@ -1013,10 +1054,10 @@ fn decode_record(
     let mut reader = Reader::new(bytes, base);
 
     let version_offset = reader.offset();
-    let record_version = reader.u16(&format!("{path}.record_version"))?;
+    let record_version = reader.read_u16_at(path, "record_version")?;
     if record_version != 1 {
         return Err(SaveError::new(
-            format!("{path}.record_version"),
+            field_path(path, "record_version"),
             version_offset,
             SaveErrorKind::Unsupported {
                 what: "record_version",
@@ -1026,10 +1067,10 @@ fn decode_record(
     }
 
     let flags_offset = reader.offset();
-    let flags = reader.u16(&format!("{path}.flags"))?;
+    let flags = reader.read_u16_at(path, "flags")?;
     if flags & !1 != 0 {
         return Err(SaveError::new(
-            format!("{path}.flags"),
+            field_path(path, "flags"),
             flags_offset,
             SaveErrorKind::Unsupported {
                 what: "record flags",
@@ -1040,10 +1081,10 @@ fn decode_record(
 
     let content = if flags & 1 != 0 {
         let len_offset = reader.offset();
-        let content_len = reader.u32(&format!("{path}.content_len"))?;
+        let content_len = reader.read_u32_at(path, "content_len")?;
         if content_len > MAX_RECORD_LEN {
             return Err(SaveError::new(
-                format!("{path}.content_len"),
+                field_path(path, "content_len"),
                 len_offset,
                 SaveErrorKind::TooLarge {
                     what: "content_len",
@@ -1054,17 +1095,17 @@ fn decode_record(
         }
         Some(
             reader
-                .take(u32_len(content_len), &format!("{path}.content"))?
+                .take_at(&path, "content", u32_len(content_len))?
                 .to_vec(),
         )
     } else {
         None
     };
 
-    let proposal_count = u32_len(reader.u32(&format!("{path}.proposal_count"))?);
+    let proposal_count = u32_len(reader.read_u32_at(path, "proposal_count")?);
     if proposal_count > reader.remaining() / PROPOSAL_RECORD_LEN {
         return Err(SaveError::new(
-            format!("{path}.proposal_count"),
+            field_path(path, "proposal_count"),
             reader.offset(),
             SaveErrorKind::Truncated {
                 need: proposal_count.saturating_mul(PROPOSAL_RECORD_LEN),
@@ -1075,15 +1116,15 @@ fn decode_record(
 
     let mut proposals: Vec<ProposalRecord> = Vec::with_capacity(proposal_count);
     for index in 0..proposal_count {
-        let ppath = format!("{path}.proposal[{index}]");
+        let ppath = indexed_path(path, "proposal", index);
 
-        let feature_type = reader.u16(&format!("{ppath}.feature_type"))?;
+        let feature_type = reader.read_u16_at(&ppath, "feature_type")?;
 
         let reserved_offset = reader.offset();
-        let reserved = reader.u16(&format!("{ppath}.reserved"))?;
+        let reserved = reader.read_u16_at(&ppath, "reserved")?;
         if reserved != 0 {
             return Err(SaveError::new(
-                format!("{ppath}.reserved"),
+                field_path(&ppath, "reserved"),
                 reserved_offset,
                 SaveErrorKind::NonZeroReserved {
                     value: u64::from(reserved),
@@ -1091,23 +1132,23 @@ fn decode_record(
             ));
         }
 
-        let seq = reader.u32(&format!("{ppath}.seq"))?;
-        let priority = reader.i32(&format!("{ppath}.priority"))?;
-        let tie_break = reader.u64(&format!("{ppath}.tie_break"))?;
+        let seq = reader.read_u32_at(&ppath, "seq")?;
+        let priority = reader.read_i32_at(&ppath, "priority")?;
+        let tie_break = reader.read_u64_at(&ppath, "tie_break")?;
         let origin = [
-            reader.i32(&format!("{ppath}.origin.x"))?,
-            reader.i32(&format!("{ppath}.origin.y"))?,
-            reader.i32(&format!("{ppath}.origin.z"))?,
+            reader.read_i32_at(&ppath, "origin.x")?,
+            reader.read_i32_at(&ppath, "origin.y")?,
+            reader.read_i32_at(&ppath, "origin.z")?,
         ];
         let bounds_min = [
-            reader.i32(&format!("{ppath}.bounds_min.x"))?,
-            reader.i32(&format!("{ppath}.bounds_min.y"))?,
-            reader.i32(&format!("{ppath}.bounds_min.z"))?,
+            reader.read_i32_at(&ppath, "bounds_min.x")?,
+            reader.read_i32_at(&ppath, "bounds_min.y")?,
+            reader.read_i32_at(&ppath, "bounds_min.z")?,
         ];
         let bounds_max = [
-            reader.i32(&format!("{ppath}.bounds_max.x"))?,
-            reader.i32(&format!("{ppath}.bounds_max.y"))?,
-            reader.i32(&format!("{ppath}.bounds_max.z"))?,
+            reader.read_i32_at(&ppath, "bounds_max.x")?,
+            reader.read_i32_at(&ppath, "bounds_max.y")?,
+            reader.read_i32_at(&ppath, "bounds_max.z")?,
         ];
 
         let proposal = ProposalRecord {
@@ -1122,7 +1163,7 @@ fn decode_record(
 
         if let Some(axis) = proposal.invalid_axis() {
             return Err(SaveError::new(
-                format!("{ppath}.bounds"),
+                field_path(&ppath, "bounds"),
                 base,
                 SaveErrorKind::InvalidBounds { index, axis },
             ));
@@ -1144,18 +1185,18 @@ fn decode_record(
                         current: (u64::from(current_key.0) << 32) | u64::from(current_key.1),
                     }
                 };
-                return Err(SaveError::new(format!("{ppath}.seq"), base, kind));
+                return Err(SaveError::new(field_path(&ppath, "seq"), base, kind));
             }
         }
 
         proposals.push(proposal);
     }
 
-    let entity_count = u32_len(reader.u32(&format!("{path}.entity_count"))?);
+    let entity_count = u32_len(reader.read_u32_at(path, "entity_count")?);
     // 每条实体至少 16 B（id + type + payload_len），先按上限判断再分配。
     if entity_count > reader.remaining() / 16 {
         return Err(SaveError::new(
-            format!("{path}.entity_count"),
+            field_path(path, "entity_count"),
             reader.offset(),
             SaveErrorKind::Truncated {
                 need: entity_count.saturating_mul(16),
@@ -1166,10 +1207,10 @@ fn decode_record(
 
     let mut entities: Vec<EntityRecord> = Vec::with_capacity(entity_count);
     for index in 0..entity_count {
-        let epath = format!("{path}.entity[{index}]");
+        let epath = indexed_path(path, "entity", index);
 
         let id_offset = reader.offset();
-        let stable_entity_id = reader.u64(&format!("{epath}.stable_entity_id"))?;
+        let stable_entity_id = reader.read_u64_at(&epath, "stable_entity_id")?;
         if let Some(previous) = entities.last().map(|entity| entity.stable_entity_id) {
             if stable_entity_id <= previous {
                 let kind = if stable_entity_id == previous {
@@ -1185,7 +1226,7 @@ fn decode_record(
                     }
                 };
                 return Err(SaveError::new(
-                    format!("{epath}.stable_entity_id"),
+                    field_path(&epath, "stable_entity_id"),
                     id_offset,
                     kind,
                 ));
@@ -1193,10 +1234,10 @@ fn decode_record(
         }
 
         let type_offset = reader.offset();
-        let stable_type_id = reader.u32(&format!("{epath}.stable_type_id"))?;
+        let stable_type_id = reader.read_u32_at(&epath, "stable_type_id")?;
         if stable_type_id == 0 {
             return Err(SaveError::new(
-                format!("{epath}.stable_type_id"),
+                field_path(&epath, "stable_type_id"),
                 type_offset,
                 SaveErrorKind::InvalidValue {
                     what: "stable_type_id",
@@ -1206,10 +1247,10 @@ fn decode_record(
         }
 
         let payload_len_offset = reader.offset();
-        let payload_len = reader.u32(&format!("{epath}.payload_len"))?;
+        let payload_len = reader.read_u32_at(&epath, "payload_len")?;
         if payload_len > MAX_RECORD_LEN {
             return Err(SaveError::new(
-                format!("{epath}.payload_len"),
+                field_path(&epath, "payload_len"),
                 payload_len_offset,
                 SaveErrorKind::TooLarge {
                     what: "entity payload_len",
@@ -1221,13 +1262,13 @@ fn decode_record(
 
         let payload_offset = reader.offset();
         let payload = reader
-            .take(u32_len(payload_len), &format!("{epath}.payload"))?
+            .take_at(&epath, "payload", u32_len(payload_len))?
             .to_vec();
-        decode_component_table_at(&payload, &format!("{epath}.payload"), payload_offset)?;
+        decode_component_table_at(&payload, &field_path(&epath, "payload"), payload_offset)?;
 
         if !seen_entities.insert(stable_entity_id) {
             return Err(SaveError::new(
-                format!("{epath}.stable_entity_id"),
+                field_path(&epath, "stable_entity_id"),
                 id_offset,
                 SaveErrorKind::Duplicate {
                     what: "entity id in region",
@@ -1255,7 +1296,7 @@ fn decode_record(
 
     if content.is_some() && !proposals.is_empty() {
         return Err(SaveError::new(
-            format!("{path}.proposal_count"),
+            field_path(path, "proposal_count"),
             base,
             SaveErrorKind::InvalidCombination {
                 what: "content with proposals",
@@ -1346,7 +1387,7 @@ pub fn encode_region(region: &RegionFile) -> Result<Vec<u8>, SaveError> {
         let start = usize::try_from(record_offset).unwrap_or(usize::MAX);
         let bytes = encode_record(
             record,
-            &format!("region.chunk[{index}].record"),
+            &field_path(&indexed_path("region", "chunk", index), "record"),
             start,
             &mut seen_entities,
         )?;
@@ -1579,26 +1620,26 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
     let mut computed_max: u64 = 0;
 
     for index in 0..u32_len(chunk_count) {
-        let ipath = format!("region.index[{index}]");
+        let ipath = indexed_path("region", "index", index);
 
-        let x = index_reader.i32(&format!("{ipath}.x"))?;
-        let y = index_reader.i32(&format!("{ipath}.y"))?;
-        let z = index_reader.i32(&format!("{ipath}.z"))?;
+        let x = index_reader.read_i32_at(&ipath, "x")?;
+        let y = index_reader.read_i32_at(&ipath, "y")?;
+        let z = index_reader.read_i32_at(&ipath, "z")?;
         let key = ChunkKey::new(x, y, z);
 
-        let generator_version = index_reader.u32(&format!("{ipath}.generator_version"))?;
+        let generator_version = index_reader.read_u32_at(&ipath, "generator_version")?;
 
         let offset_field = index_reader.offset();
-        let record_offset = index_reader.u64(&format!("{ipath}.record_offset"))?;
+        let record_offset = index_reader.read_u64_at(&ipath, "record_offset")?;
 
         let len_field = index_reader.offset();
-        let record_len = index_reader.u32(&format!("{ipath}.record_len"))?;
+        let record_len = index_reader.read_u32_at(&ipath, "record_len")?;
 
         let reserved_field = index_reader.offset();
-        let reserved = index_reader.u32(&format!("{ipath}.reserved"))?;
+        let reserved = index_reader.read_u32_at(&ipath, "reserved")?;
         if reserved != 0 {
             return Err(SaveError::new(
-                format!("{ipath}.reserved"),
+                field_path(&ipath, "reserved"),
                 reserved_field,
                 SaveErrorKind::NonZeroReserved {
                     value: u64::from(reserved),
@@ -1609,7 +1650,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
         if let Some(previous) = previous_key {
             if key <= previous {
                 return Err(SaveError::new(
-                    format!("{ipath}"),
+                    ipath.clone(),
                     offset_field.saturating_sub(I_RECORD_OFFSET),
                     SaveErrorKind::ChunkKeyOrder {
                         previous: [previous.x, previous.y, previous.z],
@@ -1622,7 +1663,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
 
         if record_offset != expected_offset {
             return Err(SaveError::new(
-                format!("{ipath}.record_offset"),
+                field_path(&ipath, "record_offset"),
                 offset_field,
                 SaveErrorKind::Inconsistent {
                     what: "record_offset (records must be contiguous from header end)",
@@ -1634,7 +1675,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
 
         if record_len == 0 {
             return Err(SaveError::new(
-                format!("{ipath}.record_len"),
+                field_path(&ipath, "record_len"),
                 len_field,
                 SaveErrorKind::InvalidValue {
                     what: "record_len",
@@ -1644,7 +1685,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
         }
         if record_len > MAX_RECORD_LEN {
             return Err(SaveError::new(
-                format!("{ipath}.record_len"),
+                field_path(&ipath, "record_len"),
                 len_field,
                 SaveErrorKind::TooLarge {
                     what: "record_len",
@@ -1658,7 +1699,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
             .checked_add(u64::from(record_len))
             .ok_or_else(|| {
                 SaveError::new(
-                    format!("{ipath}.record_offset"),
+                    field_path(&ipath, "record_offset"),
                     offset_field,
                     SaveErrorKind::TooLarge {
                         what: "record end",
@@ -1669,7 +1710,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
             })?;
         if end > index_offset {
             return Err(SaveError::new(
-                format!("{ipath}.record_offset"),
+                field_path(&ipath, "record_offset"),
                 offset_field,
                 SaveErrorKind::TooLarge {
                     what: "record end",
@@ -1681,7 +1722,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
 
         let start = usize::try_from(record_offset).map_err(|_| {
             SaveError::new(
-                format!("{ipath}.record_offset"),
+                field_path(&ipath, "record_offset"),
                 offset_field,
                 SaveErrorKind::TooLarge {
                     what: "record_offset",
@@ -1692,7 +1733,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
         })?;
         let end = usize::try_from(end).map_err(|_| {
             SaveError::new(
-                format!("{ipath}.record_len"),
+                field_path(&ipath, "record_len"),
                 len_field,
                 SaveErrorKind::TooLarge {
                     what: "record_len",
@@ -1704,7 +1745,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
 
         let record = decode_record(
             &bytes[start..end],
-            &format!("region.chunk[{index}].record"),
+            &field_path(&indexed_path("region", "chunk", index), "record"),
             start,
             generator_version,
             &mut seen_entities,
