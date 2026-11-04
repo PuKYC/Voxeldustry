@@ -735,6 +735,50 @@ fn set_batch_at_root<T: VoxelTrait>(
     set_batch_at_depth_iterative(interner, node_id, &depth, batch)
 }
 
+/// 批量写入逐层积分的工作区：`current`/`next` 保存每层 path 对应的节点 id，
+/// `paths`/`next_paths` 保存该层尚待合并的 path。
+struct BatchLevels {
+    current: Vec<BlockId>,
+    next: Vec<BlockId>,
+    paths: Vec<usize>,
+    next_paths: Vec<usize>,
+}
+
+impl BatchLevels {
+    /// 按 batch 的 path 数量分配两层缓冲。
+    fn new(len: usize) -> Self {
+        Self {
+            current: vec![BlockId::INVALID; len],
+            next: vec![BlockId::INVALID; len],
+            paths: Vec::with_capacity(len),
+            next_paths: Vec::with_capacity(len),
+        }
+    }
+}
+
+/// 某一层正在拼装的 8 个兄弟槽位；`path` 为处理完当前兄弟组后的路径。
+struct SiblingSlot {
+    children: [BlockId; MAX_CHILDREN],
+    types: u8,
+    mask: u8,
+    path: usize,
+}
+
+impl SiblingSlot {
+    fn new(path: usize) -> Self {
+        Self {
+            children: EMPTY_CHILD,
+            types: 0,
+            mask: 0,
+            path,
+        }
+    }
+}
+
+/// 把一个 batch 按层写入 SVO DAG，返回新的根节点 id。
+///
+/// 整个写入分三个阶段：先把 batch 的整体填充值与最低层分支/叶节点写出来，
+/// 再由下往上逐层把悬空分支合并进现有树，最后返回收敛后的根。
 fn set_batch_at_depth_iterative<T: VoxelTrait>(
     interner: &mut VoxInterner<T>,
     initial_node_id: &BlockId,
@@ -752,8 +796,96 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
     let _span = tracy_client::span!("set_batch_at_depth_iterative");
 
     // Phase 0: handle fill
+    let initial_node_id = batch_fill_node(interner, initial_node_id, batch);
+
+    if !batch.has_patches() {
+        return initial_node_id;
+    }
+
+    let max_depth = initial_depth.max() as usize;
+    let initial_depth = initial_depth.current() as usize;
+
+    let mut levels =
+        build_dangling_branches(interner, batch, &initial_node_id, initial_depth, max_depth);
+
+    // Phase 2: Integrate dangling branches
+    trace_refs! {
+        println!(" Phase 2 - Integrate dangling branches");
+    }
+
+    if levels.paths.is_empty() {
+        trace_refs! {
+            println!("  No paths to process");
+        }
+        return BlockId::INVALID;
+    }
+
+    let final_node_id = integrate_dangling_branches(
+        interner,
+        &initial_node_id,
+        &mut levels,
+        max_depth - 1,
+        max_depth,
+    );
+
+    trace_refs! {
+        println!(" Phase 3 - Finalize");
+        println!("  new_root: {final_node_id:?}");
+        interner.dump_node(final_node_id, 0, "  ");
+    }
+
+    final_node_id
+}
+
+/// 阶段 1：为 batch 里每个非空 set_mask 写出一条悬空分支或叶节点。
+fn build_dangling_branches<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    batch: &Batch<T>,
+    initial_node_id: &BlockId,
+    initial_depth: usize,
+    max_depth: usize,
+) -> BatchLevels {
+    trace_refs! {
+        println!(" Phase 1 - Prepare the chain & build dangling branches",);
+        interner.dump_node(*initial_node_id, 0, "  ");
+    }
+
+    let mut levels = BatchLevels::new(batch.masks().len());
+
+    for (path_index, (set_mask, _clear_mask)) in batch.masks().iter().enumerate() {
+        if *set_mask == 0 {
+            continue;
+        }
+
+        let path = path_index << 3;
+        let values = &batch.values()[path_index];
+
+        if let Some(node_id) = place_path_at_leaf_level(
+            interner,
+            values,
+            path,
+            *set_mask,
+            initial_node_id,
+            initial_depth,
+            max_depth,
+        ) {
+            levels.current[path_index] = node_id;
+            levels.paths.push(path);
+        }
+    }
+
+    levels
+}
+
+/// 阶段 0：batch 是整体填充时直接创建对应的叶节点，否则沿用传入的根。
+fn batch_fill_node<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    initial_node_id: &BlockId,
+    batch: &Batch<T>,
+) -> BlockId {
     trace_refs! { println!(" Phase 0 - Handle fill",); }
-    let initial_node_id = if let Some(voxel) = batch.to_fill() {
+
+    if let Some(voxel) = batch.to_fill() {
         let node_id = interner.get_or_create_leaf(voxel);
 
         trace_refs! {
@@ -764,366 +896,489 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
         node_id
     } else {
         *initial_node_id
-    };
-
-    if !batch.has_patches() {
-        return initial_node_id;
     }
+}
 
-    let max_depth = initial_depth.max() as usize;
-    let initial_depth = initial_depth.current() as usize;
+/// 阶段 1 的单条路径：下探到最低层，写出该路径对应的分支或叶节点。
+///
+/// 返回值是写出的节点 id；该路径没有任何子节点发生变化时返回 `None`。
+fn place_path_at_leaf_level<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    values: &[T],
+    path: usize,
+    set_mask: u8,
+    initial_node_id: &BlockId,
+    initial_depth: usize,
+    max_depth: usize,
+) -> Option<BlockId> {
+    trace_refs! { println!("  path: 0x{path:08X} {path:09b}"); }
 
-    // Phase 1: prepare the chain & build dangling branches
-    trace_refs! {
-        println!(" Phase 1 - Prepare the chain & build dangling branches",);
-        interner.dump_node(initial_node_id, 0, "  ");
+    let (current_node_id, leaf_node_id) =
+        descend_path_to_last_level(interner, initial_node_id, path, initial_depth, max_depth);
+
+    let all_same = set_mask == 0xFF && values.iter().all(|v| *v == values[0]);
+
+    if all_same {
+        #[cfg(feature = "memory_stats")]
+        interner.bump_collapsed_branches();
+
+        let first_value = values[set_mask.trailing_zeros() as usize];
+        Some(interner.get_or_create_leaf(first_value))
+    } else {
+        write_path_children(interner, values, set_mask, &current_node_id, &leaf_node_id)
     }
+}
 
-    let data_len = batch.masks().len();
+/// 沿 `path` 自顶向下走到倒数第二层，返回 (当前节点, 被拆分的叶节点)。
+///
+/// 遇到空子节点即停止下探；中途把叶节点拆成 `BlockId::EMPTY` 并记录其 id。
+fn descend_path_to_last_level<T: VoxelTrait>(
+    interner: &VoxInterner<T>,
+    initial_node_id: &BlockId,
+    path: usize,
+    initial_depth: usize,
+    max_depth: usize,
+) -> (BlockId, BlockId) {
+    let mut current_node_id = *initial_node_id;
+    let mut leaf_node_id = BlockId::EMPTY;
 
-    let mut current_level_data = vec![BlockId::INVALID; data_len];
-    let mut next_level_data = vec![BlockId::INVALID; data_len];
-
-    let mut paths = Vec::with_capacity(data_len);
-    let mut next_paths = Vec::with_capacity(data_len);
-
-    for (path_index, (set_mask, _clear_mask)) in batch.masks().iter().enumerate() {
-        if *set_mask == 0 {
-            continue;
-        }
-
-        let path = path_index << 3;
-
-        let mut current_node_id = initial_node_id;
-
-        trace_refs! { println!("  path: 0x{path:08X} {path:09b}"); }
-
-        let mut leaf_node_id = BlockId::EMPTY;
-
-        for current_depth in initial_depth..(max_depth - 1) {
-            if current_node_id.is_branch() {
-                let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
-
-                trace_refs! {
-                    println!(
-                        "   depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {} [1a]",
-                        interner.get_ref(&current_node_id)
-                    );
-                }
-
-                current_node_id = interner.get_child_id(&current_node_id, index);
-            } else {
-                // Split leaf node
-                leaf_node_id = current_node_id;
-                current_node_id = BlockId::EMPTY;
-
-                trace_refs! {
-                    let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
-
-                    println!(
-                        "   depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {} [2]",
-                        interner.get_ref(&current_node_id)
-                    );
-                }
-            }
-
-            if current_node_id.is_empty() {
-                break;
-            }
-        }
-
-        let values = &batch.values()[path_index];
-
-        let all_same = *set_mask == 0xFF && values.iter().all(|v| *v == values[0]);
-
-        if !all_same {
-            let (mut children, mut types, mut mask) = if !current_node_id.is_empty() {
-                (
-                    interner.get_children(&current_node_id),
-                    current_node_id.types(),
-                    current_node_id.mask(),
-                )
-            } else if leaf_node_id.is_leaf() {
-                let data_len = set_mask.count_ones() as usize;
-                interner.inc_ref_by(&leaf_node_id, (MAX_CHILDREN - data_len) as u32);
-
-                ([leaf_node_id; MAX_CHILDREN], 0xFF, 0xFF)
-            } else {
-                (EMPTY_CHILD, 0, 0)
-            };
-
-            let mut modified_childs: u8 = 0;
-
-            let mut set_mask_bits = *set_mask;
-            while set_mask_bits != 0 {
-                let idx = set_mask_bits.trailing_zeros() as usize;
-                set_mask_bits &= !(1 << idx);
-
-                let value = &values[idx];
-
-                if !children[idx].is_empty() && interner.get_value(&children[idx]) == value {
-                    // No change needed
-                    continue;
-                }
-
-                children[idx] = interner.get_or_create_leaf(*value);
-
-                types |= 1 << idx;
-                mask |= 1 << idx;
-                modified_childs |= 1 << idx;
-            }
-
-            if modified_childs == 0 {
-                // No changes made
-                continue;
-            }
-
-            if leaf_node_id.is_empty() {
-                let mut non_modified_childs_bits = !modified_childs;
-                while non_modified_childs_bits != 0 {
-                    let idx = non_modified_childs_bits.trailing_zeros() as usize;
-                    non_modified_childs_bits &= !(1 << idx);
-
-                    if !children[idx].is_empty() {
-                        // If the child was not modified, we need to increment its ref count
-                        interner.inc_ref_by(&children[idx], 1);
-                    }
-                }
-            }
-
-            let branch_id = interner.get_or_create_branch(children, types, mask);
-
-            current_level_data[path_index] = branch_id;
-            paths.push(path);
-        } else {
-            #[cfg(feature = "memory_stats")]
-            interner.bump_collapsed_branches();
-
-            let first_value = values[set_mask.trailing_zeros() as usize];
-            let leaf_id = interner.get_or_create_leaf(first_value);
-
-            current_level_data[path_index] = leaf_id;
-            paths.push(path);
-        };
-    }
-
-    // Phase 2: Integrate dangling branches
-    trace_refs! {
-        println!(" Phase 2 - Integrate dangling branches");
-    }
-
-    if paths.is_empty() {
-        trace_refs! {
-            println!("  No paths to process");
-        }
-        return BlockId::INVALID;
-    }
-
-    let mut target_depth = max_depth - 1;
-
-    'main: while let Some(mut path) = paths.pop() {
-        trace_refs! {
-            println!(
-                "starting with path: {path:08X} {path:09b} target_depth: {target_depth} paths: {}",
-                paths.len(),
-            );
-        }
-
-        let path_mask_depth = if target_depth > 1 {
-            target_depth - 2
-        } else {
-            0
-        };
-
-        let path_mask = PATH_MASKS[max_depth][path_mask_depth] as usize;
-
-        let mut equivalent_id = initial_node_id;
-        let mut leaf_id = BlockId::EMPTY;
-
-        // Find equivalent node in the current tree
-        for current_depth in 0..(target_depth - 1) {
-            if equivalent_id.is_leaf() {
-                leaf_id = equivalent_id;
-                equivalent_id = BlockId::EMPTY;
-                break;
-            } else {
-                let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
-                equivalent_id = interner.get_child_id(&equivalent_id, index);
-            }
-
-            if equivalent_id.is_empty() {
-                break;
-            }
-        }
-
-        if equivalent_id.is_leaf() {
-            leaf_id = equivalent_id;
-            equivalent_id = BlockId::EMPTY;
-        };
-
-        let mut children = EMPTY_CHILD;
-        let mut types = 0;
-        let mut mask = 0;
-        let mut has_next_sibling = true;
-
-        while has_next_sibling {
-            trace_refs! { println!(" path: {path:08X} {path:09b}"); }
-
-            let target_index = (path >> ((max_depth - target_depth) * 3)) & 0b111;
-            let next_path = paths.last();
-
-            trace_refs! {
-                if let Some(next_path) = next_path {
-                    println!("  next path: {next_path:08X} {next_path:09b}");
-                }
-            }
-
-            has_next_sibling = if target_depth == 1 {
-                next_path.is_some()
-            } else if let Some(next_path) = next_path {
-                (path & path_mask) == (*next_path & path_mask)
-            } else {
-                false
-            };
-
-            let current_path_index = path >> 3;
-            let current_level_id = current_level_data[current_path_index];
-            children[target_index] = current_level_id;
-            current_level_data[current_path_index] = BlockId::INVALID;
-
-            types |= (current_level_id.is_leaf() as u8) << target_index;
-            mask |= 1 << target_index;
+    for current_depth in initial_depth..(max_depth - 1) {
+        if current_node_id.is_branch() {
+            let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
 
             trace_refs! {
                 println!(
-                    "  new_path: {:08X} {:09b}",
-                    path & path_mask,
-                    path & path_mask
+                    "   depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {} [1a]",
+                    interner.get_ref(&current_node_id)
                 );
             }
 
-            if has_next_sibling && !paths.is_empty() {
-                path = paths.pop().expect("No path found");
-            }
-
-            trace_refs! { println!("     has_more_paths: {}", !paths.is_empty()); }
-        }
-
-        trace_refs! {
-            println!(
-                "     types: {types:08b} mask: {mask:08b} current_path: {:09b}",
-                path & path_mask
-            );
-            for (child_idx, child) in children.iter().enumerate() {
-                println!("     child[{child_idx}]: {child:?}");
-            }
-        }
-
-        let existing_mask = equivalent_id.mask();
-        let inv_mask = !mask;
-        let cloned_nodes = existing_mask & inv_mask;
-
-        if mask != 0xFF {
-            if cloned_nodes != 0 {
-                let existing_children = interner.get_children_ref(&equivalent_id);
-
-                let mut cloned_nodes_bits = cloned_nodes;
-
-                while cloned_nodes_bits != 0 {
-                    let idx = cloned_nodes_bits.trailing_zeros() as usize;
-                    cloned_nodes_bits &= !(1 << idx);
-
-                    children[idx] = existing_children[idx];
-
-                    types |= (children[idx].is_leaf() as u8) << idx;
-                    mask |= 1 << idx;
-                }
-            } else if !leaf_id.is_empty() {
-                let leafs_to_clone = inv_mask.count_ones();
-
-                let mut leafs_to_clone_bits = inv_mask;
-
-                types |= inv_mask;
-                mask |= inv_mask;
-
-                while leafs_to_clone_bits != 0 {
-                    let idx = leafs_to_clone_bits.trailing_zeros() as usize;
-                    children[idx] = leaf_id;
-                    leafs_to_clone_bits &= !(1 << idx);
-                }
-
-                interner.inc_ref_by(&leaf_id, leafs_to_clone);
-            }
-        }
-
-        let all_same = types == 0xFF && children.iter().all(|item| item == &children[0]);
-
-        let new_node_id = if !all_same {
-            let mut cloned_nodes_bits = cloned_nodes;
-            while cloned_nodes_bits != 0 {
-                let idx = cloned_nodes_bits.trailing_zeros() as usize;
-                cloned_nodes_bits &= !(1 << idx);
-
-                interner.inc_ref(&children[idx]);
-            }
-
-            interner.get_or_create_branch(children, types, mask)
+            current_node_id = interner.get_child_id(&current_node_id, index);
         } else {
-            #[cfg(feature = "memory_stats")]
-            interner.bump_collapsed_branches();
+            // Split leaf node
+            leaf_node_id = current_node_id;
+            current_node_id = BlockId::EMPTY;
 
-            let dec_ref = if cloned_nodes != 0 {
-                cloned_nodes.count_ones().min(7)
-            } else {
-                7
-            };
+            trace_refs! {
+                let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
 
-            interner.dec_ref_by(&children[0], dec_ref);
+                println!(
+                    "   depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {} [2]",
+                    interner.get_ref(&current_node_id)
+                );
+            }
+        }
 
-            children[0]
-        };
+        if current_node_id.is_empty() {
+            break;
+        }
+    }
 
+    (current_node_id, leaf_node_id)
+}
+
+/// 取一条 path 在最低层的初始 (children, types, mask)。
+///
+/// 已有分支直接复用其子节点；被拆分的叶节点复制 8 份并补齐引用计数；
+/// 其余情况从全空开始。
+fn path_children_base<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    current_node_id: &BlockId,
+    leaf_node_id: &BlockId,
+    set_mask: u8,
+) -> ([BlockId; MAX_CHILDREN], u8, u8) {
+    if !current_node_id.is_empty() {
+        (
+            interner.get_children(current_node_id),
+            current_node_id.types(),
+            current_node_id.mask(),
+        )
+    } else if leaf_node_id.is_leaf() {
+        let data_len = set_mask.count_ones() as usize;
+        interner.inc_ref_by(leaf_node_id, (MAX_CHILDREN - data_len) as u32);
+
+        ([*leaf_node_id; MAX_CHILDREN], 0xFF, 0xFF)
+    } else {
+        (EMPTY_CHILD, 0, 0)
+    }
+}
+
+/// 写出一条 path 在最低层的 8 个子节点，返回新的分支节点 id。
+///
+/// 没有任何子节点变化时返回 `None`（调用方不记录该 path）。
+fn write_path_children<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    values: &[T],
+    set_mask: u8,
+    current_node_id: &BlockId,
+    leaf_node_id: &BlockId,
+) -> Option<BlockId> {
+    let (mut children, mut types, mut mask) =
+        path_children_base(interner, current_node_id, leaf_node_id, set_mask);
+
+    let mut modified_childs: u8 = 0;
+
+    let mut set_mask_bits = set_mask;
+    while set_mask_bits != 0 {
+        let idx = set_mask_bits.trailing_zeros() as usize;
+        set_mask_bits &= !(1 << idx);
+
+        let value = &values[idx];
+
+        if !children[idx].is_empty() && interner.get_value(&children[idx]) == value {
+            // No change needed
+            continue;
+        }
+
+        children[idx] = interner.get_or_create_leaf(*value);
+
+        types |= 1 << idx;
+        mask |= 1 << idx;
+        modified_childs |= 1 << idx;
+    }
+
+    if modified_childs == 0 {
+        // No changes made
+        return None;
+    }
+
+    if leaf_node_id.is_empty() {
+        let mut non_modified_childs_bits = !modified_childs;
+        while non_modified_childs_bits != 0 {
+            let idx = non_modified_childs_bits.trailing_zeros() as usize;
+            non_modified_childs_bits &= !(1 << idx);
+
+            if !children[idx].is_empty() {
+                // If the child was not modified, we need to increment its ref count
+                interner.inc_ref_by(&children[idx], 1);
+            }
+        }
+    }
+
+    Some(interner.get_or_create_branch(children, types, mask))
+}
+
+/// 阶段 2：从 `target_depth` 层开始，把阶段 1 写出的悬空分支逐层合并进现有树。
+///
+/// 每轮消费同一父节点下的所有兄弟 path，生成上一层节点，直到 `target_depth` 归零，
+/// 返回当前层里唯一的根节点 id。
+fn integrate_dangling_branches<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    initial_node_id: &BlockId,
+    levels: &mut BatchLevels,
+    mut target_depth: usize,
+    max_depth: usize,
+) -> BlockId {
+    'main: while let Some(path) = levels.paths.pop() {
         trace_refs! {
             println!(
-                "     new_node_id: {new_node_id:?} ref_count: {}",
-                interner.get_ref(&new_node_id)
+                "starting with path: {path:08X} {path:09b} target_depth: {target_depth} paths: {}",
+                levels.paths.len(),
             );
         }
 
-        let next_path = path & path_mask;
-        next_paths.push(next_path);
-        next_level_data[next_path >> 3] = new_node_id;
+        let path_mask = level_path_mask(target_depth, max_depth);
+        merge_sibling_group(
+            interner,
+            initial_node_id,
+            levels,
+            path,
+            target_depth,
+            max_depth,
+            path_mask,
+        );
 
         trace_refs! {
             println!(
                 "     has_more_paths: {} target_depth: {target_depth}",
-                !paths.is_empty(),
+                !levels.paths.is_empty(),
             );
         }
 
-        if paths.is_empty() {
-            std::mem::swap(&mut current_level_data, &mut next_level_data);
-            std::mem::swap(&mut paths, &mut next_paths);
-            next_paths.clear();
-
-            trace_refs! { println!("  paths: {paths:#?}"); }
-
-            target_depth -= 1;
+        if levels.paths.is_empty() {
+            advance_level(levels, &mut target_depth);
             if target_depth == 0 {
                 break 'main;
             }
         }
     }
 
-    let final_node_id = current_level_data[paths[0] >> 3];
+    levels.current[levels.paths[0] >> 3]
+}
+
+/// 返回合并 `target_depth` 层兄弟时用来判定同一父节点的掩码。
+fn level_path_mask(target_depth: usize, max_depth: usize) -> usize {
+    let path_mask_depth = if target_depth > 1 {
+        target_depth - 2
+    } else {
+        0
+    };
+    PATH_MASKS[max_depth][path_mask_depth] as usize
+}
+
+/// 合并 `path` 所在的一组兄弟，产出上一层的节点并登记到下一层缓冲。
+fn merge_sibling_group<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    initial_node_id: &BlockId,
+    levels: &mut BatchLevels,
+    path: usize,
+    target_depth: usize,
+    max_depth: usize,
+    path_mask: usize,
+) {
+    let (equivalent_id, leaf_id) =
+        find_equivalent_node(interner, initial_node_id, path, target_depth, max_depth);
+
+    let mut slot = collect_siblings(
+        &mut levels.paths,
+        &mut levels.current,
+        path,
+        target_depth,
+        max_depth,
+        path_mask,
+    );
+
+    let cloned_nodes = merge_cloned_children(interner, &equivalent_id, &leaf_id, &mut slot);
+
+    let new_node_id = finish_level_node(interner, &slot, cloned_nodes);
 
     trace_refs! {
-        println!(" Phase 3 - Finalize");
-        println!("  new_root: {final_node_id:?}");
-        interner.dump_node(final_node_id, 0, "  ");
+        println!(
+            "     new_node_id: {new_node_id:?} ref_count: {}",
+            interner.get_ref(&new_node_id)
+        );
     }
 
-    final_node_id
+    let next_path = slot.path & path_mask;
+    levels.next_paths.push(next_path);
+    levels.next[next_path >> 3] = new_node_id;
+}
+
+/// 当前层处理完后交换双缓冲，并让层数减一。
+fn advance_level(levels: &mut BatchLevels, target_depth: &mut usize) {
+    std::mem::swap(&mut levels.current, &mut levels.next);
+    std::mem::swap(&mut levels.paths, &mut levels.next_paths);
+    levels.next_paths.clear();
+
+    trace_refs! { println!("  paths: {:#?}", levels.paths); }
+
+    *target_depth -= 1;
+}
+
+/// 在 `target_depth - 1` 层找到与 `path` 对应的现有节点，用于继承未被覆盖的兄弟。
+///
+/// 返回 (对应节点, 可整层克隆的叶节点)；对应节点不存在时为空 id。
+fn find_equivalent_node<T: VoxelTrait>(
+    interner: &VoxInterner<T>,
+    initial_node_id: &BlockId,
+    path: usize,
+    target_depth: usize,
+    max_depth: usize,
+) -> (BlockId, BlockId) {
+    let mut equivalent_id = *initial_node_id;
+    let mut leaf_id = BlockId::EMPTY;
+
+    // Find equivalent node in the current tree
+    for current_depth in 0..(target_depth - 1) {
+        if equivalent_id.is_leaf() {
+            leaf_id = equivalent_id;
+            equivalent_id = BlockId::EMPTY;
+            break;
+        } else {
+            let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
+            equivalent_id = interner.get_child_id(&equivalent_id, index);
+        }
+
+        if equivalent_id.is_empty() {
+            break;
+        }
+    }
+
+    if equivalent_id.is_leaf() {
+        leaf_id = equivalent_id;
+        equivalent_id = BlockId::EMPTY;
+    }
+
+    (equivalent_id, leaf_id)
+}
+
+/// 收集 `target_depth` 层中与 `path` 同属一个父节点的所有兄弟槽位。
+///
+/// 消费的 path 从 `paths` 中弹出并清空 `current_level` 中对应槽位；
+/// 返回的槽位里 `path` 是最后一个被消费的路径。
+fn collect_siblings(
+    paths: &mut Vec<usize>,
+    current_level: &mut [BlockId],
+    mut path: usize,
+    target_depth: usize,
+    max_depth: usize,
+    path_mask: usize,
+) -> SiblingSlot {
+    let mut slot = SiblingSlot::new(path);
+    let mut has_next_sibling = true;
+
+    while has_next_sibling {
+        trace_refs! { println!(" path: {path:08X} {path:09b}"); }
+
+        let next_path = paths.last();
+
+        trace_refs! {
+            if let Some(next_path) = next_path {
+                println!("  next path: {next_path:08X} {next_path:09b}");
+            }
+        }
+
+        has_next_sibling = sibling_continues(path, path_mask, target_depth, next_path);
+        write_slot_child(&mut slot, current_level, path, target_depth, max_depth);
+
+        trace_refs! {
+            println!(
+                "  new_path: {:08X} {:09b}",
+                path & path_mask,
+                path & path_mask
+            );
+        }
+
+        if has_next_sibling && !paths.is_empty() {
+            path = paths.pop().expect("No path found");
+        }
+
+        trace_refs! { println!("     has_more_paths: {}", !paths.is_empty()); }
+    }
+
+    trace_refs! {
+        println!(
+            "     types: {:08b} mask: {:08b} current_path: {:09b}",
+            slot.types,
+            slot.mask,
+            path & path_mask
+        );
+        for (child_idx, child) in slot.children.iter().enumerate() {
+            println!("     child[{child_idx}]: {child:?}");
+        }
+    }
+
+    slot.path = path;
+    slot
+}
+
+/// 判断 `next_path` 是否与当前 `path` 同属一个父节点，需要并入同一个槽位。
+fn sibling_continues(
+    path: usize,
+    path_mask: usize,
+    target_depth: usize,
+    next_path: Option<&usize>,
+) -> bool {
+    if target_depth == 1 {
+        next_path.is_some()
+    } else if let Some(next_path) = next_path {
+        (path & path_mask) == (*next_path & path_mask)
+    } else {
+        false
+    }
+}
+
+/// 把 `path` 在 `target_depth` 层的节点写入槽位，并清空当前层对应槽位。
+fn write_slot_child(
+    slot: &mut SiblingSlot,
+    current_level: &mut [BlockId],
+    path: usize,
+    target_depth: usize,
+    max_depth: usize,
+) {
+    let target_index = (path >> ((max_depth - target_depth) * 3)) & 0b111;
+    let current_path_index = path >> 3;
+    let current_level_id = current_level[current_path_index];
+    slot.children[target_index] = current_level_id;
+    current_level[current_path_index] = BlockId::INVALID;
+
+    slot.types |= (current_level_id.is_leaf() as u8) << target_index;
+    slot.mask |= 1 << target_index;
+}
+
+/// 把现有节点中未被本次写入覆盖的兄弟合并进槽位。
+///
+/// 优先克隆 `equivalent_id` 的现有子节点；若该节点是被压平的叶节点，则整层用
+/// `leaf_id` 填充。返回仍需补充引用计数的克隆位图 `cloned_nodes`。
+fn merge_cloned_children<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    equivalent_id: &BlockId,
+    leaf_id: &BlockId,
+    slot: &mut SiblingSlot,
+) -> u8 {
+    let existing_mask = equivalent_id.mask();
+    let inv_mask = !slot.mask;
+    let cloned_nodes = existing_mask & inv_mask;
+
+    if slot.mask != 0xFF {
+        if cloned_nodes != 0 {
+            let existing_children = interner.get_children_ref(equivalent_id);
+
+            let mut cloned_nodes_bits = cloned_nodes;
+
+            while cloned_nodes_bits != 0 {
+                let idx = cloned_nodes_bits.trailing_zeros() as usize;
+                cloned_nodes_bits &= !(1 << idx);
+
+                slot.children[idx] = existing_children[idx];
+
+                slot.types |= (slot.children[idx].is_leaf() as u8) << idx;
+                slot.mask |= 1 << idx;
+            }
+        } else if !leaf_id.is_empty() {
+            let leafs_to_clone = inv_mask.count_ones();
+
+            let mut leafs_to_clone_bits = inv_mask;
+
+            slot.types |= inv_mask;
+            slot.mask |= inv_mask;
+
+            while leafs_to_clone_bits != 0 {
+                let idx = leafs_to_clone_bits.trailing_zeros() as usize;
+                slot.children[idx] = *leaf_id;
+                leafs_to_clone_bits &= !(1 << idx);
+            }
+
+            interner.inc_ref_by(leaf_id, leafs_to_clone);
+        }
+    }
+
+    cloned_nodes
+}
+
+/// 由拼好的兄弟槽位生成（或复用）父分支节点；8 个子节点全同时折叠回单个叶节点。
+fn finish_level_node<T: VoxelTrait>(
+    interner: &mut VoxInterner<T>,
+    slot: &SiblingSlot,
+    cloned_nodes: u8,
+) -> BlockId {
+    let children = slot.children;
+    let all_same = slot.types == 0xFF && children.iter().all(|item| item == &children[0]);
+
+    if !all_same {
+        let mut cloned_nodes_bits = cloned_nodes;
+        while cloned_nodes_bits != 0 {
+            let idx = cloned_nodes_bits.trailing_zeros() as usize;
+            cloned_nodes_bits &= !(1 << idx);
+
+            interner.inc_ref(&children[idx]);
+        }
+
+        interner.get_or_create_branch(children, slot.types, slot.mask)
+    } else {
+        #[cfg(feature = "memory_stats")]
+        interner.bump_collapsed_branches();
+
+        let dec_ref = if cloned_nodes != 0 {
+            cloned_nodes.count_ones().min(7)
+        } else {
+            7
+        };
+
+        interner.dec_ref_by(&children[0], dec_ref);
+
+        children[0]
+    }
 }
 
 #[cfg(test)]
