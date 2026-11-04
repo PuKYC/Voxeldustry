@@ -7,11 +7,14 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 
 use crate::store::{
-    BlockId, ByteConversion, ChunkKey, Lod, MaxDepth, VoxInterner, VoxOpsConfig, VoxTree,
-    VoxelTrait, EMPTY_CHILD, MAX_ALLOWED_DEPTH, MAX_CHILDREN,
+    BlockId, ChunkKey, Lod, MaxDepth, VoxInterner, VoxOpsConfig, VoxTree, VoxelTrait, EMPTY_CHILD,
+    MAX_ALLOWED_DEPTH, MAX_CHILDREN,
 };
 
 use super::{MAGIC, TAG_BRANCH, TAG_EMPTY, TAG_LEAF, VERSION};
+
+/// 体积导入结果：按 `ChunkKey` 升序的子块树与共享的 interner。
+pub type ImportedVolume<T> = (BTreeMap<ChunkKey, VoxTree<T>>, VoxInterner<T>);
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -71,9 +74,9 @@ fn read_node<R: Read, T: VoxelTrait>(
                 return Ok(BlockId::EMPTY);
             }
             let mut children = EMPTY_CHILD;
-            for i in 0..MAX_CHILDREN {
+            for (i, child) in children.iter_mut().enumerate() {
                 if mask & (1 << i) != 0 {
-                    children[i] = read_node(reader, interner)?;
+                    *child = read_node(reader, interner)?;
                 }
             }
             let types = types_from_children(&children);
@@ -212,9 +215,7 @@ pub fn import_tree_into<T: VoxelTrait>(
 }
 
 /// 从字节流导入一组子块（`ChunkKey` 升序），共享同一个 interner。
-pub fn import_volume<T: VoxelTrait>(
-    bytes: &[u8],
-) -> io::Result<(BTreeMap<ChunkKey, VoxTree<T>>, VoxInterner<T>)> {
+pub fn import_volume<T: VoxelTrait>(bytes: &[u8]) -> io::Result<ImportedVolume<T>> {
     let mut cursor = io::Cursor::new(bytes);
     read_header(&mut cursor)?;
     let chunk_count = read_u32(&mut cursor)?;

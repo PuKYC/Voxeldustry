@@ -18,10 +18,10 @@
 //!
 //! - **索引稳定**：增长只重分配 pool 内存，`BlockId` 与 patterns 无需重映射。
 //! - **结构化哈希**：`hashes` 只依赖结构（子哈希 + child_mask 或叶值），与节点索引无关；
-//! `content_hash` 因此可直接由引擎用于存档 / 脏比较。
+//!   `content_hash` 因此可直接由引擎用于存档 / 脏比较。
 //! - **碰撞 bucket**：紧凑 SoA 开放寻址表（`keys: Vec<u32>` + `values: Vec<u64>`，
 //!   线性探测、2 的幂容量、装载因子 ≤ 0.75），`Bucket = Inline | Spill`；查表返回
-//! 候选后必须按 `child_mask` + children（分支）或 value（叶）**结构校验**。
+//!   候选后必须按 `child_mask` + children（分支）或 value（叶）**结构校验**。
 //! - **从不迭代 patterns 产生字节 / 哈希**；表内部的重排（rehash / spill 压缩）
 //!   只由操作序列确定，不改变对外查询结果。
 //!
@@ -1686,8 +1686,8 @@ mod tests {
         let mut roots = Vec::new();
         for seed in 1u8..=4 {
             let mut children = EMPTY_CHILD;
-            for i in 0..8 {
-                children[i] = interner.get_or_create_leaf(seed * 10 + i as u8);
+            for (i, child) in children.iter_mut().enumerate() {
+                *child = interner.get_or_create_leaf(seed * 10 + i as u8);
             }
             roots.push(interner.get_or_create_branch(children, 0xFF, 0xFF));
         }

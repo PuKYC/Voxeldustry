@@ -45,9 +45,9 @@ pub fn compute_branch_hash_from_child_hashes(child_hashes: &[u32; MAX_CHILDREN],
     NODE_TYPE_BRANCH.hash(&mut hasher);
     mask.hash(&mut hasher);
 
-    for i in 0..MAX_CHILDREN {
+    for (i, child_hash) in child_hashes.iter().enumerate() {
         if mask & (1 << i) != 0 {
-            child_hashes[i].hash(&mut hasher);
+            child_hash.hash(&mut hasher);
         } else {
             0u32.hash(&mut hasher);
         }

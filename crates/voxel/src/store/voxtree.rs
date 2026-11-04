@@ -113,9 +113,6 @@ pub struct VoxTree<T: VoxelTrait> {
 
 impl<T: VoxelTrait> VoxTree<T> {
     pub fn new(max_depth: MaxDepth) -> Self {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::new");
-
         Self {
             max_depth,
             root_id: BlockId::EMPTY,
@@ -125,16 +122,10 @@ impl<T: VoxelTrait> VoxTree<T> {
     }
 
     pub fn get_root_id(&self) -> BlockId {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::get_root_id");
-
         self.root_id
     }
 
     pub fn set_root_id(&mut self, interner: &mut VoxInterner<T>, root_id: BlockId) {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::set_root_id");
-
         self.root_id = root_id;
         interner.inc_ref(&self.root_id);
     }
@@ -159,9 +150,6 @@ impl<T: VoxelTrait> VoxOpsRead<T> for VoxTree<T> {
         assert!(position.y >= 0 && position.y < (1 << self.max_depth.max()));
         assert!(position.z >= 0 && position.z < (1 << self.max_depth.max()));
 
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::get");
-
         get_at_depth(
             interner,
             self.root_id,
@@ -176,9 +164,6 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
         assert!(position.x >= 0 && position.x < (1 << self.max_depth.max()));
         assert!(position.y >= 0 && position.y < (1 << self.max_depth.max()));
         assert!(position.z >= 0 && position.z < (1 << self.max_depth.max()));
-
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::set");
 
         trace_refs! {
             println!("\n");
@@ -266,9 +251,6 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
 
 impl<T: VoxelTrait> VoxOpsBulkWrite<T> for VoxTree<T> {
     fn fill(&mut self, interner: &mut VoxInterner<T>, value: T) {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::fill");
-
         if value != T::default() {
             if !self.root_id.is_empty() {
                 interner.dec_ref_recursive(&self.root_id);
@@ -281,9 +263,6 @@ impl<T: VoxelTrait> VoxOpsBulkWrite<T> for VoxTree<T> {
     }
 
     fn clear(&mut self, interner: &mut VoxInterner<T>) {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::clear");
-
         if !self.root_id.is_empty() {
             trace_refs! { println!("clear root_id: {:?}", self.root_id); }
 
@@ -297,16 +276,10 @@ impl<T: VoxelTrait> VoxOpsBulkWrite<T> for VoxTree<T> {
 
 impl<T: VoxelTrait> VoxOpsBatch<T> for VoxTree<T> {
     fn create_batch(&self) -> Batch<T> {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::create_batch");
-
         Batch::new(self.max_depth)
     }
 
     fn apply_batch(&mut self, interner: &mut VoxInterner<T>, batch: &Batch<T>) -> bool {
-        #[cfg(feature = "tracy")]
-        let _span = tracy_client::span!("VoxTree::apply_batch");
-
         let new_root_id = set_batch_at_root(interner, &self.root_id, self.max_depth.max(), batch);
 
         if new_root_id != BlockId::INVALID {
@@ -382,9 +355,6 @@ fn set_at_root<T: VoxelTrait>(
 ) -> BlockId {
     assert!(*node_id != BlockId::INVALID);
 
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("set_at_root");
-
     let depth = TraversalDepth::new(0, max_depth);
     if voxel != T::default() {
         set_at_depth_iterative(interner, node_id, position, &depth, voxel)
@@ -405,9 +375,6 @@ fn set_at_depth_iterative<T: VoxelTrait>(
             "set_at_depth_iterative initial_node: {initial_node_id:?} position: {position:?} voxel: {voxel}"
         );
     }
-
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("set_at_depth_iterative");
 
     let mut stack =
         [const { (BlockId::INVALID, BlockId::INVALID, u8::MAX) }; MAX_ALLOWED_DEPTH as usize];
@@ -574,9 +541,6 @@ fn remove_at_depth<T: VoxelTrait>(
 ) -> BlockId {
     assert!(*node_id != BlockId::INVALID);
 
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("remove_at_depth");
-
     if node_id.is_branch() {
         remove_at_depth_branch(interner, node_id, position, depth)
     } else {
@@ -598,9 +562,6 @@ fn remove_at_depth_branch<T: VoxelTrait>(
 
     assert!(interner.is_valid_block_id(node_id));
     assert!(depth.current() < depth.max(), "Branch node at max depth");
-
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("remove_at_depth_branch");
 
     let index = child_index(position, depth);
 
@@ -685,9 +646,6 @@ fn remove_at_depth_leaf<T: VoxelTrait>(
 
     assert!(interner.is_valid_block_id(node_id));
 
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("remove_at_depth_leaf");
-
     if depth.current() == depth.max() {
         // At max depth, just remove the leaf
         BlockId::EMPTY
@@ -726,9 +684,6 @@ fn set_batch_at_root<T: VoxelTrait>(
     batch: &Batch<T>,
 ) -> BlockId {
     assert!(*node_id != BlockId::INVALID);
-
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("set_batch_at_root");
 
     let depth = TraversalDepth::new(0, max_depth);
 
@@ -791,9 +746,6 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
             batch.size()
         );
     }
-
-    #[cfg(feature = "tracy")]
-    let _span = tracy_client::span!("set_batch_at_depth_iterative");
 
     // Phase 0: handle fill
     let initial_node_id = batch_fill_node(interner, initial_node_id, batch);
@@ -1406,7 +1358,7 @@ mod tests {
     #[test]
     fn test_child_index() {
         // 只穷举到 depth 6：child_index 的正确性与深度无关，避免 depth 8 的 256^3 穷举。
-        for max_depth in 0..(MAX_ALLOWED_DEPTH.min(7) as u8) {
+        for max_depth in 0..MAX_ALLOWED_DEPTH.min(7) {
             let voxels_per_axis = 1 << max_depth;
             for depth in 0..max_depth {
                 for y in 0..voxels_per_axis {
@@ -2544,16 +2496,12 @@ mod tests {
         let mask = node_id.mask();
         let types = node_id.types();
         let children = interner.get_children(&node_id);
-        for i in 0..MAX_CHILDREN {
-            let present = !children[i].is_empty();
+        for (i, child) in children.iter().enumerate() {
+            let present = !child.is_empty();
             assert_eq!(present, (mask & (1 << i)) != 0, "child_mask bit {i}");
             if present {
-                assert_eq!(
-                    children[i].is_leaf(),
-                    (types & (1 << i)) != 0,
-                    "types bit {i}"
-                );
-                verify_child_masks(interner, children[i]);
+                assert_eq!(child.is_leaf(), (types & (1 << i)) != 0, "types bit {i}");
+                verify_child_masks(interner, *child);
             }
         }
     }
