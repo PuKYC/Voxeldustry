@@ -224,6 +224,149 @@ fn u32_len(value: u32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// 校验 helper（统一构造 SaveError）
+// ---------------------------------------------------------------------------
+
+/// 校验两个值相等；失败报 Inconsistent（头长度、索引偏移、最大实体 id 等）。
+fn expect_eq(
+    path: &str,
+    field: &str,
+    offset: usize,
+    what: &'static str,
+    expected: u64,
+    found: u64,
+) -> Result<(), SaveError> {
+    if expected != found {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::Inconsistent {
+                what,
+                expected,
+                found,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// 校验 `value` 没有置起 `allowed` 之外的标志位；失败报 Unsupported。
+fn expect_flags_mask(
+    path: &str,
+    field: &str,
+    offset: usize,
+    what: &'static str,
+    value: u64,
+    allowed: u64,
+) -> Result<(), SaveError> {
+    if value & !allowed != 0 {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::Unsupported { what, value },
+        ));
+    }
+    Ok(())
+}
+
+/// 校验 `value <= max`；失败报 TooLarge。
+fn expect_max(
+    path: &str,
+    field: &str,
+    offset: usize,
+    what: &'static str,
+    value: u64,
+    max: u64,
+) -> Result<(), SaveError> {
+    if value > max {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::TooLarge { what, value, max },
+        ));
+    }
+    Ok(())
+}
+
+/// 校验保留字段为 0；失败报 NonZeroReserved。
+fn expect_reserved_zero(
+    path: &str,
+    field: &str,
+    offset: usize,
+    value: u64,
+) -> Result<(), SaveError> {
+    if value != 0 {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::NonZeroReserved { value },
+        ));
+    }
+    Ok(())
+}
+
+/// 校验 `value != 0`；失败报 InvalidValue。
+fn expect_nonzero(
+    path: &str,
+    field: &str,
+    offset: usize,
+    what: &'static str,
+    value: i64,
+) -> Result<(), SaveError> {
+    if value == 0 {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::InvalidValue { what, value },
+        ));
+    }
+    Ok(())
+}
+
+/// 校验版本 / 枚举取值必须等于 `expected`；失败报 Unsupported。
+fn expect_supported(
+    path: &str,
+    field: &str,
+    offset: usize,
+    what: &'static str,
+    expected: u64,
+    found: u64,
+) -> Result<(), SaveError> {
+    if found != expected {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::Unsupported { what, value: found },
+        ));
+    }
+    Ok(())
+}
+
+/// 校验键严格升序；重复报 Duplicate，逆序报 NotStrictlyIncreasing。
+fn expect_strictly_increasing(
+    path: &str,
+    field: &str,
+    offset: usize,
+    what: &'static str,
+    previous: u64,
+    current: u64,
+) -> Result<(), SaveError> {
+    if current <= previous {
+        let kind = if current == previous {
+            SaveErrorKind::Duplicate { what, id: current }
+        } else {
+            SaveErrorKind::NotStrictlyIncreasing {
+                what,
+                previous,
+                current,
+            }
+        };
+        return Err(SaveError::new(field_path(path, field), offset, kind));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // world.meta（§2）
 // ---------------------------------------------------------------------------
 
@@ -1055,44 +1198,37 @@ fn decode_record(
 
     let version_offset = reader.offset();
     let record_version = reader.read_u16_at(path, "record_version")?;
-    if record_version != 1 {
-        return Err(SaveError::new(
-            field_path(path, "record_version"),
-            version_offset,
-            SaveErrorKind::Unsupported {
-                what: "record_version",
-                value: u64::from(record_version),
-            },
-        ));
-    }
+    expect_supported(
+        path,
+        "record_version",
+        version_offset,
+        "record_version",
+        1,
+        u64::from(record_version),
+    )?;
 
     let flags_offset = reader.offset();
     let flags = reader.read_u16_at(path, "flags")?;
-    if flags & !1 != 0 {
-        return Err(SaveError::new(
-            field_path(path, "flags"),
-            flags_offset,
-            SaveErrorKind::Unsupported {
-                what: "record flags",
-                value: u64::from(flags),
-            },
-        ));
-    }
+    expect_flags_mask(
+        path,
+        "flags",
+        flags_offset,
+        "record flags",
+        u64::from(flags),
+        1,
+    )?;
 
     let content = if flags & 1 != 0 {
         let len_offset = reader.offset();
         let content_len = reader.read_u32_at(path, "content_len")?;
-        if content_len > MAX_RECORD_LEN {
-            return Err(SaveError::new(
-                field_path(path, "content_len"),
-                len_offset,
-                SaveErrorKind::TooLarge {
-                    what: "content_len",
-                    value: u64::from(content_len),
-                    max: u64::from(MAX_RECORD_LEN),
-                },
-            ));
-        }
+        expect_max(
+            path,
+            "content_len",
+            len_offset,
+            "content_len",
+            u64::from(content_len),
+            u64::from(MAX_RECORD_LEN),
+        )?;
         Some(
             reader
                 .take_at(&path, "content", u32_len(content_len))?
@@ -1122,15 +1258,7 @@ fn decode_record(
 
         let reserved_offset = reader.offset();
         let reserved = reader.read_u16_at(&ppath, "reserved")?;
-        if reserved != 0 {
-            return Err(SaveError::new(
-                field_path(&ppath, "reserved"),
-                reserved_offset,
-                SaveErrorKind::NonZeroReserved {
-                    value: u64::from(reserved),
-                },
-            ));
-        }
+        expect_reserved_zero(&ppath, "reserved", reserved_offset, u64::from(reserved))?;
 
         let seq = reader.read_u32_at(&ppath, "seq")?;
         let priority = reader.read_i32_at(&ppath, "priority")?;
@@ -1172,21 +1300,14 @@ fn decode_record(
         if let Some(previous) = proposals.last() {
             let previous_key = (previous.feature_type, previous.seq);
             let current_key = (proposal.feature_type, proposal.seq);
-            if current_key <= previous_key {
-                let kind = if current_key == previous_key {
-                    SaveErrorKind::Duplicate {
-                        what: "proposal (feature_type, seq)",
-                        id: (u64::from(current_key.0) << 32) | u64::from(current_key.1),
-                    }
-                } else {
-                    SaveErrorKind::NotStrictlyIncreasing {
-                        what: "proposal (feature_type, seq)",
-                        previous: (u64::from(previous_key.0) << 32) | u64::from(previous_key.1),
-                        current: (u64::from(current_key.0) << 32) | u64::from(current_key.1),
-                    }
-                };
-                return Err(SaveError::new(field_path(&ppath, "seq"), base, kind));
-            }
+            expect_strictly_increasing(
+                &ppath,
+                "seq",
+                base,
+                "proposal (feature_type, seq)",
+                (u64::from(previous_key.0) << 32) | u64::from(previous_key.1),
+                (u64::from(current_key.0) << 32) | u64::from(current_key.1),
+            )?;
         }
 
         proposals.push(proposal);
@@ -1212,53 +1333,30 @@ fn decode_record(
         let id_offset = reader.offset();
         let stable_entity_id = reader.read_u64_at(&epath, "stable_entity_id")?;
         if let Some(previous) = entities.last().map(|entity| entity.stable_entity_id) {
-            if stable_entity_id <= previous {
-                let kind = if stable_entity_id == previous {
-                    SaveErrorKind::Duplicate {
-                        what: "entity id in chunk",
-                        id: stable_entity_id,
-                    }
-                } else {
-                    SaveErrorKind::NotStrictlyIncreasing {
-                        what: "entity id in chunk",
-                        previous,
-                        current: stable_entity_id,
-                    }
-                };
-                return Err(SaveError::new(
-                    field_path(&epath, "stable_entity_id"),
-                    id_offset,
-                    kind,
-                ));
-            }
+            expect_strictly_increasing(
+                &epath,
+                "stable_entity_id",
+                id_offset,
+                "entity id in chunk",
+                previous,
+                stable_entity_id,
+            )?;
         }
 
         let type_offset = reader.offset();
         let stable_type_id = reader.read_u32_at(&epath, "stable_type_id")?;
-        if stable_type_id == 0 {
-            return Err(SaveError::new(
-                field_path(&epath, "stable_type_id"),
-                type_offset,
-                SaveErrorKind::InvalidValue {
-                    what: "stable_type_id",
-                    value: 0,
-                },
-            ));
-        }
+        expect_nonzero(&epath, "stable_type_id", type_offset, "stable_type_id", 0)?;
 
         let payload_len_offset = reader.offset();
         let payload_len = reader.read_u32_at(&epath, "payload_len")?;
-        if payload_len > MAX_RECORD_LEN {
-            return Err(SaveError::new(
-                field_path(&epath, "payload_len"),
-                payload_len_offset,
-                SaveErrorKind::TooLarge {
-                    what: "entity payload_len",
-                    value: u64::from(payload_len),
-                    max: u64::from(MAX_RECORD_LEN),
-                },
-            ));
-        }
+        expect_max(
+            &epath,
+            "payload_len",
+            payload_len_offset,
+            "entity payload_len",
+            u64::from(payload_len),
+            u64::from(MAX_RECORD_LEN),
+        )?;
 
         let payload_offset = reader.offset();
         let payload = reader
