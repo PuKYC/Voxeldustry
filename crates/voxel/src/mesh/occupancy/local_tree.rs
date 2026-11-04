@@ -93,25 +93,10 @@ pub(crate) struct LocalTree {
 }
 
 impl LocalTree {
-    /// The empty local tree.
-    #[must_use]
-    pub(crate) fn empty() -> Self {
-        Self {
-            nodes: Vec::new(),
-            root: LOCAL_EMPTY,
-        }
-    }
-
     /// Root handle.
     #[must_use]
     pub(crate) fn root(&self) -> u32 {
         self.root
-    }
-
-    /// Number of materialised nodes (test/diagnostics helper).
-    #[must_use]
-    pub(crate) fn node_count(&self) -> usize {
-        self.nodes.len()
     }
 }
 
