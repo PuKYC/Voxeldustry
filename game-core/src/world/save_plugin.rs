@@ -47,11 +47,16 @@
 //! 没有触发时只读资源（tick / 状态），不建目录、不碰文件、不 stat 路径。
 //!
 //! # 装配
-//!
-//!     app.add_plugins(SavePlugin { config: SaveConfig { root, ..Default::default() } });
-//!     app.add_plugins(WorldSavePlugin {
-//!         config: WorldSaveConfig { autosave_interval_ticks: Some(600) },
-//!     });
+//! ```ignore
+//! # use bevy::prelude::*;
+//! # use game_core::world::save_plugin::{SavePlugin, SaveConfig, WorldSavePlugin, WorldSaveConfig};
+//! # let mut app = App::new();
+//! # let root = std::path::PathBuf::from("/tmp/save");
+//! app.add_plugins(SavePlugin { config: SaveConfig { root: root.clone(), ..Default::default() } });
+//! app.add_plugins(WorldSavePlugin {
+//!     config: WorldSaveConfig { autosave_interval_ticks: Some(600) },
+//! });
+//! ```
 //!
 //! WorldSavePlugin 依赖 SaveConfig / SaveStore（game-engine 的 SavePlugin 注册）
 //! 与采集所需的 PersistRegistry / OpaqueComponents / IslandRegistry / WorldSeed /
