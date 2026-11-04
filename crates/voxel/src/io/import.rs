@@ -71,9 +71,9 @@ fn read_node<R: Read, T: VoxelTrait>(
                 return Ok(BlockId::EMPTY);
             }
             let mut children = EMPTY_CHILD;
-            for i in 0..MAX_CHILDREN {
+            for (i, child) in children.iter_mut().enumerate() {
                 if mask & (1 << i) != 0 {
-                    children[i] = read_node(reader, interner)?;
+                    *child = read_node(reader, interner)?;
                 }
             }
             let types = types_from_children(&children);

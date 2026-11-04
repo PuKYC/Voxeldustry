@@ -7,7 +7,6 @@ use std::io::{self, Write};
 
 use crate::store::{
     BlockId, ByteConversion, ChunkKey, Lod, VoxInterner, VoxOpsConfig, VoxTree, VoxelTrait,
-    MAX_CHILDREN,
 };
 
 use super::{MAGIC, TAG_BRANCH, TAG_EMPTY, TAG_LEAF, VERSION};
@@ -30,9 +29,9 @@ fn write_node<W: Write, T: VoxelTrait>(
     out.write_all(&[mask])?;
 
     let children = interner.get_children(id);
-    for i in 0..MAX_CHILDREN {
+    for (i, child) in children.iter().enumerate() {
         if mask & (1 << i) != 0 {
-            write_node(out, interner, &children[i])?;
+            write_node(out, interner, child)?;
         }
     }
     Ok(())

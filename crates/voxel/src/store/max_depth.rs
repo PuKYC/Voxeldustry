@@ -45,7 +45,7 @@ impl TryFrom<u8> for MaxDepth {
 
     #[inline]
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value < MAX_ALLOWED_DEPTH as u8 {
+        if value < MAX_ALLOWED_DEPTH {
             Ok(Self(value))
         } else {
             Err("Max depth exceeds allowed limit")
@@ -75,10 +75,7 @@ impl MaxDepth {
     #[must_use]
     #[inline(always)]
     pub const fn new(max: u8) -> Self {
-        assert!(
-            max < MAX_ALLOWED_DEPTH as u8,
-            "Max depth exceeds allowed limit"
-        );
+        assert!(max < MAX_ALLOWED_DEPTH, "Max depth exceeds allowed limit");
         Self(max)
     }
 
@@ -168,7 +165,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "Max depth exceeds allowed limit")]
     fn test_max_allowed_depth() {
-        let _ = MaxDepth::new(MAX_ALLOWED_DEPTH as u8);
+        let _ = MaxDepth::new(MAX_ALLOWED_DEPTH);
     }
 
     #[test]
@@ -181,7 +178,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Max depth exceeds allowed limit")]
     fn test_new_current_eq_max() {
-        let _ = MaxDepth::new(MAX_ALLOWED_DEPTH as u8);
+        let _ = MaxDepth::new(MAX_ALLOWED_DEPTH);
     }
 
     #[test]
@@ -192,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_maximum_valid_depth() {
-        let max = MAX_ALLOWED_DEPTH as u8 - 1;
+        let max = MAX_ALLOWED_DEPTH - 1;
         let depth = MaxDepth::new(max);
         assert_eq!(depth.max(), max);
     }
@@ -207,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_try_from_err() {
-        let val: u8 = MAX_ALLOWED_DEPTH as u8;
+        let val: u8 = MAX_ALLOWED_DEPTH;
         let depth = MaxDepth::try_from(val);
         assert!(depth.is_err());
     }
