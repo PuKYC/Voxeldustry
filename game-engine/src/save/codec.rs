@@ -1567,6 +1567,68 @@ pub fn encode_region(region: &RegionFile) -> Result<Vec<u8>, SaveError> {
 /// index_offset = 32 + Σ record_len 且等于文件里索引表位置、max_stable_entity_id 与实算相等、
 /// 记录体恰好消费完、同 region 实体 ID 不重复、尾摘要覆盖前面全部字节。
 pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
+    let header = check_header(bytes)?;
+    let entries = parse_directory(bytes, &header)?;
+
+    let expected_offset = entries
+        .last()
+        .map_or(u64::from(REGION_HEADER_LEN), |entry| entry.end as u64);
+    expect_eq(
+        "region",
+        "index_offset",
+        R_INDEX_OFFSET,
+        "index_offset (32 + sum of record_len)",
+        expected_offset,
+        header.index_offset,
+    )?;
+
+    let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
+    let (chunks, computed_max) = decode_records(bytes, &entries, &mut seen_entities)?;
+
+    expect_eq(
+        "region",
+        "max_stable_entity_id",
+        R_MAX_STABLE_ENTITY_ID,
+        "max_stable_entity_id",
+        computed_max,
+        header.max_stable_entity_id,
+    )?;
+
+    let stored = read_u64_at(bytes, header.body_len);
+    let computed = digest(&bytes[..header.body_len]);
+    if stored != computed {
+        return Err(SaveError::new(
+            "region.digest",
+            header.body_len,
+            SaveErrorKind::DigestMismatch { stored, computed },
+        ));
+    }
+
+    Ok(RegionFile { chunks })
+}
+
+/// region 头（§3，32 B）中后续解码步骤需要的布局信息。
+struct RegionHeader {
+    chunk_count: u32,
+    index_offset: u64,
+    max_stable_entity_id: u64,
+    /// 索引表在文件里的起点与长度（字节）。
+    index_start: usize,
+    index_len: usize,
+    /// 尾摘要之前的正文字节数。
+    body_len: usize,
+}
+
+/// 一条 region 索引项（§3，32 B）的解析结果。
+struct IndexEntry {
+    key: ChunkKey,
+    generator_version: u32,
+    start: usize,
+    end: usize,
+}
+
+/// 解析并校验 region 头（§3），返回索引表位置与正文长度。
+fn check_header(bytes: &[u8]) -> Result<RegionHeader, SaveError> {
     if bytes.len() as u64 > MAX_REGION_FILE_LEN {
         return Err(SaveError::new(
             "region.file_len",
@@ -1608,42 +1670,34 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
     }
 
     let format_version = reader.u16("region.format_version")?;
-    if format_version != FORMAT_VERSION {
-        return Err(SaveError::new(
-            "region.format_version",
-            R_FORMAT_VERSION,
-            SaveErrorKind::Unsupported {
-                what: "format_version",
-                value: u64::from(format_version),
-            },
-        ));
-    }
+    expect_supported(
+        "region",
+        "format_version",
+        R_FORMAT_VERSION,
+        "format_version",
+        u64::from(FORMAT_VERSION),
+        u64::from(format_version),
+    )?;
 
     let header_len = reader.u16("region.header_len")?;
-    if header_len != REGION_HEADER_LEN {
-        return Err(SaveError::new(
-            "region.header_len",
-            R_HEADER_LEN,
-            SaveErrorKind::Inconsistent {
-                what: "header_len",
-                expected: u64::from(REGION_HEADER_LEN),
-                found: u64::from(header_len),
-            },
-        ));
-    }
+    expect_eq(
+        "region",
+        "header_len",
+        R_HEADER_LEN,
+        "header_len",
+        u64::from(REGION_HEADER_LEN),
+        u64::from(header_len),
+    )?;
 
     let chunk_count = reader.u32("region.chunk_count")?;
-    if chunk_count > MAX_CHUNK_COUNT {
-        return Err(SaveError::new(
-            "region.chunk_count",
-            R_CHUNK_COUNT,
-            SaveErrorKind::TooLarge {
-                what: "chunk_count",
-                value: u64::from(chunk_count),
-                max: u64::from(MAX_CHUNK_COUNT),
-            },
-        ));
-    }
+    expect_max(
+        "region",
+        "chunk_count",
+        R_CHUNK_COUNT,
+        "chunk_count",
+        u64::from(chunk_count),
+        u64::from(MAX_CHUNK_COUNT),
+    )?;
 
     let index_offset = reader.u64("region.index_offset")?;
     let max_stable_entity_id = reader.u64("region.max_stable_entity_id")?;
@@ -1659,17 +1713,14 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
             },
         ));
     }
-    if index_offset > body_len as u64 {
-        return Err(SaveError::new(
-            "region.index_offset",
-            R_INDEX_OFFSET,
-            SaveErrorKind::TooLarge {
-                what: "index_offset",
-                value: index_offset,
-                max: body_len as u64,
-            },
-        ));
-    }
+    expect_max(
+        "region",
+        "index_offset",
+        R_INDEX_OFFSET,
+        "index_offset",
+        index_offset,
+        body_len as u64,
+    )?;
 
     let expected_len = index_offset
         .checked_add(u64::from(chunk_count) * REGION_INDEX_ENTRY_LEN as u64)
@@ -1685,17 +1736,14 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
             },
         ));
     };
-    if bytes.len() as u64 != expected_len {
-        return Err(SaveError::new(
-            "region.file_len",
-            bytes.len(),
-            SaveErrorKind::Inconsistent {
-                what: "file length for index_offset and chunk_count",
-                expected: expected_len,
-                found: bytes.len() as u64,
-            },
-        ));
-    }
+    expect_eq(
+        "region",
+        "file_len",
+        bytes.len(),
+        "file length for index_offset and chunk_count",
+        expected_len,
+        bytes.len() as u64,
+    )?;
 
     let index_start = usize::try_from(index_offset).map_err(|_| {
         SaveError::new(
@@ -1709,15 +1757,32 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
         )
     })?;
     let index_len = u32_len(chunk_count) * REGION_INDEX_ENTRY_LEN;
-    let mut index_reader = Reader::new(&bytes[index_start..index_start + index_len], index_start);
 
-    let mut chunks: BTreeMap<ChunkKey, ChunkRecord> = BTreeMap::new();
-    let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
+    Ok(RegionHeader {
+        chunk_count,
+        index_offset,
+        max_stable_entity_id,
+        index_start,
+        index_len,
+        body_len,
+    })
+}
+
+/// 解析 region 索引表（§3）。
+///
+/// 校验 ChunkKey 严格升序且不重复、record_offset 从 32 起连续、record_len 非 0 且不超上限、
+/// 记录区间完全落在索引表之前。
+fn parse_directory(bytes: &[u8], header: &RegionHeader) -> Result<Vec<IndexEntry>, SaveError> {
+    let mut index_reader = Reader::new(
+        &bytes[header.index_start..header.index_start + header.index_len],
+        header.index_start,
+    );
+
+    let mut entries: Vec<IndexEntry> = Vec::with_capacity(u32_len(header.chunk_count));
     let mut previous_key: Option<ChunkKey> = None;
     let mut expected_offset = u64::from(REGION_HEADER_LEN);
-    let mut computed_max: u64 = 0;
 
-    for index in 0..u32_len(chunk_count) {
+    for index in 0..u32_len(header.chunk_count) {
         let ipath = indexed_path("region", "index", index);
 
         let x = index_reader.read_i32_at(&ipath, "x")?;
@@ -1735,15 +1800,7 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
 
         let reserved_field = index_reader.offset();
         let reserved = index_reader.read_u32_at(&ipath, "reserved")?;
-        if reserved != 0 {
-            return Err(SaveError::new(
-                field_path(&ipath, "reserved"),
-                reserved_field,
-                SaveErrorKind::NonZeroReserved {
-                    value: u64::from(reserved),
-                },
-            ));
-        }
+        expect_reserved_zero(&ipath, "reserved", reserved_field, u64::from(reserved))?;
 
         if let Some(previous) = previous_key {
             if key <= previous {
@@ -1759,39 +1816,24 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
         }
         previous_key = Some(key);
 
-        if record_offset != expected_offset {
-            return Err(SaveError::new(
-                field_path(&ipath, "record_offset"),
-                offset_field,
-                SaveErrorKind::Inconsistent {
-                    what: "record_offset (records must be contiguous from header end)",
-                    expected: expected_offset,
-                    found: record_offset,
-                },
-            ));
-        }
+        expect_eq(
+            &ipath,
+            "record_offset",
+            offset_field,
+            "record_offset (records must be contiguous from header end)",
+            expected_offset,
+            record_offset,
+        )?;
 
-        if record_len == 0 {
-            return Err(SaveError::new(
-                field_path(&ipath, "record_len"),
-                len_field,
-                SaveErrorKind::InvalidValue {
-                    what: "record_len",
-                    value: 0,
-                },
-            ));
-        }
-        if record_len > MAX_RECORD_LEN {
-            return Err(SaveError::new(
-                field_path(&ipath, "record_len"),
-                len_field,
-                SaveErrorKind::TooLarge {
-                    what: "record_len",
-                    value: u64::from(record_len),
-                    max: u64::from(MAX_RECORD_LEN),
-                },
-            ));
-        }
+        expect_nonzero(&ipath, "record_len", len_field, "record_len", 0)?;
+        expect_max(
+            &ipath,
+            "record_len",
+            len_field,
+            "record_len",
+            u64::from(record_len),
+            u64::from(MAX_RECORD_LEN),
+        )?;
 
         let end = record_offset
             .checked_add(u64::from(record_len))
@@ -1802,18 +1844,18 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
                     SaveErrorKind::TooLarge {
                         what: "record end",
                         value: u64::MAX,
-                        max: index_offset,
+                        max: header.index_offset,
                     },
                 )
             })?;
-        if end > index_offset {
+        if end > header.index_offset {
             return Err(SaveError::new(
                 field_path(&ipath, "record_offset"),
                 offset_field,
                 SaveErrorKind::TooLarge {
                     what: "record end",
                     value: end,
-                    max: index_offset,
+                    max: header.index_offset,
                 },
             ));
         }
@@ -1841,57 +1883,44 @@ pub fn decode_region(bytes: &[u8]) -> Result<RegionFile, SaveError> {
             )
         })?;
 
-        let record = decode_record(
-            &bytes[start..end],
-            &field_path(&indexed_path("region", "chunk", index), "record"),
-            start,
+        entries.push(IndexEntry {
+            key,
             generator_version,
-            &mut seen_entities,
+            start,
+            end,
+        });
+        expected_offset = record_offset + u64::from(record_len);
+    }
+
+    Ok(entries)
+}
+
+/// 逐条解码 region 记录体（§3.1），并统计 region 内实体 ID 上界。
+fn decode_records(
+    bytes: &[u8],
+    entries: &[IndexEntry],
+    seen_entities: &mut BTreeSet<u64>,
+) -> Result<(BTreeMap<ChunkKey, ChunkRecord>, u64), SaveError> {
+    let mut chunks: BTreeMap<ChunkKey, ChunkRecord> = BTreeMap::new();
+    let mut computed_max: u64 = 0;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let record = decode_record(
+            &bytes[entry.start..entry.end],
+            &field_path(&indexed_path("region", "chunk", index), "record"),
+            entry.start,
+            entry.generator_version,
+            seen_entities,
         )?;
 
         for entity in &record.entities {
             computed_max = computed_max.max(entity.stable_entity_id);
         }
 
-        chunks.insert(key, record);
-        expected_offset = record_offset + u64::from(record_len);
+        chunks.insert(entry.key, record);
     }
 
-    if expected_offset != index_offset {
-        return Err(SaveError::new(
-            "region.index_offset",
-            R_INDEX_OFFSET,
-            SaveErrorKind::Inconsistent {
-                what: "index_offset (32 + sum of record_len)",
-                expected: expected_offset,
-                found: index_offset,
-            },
-        ));
-    }
-
-    if computed_max != max_stable_entity_id {
-        return Err(SaveError::new(
-            "region.max_stable_entity_id",
-            R_MAX_STABLE_ENTITY_ID,
-            SaveErrorKind::Inconsistent {
-                what: "max_stable_entity_id",
-                expected: computed_max,
-                found: max_stable_entity_id,
-            },
-        ));
-    }
-
-    let stored = read_u64_at(bytes, body_len);
-    let computed = digest(&bytes[..body_len]);
-    if stored != computed {
-        return Err(SaveError::new(
-            "region.digest",
-            body_len,
-            SaveErrorKind::DigestMismatch { stored, computed },
-        ));
-    }
-
-    Ok(RegionFile { chunks })
+    Ok((chunks, computed_max))
 }
 
 #[cfg(test)]
