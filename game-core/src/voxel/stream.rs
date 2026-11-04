@@ -710,6 +710,41 @@ pub fn advance_proposals(
     stats.staged = staging.staged.0.len();
 }
 
+/// 26 邻偏移，按邻键 `(x, y, z)` 升序排好。
+///
+/// 顺序与旧的「三轴 -1..=1 生成后 `sort()`」逐项一致（见测试
+/// [`neighbour_offsets_match_the_sorted_vec`]）：[ChunkKey] 的 `Ord` 就是逐个
+/// 比较 `x`、`y`、`z`，而三轴循环的生成顺序本来也是这个字典序，排序只是空转。
+/// 常量数组省掉每块一次的 `Vec` 分配与排序。
+const NEIGHBOUR_OFFSETS: [IVec3; 26] = [
+    IVec3::new(-1, -1, -1),
+    IVec3::new(-1, -1, 0),
+    IVec3::new(-1, -1, 1),
+    IVec3::new(-1, 0, -1),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(-1, 0, 1),
+    IVec3::new(-1, 1, -1),
+    IVec3::new(-1, 1, 0),
+    IVec3::new(-1, 1, 1),
+    IVec3::new(0, -1, -1),
+    IVec3::new(0, -1, 0),
+    IVec3::new(0, -1, 1),
+    IVec3::new(0, 0, -1),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 1, -1),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, 1, 1),
+    IVec3::new(1, -1, -1),
+    IVec3::new(1, -1, 0),
+    IVec3::new(1, -1, 1),
+    IVec3::new(1, 0, -1),
+    IVec3::new(1, 0, 0),
+    IVec3::new(1, 0, 1),
+    IVec3::new(1, 1, -1),
+    IVec3::new(1, 1, 0),
+    IVec3::new(1, 1, 1),
+];
+
 /// 系统 5：结算暂存块——26 邻提案门 → 全序裁决 → realize 落体素 → 装容器 → 定稿。
 ///
 /// 只处理**上一次运行**就已经暂存的块（[StagedChunk::observed]）：同一条 chain
@@ -782,22 +817,10 @@ pub fn settle_chunks(
             continue 'settle;
         };
 
-        // 邻居门：26 个邻块，逐轴 -1/0/+1，(0,0,0) 跳过，按邻键升序拼。
-        let mut neighbours: Vec<ChunkKey> = Vec::with_capacity(26);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    if dx == 0 && dy == 0 && dz == 0 {
-                        continue;
-                    }
-                    neighbours.push(ChunkKey::new(key.x + dx, key.y + dy, key.z + dz));
-                }
-            }
-        }
-        neighbours.sort();
-
+        // 邻居门：常量里就是 26 个邻块，按邻键升序排列（无自身）。
         let mut union = proposals;
-        for neighbour in neighbours {
+        for offset in NEIGHBOUR_OFFSETS {
+            let neighbour = ChunkKey::new(key.x + offset.x, key.y + offset.y, key.z + offset.z);
             let neighbour_pair = (body, neighbour);
             if !staging.cache.0.contains_key(&neighbour_pair) {
                 let computed = match (world.registry.as_deref(), world.seed.as_deref()) {
@@ -3699,6 +3722,39 @@ mod tests {
             );
         }
         assert_eq!(cache.0.len(), 27, "自身 + 26 邻");
+    }
+
+    /// 1.1 的等价性证明：常量数组必须与旧的「三轴生成 + sort」逐项一致。
+    #[test]
+    fn neighbour_offsets_match_the_sorted_vec() {
+        let key = chunk_key(-3, 5, -1);
+
+        // 旧实现：三轴 -1..=1、跳过原点、按邻键排序。
+        let mut expected: Vec<ChunkKey> = Vec::with_capacity(26);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    expected.push(chunk_key(key.x + dx, key.y + dy, key.z + dz));
+                }
+            }
+        }
+        expected.sort();
+
+        // 新实现：直接遍历常量数组。
+        let actual: Vec<ChunkKey> = NEIGHBOUR_OFFSETS
+            .iter()
+            .map(|offset| chunk_key(key.x + offset.x, key.y + offset.y, key.z + offset.z))
+            .collect();
+
+        assert_eq!(actual, expected, "常量数组的顺序必须与旧的 sort 结果一致");
+        assert_eq!(actual.len(), 26, "邻域恰好 26 项");
+        assert!(
+            actual.windows(2).all(|pair| pair[0] < pair[1]),
+            "邻键必须严格升序（无重复、也不含自身）"
+        );
     }
 
     #[test]
