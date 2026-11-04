@@ -164,7 +164,7 @@ pub fn rect_key(rect: &RectInstance) -> (u8, u8, u8, u8, u8, u8) {
 
 /// Sorts a rectangle list by (plane, dir, material, slice, row, col).
 pub fn sort_rects(rects: &mut [RectInstance]) {
-    rects.sort_by(|a, b| rect_key(a).cmp(&rect_key(b)));
+    rects.sort_by_key(rect_key);
 }
 
 /// All rectangles extracted from one mesh block, position independent.
@@ -240,7 +240,7 @@ impl MeshBlock {
 }
 
 fn finish(origin: ChunkKey, lod: Lod, mut pairs: Vec<(RectInstance, [u8; 4])>) -> AoRectBatch {
-    pairs.sort_by(|a, b| rect_key(&a.0).cmp(&rect_key(&b.0)));
+    pairs.sort_by_key(|a| rect_key(&a.0));
     let mut rects = Vec::with_capacity(pairs.len());
     let mut ao = Vec::with_capacity(pairs.len());
     for (rect, code) in pairs {
