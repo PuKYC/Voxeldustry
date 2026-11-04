@@ -9,9 +9,9 @@ mod camera;
 mod death;
 mod movement;
 
-pub use block_edit::BlockEditPlugin;
 #[cfg(test)]
 pub use block_edit::BlockEditConfig;
+pub use block_edit::BlockEditPlugin;
 pub use camera::{
     camera_system, spawn_camera_rig, CameraFlag, CameraPlugin, CameraView, Facing, LOOK_SENSITIVITY,
 };
