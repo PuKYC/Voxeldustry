@@ -322,6 +322,29 @@ fn horizontal_neighbor(
     dir_x: i32,
     dir_z: i32,
 ) -> FaceNeighbor {
+    let (nx, nz, tan_start, normal_is_x) = neighbour_plane(origin, span, dir_x, dir_z);
+    let leaves = face_leaves(partition, nx, nz, normal_is_x, tan_start, span);
+    if leaves.is_empty() {
+        return FaceNeighbor::Missing;
+    }
+    let Some(neighbour_lod) = single_leaf_lod(&leaves) else {
+        return FaceNeighbor::Missing;
+    };
+    if neighbour_lod == lod {
+        return same_lod_leaf(partition, &leaves, origin, lod);
+    }
+    if neighbour_lod == lod + 1 {
+        return coarser_leaf(partition, &leaves, origin, lod, normal_is_x);
+    }
+    if neighbour_lod + 1 == lod {
+        return finer_leaf(partition, &leaves, origin, lod, normal_is_x, tan_start);
+    }
+    debug_assert!(false, "LOD 差超过 1: {} -> {}", lod, neighbour_lod);
+    FaceNeighbor::Missing
+}
+
+/// 面外第一层位置（法向）与切向起点：n 轴 = 面外一格，切向从 origin 起 span 格。
+fn neighbour_plane(origin: ChunkKey, span: i32, dir_x: i32, dir_z: i32) -> (i32, i32, i32, bool) {
     let nx = if dir_x > 0 {
         origin.x + span
     } else if dir_x < 0 {
@@ -341,8 +364,18 @@ fn horizontal_neighbor(
     } else {
         (origin.x, false)
     };
+    (nx, nz, tan_start, normal_is_x)
+}
 
-    // 切向坐标 -> 所属叶子。同一面下最多两个不同叶子（更细时）。
+/// 切向坐标 -> 所属叶子。同一面下最多两个不同叶子（更细时）。
+fn face_leaves(
+    partition: &TerrainPartition,
+    nx: i32,
+    nz: i32,
+    normal_is_x: bool,
+    tan_start: i32,
+    span: i32,
+) -> BTreeMap<i32, (i32, i32, u8)> {
     let mut leaves: BTreeMap<i32, (i32, i32, u8)> = BTreeMap::new();
     for t in tan_start..tan_start + span {
         let (x, z) = if normal_is_x { (nx, t) } else { (t, nz) };
@@ -350,73 +383,90 @@ fn horizontal_neighbor(
             leaves.insert(t, leaf);
         }
     }
-    if leaves.is_empty() {
-        return FaceNeighbor::Missing;
-    }
+    leaves
+}
 
+/// 同一面下所有叶子必须同 LOD（2:1 对齐）；不一致只可能是外部传入非划分集合。
+fn single_leaf_lod(leaves: &BTreeMap<i32, (i32, i32, u8)>) -> Option<u8> {
     let lods: BTreeSet<u8> = leaves.values().map(|(_, _, l)| *l).collect();
     if lods.len() != 1 {
-        // 2:1 对齐下同一面的邻居 LOD 必然一致；不一致只可能是外部传入了
-        // 非划分集合，保守按空气处理。
         debug_assert!(false, "同一面的邻居 LOD 不一致: {lods:?}");
-        return FaceNeighbor::Missing;
+        return None;
     }
-    let neighbour_lod = *lods.iter().next().expect("非空");
+    lods.iter().next().copied()
+}
+
+/// 邻居同 LOD：直接返回其块原点。
+fn same_lod_leaf(
+    partition: &TerrainPartition,
+    leaves: &BTreeMap<i32, (i32, i32, u8)>,
+    origin: ChunkKey,
+    lod: u8,
+) -> FaceNeighbor {
     let (&_, &(leaf_x, leaf_z, _)) = leaves.iter().next().expect("非空");
+    let neighbour = chunk_key(leaf_x, origin.y, leaf_z);
+    debug_assert!(partition.contains(neighbour, lod));
+    FaceNeighbor::Same(neighbour)
+}
 
-    if neighbour_lod == lod {
-        let neighbour = chunk_key(leaf_x, origin.y, leaf_z);
-        debug_assert!(partition.contains(neighbour, lod));
-        return FaceNeighbor::Same(neighbour);
+/// 邻居更粗：一个粗叶子覆盖整个切向范围，本块面是其 16x16 子块。
+fn coarser_leaf(
+    partition: &TerrainPartition,
+    leaves: &BTreeMap<i32, (i32, i32, u8)>,
+    origin: ChunkKey,
+    lod: u8,
+    normal_is_x: bool,
+) -> FaceNeighbor {
+    let (&_, &(leaf_x, leaf_z, _)) = leaves.iter().next().expect("非空");
+    let coarse_span = 1i32 << (lod + 1);
+    let y_origin = origin.y.div_euclid(coarse_span) * coarse_span;
+    let neighbour = chunk_key(leaf_x, y_origin, leaf_z);
+    debug_assert!(partition.contains(neighbour, lod + 1));
+    // 32 / 2^(lod+1) = 2^(4-lod)：粗格数 = 细格数 / 2。
+    let shift = 4 - i32::from(lod);
+    let row_offset = ((origin.y - y_origin) << shift) as u8;
+    let col_offset = if normal_is_x {
+        ((origin.z - leaf_z) << shift) as u8
+    } else {
+        ((origin.x - leaf_x) << shift) as u8
+    };
+    FaceNeighbor::Coarser {
+        origin: neighbour,
+        offset: [row_offset, col_offset],
     }
+}
 
-    if neighbour_lod == lod + 1 {
-        // 邻居更粗：一个粗叶子覆盖整个切向范围，本块面是其 16x16 子块。
-        let coarse_span = 1i32 << neighbour_lod;
-        let y_origin = origin.y.div_euclid(coarse_span) * coarse_span;
-        let neighbour = chunk_key(leaf_x, y_origin, leaf_z);
-        debug_assert!(partition.contains(neighbour, neighbour_lod));
-        // 32 / 2^(lod+1) = 2^(4-lod)：粗格数 = 细格数 / 2。
-        let shift = 4 - i32::from(lod);
-        let row_offset = ((origin.y - y_origin) << shift) as u8;
-        let col_offset = if normal_is_x {
-            ((origin.z - leaf_z) << shift) as u8
-        } else {
-            ((origin.x - leaf_x) << shift) as u8
-        };
-        return FaceNeighbor::Coarser {
-            origin: neighbour,
-            offset: [row_offset, col_offset],
-        };
+/// 邻居更细：切向每半区一个细叶子，竖直方向每半区一个 y 块。
+fn finer_leaf(
+    partition: &TerrainPartition,
+    leaves: &BTreeMap<i32, (i32, i32, u8)>,
+    origin: ChunkKey,
+    lod: u8,
+    normal_is_x: bool,
+    tan_start: i32,
+) -> FaceNeighbor {
+    let neighbour_lod = lod - 1;
+    let fine_span = 1i32 << neighbour_lod;
+    let mut by_half: [Option<(i32, i32)>; 2] = [None; 2];
+    for (_, &(lx, lz, _)) in leaves.iter() {
+        let leaf_tan = if normal_is_x { lz } else { lx };
+        let half = usize::from(leaf_tan >= tan_start + fine_span);
+        by_half[half] = Some((lx, lz));
     }
-
-    if neighbour_lod + 1 == lod {
-        // 邻居更细：切向每半区一个细叶子，竖直方向每半区一个 y 块。
-        let fine_span = 1i32 << neighbour_lod;
-        let mut by_half: [Option<(i32, i32)>; 2] = [None; 2];
-        for (_, &(lx, lz, _)) in leaves.iter() {
-            let leaf_tan = if normal_is_x { lz } else { lx };
-            let half = usize::from(leaf_tan >= tan_start + fine_span);
-            by_half[half] = Some((lx, lz));
+    let mut out = [chunk_key(0, 0, 0); 4];
+    for row_half in 0..2i32 {
+        for col_half in 0..2usize {
+            let Some((lx, lz)) = by_half[col_half] else {
+                debug_assert!(false, "更细邻居缺少切向半区 {col_half}");
+                return FaceNeighbor::Missing;
+            };
+            let y = origin.y + row_half * fine_span;
+            let neighbour = chunk_key(lx, y, lz);
+            debug_assert!(partition.contains(neighbour, neighbour_lod));
+            out[(row_half as usize) * 2 + col_half] = neighbour;
         }
-        let mut out = [chunk_key(0, 0, 0); 4];
-        for row_half in 0..2i32 {
-            for col_half in 0..2usize {
-                let Some((lx, lz)) = by_half[col_half] else {
-                    debug_assert!(false, "更细邻居缺少切向半区 {col_half}");
-                    return FaceNeighbor::Missing;
-                };
-                let y = origin.y + row_half * fine_span;
-                let neighbour = chunk_key(lx, y, lz);
-                debug_assert!(partition.contains(neighbour, neighbour_lod));
-                out[(row_half as usize) * 2 + col_half] = neighbour;
-            }
-        }
-        return FaceNeighbor::Finer(out);
     }
-
-    debug_assert!(false, "LOD 差超过 1: {} -> {}", lod, neighbour_lod);
-    FaceNeighbor::Missing
+    FaceNeighbor::Finer(out)
 }
 
 /// 块原点（米）= origin * CHUNK_SIZE * voxel_size。
