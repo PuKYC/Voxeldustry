@@ -38,6 +38,7 @@ use game_engine::save::{
     AttachTag, BodyKind, BodyRecord, OpaqueComponents, PersistRegistry, ReclaimStats, RegionFile,
     SaveError, SaveErrorKind, SavePaths, WorldMeta, REGION_SIZE,
 };
+use game_engine::streaming::EntityRecord;
 use game_engine::voxel::{
     dec_ref_recursive, Attachment, ChunkKey, VoxVolume, VoxelBox, VoxelDirtySet, VoxelInterner,
     DEFAULT_INTERNER_BUDGET_BYTES,
@@ -154,6 +155,9 @@ struct BodyPlan {
     regions: Vec<RegionFile>,
 }
 
+/// 阶段一的总编排：校验 meta -> 按 body / region 读入并校验 -> 校验序号与负载。
+///
+/// 顺序即语义：任何错误都在返回前出现，且世界一次都没有被改过。
 fn build_plan(
     world: &World,
     paths: &SavePaths,
@@ -167,64 +171,8 @@ fn build_plan(
     let mut chunk_count = 0usize;
 
     for (body_key, record) in &meta.bodies {
-        let mut regions: Vec<RegionFile> = Vec::new();
-        for region_key in regions_on_disk(paths, *body_key)? {
-            let anchor = region_anchor(*body_key, region_key)?;
-            let file = read_region(paths, *body_key, anchor)?.ok_or_else(|| {
-                region_error(
-                    *body_key,
-                    region_key,
-                    SaveErrorKind::Missing {
-                        what: "region file (meta body has no readable region)",
-                        id: 0,
-                    },
-                )
-            })?;
-
-            for (chunk_key, chunk) in &file.chunks {
-                if region_of(*chunk_key) != region_key {
-                    return Err(chunk_error(
-                        *body_key,
-                        *chunk_key,
-                        SaveErrorKind::InvalidCombination {
-                            what: "chunk key does not belong to its region file",
-                        },
-                    ));
-                }
-                if !chunk.proposals.is_empty() {
-                    debug_assert!(
-                        chunk.content.is_none(),
-                        "§3.1：content 有值时 proposals 必须为空"
-                    );
-                }
-                for entity in &chunk.entities {
-                    let id = entity.stable_entity_id;
-                    if id == 0 {
-                        return Err(chunk_error(
-                            *body_key,
-                            *chunk_key,
-                            SaveErrorKind::InvalidValue {
-                                what: "entity stable_entity_id",
-                                value: 0,
-                            },
-                        ));
-                    }
-                    if !seen_entities.insert(id) {
-                        return Err(chunk_error(
-                            *body_key,
-                            *chunk_key,
-                            SaveErrorKind::Duplicate {
-                                what: "entity stable_entity_id across regions",
-                                id,
-                            },
-                        ));
-                    }
-                }
-                chunk_count += 1;
-            }
-
-            regions.push(file);
-        }
+        let (regions, chunks) = load_body_regions(paths, *body_key, &mut seen_entities)?;
+        chunk_count += chunks;
         bodies.push(BodyPlan {
             key: *body_key,
             record: *record,
@@ -232,8 +180,131 @@ fn build_plan(
         });
     }
 
-    // next_stable_entity_id 必须大于所有已经出现的稳定 ID（body 与实体）。
-    // 空表时 next = 0 也是坏档：发号器从 1 开始。
+    validate_next_stable_id(&meta, &seen_entities)?;
+
+    // 块内容与实体负载也要在阶段一解码：否则 stage 2 装到一半才发现坏数据，
+    // 世界已经被改。旧版本的内容不会被安装，所以也不在此解码：它本来就要丢弃，
+    // 没有理由让一段无法解码的旧内容把整份存档判成坏档。
+    validate_contents(&bodies, content_budget(world), generator_version)?;
+    validate_entities(world, &bodies)?;
+    let orphan_regions = count_orphan_regions(paths, &meta)?;
+
+    Ok(Plan {
+        meta,
+        bodies,
+        chunk_count,
+        orphan_regions,
+    })
+}
+
+/// 按 region 键升序读出一个 body 的全部 region 文件，并逐块校验。
+///
+/// 返回 (region 文件, 块数)；块数包含 content = None 的记录。
+fn load_body_regions(
+    paths: &SavePaths,
+    body_key: BodyKey,
+    seen_entities: &mut BTreeSet<u64>,
+) -> Result<(Vec<RegionFile>, usize), SaveError> {
+    let mut regions: Vec<RegionFile> = Vec::new();
+    let mut chunk_count = 0usize;
+    for region_key in regions_on_disk(paths, body_key)? {
+        let file = read_region_file(paths, body_key, region_key)?;
+        chunk_count += validate_region_chunks(body_key, region_key, &file, seen_entities)?;
+        regions.push(file);
+    }
+    Ok((regions, chunk_count))
+}
+
+/// 读一个 region 文件；meta 列出的 body 缺文件是坏档，不是"跳过"。
+fn read_region_file(
+    paths: &SavePaths,
+    body_key: BodyKey,
+    region_key: ChunkKey,
+) -> Result<RegionFile, SaveError> {
+    let anchor = region_anchor(body_key, region_key)?;
+    read_region(paths, body_key, anchor)?.ok_or_else(|| {
+        region_error(
+            body_key,
+            region_key,
+            SaveErrorKind::Missing {
+                what: "region file (meta body has no readable region)",
+                id: 0,
+            },
+        )
+    })
+}
+
+/// 校验一个 region 文件里的块：键必须落在本 region，实体 ID 必须非零且全局唯一。
+///
+/// 返回该文件的块数（含 content = None 的记录）。
+fn validate_region_chunks(
+    body_key: BodyKey,
+    region_key: ChunkKey,
+    file: &RegionFile,
+    seen_entities: &mut BTreeSet<u64>,
+) -> Result<usize, SaveError> {
+    let mut chunk_count = 0usize;
+    for (chunk_key, chunk) in &file.chunks {
+        if region_of(*chunk_key) != region_key {
+            return Err(chunk_error(
+                body_key,
+                *chunk_key,
+                SaveErrorKind::InvalidCombination {
+                    what: "chunk key does not belong to its region file",
+                },
+            ));
+        }
+        if !chunk.proposals.is_empty() {
+            debug_assert!(
+                chunk.content.is_none(),
+                "§3.1：content 有值时 proposals 必须为空"
+            );
+        }
+        validate_chunk_entities(body_key, *chunk_key, &chunk.entities, seen_entities)?;
+        chunk_count += 1;
+    }
+    Ok(chunk_count)
+}
+
+/// 校验单个块里的实体记录：ID 非零，且跨 region 不能重复。
+fn validate_chunk_entities(
+    body_key: BodyKey,
+    chunk_key: ChunkKey,
+    entities: &[EntityRecord],
+    seen_entities: &mut BTreeSet<u64>,
+) -> Result<(), SaveError> {
+    for entity in entities {
+        let id = entity.stable_entity_id;
+        if id == 0 {
+            return Err(chunk_error(
+                body_key,
+                chunk_key,
+                SaveErrorKind::InvalidValue {
+                    what: "entity stable_entity_id",
+                    value: 0,
+                },
+            ));
+        }
+        if !seen_entities.insert(id) {
+            return Err(chunk_error(
+                body_key,
+                chunk_key,
+                SaveErrorKind::Duplicate {
+                    what: "entity stable_entity_id across regions",
+                    id,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// next_stable_entity_id 必须大于所有已经出现的稳定 ID（body 与实体）。
+/// 空表时 next = 0 也是坏档：发号器从 1 开始。
+fn validate_next_stable_id(
+    meta: &WorldMeta,
+    seen_entities: &BTreeSet<u64>,
+) -> Result<(), SaveError> {
     let max_seen = meta
         .bodies
         .keys()
@@ -250,20 +321,7 @@ fn build_plan(
             },
         ));
     }
-
-    // 块内容与实体负载也要在阶段一解码：否则 stage 2 装到一半才发现坏数据，
-    // 世界已经被改。旧版本的内容不会被安装，所以也不在此解码：它本来就要丢弃，
-    // 没有理由让一段无法解码的旧内容把整份存档判成坏档。
-    validate_contents(&bodies, content_budget(world), generator_version)?;
-    validate_entities(world, &bodies)?;
-    let orphan_regions = count_orphan_regions(paths, &meta)?;
-
-    Ok(Plan {
-        meta,
-        bodies,
-        chunk_count,
-        orphan_regions,
-    })
+    Ok(())
 }
 
 /// 阶段一：校验 meta 自身（解码器已做的检查之外，世界级语义再查一遍）。
@@ -1443,5 +1501,56 @@ mod tests {
         assert_eq!(result.stats.chunks, 1);
         assert!(orphan_region.exists(), "孤儿 region 不能被删");
         assert!(recovered.exists(), "孤儿 recovered 不能被删");
+    }
+
+    /// 计划的输出顺序是确定性契约：body 按 BodyKey 升序、每个 body 的 region
+    /// 按 region 键升序，与插入顺序 / 磁盘枚举顺序无关。
+    #[test]
+    fn build_plan_orders_bodies_and_regions() {
+        let mut source = test_world(7);
+        let mut expected: Vec<BodyKey> = Vec::new();
+        for index in 0..3u8 {
+            let drift = Vec3F::new(
+                FixedPoint::from_num(i64::from(index)),
+                FixedPoint::ZERO,
+                FixedPoint::ZERO,
+            );
+            let (_, body_key) = spawn_island_with_chunks(
+                &mut source,
+                drift,
+                index % 2 == 0,
+                BiomeId(index),
+                &[ChunkKey::new(0, 0, 0), ChunkKey::new(4, 0, 0)],
+            );
+            expected.push(body_key);
+        }
+
+        let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+        let dir = TempDir::new("plan_order");
+        let paths = SavePaths::new(dir.path());
+        write_capture(&paths, &capture).expect("落盘成功");
+
+        let meta = read_world_meta(&paths)
+            .expect("读 meta")
+            .expect("world.meta 存在");
+        let reader = test_world(1);
+        let plan = build_plan(&reader, &paths, meta, 1).expect("建计划成功");
+
+        expected.sort_unstable();
+        let keys: Vec<BodyKey> = plan.bodies.iter().map(|body| body.key).collect();
+        assert_eq!(keys, expected, "body 必须按 BodyKey 升序");
+        assert_eq!(plan.chunk_count, expected.len() * 2, "每个 body 两块");
+
+        for body in &plan.bodies {
+            let regions: Vec<ChunkKey> = body
+                .regions
+                .iter()
+                .map(|file| region_of(*file.chunks.keys().next().expect("region 非空")))
+                .collect();
+            let mut sorted = regions.clone();
+            sorted.sort_unstable();
+            assert_eq!(regions, sorted, "region 必须按 region 键升序");
+            assert_eq!(regions.len(), 2, "每个 body 两个 region");
+        }
     }
 }
