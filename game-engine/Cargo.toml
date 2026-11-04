@@ -45,6 +45,13 @@ name = "voxel_collider"
 harness = false
 required-features = ["voxel", "physics"]
 
+# 体素碰撞增量同步：8 root × 512 chunk 的扫描 / 哈希 / 重建耗时。
+[[bench]]
+name = "voxel_collision_sync"
+harness = false
+required-features = ["voxel", "physics"]
+
+
 # 同一批路径的指令数基准（gungraun + valgrind），CI 门禁用。
 [[bench]]
 name = "voxel_collider_inst"
