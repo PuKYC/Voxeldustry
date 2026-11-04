@@ -41,7 +41,7 @@
 //! “固定枚举顺序 -> 固定 shape 构造顺序”成立；但这不等于跨平台浮点数值一致，
 //! 物理的跨平台可复现性不由本模块保证。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ::voxel::store::{ChunkKey, VoxInterner, VoxOpsRead};
 use avian3d::math::Vector;
@@ -282,11 +282,19 @@ fn spawn_chunk_collider(
     }
 }
 
+/// 单个 chunk 实体的索引信息：实体、content_hash、voxel_size_bits。
+type ChunkCell = (Entity, u64, i64);
+
+/// 按 body 分桶的 chunk 实体索引：一次 Query 遍历建成，之后只按 root 查找。
+/// HashMap 只做查找、从不迭代；每个 body 内部仍用 BTreeMap 保证 ChunkKey 升序。
+type ChunksByBody = HashMap<Entity, BTreeMap<ChunkKey, ChunkCell>>;
+
 /// 按 per-chunk 结构哈希把 VoxVolume 同步为一组 chunk 碰撞实体（在 VoxelSet::Collision）。
 ///
 /// 过滤 Added/Changed：新挂 VoxelCollider、新增或编辑 VoxVolume 才进入；
 /// 其余 tick 不算 hash。对每个匹配的 root：
-/// 1. 收集它现有的 VoxelCollisionChunk 实体（ChunkKey 升序）；
+/// 1. 一次 Query 遍历把所有 VoxelCollisionChunk 实体按 chunk.body 分桶（每桶内
+///    ChunkKey 升序），之后每个 root 只查自己那一桶，不再重扫全部 chunk 实体；
 /// 2. 逐 chunk 比对 content_hash / voxel_size_bits，得到 changed_keys；再把「已被删除、
 ///    但还有 in-volume 邻块」的那些邻块也补进 changed_keys；
 /// 3. affected = changed_keys ∪ 其 6 邻（仅限 volume 中存在的 key），并构建 Voxels
@@ -317,17 +325,22 @@ pub fn sync_voxel_collision_chunks(
 ) {
     let interner = interner.inner();
     let chunk_axis = chunk_voxels_per_axis();
+
+    // ── 1. 一次遍历按 body 分桶（ChunkKey 升序，确定性）──
+    // 原来是「每个 root 各扫一遍全部 chunk 实体」= O(roots × chunks)；分桶后
+    // 只需 O(chunks) 一次，之后每个 root 一次 HashMap 查找。系统内 commands 是延迟
+    // 生效的，中途不会有实体增删，所以开头快照与本 root 处理时扫描等价。
+    let mut by_body: ChunksByBody = ChunksByBody::new();
+    for (entity, chunk, _collider, _transform) in chunks.iter() {
+        by_body.entry(chunk.body).or_default().insert(
+            chunk.key,
+            (entity, chunk.content_hash, chunk.voxel_size_bits),
+        );
+    }
+    let no_chunks: BTreeMap<ChunkKey, ChunkCell> = BTreeMap::new();
+
     for (root, volume, root_global, body) in &roots {
-        // ── 1. 该 root 现有的 chunk 实体（ChunkKey 升序，确定性）──
-        let mut existing: BTreeMap<ChunkKey, (Entity, u64, i64)> = BTreeMap::new();
-        for (entity, chunk, _collider, _transform) in chunks.iter() {
-            if chunk.body == root {
-                existing.insert(
-                    chunk.key,
-                    (entity, chunk.content_hash, chunk.voxel_size_bits),
-                );
-            }
-        }
+        let existing = by_body.get(&root).unwrap_or(&no_chunks);
 
         // ── 2. per-chunk 内容哈希 diff ──
         let voxel_size_bits = volume.voxel_size.to_bits();
