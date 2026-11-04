@@ -11,6 +11,25 @@ use super::voxops::{
     VoxOpsBatch, VoxOpsBulkWrite, VoxOpsConfig, VoxOpsDirty, VoxOpsRead, VoxOpsState, VoxOpsWrite,
 };
 
+/// 调试用引用计数跟踪打印。
+///
+/// feature `debug_trace_ref_counts` 关闭时展开为空（整条语句被 `#[cfg]` 移除，零运行时开销）；
+/// 打开时原样执行花括号内的打印语句。仅用于排查 SVO DAG 的引用计数问题。
+macro_rules! trace_refs {
+    // 绑定形式：保留变量作用域，供紧随其后的其它打印复用。
+    (let $name:ident = $init:expr;) => {
+        #[cfg(feature = "debug_trace_ref_counts")]
+        let $name = $init;
+    };
+    // 语句块形式：整块受 feature 门控，块内变量不泄漏到外部。
+    ($($tt:tt)*) => {
+        #[cfg(feature = "debug_trace_ref_counts")]
+        {
+            $($tt)*
+        }
+    };
+}
+
 /// Lookup table for fast sibling scanning in octree traversal using Morton-encoded paths.
 ///
 /// `PATH_MASKS[max_depth][level]` provides a bitmask indicating which sibling nodes
@@ -161,15 +180,13 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
         #[cfg(feature = "tracy")]
         let _span = tracy_client::span!("VoxTree::set");
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        {
+        trace_refs! {
             println!("\n");
             println!("set position: {position:?} voxel: {voxel}");
         }
 
         let new_root_id = if !self.root_id.is_empty() {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            {
+            trace_refs! {
                 println!("Some(root) set position: {position:?} voxel: {voxel}");
                 interner.dump_node(self.root_id, 0, "  ");
             }
@@ -183,8 +200,7 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
                 voxel,
             )
         } else if voxel != T::default() {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            {
+            trace_refs! {
                 println!("None set position: {position:?} voxel: {voxel}");
                 interner.dump_node(self.root_id, 0, "  ");
             }
@@ -200,15 +216,19 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
             return false;
         };
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!("\n setting new_root");
+        trace_refs! { println!("\n setting new_root"); }
 
         if new_root_id != BlockId::INVALID {
-            if !self.root_id.is_empty() {
+            if self.root_id.is_empty() {
+                trace_refs! {
+                    println!("new_root_id:");
+                    interner.dump_node(new_root_id, 0, "  ");
+                    println!("  new_root: {new_root_id:?}");
+                }
+            } else {
                 assert_ne!(new_root_id, self.root_id);
 
-                #[cfg(feature = "debug_trace_ref_counts")]
-                {
+                trace_refs! {
                     println!("existing_root_id:");
                     interner.dump_node(self.root_id, 0, "  ");
                     println!("new_root_id:");
@@ -221,17 +241,9 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
 
                 interner.dec_ref_recursive(&self.root_id);
 
-                #[cfg(feature = "debug_trace_ref_counts")]
-                {
+                trace_refs! {
                     println!("new_root after recycling existing_root position: {position:?}");
                     interner.dump_node(new_root_id, 0, "  ");
-                }
-            } else {
-                #[cfg(feature = "debug_trace_ref_counts")]
-                {
-                    println!("new_root_id:");
-                    interner.dump_node(new_root_id, 0, "  ");
-                    println!("  new_root: {new_root_id:?}");
                 }
             }
 
@@ -245,8 +257,7 @@ impl<T: VoxelTrait> VoxOpsWrite<T> for VoxTree<T> {
 
             true
         } else {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!("new_root is None");
+            trace_refs! { println!("new_root is None"); }
 
             false
         }
@@ -274,8 +285,7 @@ impl<T: VoxelTrait> VoxOpsBulkWrite<T> for VoxTree<T> {
         let _span = tracy_client::span!("VoxTree::clear");
 
         if !self.root_id.is_empty() {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!("clear root_id: {:?}", self.root_id);
+            trace_refs! { println!("clear root_id: {:?}", self.root_id); }
 
             interner.dec_ref_recursive(&self.root_id);
 
@@ -390,10 +400,11 @@ fn set_at_depth_iterative<T: VoxelTrait>(
     initial_depth: &TraversalDepth,
     voxel: T,
 ) -> BlockId {
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!(
-        "set_at_depth_iterative initial_node: {initial_node_id:?} position: {position:?} voxel: {voxel}"
-    );
+    trace_refs! {
+        println!(
+            "set_at_depth_iterative initial_node: {initial_node_id:?} position: {position:?} voxel: {voxel}"
+        );
+    }
 
     #[cfg(feature = "tracy")]
     let _span = tracy_client::span!("set_at_depth_iterative");
@@ -407,24 +418,23 @@ fn set_at_depth_iterative<T: VoxelTrait>(
     let mut current_depth = initial_depth;
 
     // Phase 1: descend down the tree and build the chain
-    #[cfg(feature = "debug_trace_ref_counts")]
-    {
+    trace_refs! {
         println!(" Phase 1 - Find the spot");
         interner.dump_node(current_node_id, 0, "  ");
     }
 
     let mut leaf_node_id = BlockId::EMPTY;
     while current_depth < max_depth {
-        #[cfg(feature = "debug_trace_ref_counts")]
-        let current_node_ref_count = interner.get_ref(&current_node_id);
+        trace_refs! { let current_node_ref_count = interner.get_ref(&current_node_id); }
 
         let index = child_index2(position, current_depth, max_depth);
 
         if current_node_id.is_branch() {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                "  depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {current_node_ref_count} [1]"
-            );
+            trace_refs! {
+                println!(
+                    "  depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {current_node_ref_count} [1]"
+                );
+            }
 
             stack[current_depth] = (current_node_id, leaf_node_id, index as u8);
 
@@ -438,10 +448,11 @@ fn set_at_depth_iterative<T: VoxelTrait>(
             leaf_node_id = current_node_id;
             current_node_id = BlockId::EMPTY;
 
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                "  depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {current_node_ref_count} [2]"
-            );
+            trace_refs! {
+                println!(
+                    "  depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {current_node_ref_count} [2]"
+                );
+            }
 
             stack[current_depth] = (current_node_id, leaf_node_id, index as u8);
         }
@@ -450,8 +461,7 @@ fn set_at_depth_iterative<T: VoxelTrait>(
     }
 
     // Phase 2: create a leaf at the correct depth
-    #[cfg(feature = "debug_trace_ref_counts")]
-    {
+    trace_refs! {
         println!(" Phase 2 - Create leaf");
         println!(
             "  depth: {current_depth}/{max_depth} current: {current_node_id:?} ref_count: {} is_valid: {}",
@@ -461,46 +471,47 @@ fn set_at_depth_iterative<T: VoxelTrait>(
     }
 
     if current_node_id.is_leaf() && interner.get_value(&current_node_id) == &voxel {
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!("  voxel already exists, no change required");
+        trace_refs! { println!("  voxel already exists, no change required"); }
         return BlockId::INVALID; // Nothing changed
     }
 
     current_node_id = interner.get_or_create_leaf(voxel);
 
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!(
-        "   current: {current_node_id:?} ref_count: {}",
-        interner.get_ref(&current_node_id)
-    );
+    trace_refs! {
+        println!(
+            "   current: {current_node_id:?} ref_count: {}",
+            interner.get_ref(&current_node_id)
+        );
+    }
 
     // Phase 3: propagate upwards and create new branch nodes
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!(" Phase 3 - Propagate upwards");
+    trace_refs! { println!(" Phase 3 - Propagate upwards"); }
     while current_depth > initial_depth {
         current_depth -= 1;
 
         let (parent_node_id, leaf_node_id, parent_node_index) = stack[current_depth];
 
         if !parent_node_id.is_empty() {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                "  depth: {current_depth}/{max_depth} i: {parent_node_index:2x} parent: {parent_node_id:?} current: {current_node_id:?} leaf: {leaf_node_id:?} [B]"
-            );
+            trace_refs! {
+                println!(
+                    "  depth: {current_depth}/{max_depth} i: {parent_node_index:2x} parent: {parent_node_id:?} current: {current_node_id:?} leaf: {leaf_node_id:?} [B]"
+                );
+            }
 
-            #[cfg(feature = "debug_trace_ref_counts")]
-            for (child_idx, child) in interner.get_children(&parent_node_id).iter().enumerate() {
-                if child_idx == parent_node_index as usize {
-                    println!(
-                        "   child[{child_idx}]: {child:?} [{}] => {current_node_id:?} [{}]",
-                        interner.get_ref(child),
-                        interner.get_ref(&current_node_id),
-                    );
-                } else {
-                    println!(
-                        "   child[{child_idx}]: {child:?} [{}]",
-                        interner.get_ref(child)
-                    );
+            trace_refs! {
+                for (child_idx, child) in interner.get_children(&parent_node_id).iter().enumerate() {
+                    if child_idx == parent_node_index as usize {
+                        println!(
+                            "   child[{child_idx}]: {child:?} [{}] => {current_node_id:?} [{}]",
+                            interner.get_ref(child),
+                            interner.get_ref(&current_node_id),
+                        );
+                    } else {
+                        println!(
+                            "   child[{child_idx}]: {child:?} [{}]",
+                            interner.get_ref(child)
+                        );
+                    }
                 }
             }
 
@@ -518,10 +529,11 @@ fn set_at_depth_iterative<T: VoxelTrait>(
                 current_node_id = interner.get_or_create_branch(branch, types, mask);
             }
         } else if leaf_node_id.is_empty() {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                "  depth: {current_depth}/{max_depth} i: {parent_node_index:2x} parent: {parent_node_id:?} current: {current_node_id:?} leaf: {leaf_node_id:?} [E]"
-            );
+            trace_refs! {
+                println!(
+                    "  depth: {current_depth}/{max_depth} i: {parent_node_index:2x} parent: {parent_node_id:?} current: {current_node_id:?} leaf: {leaf_node_id:?} [E]"
+                );
+            }
 
             let mut children = EMPTY_CHILD;
             children[parent_node_index as usize] = current_node_id;
@@ -529,10 +541,11 @@ fn set_at_depth_iterative<T: VoxelTrait>(
             let mask = 1 << parent_node_index;
             current_node_id = interner.get_or_create_branch(children, types, mask);
         } else {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                "  depth: {current_depth}/{max_depth} i: {parent_node_index:2x} parent: {parent_node_id:?} current: {current_node_id:?} leaf: {leaf_node_id:?} [ESL]"
-            );
+            trace_refs! {
+                println!(
+                    "  depth: {current_depth}/{max_depth} i: {parent_node_index:2x} parent: {parent_node_id:?} current: {current_node_id:?} leaf: {leaf_node_id:?} [ESL]"
+                );
+            }
 
             let mut children = [leaf_node_id; MAX_CHILDREN];
             interner.inc_ref_by(&leaf_node_id, 7);
@@ -544,8 +557,7 @@ fn set_at_depth_iterative<T: VoxelTrait>(
         }
     }
 
-    #[cfg(feature = "debug_trace_ref_counts")]
-    {
+    trace_refs! {
         println!(" Phase 4 - Finalize");
         println!("  new_root: {current_node_id:?}");
         interner.dump_node(current_node_id, 0, "  ");
@@ -578,8 +590,11 @@ fn remove_at_depth_branch<T: VoxelTrait>(
     position: &IVec3,
     depth: &TraversalDepth,
 ) -> BlockId {
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!("remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}");
+    trace_refs! {
+        println!(
+            "remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
+        );
+    }
 
     assert!(interner.is_valid_block_id(node_id));
     assert!(depth.current() < depth.max(), "Branch node at max depth");
@@ -627,27 +642,30 @@ fn remove_at_depth_branch<T: VoxelTrait>(
 
                 branch[index] = new_child_id;
 
-                #[cfg(feature = "debug_trace_ref_counts")]
-                println!(
-                    ".. [new branch] remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
-                );
+                trace_refs! {
+                    println!(
+                        ".. [new branch] remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
+                    );
+                }
 
                 interner.inc_child_refs(&branch, index);
 
                 interner.get_or_create_branch(branch, types, mask)
             }
         } else {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                ".. [invalid new_child_id] remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
-            );
+            trace_refs! {
+                println!(
+                    ".. [invalid new_child_id] remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
+                );
+            }
             BlockId::INVALID
         }
     } else {
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!(
-            ".. [no child] remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
-        );
+        trace_refs! {
+            println!(
+                ".. [no child] remove_at_depth_branch node_id: {node_id:?} position: {position:?} depth: {depth:?}"
+            );
+        }
 
         BlockId::INVALID
     }
@@ -659,8 +677,11 @@ fn remove_at_depth_leaf<T: VoxelTrait>(
     position: &IVec3,
     depth: &TraversalDepth,
 ) -> BlockId {
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!("remove_at_depth_leaf node_id: {node_id:?} position: {position:?} depth: {depth:?}");
+    trace_refs! {
+        println!(
+            "remove_at_depth_leaf node_id: {node_id:?} position: {position:?} depth: {depth:?}"
+        );
+    }
 
     assert!(interner.is_valid_block_id(node_id));
 
@@ -686,8 +707,7 @@ fn remove_at_depth_leaf<T: VoxelTrait>(
         let types = !(1 << index) | ((is_leaf as u8) << index);
         let mask = !(1 << index) | ((!is_empty as u8) << index);
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!("incrementing refs for node_id: {node_id:?}");
+        trace_refs! { println!("incrementing refs for node_id: {node_id:?}"); }
 
         // println!("types: {types:b} mask: {mask:b}");
 
@@ -721,23 +741,22 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
     initial_depth: &TraversalDepth,
     batch: &Batch<T>,
 ) -> BlockId {
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!(
-        "set_batch_at_depth_iterative initial node: {initial_node_id:?} depth: {initial_depth:?} batch size: {}",
-        batch.size()
-    );
+    trace_refs! {
+        println!(
+            "set_batch_at_depth_iterative initial node: {initial_node_id:?} depth: {initial_depth:?} batch size: {}",
+            batch.size()
+        );
+    }
 
     #[cfg(feature = "tracy")]
     let _span = tracy_client::span!("set_batch_at_depth_iterative");
 
     // Phase 0: handle fill
-    #[cfg(feature = "debug_trace_ref_counts")]
-    println!(" Phase 0 - Handle fill",);
+    trace_refs! { println!(" Phase 0 - Handle fill",); }
     let initial_node_id = if let Some(voxel) = batch.to_fill() {
         let node_id = interner.get_or_create_leaf(voxel);
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        {
+        trace_refs! {
             let ref_count = interner.get_ref(&node_id);
             println!("  current: {node_id:?} value: {voxel:?} ref_count: {ref_count}");
         }
@@ -755,8 +774,7 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
     let initial_depth = initial_depth.current() as usize;
 
     // Phase 1: prepare the chain & build dangling branches
-    #[cfg(feature = "debug_trace_ref_counts")]
-    {
+    trace_refs! {
         println!(" Phase 1 - Prepare the chain & build dangling branches",);
         interner.dump_node(initial_node_id, 0, "  ");
     }
@@ -778,8 +796,7 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
 
         let mut current_node_id = initial_node_id;
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!("  path: 0x{path:08X} {path:09b}");
+        trace_refs! { println!("  path: 0x{path:08X} {path:09b}"); }
 
         let mut leaf_node_id = BlockId::EMPTY;
 
@@ -787,11 +804,12 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
             if current_node_id.is_branch() {
                 let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
 
-                #[cfg(feature = "debug_trace_ref_counts")]
-                println!(
-                    "   depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {} [1a]",
-                    interner.get_ref(&current_node_id)
-                );
+                trace_refs! {
+                    println!(
+                        "   depth: {current_depth}/{max_depth} i: {index:2x} current: {current_node_id:?} leaf: {leaf_node_id:?} ref_count: {} [1a]",
+                        interner.get_ref(&current_node_id)
+                    );
+                }
 
                 current_node_id = interner.get_child_id(&current_node_id, index);
             } else {
@@ -799,8 +817,7 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
                 leaf_node_id = current_node_id;
                 current_node_id = BlockId::EMPTY;
 
-                #[cfg(feature = "debug_trace_ref_counts")]
-                {
+                trace_refs! {
                     let index = (path >> ((max_depth - current_depth - 1) * 3)) & 0b111;
 
                     println!(
@@ -891,14 +908,12 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
     }
 
     // Phase 2: Integrate dangling branches
-    #[cfg(feature = "debug_trace_ref_counts")]
-    {
+    trace_refs! {
         println!(" Phase 2 - Integrate dangling branches");
     }
 
     if paths.is_empty() {
-        #[cfg(feature = "debug_trace_ref_counts")]
-        {
+        trace_refs! {
             println!("  No paths to process");
         }
         return BlockId::INVALID;
@@ -907,11 +922,12 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
     let mut target_depth = max_depth - 1;
 
     'main: while let Some(mut path) = paths.pop() {
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!(
-            "starting with path: {path:08X} {path:09b} target_depth: {target_depth} paths: {}",
-            paths.len(),
-        );
+        trace_refs! {
+            println!(
+                "starting with path: {path:08X} {path:09b} target_depth: {target_depth} paths: {}",
+                paths.len(),
+            );
+        }
 
         let path_mask_depth = if target_depth > 1 {
             target_depth - 2
@@ -951,15 +967,15 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
         let mut has_next_sibling = true;
 
         while has_next_sibling {
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(" path: {path:08X} {path:09b}");
+            trace_refs! { println!(" path: {path:08X} {path:09b}"); }
 
             let target_index = (path >> ((max_depth - target_depth) * 3)) & 0b111;
             let next_path = paths.last();
 
-            #[cfg(feature = "debug_trace_ref_counts")]
-            if let Some(next_path) = next_path {
-                println!("  next path: {next_path:08X} {next_path:09b}");
+            trace_refs! {
+                if let Some(next_path) = next_path {
+                    println!("  next path: {next_path:08X} {next_path:09b}");
+                }
             }
 
             has_next_sibling = if target_depth == 1 {
@@ -978,23 +994,22 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
             types |= (current_level_id.is_leaf() as u8) << target_index;
             mask |= 1 << target_index;
 
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!(
-                "  new_path: {:08X} {:09b}",
-                path & path_mask,
-                path & path_mask
-            );
+            trace_refs! {
+                println!(
+                    "  new_path: {:08X} {:09b}",
+                    path & path_mask,
+                    path & path_mask
+                );
+            }
 
             if has_next_sibling && !paths.is_empty() {
                 path = paths.pop().expect("No path found");
             }
 
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!("     has_more_paths: {}", !paths.is_empty());
+            trace_refs! { println!("     has_more_paths: {}", !paths.is_empty()); }
         }
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        {
+        trace_refs! {
             println!(
                 "     types: {types:08b} mask: {mask:08b} current_path: {:09b}",
                 path & path_mask
@@ -1068,29 +1083,30 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
             children[0]
         };
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!(
-            "     new_node_id: {new_node_id:?} ref_count: {}",
-            interner.get_ref(&new_node_id)
-        );
+        trace_refs! {
+            println!(
+                "     new_node_id: {new_node_id:?} ref_count: {}",
+                interner.get_ref(&new_node_id)
+            );
+        }
 
         let next_path = path & path_mask;
         next_paths.push(next_path);
         next_level_data[next_path >> 3] = new_node_id;
 
-        #[cfg(feature = "debug_trace_ref_counts")]
-        println!(
-            "     has_more_paths: {} target_depth: {target_depth}",
-            !paths.is_empty(),
-        );
+        trace_refs! {
+            println!(
+                "     has_more_paths: {} target_depth: {target_depth}",
+                !paths.is_empty(),
+            );
+        }
 
         if paths.is_empty() {
             std::mem::swap(&mut current_level_data, &mut next_level_data);
             std::mem::swap(&mut paths, &mut next_paths);
             next_paths.clear();
 
-            #[cfg(feature = "debug_trace_ref_counts")]
-            println!("  paths: {paths:#?}");
+            trace_refs! { println!("  paths: {paths:#?}"); }
 
             target_depth -= 1;
             if target_depth == 0 {
@@ -1101,8 +1117,7 @@ fn set_batch_at_depth_iterative<T: VoxelTrait>(
 
     let final_node_id = current_level_data[paths[0] >> 3];
 
-    #[cfg(feature = "debug_trace_ref_counts")]
-    {
+    trace_refs! {
         println!(" Phase 3 - Finalize");
         println!("  new_root: {final_node_id:?}");
         interner.dump_node(final_node_id, 0, "  ");
