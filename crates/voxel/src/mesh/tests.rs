@@ -501,7 +501,7 @@ fn ao_is_constant_across_merged_rects() {
 fn ao_samples_normal_face_neighbour() {
     let n = 4usize;
     let mut b = OccupancyDataBuilder::new(n as u32);
-    b.external[0 * n + 0] = 1; // +X 邻块 (y=0, z=0) 实心
+    b.external[0] = 1; // +X 邻块 (y=0, z=0) 实心
     b.external_exists[0] = true;
     let occ = b.build();
     // +X 面位于 x=n-1，以 (row,col)=(y,z)=(1,1) 为角；负 y/负 z 采样落到外部邻居。
@@ -517,7 +517,7 @@ fn ao_samples_normal_face_neighbour() {
 fn ao_samples_perpendicular_face_neighbour() {
     let n = 4usize;
     let mut b = OccupancyDataBuilder::new(n as u32);
-    b.external[0 * n + 2] = 1 << 1; // +X 邻块 (y=2, z=1) 实心
+    b.external[2] = 1 << 1; // +X 邻块 (y=2, z=1) 实心
     b.external_exists[0] = true;
     let occ = b.build();
     // +Y 面位于 y=2，采样时 x 越界落到 +X 邻居（切向）。
@@ -563,7 +563,7 @@ fn solid_at_reads_padded_halo_face_edge_corner() {
 
     // 无 halo 时回落到 global + 6 面 external 的旧逻辑。
     let mut b2 = OccupancyDataBuilder::new(n as u32);
-    b2.external[0 * n + 1] = 1 << 1; // +X 邻块 (y=1, z=1) 实心
+    b2.external[1] = 1 << 1; // +X 邻块 (y=1, z=1) 实心
     let occ2 = b2.build();
     assert!(solid_at(&occ2, n, n as i64, 1, 1), "旧逻辑：面掩码");
     assert!(
