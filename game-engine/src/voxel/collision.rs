@@ -289,20 +289,305 @@ type ChunkCell = (Entity, u64, i64);
 /// HashMap 只做查找、从不迭代；每个 body 内部仍用 BTreeMap 保证 ChunkKey 升序。
 type ChunksByBody = HashMap<Entity, BTreeMap<ChunkKey, ChunkCell>>;
 
+/// 待落盘的 chunk 集合：None 表示该 key 在 volume 中但内容为空（应撤销实体）。
+type AffectedChunks = BTreeMap<ChunkKey, Option<Voxels>>;
+
+/// chunk 碰撞实体查询：实体 + 数据 + 可选的 Collider / Transform 槽位。
+type ChunkQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut VoxelCollisionChunk,
+        Option<&'static mut Collider>,
+        Option<&'static mut Transform>,
+    ),
+>;
+
+/// 一个 root 在一次同步中的只读上下文。
+struct RootContext<'a> {
+    root: Entity,
+    volume: &'a VoxVolume,
+    root_global: &'a GlobalTransform,
+    body: Option<&'a RigidBody>,
+    interner: &'a VoxInterner<u8>,
+}
+
+/// 第 1 步：一次 Query 遍历，按 chunk.body 把现有 chunk 实体分桶。
+///
+/// 原来是「每个 root 各扫一遍全部 chunk 实体」= O(roots × chunks)；分桶后只需
+/// O(chunks) 一次，之后每个 root 一次 HashMap 查找。系统内 commands 是延迟生效的，
+/// 中途不会有实体增删，所以开头快照与「该 root 处理时再扫描」等价。
+fn collect_existing(chunks: &ChunkQuery<'_, '_>) -> ChunksByBody {
+    let mut by_body = ChunksByBody::new();
+    for (entity, chunk, _collider, _transform) in chunks.iter() {
+        by_body.entry(chunk.body).or_default().insert(
+            chunk.key,
+            (entity, chunk.content_hash, chunk.voxel_size_bits),
+        );
+    }
+    by_body
+}
+
+/// 第 2、2b 步：按 per-chunk 内容哈希求出需要重建的 key。
+///
+/// 2b：changed_keys 只从 volume 现有 chunk 推出；被删的 key 已不在 volume，其邻居若不
+/// 回炉，就会保留指向空洞的陈旧邻接位（combine 只 OR、清不掉）。把这些邻居也标为
+/// changed，它们会被 fresh 重建，朝空洞的位自然为 0。
+fn diff_by_hash(
+    ctx: &RootContext<'_>,
+    existing: &BTreeMap<ChunkKey, ChunkCell>,
+) -> BTreeSet<ChunkKey> {
+    let voxel_size_bits = ctx.volume.voxel_size.to_bits();
+    // BTreeSet：去重 + 升序迭代（确定性），也免掉 2b 里手写的 contains 判重。
+    let mut changed_keys: BTreeSet<ChunkKey> = BTreeSet::new();
+    for (key, tree) in ctx.volume.chunks.iter() {
+        let hash = chunk_content_hash(ctx.interner, tree);
+        match existing.get(key) {
+            Some((_, old_hash, old_bits)) if *old_hash == hash && *old_bits == voxel_size_bits => {}
+            _ => {
+                changed_keys.insert(*key);
+            }
+        }
+    }
+    for (key, _cell) in existing.iter() {
+        if ctx.volume.contains_chunk(key) {
+            continue;
+        }
+        for neighbor in neighbors6(*key) {
+            if ctx.volume.contains_chunk(&neighbor) {
+                changed_keys.insert(neighbor);
+            }
+        }
+    }
+    changed_keys
+}
+
+/// 第 3 步：affected = changed ∪ 6 邻（仅保留 volume 中存在的 key）；None = 应为空。
+fn expand_affected(ctx: &RootContext<'_>, changed_keys: &BTreeSet<ChunkKey>) -> AffectedChunks {
+    let mut affected = AffectedChunks::new();
+    for key in changed_keys.iter().copied() {
+        for candidate in std::iter::once(key).chain(neighbors6(key)) {
+            if !ctx.volume.contains_chunk(&candidate) {
+                continue;
+            }
+            if affected.contains_key(&candidate) {
+                continue;
+            }
+            affected.insert(
+                candidate,
+                build_chunk_voxels(ctx.volume, ctx.interner, candidate),
+            );
+        }
+    }
+    affected
+}
+
+/// 第 4 步：跨块边界合并，只走 +x/+y/+z，BTreeMap 升序保证每对只处理一次。
+fn combine_across_chunks(affected: &mut AffectedChunks, chunk_axis: i32) {
+    let affected_keys: Vec<ChunkKey> = affected.keys().copied().collect();
+    for key in affected_keys.iter().copied() {
+        for delta in [
+            bevy::math::IVec3::X,
+            bevy::math::IVec3::Y,
+            bevy::math::IVec3::Z,
+        ] {
+            let neighbor = ChunkKey::new(key.x + delta.x, key.y + delta.y, key.z + delta.z);
+            if !affected.contains_key(&neighbor) {
+                continue;
+            }
+            let a_cell = affected.remove(&key).expect("affected key present");
+            let b_cell = affected
+                .remove(&neighbor)
+                .expect("affected neighbor present");
+            match (a_cell, b_cell) {
+                (Some(mut a), Some(mut b)) => {
+                    let shift = bevy::math::IVec3::new(
+                        neighbor.x - key.x,
+                        neighbor.y - key.y,
+                        neighbor.z - key.z,
+                    ) * chunk_axis;
+                    a.combine_voxel_states(&mut b, shift);
+                    affected.insert(key, Some(a));
+                    affected.insert(neighbor, Some(b));
+                }
+                (a_cell, b_cell) => {
+                    affected.insert(key, a_cell);
+                    affected.insert(neighbor, b_cell);
+                }
+            }
+        }
+    }
+}
+
+/// 第 4b 步：affected 块与「affected 外但有现存实体」的邻块做 stored-shape combine。
+///
+/// 正确性依据：affected = C_set ∪ N(C_set)（C_set = changed_keys）。若 x ∈ affected、
+/// y 与 x 邻接且 y ∉ affected，则必有 x ∉ C_set —— 否则 y ∈ N(C_set) ⊆ affected，
+/// 矛盾；即 x 的 volume 内容未变。因此 y 现存 Collider 的 Voxels 里关于 x 的邻接位
+/// 仍然有效：用 y 的 stored shape 参与 combine，就能把 x 因 fresh 重建丢掉的位补回来。
+/// y 自身的位没有变化，不需要写回（丢弃克隆即可）。
+///
+/// 确定性：x 按 affected 的 BTreeMap 升序、6 邻按 neighbors6 固定顺序。
+/// 借用顺序：这里只用 chunks.get（只读 query item），必须在第 5b 步 apply_to_entities
+/// 的 chunks.get_mut 之前完成，且 clone 出的 Voxels 不跨语句持有 Collider 借用。
+fn combine_with_stored(
+    ctx: &RootContext<'_>,
+    existing: &BTreeMap<ChunkKey, ChunkCell>,
+    chunks: &ChunkQuery<'_, '_>,
+    affected: &mut AffectedChunks,
+    chunk_axis: i32,
+) {
+    let affected_keys: Vec<ChunkKey> = affected.keys().copied().collect();
+    for key in affected_keys.iter().copied() {
+        let Some(cell) = affected.remove(&key) else {
+            continue;
+        };
+        let Some(mut voxels) = cell else {
+            // 该 key 应为空：不参与边界合并，原样放回。
+            affected.insert(key, None);
+            continue;
+        };
+        for neighbor in neighbors6(key) {
+            if affected.contains_key(&neighbor) {
+                // affected 内部的配对已在第 4 步处理。
+                continue;
+            }
+            // neighbor 必须仍在 volume：被删的 chunk 实体要到第 5a 步才 try_despawn，
+            // 此刻 existing 里还残留它的旧实体；若拿它的陈旧 shape 回填，会把第 2b 步
+            // 刚清掉的、指向空洞的邻接位又 OR 回来。
+            if !ctx.volume.contains_chunk(&neighbor) {
+                continue;
+            }
+            let Some((entity, _hash, _bits)) = existing.get(&neighbor).copied() else {
+                // affected 外且无现存实体：本就没派生，跳过。
+                continue;
+            };
+            // chunks.get 返回只读 query item：Option<&mut Collider> 降为 Option<&Collider>。
+            let stored =
+                chunks
+                    .get(entity)
+                    .ok()
+                    .and_then(|(_entity, _chunk, collider, _transform)| {
+                        collider.and_then(|collider| collider.shape().as_voxels().cloned())
+                    });
+            let Some(mut neighbor_voxels) = stored else {
+                continue;
+            };
+            let shift =
+                bevy::math::IVec3::new(neighbor.x - key.x, neighbor.y - key.y, neighbor.z - key.z)
+                    * chunk_axis;
+            voxels.combine_voxel_states(&mut neighbor_voxels, shift);
+            // neighbor_voxels 是克隆，丢弃即可；y 的实体不在本次落盘范围。
+        }
+        affected.insert(key, Some(voxels));
+    }
+}
+
+/// 第 5a、5b 步：撤销已不在 volume 的旧 chunk，并落盘 affected。
+///
+/// 5a：旧 chunk 已不在 volume 时撤销实体。
+/// 5b：affected 逐 key 落盘 —— None 撤销；已有实体原地替换数据 / Collider / Transform；
+/// 没有实体则 spawn_chunk_collider（按 root 是否带 RigidBody 走 dual path）。
+fn apply_to_entities(
+    commands: &mut Commands,
+    chunks: &mut ChunkQuery<'_, '_>,
+    ctx: &RootContext<'_>,
+    existing: &BTreeMap<ChunkKey, ChunkCell>,
+    affected: AffectedChunks,
+) {
+    let chunk_axis = chunk_voxels_per_axis();
+    let voxel_size_bits = ctx.volume.voxel_size.to_bits();
+
+    // ── 5a. 旧 chunk 已不在 volume：撤销 ──
+    for (key, (entity, _hash, _bits)) in existing.iter() {
+        if !ctx.volume.contains_chunk(key) {
+            if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                entity_commands.try_despawn();
+            }
+        }
+    }
+
+    // ── 5b. 落盘 affected ──
+    let size = voxel_size_meters_f32(ctx.volume.voxel_size);
+    for (key, voxels) in affected {
+        let old_entity = existing.get(&key).map(|(entity, _hash, _bits)| *entity);
+        let Some(voxels) = voxels else {
+            // 该 key 在 volume 中但内容为空：撤销已有实体。
+            if let Some(entity) = old_entity {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_despawn();
+                }
+            }
+            continue;
+        };
+        let content_hash = ctx
+            .volume
+            .get_chunk(&key)
+            .map(|tree| chunk_content_hash(ctx.interner, tree))
+            .unwrap_or(0);
+        let collider = Collider::from(SharedShape::new(voxels));
+        let local_offset = Vec3::new(
+            key.x as f32 * chunk_axis as f32 * size,
+            key.y as f32 * chunk_axis as f32 * size,
+            key.z as f32 * chunk_axis as f32 * size,
+        );
+        match old_entity {
+            Some(entity) => {
+                if let Ok((_entity, mut chunk, collider_slot, transform_slot)) =
+                    chunks.get_mut(entity)
+                {
+                    *chunk = VoxelCollisionChunk {
+                        body: ctx.root,
+                        key,
+                        content_hash,
+                        voxel_size_bits,
+                    };
+                    match collider_slot {
+                        // 编辑后整体替换：绝不在 shape_mut() 后再 set_scale。
+                        Some(mut slot) => *slot = collider,
+                        None => {
+                            commands.entity(entity).insert(collider);
+                        }
+                    }
+                    // voxel_size / root 位姿变化时同步块偏移（voxel_size_bits 变化
+                    // 也会让该 key 进入 affected）。
+                    if let Some(mut transform) = transform_slot {
+                        transform.translation = if ctx.body.is_some() {
+                            local_offset
+                        } else {
+                            ctx.root_global.transform_point(local_offset)
+                        };
+                    }
+                }
+            }
+            None => {
+                spawn_chunk_collider(
+                    commands,
+                    ctx.root,
+                    ctx.root_global,
+                    ctx.body,
+                    VoxelCollisionChunk {
+                        body: ctx.root,
+                        key,
+                        content_hash,
+                        voxel_size_bits,
+                    },
+                    local_offset,
+                    collider,
+                );
+            }
+        }
+    }
+}
+
 /// 按 per-chunk 结构哈希把 VoxVolume 同步为一组 chunk 碰撞实体（在 VoxelSet::Collision）。
 ///
 /// 过滤 Added/Changed：新挂 VoxelCollider、新增或编辑 VoxVolume 才进入；
-/// 其余 tick 不算 hash。对每个匹配的 root：
-/// 1. 一次 Query 遍历把所有 VoxelCollisionChunk 实体按 chunk.body 分桶（每桶内
-///    ChunkKey 升序），之后每个 root 只查自己那一桶，不再重扫全部 chunk 实体；
-/// 2. 逐 chunk 比对 content_hash / voxel_size_bits，得到 changed_keys；再把「已被删除、
-///    但还有 in-volume 邻块」的那些邻块也补进 changed_keys；
-/// 3. affected = changed_keys ∪ 其 6 邻（仅限 volume 中存在的 key），并构建 Voxels
-///    （空 chunk 记为 None = 应为空）；
-/// 4. 对 affected 内相邻块做 combine_voxel_states（单向 +x/+y/+z）；
-/// 4b. 对 affected 内非空的块，与其「affected 外但有现存实体」的邻块，用该邻块
-///     Collider 里 stored Voxels 的克隆再做一次 combine（补回重建丢掉的邻接位）；
-/// 5. 落盘：替换 / 生成 / 撤销 chunk 实体，并 try_despawn 已不在 volume 的旧 chunk。
+/// 其余 tick 不算 hash。每个匹配的 root 依次走：collect_existing 分桶 → diff_by_hash
+/// 求 changed_keys（含被删 chunk 的 in-volume 6 邻）→ expand_affected 展开 changed ∪ 6 邻
+/// 并构建 Voxels → combine_across_chunks 做 affected 内的跨块合并 → combine_with_stored
+/// 用邻块现存 Collider 的 Voxels 补回边界位 → apply_to_entities 落盘（撤销/替换/生成）。
 ///
 /// 不复用 VoxelDirtySet：脏 key 不带 body 身份，多个 body 可能共用同一 key；
 /// Changed<VoxVolume> + per-chunk hash diff 已覆盖增量。
@@ -316,247 +601,27 @@ pub fn sync_voxel_collision_chunks(
             Or<(Added<VoxVolume>, Changed<VoxVolume>, Added<VoxelCollider>)>,
         ),
     >,
-    mut chunks: Query<(
-        Entity,
-        &mut VoxelCollisionChunk,
-        Option<&mut Collider>,
-        Option<&mut Transform>,
-    )>,
+    mut chunks: ChunkQuery,
 ) {
     let interner = interner.inner();
     let chunk_axis = chunk_voxels_per_axis();
-
-    // ── 1. 一次遍历按 body 分桶（ChunkKey 升序，确定性）──
-    // 原来是「每个 root 各扫一遍全部 chunk 实体」= O(roots × chunks)；分桶后
-    // 只需 O(chunks) 一次，之后每个 root 一次 HashMap 查找。系统内 commands 是延迟
-    // 生效的，中途不会有实体增删，所以开头快照与本 root 处理时扫描等价。
-    let mut by_body: ChunksByBody = ChunksByBody::new();
-    for (entity, chunk, _collider, _transform) in chunks.iter() {
-        by_body.entry(chunk.body).or_default().insert(
-            chunk.key,
-            (entity, chunk.content_hash, chunk.voxel_size_bits),
-        );
-    }
+    let by_body = collect_existing(&chunks);
     let no_chunks: BTreeMap<ChunkKey, ChunkCell> = BTreeMap::new();
 
     for (root, volume, root_global, body) in &roots {
+        let ctx = RootContext {
+            root,
+            volume,
+            root_global,
+            body,
+            interner,
+        };
         let existing = by_body.get(&root).unwrap_or(&no_chunks);
-
-        // ── 2. per-chunk 内容哈希 diff ──
-        let voxel_size_bits = volume.voxel_size.to_bits();
-        // BTreeSet：去重 + 升序迭代（确定性），也免掉 2b 里手写的 contains 判重。
-        let mut changed_keys: BTreeSet<ChunkKey> = BTreeSet::new();
-        for (key, tree) in volume.chunks.iter() {
-            let hash = chunk_content_hash(interner, tree);
-            match existing.get(key) {
-                Some((_, old_hash, old_bits))
-                    if *old_hash == hash && *old_bits == voxel_size_bits => {}
-                _ => {
-                    changed_keys.insert(*key);
-                }
-            }
-        }
-
-        // ── 2b. 被删 chunk 的 in-volume 6 邻补进 changed_keys ──
-        // changed_keys 只从 volume 现有 chunk 推出；被删的 key 已不在 volume，其邻居
-        // 若不回炉，就会保留指向空洞的陈旧邻接位（combine 只 OR、清不掉）。把这些邻居
-        // 也标为 changed，它们会被 fresh 重建，朝空洞的位自然为 0。
-        for (key, _cell) in existing.iter() {
-            if volume.contains_chunk(key) {
-                continue;
-            }
-            for neighbor in neighbors6(*key) {
-                if volume.contains_chunk(&neighbor) {
-                    changed_keys.insert(neighbor);
-                }
-            }
-        }
-
-        // ── 3. affected = changed ∪ 6 邻（仅保留 volume 中存在的 key）；None = 应为空 ──
-        let mut affected: BTreeMap<ChunkKey, Option<Voxels>> = BTreeMap::new();
-        for key in changed_keys.iter().copied() {
-            for candidate in std::iter::once(key).chain(neighbors6(key)) {
-                if !volume.contains_chunk(&candidate) {
-                    continue;
-                }
-                if affected.contains_key(&candidate) {
-                    continue;
-                }
-                affected.insert(candidate, build_chunk_voxels(volume, interner, candidate));
-            }
-        }
-
-        // ── 4. 跨块边界合并：只走 +x/+y/+z，BTreeMap 升序保证每对只处理一次 ──
-        let affected_keys: Vec<ChunkKey> = affected.keys().copied().collect();
-        for key in affected_keys.iter().copied() {
-            for delta in [
-                bevy::math::IVec3::X,
-                bevy::math::IVec3::Y,
-                bevy::math::IVec3::Z,
-            ] {
-                let neighbor = ChunkKey::new(key.x + delta.x, key.y + delta.y, key.z + delta.z);
-                if !affected.contains_key(&neighbor) {
-                    continue;
-                }
-                let a_cell = affected.remove(&key).expect("affected key present");
-                let b_cell = affected
-                    .remove(&neighbor)
-                    .expect("affected neighbor present");
-                match (a_cell, b_cell) {
-                    (Some(mut a), Some(mut b)) => {
-                        let shift = bevy::math::IVec3::new(
-                            neighbor.x - key.x,
-                            neighbor.y - key.y,
-                            neighbor.z - key.z,
-                        ) * chunk_axis;
-                        a.combine_voxel_states(&mut b, shift);
-                        affected.insert(key, Some(a));
-                        affected.insert(neighbor, Some(b));
-                    }
-                    (a_cell, b_cell) => {
-                        affected.insert(key, a_cell);
-                        affected.insert(neighbor, b_cell);
-                    }
-                }
-            }
-        }
-
-        // ── 4b. affected 块与「affected 外但有现存实体」的邻块做 stored-shape combine ──
-        //
-        // 正确性依据：affected = C_set ∪ N(C_set)（C_set = changed_keys）。若 x ∈ affected
-        // 且 y 与 x 邻接且 y ∉ affected，则必有 x ∉ C_set —— 否则 y ∈ N(C_set) ⊆ affected，
-        // 矛盾；即 x 的 volume 内容未变。因此 y 现存 Collider 的 Voxels 里关于 x 的邻接位
-        // 仍然有效：用 y 的 stored shape 参与 combine，就能把 x 因 fresh 重建丢掉的位补回来。
-        // y 自身的位没有变化，不需要写回（丢弃克隆即可）。
-        //
-        // 确定性：x 按 affected_keys 的 BTreeMap 升序、6 邻按 neighbors6 固定顺序。
-        // 借用顺序：这里只用 chunks.get（只读 query item），必须在 Step 5b 的
-        // chunks.get_mut 之前完成，且 clone 出的 Voxels 不跨语句持有 Collider 借用。
-        for key in affected_keys.iter().copied() {
-            let Some(cell) = affected.remove(&key) else {
-                continue;
-            };
-            let Some(mut voxels) = cell else {
-                // 该 key 应为空：不参与边界合并，原样放回。
-                affected.insert(key, None);
-                continue;
-            };
-            for neighbor in neighbors6(key) {
-                if affected.contains_key(&neighbor) {
-                    // affected 内部的配对已在 Step 4 处理。
-                    continue;
-                }
-                // neighbor 必须仍在 volume：被删的 chunk 实体要到 Step 5a 才 try_despawn，
-                // 此刻 existing 里还残留它的旧实体；若拿它的陈旧 shape 回填，会把 Step 2b
-                // 刚清掉的、指向空洞的邻接位又 OR 回来。
-                if !volume.contains_chunk(&neighbor) {
-                    continue;
-                }
-                let Some((entity, _hash, _bits)) = existing.get(&neighbor).copied() else {
-                    // affected 外且无现存实体：本就没派生，跳过。
-                    continue;
-                };
-                // chunks.get 返回只读 query item：Option<&mut Collider> 降为 Option<&Collider>。
-                let stored =
-                    chunks
-                        .get(entity)
-                        .ok()
-                        .and_then(|(_entity, _chunk, collider, _transform)| {
-                            collider.and_then(|collider| collider.shape().as_voxels().cloned())
-                        });
-                let Some(mut neighbor_voxels) = stored else {
-                    continue;
-                };
-                let shift = bevy::math::IVec3::new(
-                    neighbor.x - key.x,
-                    neighbor.y - key.y,
-                    neighbor.z - key.z,
-                ) * chunk_axis;
-                voxels.combine_voxel_states(&mut neighbor_voxels, shift);
-                // neighbor_voxels 是克隆，丢弃即可；y 的实体不在本次落盘范围。
-            }
-            affected.insert(key, Some(voxels));
-        }
-
-        // ── 5a. 旧 chunk 已不在 volume：撤销 ──
-        for (key, (entity, _hash, _bits)) in existing.iter() {
-            if !volume.contains_chunk(key) {
-                if let Ok(mut entity_commands) = commands.get_entity(*entity) {
-                    entity_commands.try_despawn();
-                }
-            }
-        }
-
-        // ── 5b. 落盘 affected ──
-        let size = voxel_size_meters_f32(volume.voxel_size);
-        for (key, voxels) in affected {
-            let old_entity = existing.get(&key).map(|(entity, _hash, _bits)| *entity);
-            let Some(voxels) = voxels else {
-                // 该 key 在 volume 中但内容为空：撤销已有实体。
-                if let Some(entity) = old_entity {
-                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                        entity_commands.try_despawn();
-                    }
-                }
-                continue;
-            };
-            let content_hash = volume
-                .get_chunk(&key)
-                .map(|tree| chunk_content_hash(interner, tree))
-                .unwrap_or(0);
-            let collider = Collider::from(SharedShape::new(voxels));
-            let local_offset = Vec3::new(
-                key.x as f32 * chunk_axis as f32 * size,
-                key.y as f32 * chunk_axis as f32 * size,
-                key.z as f32 * chunk_axis as f32 * size,
-            );
-            match old_entity {
-                Some(entity) => {
-                    if let Ok((_entity, mut chunk, collider_slot, transform_slot)) =
-                        chunks.get_mut(entity)
-                    {
-                        *chunk = VoxelCollisionChunk {
-                            body: root,
-                            key,
-                            content_hash,
-                            voxel_size_bits,
-                        };
-                        match collider_slot {
-                            // 编辑后整体替换：绝不在 shape_mut() 后再 set_scale。
-                            Some(mut slot) => *slot = collider,
-                            None => {
-                                commands.entity(entity).insert(collider);
-                            }
-                        }
-                        // voxel_size / root 位姿变化时同步块偏移（voxel_size_bits 变化
-                        // 也会让该 key 进入 affected）。
-                        if let Some(mut transform) = transform_slot {
-                            transform.translation = if body.is_some() {
-                                local_offset
-                            } else {
-                                root_global.transform_point(local_offset)
-                            };
-                        }
-                    }
-                }
-                None => {
-                    spawn_chunk_collider(
-                        &mut commands,
-                        root,
-                        root_global,
-                        body,
-                        VoxelCollisionChunk {
-                            body: root,
-                            key,
-                            content_hash,
-                            voxel_size_bits,
-                        },
-                        local_offset,
-                        collider,
-                    );
-                }
-            }
-        }
+        let changed_keys = diff_by_hash(&ctx, existing);
+        let mut affected = expand_affected(&ctx, &changed_keys);
+        combine_across_chunks(&mut affected, chunk_axis);
+        combine_with_stored(&ctx, existing, &chunks, &mut affected, chunk_axis);
+        apply_to_entities(&mut commands, &mut chunks, &ctx, existing, affected);
     }
 }
 
