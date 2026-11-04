@@ -71,10 +71,7 @@ impl TraversalDepth {
             current <= max,
             "Current depth cannot be greater than max depth"
         );
-        assert!(
-            max < MAX_ALLOWED_DEPTH as u8,
-            "Max depth exceeds allowed limit"
-        );
+        assert!(max < MAX_ALLOWED_DEPTH, "Max depth exceeds allowed limit");
         Self(((current as u16) << 8) | max as u16)
     }
 
@@ -185,7 +182,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "Max depth exceeds allowed limit")]
     fn test_max_allowed_depth() {
-        let _ = TraversalDepth::new(3, MAX_ALLOWED_DEPTH as u8);
+        let _ = TraversalDepth::new(3, MAX_ALLOWED_DEPTH);
     }
 
     #[test]
@@ -237,9 +234,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "Max depth exceeds allowed limit")]
     fn test_new_current_eq_max() {
-        let depth = TraversalDepth::new(MAX_ALLOWED_DEPTH as u8, MAX_ALLOWED_DEPTH as u8);
-        assert_eq!(depth.current(), MAX_ALLOWED_DEPTH as u8);
-        assert_eq!(depth.max(), MAX_ALLOWED_DEPTH as u8);
+        let depth = TraversalDepth::new(MAX_ALLOWED_DEPTH, MAX_ALLOWED_DEPTH);
+        assert_eq!(depth.current(), MAX_ALLOWED_DEPTH);
+        assert_eq!(depth.max(), MAX_ALLOWED_DEPTH);
     }
 
     #[test]
@@ -251,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_maximum_valid_depth() {
-        let max = MAX_ALLOWED_DEPTH as u8 - 1;
+        let max = MAX_ALLOWED_DEPTH - 1;
         let depth = TraversalDepth::new(max, max);
         assert_eq!(depth.current(), max);
         assert_eq!(depth.max(), max);
@@ -259,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_increment_to_max() {
-        let max = MAX_ALLOWED_DEPTH as u8 - 1;
+        let max = MAX_ALLOWED_DEPTH - 1;
         let depth = TraversalDepth::new(max - 1, max);
         let inc = depth.increment();
         assert_eq!(inc.current(), max);

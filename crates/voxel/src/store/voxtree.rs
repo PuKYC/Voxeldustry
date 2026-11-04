@@ -1358,7 +1358,7 @@ mod tests {
     #[test]
     fn test_child_index() {
         // 只穷举到 depth 6：child_index 的正确性与深度无关，避免 depth 8 的 256^3 穷举。
-        for max_depth in 0..(MAX_ALLOWED_DEPTH.min(7) as u8) {
+        for max_depth in 0..MAX_ALLOWED_DEPTH.min(7) {
             let voxels_per_axis = 1 << max_depth;
             for depth in 0..max_depth {
                 for y in 0..voxels_per_axis {
@@ -2496,16 +2496,12 @@ mod tests {
         let mask = node_id.mask();
         let types = node_id.types();
         let children = interner.get_children(&node_id);
-        for i in 0..MAX_CHILDREN {
-            let present = !children[i].is_empty();
+        for (i, child) in children.iter().enumerate() {
+            let present = !child.is_empty();
             assert_eq!(present, (mask & (1 << i)) != 0, "child_mask bit {i}");
             if present {
-                assert_eq!(
-                    children[i].is_leaf(),
-                    (types & (1 << i)) != 0,
-                    "types bit {i}"
-                );
-                verify_child_masks(interner, children[i]);
+                assert_eq!(child.is_leaf(), (types & (1 << i)) != 0, "types bit {i}");
+                verify_child_masks(interner, *child);
             }
         }
     }
