@@ -34,7 +34,7 @@ pub struct CollectPresentationSet;
 pub struct FinalizePresentationSet;
 
 /// 表现管线运行时状态（诊断 + 帧号 + 会话号）。
-#[derive(Resource, Debug)]
+#[derive(Resource, Debug, Default)]
 pub struct PresentationRuntime {
     /// 复用 `session`，让 Godot 丢弃重启前的残留帧。
     pub session: u64,
@@ -45,20 +45,6 @@ pub struct PresentationRuntime {
     /// 发布时覆盖掉了尚未被 Godot 取走的帧的次数（Godot 掉帧诊断）。
     pub frames_overwritten: u64,
     pub last_commands: usize,
-}
-
-impl Default for PresentationRuntime {
-    fn default() -> Self {
-        Self {
-            session: 0,
-            seq: 0,
-            tick: 0,
-            render_clock_ms: 0,
-            frames_published: 0,
-            frames_overwritten: 0,
-            last_commands: 0,
-        }
-    }
 }
 
 impl PresentationRuntime {

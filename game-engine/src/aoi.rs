@@ -201,6 +201,17 @@ impl<A: SpatialAnchor> Plugin for AoIPlugin<A> {
     }
 }
 
+/// 观察者自身状态变化（锚点增删改、[`AoiObserver`] 增删改）的过滤条件。
+type ChangedObserversFilter<A> = (
+    With<AoiObserver>,
+    Or<(
+        Added<A>,
+        Changed<A>,
+        Added<AoiObserver>,
+        Changed<AoiObserver>,
+    )>,
+);
+
 /// 每帧增量更新 AOI。
 ///
 /// 输入：本帧空间变化（[`SpatialChanges`]）、空间索引与观察者组件查询。
@@ -217,18 +228,7 @@ pub fn update_aoi<A: SpatialAnchor>(
     index: Res<SpatialIndex>,
     changes: Res<SpatialChanges>,
     observers: Query<(Entity, &A, &AoiObserver)>,
-    changed_observers: Query<
-        Entity,
-        (
-            With<AoiObserver>,
-            Or<(
-                Added<A>,
-                Changed<A>,
-                Added<AoiObserver>,
-                Changed<AoiObserver>,
-            )>,
-        ),
-    >,
+    changed_observers: Query<Entity, ChangedObserversFilter<A>>,
     invalid_observers: Query<Entity, (With<AoiObserver>, Without<A>)>,
     mut removed_observers: RemovedComponents<AoiObserver>,
     mut ev_entered: MessageWriter<EntityEntered>,
@@ -343,7 +343,7 @@ fn refresh_observer(
     buffer.clear();
     index.query_radius_into(center, radius, buffer);
 
-    buffer.sort_unstable_by(|a, b| a.to_bits().cmp(&b.to_bits()));
+    buffer.sort_unstable_by_key(|a| a.to_bits());
     buffer.dedup();
 
     // 只有观察者自身空间状态变化时才重新注册区块。

@@ -602,6 +602,9 @@ fn remove_spatial_entity(index: &mut SpatialIndex, changes: &mut SpatialChanges,
     }
 }
 
+/// 实体空间状态变化（锚点或尺寸改动）的过滤条件。
+type SpatialChangeFilter<A, X> = Or<(Changed<A>, Changed<X>)>;
+
 /// 自动更新空间索引，并记录脏区块。
 ///
 /// 该系统监听 `GlobalTransform` 和 `Size` 的变化。
@@ -612,7 +615,7 @@ fn remove_spatial_entity(index: &mut SpatialIndex, changes: &mut SpatialChanges,
 pub fn update_spatial_index<A: SpatialAnchor, X: SpatialExtent>(
     mut index: ResMut<SpatialIndex>,
     mut changes: ResMut<SpatialChanges>,
-    query: Query<(Entity, &A, &X), Or<(Changed<A>, Changed<X>)>>,
+    query: Query<(Entity, &A, &X), SpatialChangeFilter<A, X>>,
 ) {
     let chunk_size = index.chunk_size;
 

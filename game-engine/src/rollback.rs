@@ -65,6 +65,9 @@ pub trait RollbackState: Clone + Send + Sync + 'static {
     fn lerp(a: &Self::Sample, b: &Self::Sample, alpha: f32) -> Self::Sample;
 }
 
+/// [`StateHistory::bracket`] 返回的「<= tick 的最近一条 / >= tick 的最近一条」。
+type BracketNeighbours<'a, S> = (&'a (u32, S), &'a (u32, S));
+
 /// 某实体按 tick 的状态历史（环形缓冲，tick 单调递增）。
 ///
 /// 同一 tick 重复写入表示覆盖（回滚重演后重写）。容量满时丢弃最旧一条。
@@ -112,7 +115,7 @@ impl<S> StateHistory<S> {
     /// 取「<= tick 的最近一条」与「>= tick 的最近一条」。
     ///
     /// tick 恰好命中时两端为同一条；越界时取最近端点。空历史返回 None。
-    pub fn bracket(&self, tick: u32) -> Option<(&(u32, S), &(u32, S))> {
+    pub fn bracket(&self, tick: u32) -> Option<BracketNeighbours<'_, S>> {
         if self.entries.is_empty() {
             return None;
         }
