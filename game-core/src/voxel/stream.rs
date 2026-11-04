@@ -935,8 +935,8 @@ struct Settled {
 
 /// 结算单个暂存块：邻居门 → 全序裁决 → realize → 装容器 → 抽载荷。
 ///
-/// 失败时**不动** `tree`：装容器是最后一步，此前的任何错误都让树留在槽里，
-/// 由外层唯一出口 [fail_staged] 释放（`VoxTree` 没有 `Drop`，漏一次就泄漏节点）。
+/// 失败时**不动** tree：装容器是最后一步，此前的任何错误都让树留在槽里，
+/// 由外层唯一出口 fail_staged 释放（VoxTree 没有 Drop，漏一次就泄漏节点）。
 fn settle_one(
     pair: (BodyKey, ChunkKey),
     proposals: Vec<ProposalRecord>,
@@ -954,7 +954,24 @@ fn settle_one(
         return Err(SettleError::VolumeMissing { entity, key });
     };
 
-    // 邻居门：常量里就是 26 个邻块，按邻键升序排列（无自身）。
+    let union = gather_neighbour_proposals(pair, proposals, staging, world)?;
+    arbitrate_and_realize(key, &union, tree, world, ctx.interner)?;
+
+    let level = ctx.wanted.0.get(&pair).copied().unwrap_or(Residency::Data);
+    let owned = tree.take().expect("装容器之前树必须还在槽里");
+    let raw = install_chunk(&mut volume, key, owned, ctx.interner, level);
+    Ok(Settled { level, raw })
+}
+
+/// 邻居门：本块提案加上 26 个邻块的提案，缺失的邻块按 (registry, seed) 现算并缓存。
+fn gather_neighbour_proposals(
+    pair: (BodyKey, ChunkKey),
+    proposals: Vec<ProposalRecord>,
+    staging: &mut Staging<'_>,
+    world: &WorldInputs<'_>,
+) -> Result<Vec<ProposalRecord>, SettleError> {
+    let (body, key) = pair;
+    // 常量里就是 26 个邻块，按邻键升序排列（无自身）。
     let mut union = proposals;
     for offset in NEIGHBOUR_OFFSETS {
         let neighbour = ChunkKey::new(key.x + offset.x, key.y + offset.y, key.z + offset.z);
@@ -986,9 +1003,18 @@ fn settle_one(
             union.extend(cached.iter().copied());
         }
     }
+    Ok(union)
+}
 
-    let winners = arbitrate(&union);
-
+/// 全序裁决出赢家，再把赢家 realize 进暂存树。
+fn arbitrate_and_realize(
+    key: ChunkKey,
+    union: &[ProposalRecord],
+    tree: &mut Option<VoxTree<u8>>,
+    world: &WorldInputs<'_>,
+    interner: &mut VoxelInterner,
+) -> Result<(), SettleError> {
+    let winners = arbitrate(union);
     // 没有注册表 = 没有物体：winners 必为空，realize 直接跳过。
     if let Some(registry) = world.registry.as_deref() {
         let Some(seed) = world.seed.as_deref() else {
@@ -998,25 +1024,25 @@ fn settle_one(
             });
         };
         let owned = tree.as_mut().expect("realize 之前树必须还在槽里");
-        realize_chunk(
-            registry,
-            seed.0,
-            key,
-            &winners,
-            owned,
-            ctx.interner.inner_mut(),
-        )
-        .map_err(|error| SettleError::Realize { key, error })?;
+        realize_chunk(registry, seed.0, key, &winners, owned, interner.inner_mut())
+            .map_err(|error| SettleError::Realize { key, error })?;
     }
+    Ok(())
+}
 
-    let level = ctx.wanted.0.get(&pair).copied().unwrap_or(Residency::Data);
-    let owned = tree.take().expect("装容器之前树必须还在槽里");
-    // 装容器：防御式先取旧树（insert_chunk 覆盖会 debug_assert!）。
+/// 把暂存树装进容器：先摘旧树、装新树、释放旧树，再抽出该档位载荷。
+fn install_chunk(
+    volume: &mut VoxVolume,
+    key: ChunkKey,
+    tree: VoxTree<u8>,
+    interner: &mut VoxelInterner,
+    level: Residency,
+) -> Option<Vec<u8>> {
+    // 防御式先取旧树（insert_chunk 覆盖会 debug_assert!）。
     let old = volume.take_chunk_raw(&key);
-    volume.insert_chunk(key, owned);
-    release_tree(ctx.interner, old);
-    let raw = extract_block_raw(&volume, ctx.interner, key, level);
-    Ok(Settled { level, raw })
+    volume.insert_chunk(key, tree);
+    release_tree(interner, old);
+    extract_block_raw(volume, interner, key, level)
 }
 
 /// 把暂存块标成「看见过」，挑出上一次就已标记、本 tick 可以结算的块。
