@@ -15,7 +15,9 @@ default = []
 # 内存统计（estimated_total_bytes / stats）。
 memory_stats = []
 # 上游 cfg 名称保留（默认关闭）：供移植代码的 #[cfg(feature = ...)] 门控使用。
-# 注意：上游的 tracy feature 依赖未移植的 tracy-client，故不声明；相关 cfg 块永不编译。
+# 注意：上游的 tracy 计时 span 依赖未移植的 tracy-client，相关 cfg 块已删除：
+# 既不声明 tracy feature（空 feature 会让 tracy_client::span! 无法编译），
+# 也不保留永不编译的死 cfg。
 debug_trace_ref_counts = []
 trace_greedy_timings = []
 
