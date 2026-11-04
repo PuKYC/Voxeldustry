@@ -5,9 +5,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-use crate::store::{
-    BlockId, ByteConversion, ChunkKey, Lod, VoxInterner, VoxOpsConfig, VoxTree, VoxelTrait,
-};
+use crate::store::{BlockId, ChunkKey, Lod, VoxInterner, VoxOpsConfig, VoxTree, VoxelTrait};
 
 use super::{MAGIC, TAG_BRANCH, TAG_EMPTY, TAG_LEAF, VERSION};
 
