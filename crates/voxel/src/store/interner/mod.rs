@@ -1686,8 +1686,8 @@ mod tests {
         let mut roots = Vec::new();
         for seed in 1u8..=4 {
             let mut children = EMPTY_CHILD;
-            for i in 0..8 {
-                children[i] = interner.get_or_create_leaf(seed * 10 + i as u8);
+            for (i, child) in children.iter_mut().enumerate() {
+                *child = interner.get_or_create_leaf(seed * 10 + i as u8);
             }
             roots.push(interner.get_or_create_branch(children, 0xFF, 0xFF));
         }
