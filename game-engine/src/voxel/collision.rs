@@ -41,7 +41,7 @@
 //! “固定枚举顺序 -> 固定 shape 构造顺序”成立；但这不等于跨平台浮点数值一致，
 //! 物理的跨平台可复现性不由本模块保证。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ::voxel::store::{ChunkKey, VoxInterner, VoxOpsRead};
 use avian3d::math::Vector;
@@ -331,13 +331,16 @@ pub fn sync_voxel_collision_chunks(
 
         // ── 2. per-chunk 内容哈希 diff ──
         let voxel_size_bits = volume.voxel_size.to_bits();
-        let mut changed_keys: Vec<ChunkKey> = Vec::new();
+        // BTreeSet：去重 + 升序迭代（确定性），也免掉 2b 里手写的 contains 判重。
+        let mut changed_keys: BTreeSet<ChunkKey> = BTreeSet::new();
         for (key, tree) in volume.chunks.iter() {
             let hash = chunk_content_hash(interner, tree);
             match existing.get(key) {
                 Some((_, old_hash, old_bits))
                     if *old_hash == hash && *old_bits == voxel_size_bits => {}
-                _ => changed_keys.push(*key),
+                _ => {
+                    changed_keys.insert(*key);
+                }
             }
         }
 
@@ -350,8 +353,8 @@ pub fn sync_voxel_collision_chunks(
                 continue;
             }
             for neighbor in neighbors6(*key) {
-                if volume.contains_chunk(&neighbor) && !changed_keys.contains(&neighbor) {
-                    changed_keys.push(neighbor);
+                if volume.contains_chunk(&neighbor) {
+                    changed_keys.insert(neighbor);
                 }
             }
         }
