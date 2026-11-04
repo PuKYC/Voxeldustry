@@ -1,6 +1,7 @@
 //! region 文件（§3）的编解码：头、索引表、记录区与尾摘要。
 
 use super::reader::{field_path, indexed_path, read_u64_at, u32_len, Reader, Writer};
+use super::record::{decode_record, encode_record};
 use super::{expect_eq, expect_max, expect_nonzero, expect_reserved_zero, expect_supported};
 use crate::save::format::{
     digest, ChunkRecord, RegionFile, DIGEST_LEN, FORMAT_VERSION, MAX_CHUNK_COUNT, MAX_RECORD_LEN,
@@ -391,7 +392,13 @@ pub(crate) fn parse_directory(
             record_offset,
         )?;
 
-        expect_nonzero(&ipath, "record_len", len_field, "record_len", 0)?;
+        expect_nonzero(
+            &ipath,
+            "record_len",
+            len_field,
+            "record_len",
+            i64::from(record_len),
+        )?;
         expect_max(
             &ipath,
             "record_len",

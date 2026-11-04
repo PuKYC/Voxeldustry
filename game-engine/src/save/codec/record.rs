@@ -36,7 +36,7 @@ pub fn encode_component_table(components: &[ComponentRecord]) -> Result<Vec<u8>,
 
     let mut sorted: BTreeMap<u32, &ComponentRecord> = BTreeMap::new();
     for (index, component) in components.iter().enumerate() {
-        let path = indexed_path("component_table", "component", index);
+        let path = &indexed_path("component_table", "component", index);
         if component.stable_type_id == 0 {
             return Err(SaveError::new(
                 field_path(path, "stable_type_id"),
@@ -615,7 +615,13 @@ pub(crate) fn decode_entities(
 
         let type_offset = reader.offset();
         let stable_type_id = reader.read_u32_at(&epath, "stable_type_id")?;
-        expect_nonzero(&epath, "stable_type_id", type_offset, "stable_type_id", 0)?;
+        expect_nonzero(
+            &epath,
+            "stable_type_id",
+            type_offset,
+            "stable_type_id",
+            i64::from(stable_type_id),
+        )?;
 
         let payload_len_offset = reader.offset();
         let payload_len = reader.read_u32_at(&epath, "payload_len")?;
