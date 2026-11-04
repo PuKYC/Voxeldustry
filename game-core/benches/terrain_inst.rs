@@ -40,7 +40,7 @@ const BENCH_Y_MAX: i32 = 3; // exclusive
 
 /// 固定 seed 的真实地形子块（确定性）。
 fn build_chunks(interner: &mut VoxInterner<u8>) -> BTreeMap<ChunkKey, VoxTree<u8>> {
-    let generator = WorldGenerator::new(WorldSeed(0xC0FF_EE), DEFAULT_BIOME);
+    let generator = WorldGenerator::new(WorldSeed(0x00C0_FFEE), DEFAULT_BIOME);
     let mut chunks = BTreeMap::new();
     for x in -1..=BENCH_RADIUS_CHUNKS {
         for z in -1..=BENCH_RADIUS_CHUNKS {

@@ -169,6 +169,22 @@ fn spawn_platform(world: &mut World) {
     ));
 }
 
+/// 参与物理推进的本地玩家：输入 + 朝向 + 碰撞体 + 位姿 + 速度。
+type PhysicsPlayerQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static ResolvedInput,
+        Option<&'static Facing>,
+        &'static PlayerCollider,
+        &'static Transform,
+        &'static mut LinearVelocity,
+        &'static mut Velocity,
+    ),
+    With<LocalPlayer>,
+>;
+
 /// 把过滤后的 `ResolvedInput` 写进 avian 的速度组件。
 ///
 /// - 水平方向：相对 `Facing.yaw` 的目标速度 + 加速度靠拢；
@@ -176,22 +192,10 @@ fn spawn_platform(world: &mut World) {
 /// - 竖直方向：落地后把残余向下速度清零，避免重力在接触面上累积。
 ///
 /// 同步维护 gameplay 层的 `Velocity`，让回滚历史 / 表现采样读到同一份速度。
-#[allow(clippy::too_many_arguments)]
 fn drive_physics_player(
     time: Res<Time<Fixed>>,
     spatial_query: SpatialQuery,
-    mut query: Query<
-        (
-            Entity,
-            &ResolvedInput,
-            Option<&Facing>,
-            &PlayerCollider,
-            &Transform,
-            &mut LinearVelocity,
-            &mut Velocity,
-        ),
-        With<LocalPlayer>,
-    >,
+    mut query: PhysicsPlayerQuery,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {

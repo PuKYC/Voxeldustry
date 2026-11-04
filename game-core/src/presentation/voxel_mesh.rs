@@ -155,6 +155,18 @@ impl Plugin for VoxelMeshRefreshPlugin {
     }
 }
 
+/// 待刷新的分组实体：原始块 + 可选的体积 / 稳定 id / body 归属。
+type DirtyVoxelGroupQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut VoxChunkGroupRaw,
+        Option<&'static VoxVolume>,
+        Option<&'static StableEntityId>,
+        Option<&'static RenderGroupBody>,
+    ),
+>;
+
 /// 消费脏块并增量重建 `VoxChunkGroupRaw` 内受影响的块。
 ///
 /// ## 三种分组形状
@@ -186,12 +198,7 @@ pub fn refresh_dirty_voxel_meshes(
     mut dirty: ResMut<VoxelDirtySet>,
     interner: Res<VoxelInterner>,
     volumes: Query<(&VoxVolume, &StableEntityId), Without<VoxChunkGroupRaw>>,
-    mut groups: Query<(
-        &mut VoxChunkGroupRaw,
-        Option<&VoxVolume>,
-        Option<&StableEntityId>,
-        Option<&RenderGroupBody>,
-    )>,
+    mut groups: DirtyVoxelGroupQuery,
 ) {
     let edits = dirty.take_edits();
     if edits.is_empty() {
@@ -424,16 +431,9 @@ mod tests {
     };
     use game_engine::voxel::{set_voxel_for, MaxDepth, VoxOpsWrite, VoxTree, CHUNK_DEPTH};
 
-    fn rect(
-        plane: u8,
-        dir: u8,
-        slice: u8,
-        row: u8,
-        col: u8,
-        w: u8,
-        h: u8,
-        material: u8,
-    ) -> RectInstance {
+    /// 按 `RectInstance` 的字段顺序打包：(plane, dir, slice, row, col, w, h, material)。
+    fn rect(v: [u8; 8]) -> RectInstance {
+        let [plane, dir, slice, row, col, w, h, material] = v;
         RectInstance {
             plane,
             dir,
@@ -449,9 +449,9 @@ mod tests {
     #[test]
     fn word_roundtrips_through_engine_layout() {
         let cases = [
-            rect(0, 0, 0, 0, 0, 4, 3, 7),
-            rect(1, 1, 17, 3, 5, 7, 9, 42),
-            rect(2, 0, 32, 31, 31, 32, 32, 255),
+            rect([0, 0, 0, 0, 0, 4, 3, 7]),
+            rect([1, 1, 17, 3, 5, 7, 9, 42]),
+            rect([2, 0, 32, 31, 31, 32, 32, 255]),
         ];
         for r in cases {
             assert_eq!(unpack_rect(pack_rect(&r)), r);
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn yz_face_corners_span_row_and_col() {
         // slice=5 的 +X 面，row=2 h=3（y），col=4 w=6（z）。
-        let r = rect(0, 0, 5, 2, 4, 6, 3, 1);
+        let r = rect([0, 0, 5, 2, 4, 6, 3, 1]);
         let c: Vec<[i32; 3]> = (0..4).map(|i| rect_corner(r, i)).collect();
         assert_eq!(c, vec![[5, 2, 4], [5, 2, 10], [5, 5, 4], [5, 5, 10]]);
         assert_eq!(rect_normal(r), [1, 0, 0]);
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn xz_face_corners_span_col_and_row() {
         // plane XZ: rows=z(h), cols=x(w)，slice 是 y。
-        let r = rect(1, 1, 9, 1, 3, 5, 2, 2);
+        let r = rect([1, 1, 9, 1, 3, 5, 2, 2]);
         let c: Vec<[i32; 3]> = (0..4).map(|i| rect_corner(r, i)).collect();
         assert_eq!(c, vec![[3, 9, 1], [8, 9, 1], [3, 9, 3], [8, 9, 3]]);
         assert_eq!(rect_normal(r), [0, -1, 0]);
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn xy_face_corners_span_col_and_row() {
         // plane XY: rows=y(h), cols=x(w)，slice 是 z。
-        let r = rect(2, 0, 4, 6, 2, 3, 5, 3);
+        let r = rect([2, 0, 4, 6, 2, 3, 5, 3]);
         let c: Vec<[i32; 3]> = (0..4).map(|i| rect_corner(r, i)).collect();
         assert_eq!(c, vec![[2, 6, 4], [5, 6, 4], [2, 11, 4], [5, 11, 4]]);
         assert_eq!(rect_normal(r), [0, 0, 1]);
@@ -489,7 +489,7 @@ mod tests {
     fn all_six_orientations_have_unit_axis_normals() {
         for plane in 0..3u8 {
             for dir in 0..2u8 {
-                let r = rect(plane, dir, 1, 1, 1, 1, 1, 0);
+                let r = rect([plane, dir, 1, 1, 1, 1, 1, 0]);
                 let n = rect_normal(r);
                 assert_eq!(n.iter().map(|x| x.abs()).sum::<i32>(), 1);
                 assert_eq!(n[usize::from(plane)], if dir == 0 { 1 } else { -1 });
@@ -514,9 +514,9 @@ mod tests {
     fn ao_corner_index_matches_rect_corner_uv() {
         // 着色器用 UV (cx, cy) 取 AO：i = cx | (cy << 1)，与 rect_corner 同序。
         for r in [
-            rect(0, 0, 5, 2, 4, 6, 3, 1),
-            rect(1, 1, 9, 1, 3, 5, 2, 2),
-            rect(2, 0, 4, 6, 2, 3, 5, 3),
+            rect([0, 0, 5, 2, 4, 6, 3, 1]),
+            rect([1, 1, 9, 1, 3, 5, 2, 2]),
+            rect([2, 0, 4, 6, 2, 3, 5, 3]),
         ] {
             for cy in 0..2u32 {
                 for cx in 0..2u32 {
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn ao_bits_do_not_disturb_the_39_bit_rect() {
-        let r = rect(2, 1, 4, 6, 2, 3, 5, 200);
+        let r = rect([2, 1, 4, 6, 2, 3, 5, 200]);
         let ao = [3u8, 2, 1, 0];
         let word = pack_rect_with_ao(&r, &ao);
         assert_eq!(

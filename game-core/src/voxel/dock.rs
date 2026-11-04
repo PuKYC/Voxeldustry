@@ -36,7 +36,7 @@ impl DockRecord {
 
     /// 朝向是否已量化到 90 度倍数（v1 只做校验，不做玩法判定）。
     pub const fn is_rotation_quantized(&self) -> bool {
-        self.rotation % 90 == 0
+        self.rotation.is_multiple_of(90)
     }
 }
 

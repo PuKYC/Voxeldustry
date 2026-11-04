@@ -3,6 +3,7 @@
 //! 闸门用例（最可能推翻设计）：
 //! - perception_change_resends_and_hides_required_field（G1，含 Required 感知变化）
 //! - empty_bag_emits_remove_and_readd_emits_add（G2/G3）
+//!
 //! 其余为去抖、字段序、字节稳定性、上限、清理所有权与注册顺序确定性。
 
 use bevy::prelude::*;

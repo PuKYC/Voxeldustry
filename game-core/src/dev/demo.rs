@@ -262,7 +262,7 @@ fn demo_emit_events(
     players: Query<&StableEntityId, With<LocalPlayer>>,
 ) {
     // 每 3 秒（60Hz * 3）一次。
-    if tick.0 == 0 || tick.0 % 180 != 0 {
+    if !tick.0.is_multiple_of(180) {
         return;
     }
 
@@ -294,7 +294,7 @@ mod tests {
             let value = (step * 7) as f32;
             let wrapped = wrap_span(value, span);
             assert!(
-                wrapped >= -50.0 && wrapped < 50.0,
+                (-50.0..50.0).contains(&wrapped),
                 "wrap 结果越界: {wrapped:?}"
             );
         }

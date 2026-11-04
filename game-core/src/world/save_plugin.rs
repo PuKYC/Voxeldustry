@@ -97,21 +97,13 @@ pub struct SaveRoot(pub PathBuf);
 /// 生成器版本**不在这里**：它只有一个来源
 /// [VoxelStreamConfig::generator_version]。存档插件与流式卸载落盘共用同一个值，
 /// 磁盘上同一个块才不会出现两个互相矛盾的版本号。
-#[derive(Resource, Clone, Debug, PartialEq, Eq)]
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldSaveConfig {
     /// 自动存档周期（tick）；None = 关闭。Some(0) / Some(1) = 每个 tick。
     ///
     /// tick 来自 [SaveStore::tick]（每个 FixedUpdate +1，首 tick 为 1），
     /// 即 Some(n) 在 n、2n、3n…… 落盘。
     pub autosave_interval_ticks: Option<u64>,
-}
-
-impl Default for WorldSaveConfig {
-    fn default() -> Self {
-        Self {
-            autosave_interval_ticks: None,
-        }
-    }
 }
 
 /// 玩家 / 指令触发的**全量世界快照**请求。
@@ -215,7 +207,7 @@ fn autosave_due(config: &WorldSaveConfig, tick: u64) -> bool {
         None => false,
         // 0 与 1 同义：每个 tick；别让 tick % 0 变成 panic。
         Some(interval) if interval <= 1 => true,
-        Some(interval) => tick % interval == 0,
+        Some(interval) => tick.is_multiple_of(interval),
     }
 }
 
@@ -694,7 +686,7 @@ mod tests {
             let status = app.world().resource::<WorldSaveStatus>();
             let expected_saves = match tick_index {
                 1 | 2 => 0,
-                3 | 4 | 5 => 1,
+                3..=5 => 1,
                 _ => 2,
             };
             assert_eq!(

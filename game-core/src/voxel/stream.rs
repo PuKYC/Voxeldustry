@@ -495,7 +495,7 @@ pub fn intake_residency_changes(
 
         // 数据已在容器里：直接结算，不重生成、不查存档。
         // 快路径同样走 finish_chunk，Render 档才会拿到分组实体。
-        let raw = extract_block_raw(&volume, &interner, key, to);
+        let raw = extract_block_raw(volume, &interner, key, to);
         finish_chunk(
             pair,
             to,

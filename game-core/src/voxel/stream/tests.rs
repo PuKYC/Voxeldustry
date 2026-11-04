@@ -2219,13 +2219,12 @@ fn unload_before_settle_releases_staged_tree() {
         harness.app.world().resource::<StagedChunks>().0.is_empty(),
         "降档必须丢弃暂存块"
     );
-    assert!(harness
+    assert!(!harness
         .app
         .world()
         .resource::<ProposalCache>()
         .0
-        .get(&pair)
-        .is_none());
+        .contains_key(&pair));
     assert_eq!(
         harness.alive_nodes(),
         baseline,

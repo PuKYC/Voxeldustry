@@ -28,7 +28,7 @@ pub const TERRAIN_MARGIN_CHUNKS: i32 = 1;
 /// 同时必须是 2^max_lod 的倍数，LOD 的 y 块才能对齐平铺。
 #[must_use]
 pub fn y_band_layers(max_lod: u8) -> i32 {
-    1 << u32::from(max_lod.min(MAX_LOD).max(2))
+    1 << u32::from(max_lod.clamp(2, MAX_LOD))
 }
 
 /// 一个待网格化的块：原点（对齐到 2^lod 的子块坐标）+ LOD。
