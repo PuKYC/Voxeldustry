@@ -50,3 +50,6 @@ required-features = ["voxel", "physics"]
 name = "voxel_collider_inst"
 harness = false
 required-features = ["voxel", "physics"]
+
+[lints]
+workspace = true

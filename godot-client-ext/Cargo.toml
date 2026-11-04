@@ -17,3 +17,6 @@ godot = { version = "0.5.5", features = ["api-4-2"] }
 # 但它只做 `Variant ↔ game_core 类型` 的机械搬运，不需要 Bevy 本身。
 game-core = { path = "../game-core" }
 crossbeam-channel = { workspace = true }
+
+[lints]
+workspace = true

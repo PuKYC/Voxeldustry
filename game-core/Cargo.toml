@@ -39,3 +39,6 @@ harness = false
 [[bench]]
 name = "terrain_inst"
 harness = false
+
+[lints]
+workspace = true

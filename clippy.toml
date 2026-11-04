@@ -1,0 +1,12 @@
+# 函数认知复杂度上限（默认 25）[reference:4]
+# 数值越低，对逻辑嵌套和分支的要求越严格
+cognitive-complexity-threshold = 20
+
+# 函数最大行数（默认 100）[reference:5]
+too-many-lines-threshold = 100
+
+# 函数最大参数个数（默认 7）[reference:6]
+too-many-arguments-threshold = 7
+
+# 类型复杂度上限（默认 250）[reference:7]
+type-complexity-threshold = 250

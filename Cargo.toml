@@ -38,4 +38,6 @@ criterion = "0.5"
 # gungraun：Valgrind Callgrind 指令数，确定性，适合 CI 门禁（仅 Linux）。
 gungraun = "0.20"
 
-
+[workspace.lints.clippy]
+perf = "warn"
+complexity = "warn"
