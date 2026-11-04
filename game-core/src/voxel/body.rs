@@ -319,7 +319,11 @@ mod tests {
         );
 
         let first = attach_island_entity(world, entity, drift, true, BiomeId(3));
-        assert_eq!(first, StableEntityId(1), "首次 attach 必须分配下一个稳定 ID");
+        assert_eq!(
+            first,
+            StableEntityId(1),
+            "首次 attach 必须分配下一个稳定 ID"
+        );
         assert_eq!(world.get::<StableEntityId>(entity), Some(&first));
         assert_eq!(world.resource::<StableIdAllocator>().next_id(), 2);
 
@@ -339,7 +343,9 @@ mod tests {
                 vec![IslandId(first.0)],
                 "注册表键必须是实体稳定 ID"
             );
-            let island = registry.get(IslandId(first.0)).expect("注册表必须有对应条目");
+            let island = registry
+                .get(IslandId(first.0))
+                .expect("注册表必须有对应条目");
             // 已有条目不覆盖：重复 attach 不把锚定岛的 drift / anchored / biome 改掉。
             assert_eq!(island.drift, drift);
             assert!(island.anchored);
@@ -368,7 +374,9 @@ mod tests {
         let entity = world.spawn(()).id();
         let id = attach_island_entity(world, entity, Vec3F::ZERO, true, BiomeId(1));
 
-        world.resource_mut::<IslandRegistry>().remove(IslandId(id.0));
+        world
+            .resource_mut::<IslandRegistry>()
+            .remove(IslandId(id.0));
         assert!(world.resource::<IslandRegistry>().is_empty());
 
         let again = attach_island_entity(world, entity, Vec3F::ZERO, true, BiomeId(1));

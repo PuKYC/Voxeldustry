@@ -489,7 +489,10 @@ mod tests {
     fn chunk_persistence_defaults_to_miss() {
         let persistence = ChunkPersistence::default();
         assert_eq!(persistence.lookup(body(), chunk()), StoreLookup::Miss);
-        assert_eq!(persistence.lookup(body(), ChunkKey::new(0, 0, 0)), StoreLookup::Miss);
+        assert_eq!(
+            persistence.lookup(body(), ChunkKey::new(0, 0, 0)),
+            StoreLookup::Miss
+        );
     }
 
     /// 包装层必须原样转发给内部 store，记录的每个字段都要一致。

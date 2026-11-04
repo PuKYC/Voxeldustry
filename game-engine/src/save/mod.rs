@@ -41,11 +41,11 @@ pub mod plugin;
 mod snapshot;
 pub mod store;
 
-pub use content::{export_chunk, install_chunk};
 pub use codec::{
     decode_chunk_record, decode_component_table, decode_region, decode_world_meta,
     encode_chunk_record, encode_component_table, encode_region, encode_world_meta,
 };
+pub use content::{export_chunk, install_chunk};
 pub use format::{
     digest, region_of, splitmix64, AttachTag, BodyKind, BodyRecord, ComponentRecord, RegionFile,
     WorldMeta, BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT,
@@ -204,10 +204,7 @@ pub enum SaveErrorKind {
     /// 组件负载（codec_id = 1 的 postcard）编解码失败（§4.3）。
     ///
     /// `what` 是阶段（postcard encode / decode），`detail` 是原始错误文本。
-    Payload {
-        what: &'static str,
-        detail: String,
-    },
+    Payload { what: &'static str, detail: String },
 }
 
 impl fmt::Display for SaveErrorKind {

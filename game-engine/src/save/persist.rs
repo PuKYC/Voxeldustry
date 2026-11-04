@@ -110,7 +110,9 @@ type StagedComponent = Box<dyn FnOnce(&mut World, Entity) + Send + 'static>;
 
 impl fmt::Debug for PersistEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PersistEntry").field("name", &self.name).finish()
+        f.debug_struct("PersistEntry")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -385,10 +387,7 @@ impl PersistRegistry {
                 Some(entry) => {
                     let insert = (entry.stage)(&component.payload).map_err(|error| {
                         SaveError::new(
-                            format!(
-                                "entity[{}].component[{}]",
-                                record.stable_entity_id, type_id
-                            ),
+                            format!("entity[{}].component[{}]", record.stable_entity_id, type_id),
                             0,
                             error.kind().clone(),
                         )

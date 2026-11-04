@@ -74,7 +74,8 @@ impl WorldFeature for TreeFeature {
             return Vec::new();
         };
         // column_surface 是「第一层空气的 Y」，树干底面就站在这里（下方是地表方块）。
-        let origin_y = i64::from(WorldGenerator::from_seed(seed).column_surface(column_x, column_z));
+        let origin_y =
+            i64::from(WorldGenerator::from_seed(seed).column_surface(column_x, column_z));
 
         // 同一列只有地表所在的 y 块提出这棵树：提案要求 origin 落在自己的包围盒内，
         // 其它 y 块的 origin.y 与地表高度对不上，提了也过不了校验。

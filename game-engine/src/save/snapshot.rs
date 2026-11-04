@@ -123,9 +123,7 @@ impl EntitySnapshot {
     /// 取某块的实体；没有这个块时返回空切片（不是 `Option`，调用方少一层分支）。
     #[must_use]
     pub fn for_chunk(&self, body: BodyKey, chunk: ChunkKey) -> &[EntityRecord] {
-        self.chunks
-            .get(&(body, chunk))
-            .map_or(&[], Vec::as_slice)
+        self.chunks.get(&(body, chunk)).map_or(&[], Vec::as_slice)
     }
 
     /// 把某块的实体写进调用方持有的 `ChunkRecord`，**只动 `entities`**。
@@ -182,11 +180,14 @@ pub fn capture(
         .collect();
     // 先排序再校验：iter_entities 的顺序不是契约，错误也不能随 archetype 布局漂移。
     candidates.sort_by_key(|(entity, _)| {
-        let stable = world.get::<StableEntityId>(*entity).map_or(u64::MAX, |id| id.0);
+        let stable = world
+            .get::<StableEntityId>(*entity)
+            .map_or(u64::MAX, |id| id.0);
         (stable, *entity)
     });
 
-    let mut encoded: Vec<((BodyKey, ChunkKey), EntityRecord)> = Vec::with_capacity(candidates.len());
+    let mut encoded: Vec<((BodyKey, ChunkKey), EntityRecord)> =
+        Vec::with_capacity(candidates.len());
     for (entity, persist) in candidates {
         if persist.prototype_type_id == 0 {
             return Err(SaveError::new(
@@ -308,7 +309,10 @@ mod tests {
     }
 
     fn ids(records: &[EntityRecord]) -> Vec<u64> {
-        records.iter().map(|record| record.stable_entity_id).collect()
+        records
+            .iter()
+            .map(|record| record.stable_entity_id)
+            .collect()
     }
 
     /// 块键按 (BodyKey, ChunkKey) 升序、块内实体按 stable_entity_id 升序。
@@ -321,7 +325,8 @@ mod tests {
         spawn_persist(&mut world, 50, 7, anchor(1, chunk(0, 0, 1)));
         spawn_persist(&mut world, 20, 7, anchor(1, chunk(0, 0, 0)));
 
-        let snapshot = capture(&world, &registry(), &OpaqueComponents::default()).expect("捕获成功");
+        let snapshot =
+            capture(&world, &registry(), &OpaqueComponents::default()).expect("捕获成功");
 
         assert_eq!(snapshot.len(), 3);
         assert_eq!(snapshot.entity_count(), 4);
@@ -394,7 +399,11 @@ mod tests {
             .iter()
             .find(|c| c.stable_type_id == 999)
             .expect("opaque 行必须被带出");
-        assert_eq!(opaque_row.payload, vec![0xAB, 0xCD, 0x00], "opaque 字节必须原样");
+        assert_eq!(
+            opaque_row.payload,
+            vec![0xAB, 0xCD, 0x00],
+            "opaque 字节必须原样"
+        );
 
         let health_row = components
             .iter()
@@ -484,15 +493,12 @@ mod tests {
     #[test]
     fn capture_skips_entities_without_persist_and_handles_empty_world() {
         let mut world = empty_world();
-        world.spawn((
-            StableEntityId(1),
-            anchor(1, chunk(0, 0, 0)),
-            Health(1),
-        ));
+        world.spawn((StableEntityId(1), anchor(1, chunk(0, 0, 0)), Health(1)));
         world.spawn((StableEntityId(2), anchor(1, chunk(0, 0, 0))));
         spawn_persist(&mut world, 3, 5, anchor(1, chunk(0, 0, 0)));
 
-        let snapshot = capture(&world, &registry(), &OpaqueComponents::default()).expect("捕获成功");
+        let snapshot =
+            capture(&world, &registry(), &OpaqueComponents::default()).expect("捕获成功");
         assert_eq!(snapshot.entity_count(), 1);
         assert_eq!(ids(snapshot.for_chunk(body(1), chunk(0, 0, 0))), vec![3]);
 
@@ -512,7 +518,8 @@ mod tests {
         spawn_persist(&mut world, 11, 2, anchor(1, chunk(0, 0, 0)));
         spawn_persist(&mut world, 12, 2, anchor(1, chunk(0, 0, 0)));
 
-        let snapshot = capture(&world, &registry(), &OpaqueComponents::default()).expect("捕获成功");
+        let snapshot =
+            capture(&world, &registry(), &OpaqueComponents::default()).expect("捕获成功");
 
         let mut record = ChunkRecord {
             generator_version: 7,
@@ -526,7 +533,11 @@ mod tests {
         };
 
         snapshot.apply_to(body(1), chunk(0, 0, 0), &mut record);
-        assert_eq!(ids(&record.entities), vec![11, 12], "快照权威：旧实体被覆盖");
+        assert_eq!(
+            ids(&record.entities),
+            vec![11, 12],
+            "快照权威：旧实体被覆盖"
+        );
         assert_eq!(record.content, Some(vec![0xDE, 0xAD]), "content 不得被改");
         assert_eq!(record.generator_version, 7);
 
@@ -593,7 +604,8 @@ mod tests {
         let mut first_world = empty_world();
         let source = spawn_persist(&mut first_world, 21, 7, anchor(6, chunk(0, 0, 0)));
         first_world.entity_mut(source).insert(Health(11));
-        let first = capture(&first_world, &registry, &OpaqueComponents::default()).expect("第一次捕获");
+        let first =
+            capture(&first_world, &registry, &OpaqueComponents::default()).expect("第一次捕获");
         let first_record = first.for_chunk(body(6), chunk(0, 0, 0))[0].clone();
 
         // 载入：空世界里先放好 StableEntityId / ChunkAnchor，再把组件表应用上去。

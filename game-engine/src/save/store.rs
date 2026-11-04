@@ -1182,8 +1182,8 @@ mod tests {
         let b = body(9);
 
         let first = write_region(&paths, b, key(0, 0, 0), &region(1)).expect("写 region 0");
-        let second = write_region(&paths, b, key(5, 0, 0), &RegionFile::default())
-            .expect("写 region 1");
+        let second =
+            write_region(&paths, b, key(5, 0, 0), &RegionFile::default()).expect("写 region 1");
 
         // 同 region 的 .recovered：是可用数据，但只算一次。
         let recovered_bytes = encode_region(&region(2)).expect("编码");
@@ -1201,11 +1201,7 @@ mod tests {
         // 崩溃残留与损坏备份：即使文件名主体非法也必须跳过，不能报错。
         fs::write(paths.tmp(&second), b"tmp").expect("写 .tmp");
         fs::write(paths.corrupt(&second), b"corrupt").expect("写 .corrupt");
-        fs::write(
-            paths.body_dir(b).join("region_not_a_key.tmp"),
-            b"tmp",
-        )
-        .expect("写非法 .tmp");
+        fs::write(paths.body_dir(b).join("region_not_a_key.tmp"), b"tmp").expect("写非法 .tmp");
         fs::write(
             paths.body_dir(b).join("region_not_a_key.corrupt"),
             b"corrupt",
@@ -1224,7 +1220,9 @@ mod tests {
         let dir = TempDir::new("regions-missing");
         let paths = dir.paths();
 
-        assert!(regions_on_disk(&paths, body(1)).expect("缺目录 = 空").is_empty());
+        assert!(regions_on_disk(&paths, body(1))
+            .expect("缺目录 = 空")
+            .is_empty());
     }
 
     #[test]

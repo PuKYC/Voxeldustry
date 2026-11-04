@@ -406,25 +406,31 @@ impl ResidencyTable {
     /// 某个来源当前请求的全部区块（键序确定，空则空切片）。
     #[must_use]
     pub fn requests_of(&self, source: RequestSource) -> &[(BodyKey, ChunkKey)] {
-        self.by_source.get(&source).map(Vec::as_slice).unwrap_or(&[])
+        self.by_source
+            .get(&source)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 某区块的目标档位；没有槽位时视为 [`Residency::None`]。
     #[must_use]
     pub fn target(&self, body: BodyKey, chunk: ChunkKey) -> Residency {
-        self.slot(body, chunk).map_or(Residency::None, ResidencySlot::target)
+        self.slot(body, chunk)
+            .map_or(Residency::None, ResidencySlot::target)
     }
 
     /// 某区块的到达档位；没有槽位时视为 [`Residency::None`]。
     #[must_use]
     pub fn reached(&self, body: BodyKey, chunk: ChunkKey) -> Residency {
-        self.slot(body, chunk).map_or(Residency::None, ResidencySlot::reached)
+        self.slot(body, chunk)
+            .map_or(Residency::None, ResidencySlot::reached)
     }
 
     /// 是否该区块仍被任何来源请求（不管档位）。
     #[must_use]
     pub fn is_requested(&self, body: BodyKey, chunk: ChunkKey) -> bool {
-        self.slot(body, chunk).is_some_and(|s| !s.requests.is_empty())
+        self.slot(body, chunk)
+            .is_some_and(|s| !s.requests.is_empty())
     }
 
     /// 推进 tick，返回新 tick。由 `Collect` 每 tick 调一次。
@@ -549,7 +555,13 @@ impl PinRequests {
 
     /// 查询某来源对某区块的钉住档位。
     #[must_use]
-    pub fn pinned(&self, namespace: u32, id: u64, body: BodyKey, key: ChunkKey) -> Option<Residency> {
+    pub fn pinned(
+        &self,
+        namespace: u32,
+        id: u64,
+        body: BodyKey,
+        key: ChunkKey,
+    ) -> Option<Residency> {
         self.pins
             .get(&(namespace, id))
             .and_then(|map| map.get(&(body, key)))
@@ -571,10 +583,7 @@ impl PinRequests {
         namespace: u32,
         id: u64,
     ) -> BTreeMap<(BodyKey, ChunkKey), Residency> {
-        self.pins
-            .get(&(namespace, id))
-            .cloned()
-            .unwrap_or_default()
+        self.pins.get(&(namespace, id)).cloned().unwrap_or_default()
     }
 }
 
@@ -774,9 +783,7 @@ pub(crate) fn body_key_for(
         if body_ref.0.is_valid() {
             return Some(body_ref.0);
         }
-        warn!(
-            "residency: entity {entity:?} 的 BodyRef 是 BodyKey::INVALID，已忽略（实体未锚定）"
-        );
+        warn!("residency: entity {entity:?} 的 BodyRef 是 BodyKey::INVALID，已忽略（实体未锚定）");
         return None;
     }
     match id {

@@ -169,7 +169,11 @@ fn collect_requests(
         ),
         (
             With<ObserverTag>,
-            Or<(Added<ObserverTag>, Changed<ChunkAnchor>, Changed<ObserverTag>)>,
+            Or<(
+                Added<ObserverTag>,
+                Changed<ChunkAnchor>,
+                Changed<ObserverTag>,
+            )>,
         ),
     >,
     mut removed_work_sites: RemovedComponents<WorkSites>,
@@ -295,10 +299,7 @@ fn push_site(
 }
 
 /// Observer 实体的请求集合：以锚点为中心、半径 radius 的三维球，档位 Render。
-fn observer_snapshot(
-    anchor: &ChunkAnchor,
-    radius: u8,
-) -> BTreeMap<(BodyKey, ChunkKey), Residency> {
+fn observer_snapshot(anchor: &ChunkAnchor, radius: u8) -> BTreeMap<(BodyKey, ChunkKey), Residency> {
     let mut out = BTreeMap::new();
     if !anchor.body.is_valid() {
         return out;
@@ -553,7 +554,10 @@ fn clear_agent(table: &mut ResidencyTable, entity: Entity, ids: &Query<&StableEn
     match ids.get(entity) {
         Ok(id) => table.clear_source(RequestSource::Agent(*id)),
         Err(_) => {
-            debug_assert!(false, "residency: {entity:?} 移除 Real 时读不到 StableEntityId");
+            debug_assert!(
+                false,
+                "residency: {entity:?} 移除 Real 时读不到 StableEntityId"
+            );
             warn!("residency: {entity:?} 移除 Real 时读不到 StableEntityId，请求无法清理");
         }
     }
@@ -563,7 +567,10 @@ fn clear_observer(table: &mut ResidencyTable, entity: Entity, ids: &Query<&Stabl
     match ids.get(entity) {
         Ok(id) => table.clear_source(RequestSource::Observer(*id)),
         Err(_) => {
-            debug_assert!(false, "residency: {entity:?} 移除 Observer 时读不到 StableEntityId");
+            debug_assert!(
+                false,
+                "residency: {entity:?} 移除 Observer 时读不到 StableEntityId"
+            );
             warn!("residency: {entity:?} 移除 Observer 时读不到 StableEntityId，请求无法清理");
         }
     }

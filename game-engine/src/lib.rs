@@ -29,18 +29,18 @@ pub mod modding;
 pub mod net;
 pub mod perception;
 pub mod presentation;
+#[cfg(feature = "voxel")]
+pub mod residency;
 pub mod rng;
 pub mod rollback;
+#[cfg(feature = "voxel")]
+pub mod save;
 pub mod sim;
 pub mod spatial;
 pub mod spec;
 pub mod strategy;
+#[cfg(feature = "voxel")]
+pub mod streaming;
 /// 体素世界层；仅 feature = "voxel" 编译。
 #[cfg(feature = "voxel")]
 pub mod voxel;
-#[cfg(feature = "voxel")]
-pub mod streaming;
-#[cfg(feature = "voxel")]
-pub mod residency;
-#[cfg(feature = "voxel")]
-pub mod save;

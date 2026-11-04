@@ -239,7 +239,12 @@ impl Plugin for StreamingWorldPlugin {
 ///
 /// 失败只 warn：清理失败不该把一个已经读好的世界判成启动失败。
 fn reclaim_after_load(world: &World, paths: &SavePaths) {
-    if world.get_resource::<OrphanPolicy>().copied().unwrap_or_default() != OrphanPolicy::Delete {
+    if world
+        .get_resource::<OrphanPolicy>()
+        .copied()
+        .unwrap_or_default()
+        != OrphanPolicy::Delete
+    {
         return;
     }
     match crate::world::load::reclaim_orphan_regions(paths) {
@@ -756,7 +761,9 @@ mod tests {
             "默认策略是 Keep：删除玩家数据必须由装配方显式开启"
         );
         assert!(
-            SavePaths::new(dir.path()).body_dir(BodyKey::from(saved)).exists(),
+            SavePaths::new(dir.path())
+                .body_dir(BodyKey::from(saved))
+                .exists(),
             "存档里活着的 body 目录当然也要在"
         );
         app.world_mut()
@@ -777,7 +784,9 @@ mod tests {
 
         assert!(!orphan.exists(), "Delete 策略下孤儿 body 目录必须被回收");
         assert!(
-            SavePaths::new(dir.path()).body_dir(BodyKey::from(saved)).exists(),
+            SavePaths::new(dir.path())
+                .body_dir(BodyKey::from(saved))
+                .exists(),
             "回收只能删 meta 里没有的 body，活着的 body 一个文件都不能丢"
         );
         assert_eq!(only_volume(&mut app).chunk_count(), 1, "读档本身不受影响");

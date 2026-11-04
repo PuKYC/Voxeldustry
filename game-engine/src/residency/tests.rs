@@ -180,7 +180,12 @@ fn update_anchors_writes_negative_chunk() {
 
     harness.tick();
 
-    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    let anchor = *harness
+        .app
+        .world()
+        .entity(entity)
+        .get::<ChunkAnchor>()
+        .unwrap();
     assert_eq!(anchor.body, body(1));
     assert_eq!(anchor.chunk, key(-1, -2, 0));
     // 负块坐标同样进请求表。
@@ -205,7 +210,12 @@ fn body_ref_overrides_self_id() {
 
     harness.tick();
 
-    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    let anchor = *harness
+        .app
+        .world()
+        .entity(entity)
+        .get::<ChunkAnchor>()
+        .unwrap();
     assert_eq!(anchor.body, body(99));
     assert_eq!(anchor.chunk, key(1, 0, 0));
     // 请求记在覆盖后的体上，而不是实体自己的 ID 上。
@@ -220,7 +230,12 @@ fn missing_body_ref_falls_back_to_self() {
 
     harness.tick();
 
-    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    let anchor = *harness
+        .app
+        .world()
+        .entity(entity)
+        .get::<ChunkAnchor>()
+        .unwrap();
     assert_eq!(anchor.body, body(7));
     assert_eq!(anchor.chunk, key(0, 0, 0));
 }
@@ -241,7 +256,12 @@ fn invalid_body_ref_unanchors_entity() {
 
     harness.tick();
 
-    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    let anchor = *harness
+        .app
+        .world()
+        .entity(entity)
+        .get::<ChunkAnchor>()
+        .unwrap();
     assert_eq!(anchor.body, BodyKey::INVALID);
     assert!(!anchor.is_valid());
     // 无效 BodyRef 的实体不参与驻留，也不发任何变化消息。
@@ -267,7 +287,12 @@ fn body_ref_change_reanchors() {
         .id();
 
     harness.tick();
-    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    let anchor = *harness
+        .app
+        .world()
+        .entity(entity)
+        .get::<ChunkAnchor>()
+        .unwrap();
     assert_eq!(anchor.body, body(99));
 
     // 只改 BodyRef（位置不变）：Changed<BodyRef> 必须触发锚点重算。
@@ -278,7 +303,12 @@ fn body_ref_change_reanchors() {
         .insert(BodyRef(body(100)));
     harness.tick();
 
-    let anchor = *harness.app.world().entity(entity).get::<ChunkAnchor>().unwrap();
+    let anchor = *harness
+        .app
+        .world()
+        .entity(entity)
+        .get::<ChunkAnchor>()
+        .unwrap();
     assert_eq!(anchor.body, body(100));
     assert_eq!(anchor.chunk, key(0, 0, 0));
     assert!(harness.table().is_requested(body(100), key(0, 0, 0)));
@@ -293,7 +323,10 @@ fn upgrade_is_immediate_and_emits_none_to_data() {
 
     harness.tick();
 
-    assert_eq!(harness.table().target(body(10), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(10), key(0, 0, 0)),
+        Residency::Data
+    );
     let changes = harness.take_changes();
     assert_eq!(
         changes,
@@ -310,15 +343,12 @@ fn upgrade_is_immediate_and_emits_none_to_data() {
 fn same_source_same_chunk_counts_once() {
     let mut harness = Harness::with_grace(5);
     let id = 11;
-    harness
-        .app
-        .world_mut()
-        .spawn((
-            StableEntityId(id),
-            Real,
-            pos_voxels(0, 0, 0),
-            WorkSites(vec![(body(id), key(0, 0, 0))]),
-        ));
+    harness.app.world_mut().spawn((
+        StableEntityId(id),
+        Real,
+        pos_voxels(0, 0, 0),
+        WorkSites(vec![(body(id), key(0, 0, 0))]),
+    ));
 
     harness.tick();
 
@@ -349,7 +379,9 @@ fn work_sites_and_corridor_are_requested() {
 
     harness.tick();
 
-    let requested = harness.table().requests_of(RequestSource::Agent(StableEntityId(id)));
+    let requested = harness
+        .table()
+        .requests_of(RequestSource::Agent(StableEntityId(id)));
     assert_eq!(
         requested,
         &[
@@ -377,7 +409,10 @@ fn removed_work_sites_rebuilds_agent_requests() {
 
     harness.tick();
     assert_eq!(
-        harness.table().requests_of(RequestSource::Agent(StableEntityId(id))).len(),
+        harness
+            .table()
+            .requests_of(RequestSource::Agent(StableEntityId(id)))
+            .len(),
         2
     );
 
@@ -390,7 +425,9 @@ fn removed_work_sites_rebuilds_agent_requests() {
     harness.tick();
 
     assert_eq!(
-        harness.table().requests_of(RequestSource::Agent(StableEntityId(id))),
+        harness
+            .table()
+            .requests_of(RequestSource::Agent(StableEntityId(id))),
         &[(body(id), key(0, 0, 0))]
     );
 }
@@ -480,7 +517,10 @@ fn removing_real_clears_requests() {
 
     // 防抖期内档位仍是 Data。
     harness.tick();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
 }
 
 #[test]
@@ -532,8 +572,14 @@ fn gate_lags_one_tick_behind_chunk_reached() {
     let entity = harness.spawn_real(id, pos_voxels(0, 0, 0));
 
     harness.tick();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
-    assert!(harness.awaiting(entity), "请求刚出现、流式还没汇报时必须挂起");
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
+    assert!(
+        harness.awaiting(entity),
+        "请求刚出现、流式还没汇报时必须挂起"
+    );
     assert_eq!(harness.stats().awaiting_entities, 1);
 
     // 没有 ChunkReached：一直挂着。
@@ -551,7 +597,8 @@ fn gate_lags_one_tick_behind_chunk_reached() {
 fn gate_waits_for_work_site_and_corridor() {
     let mut harness = Harness::with_grace(10);
     let id = 31;
-    let entity = harness.app
+    let entity = harness
+        .app
         .world_mut()
         .spawn((
             StableEntityId(id),
@@ -589,19 +636,28 @@ fn demote_waits_for_grace_ticks() {
 
     harness.tick();
     harness.take_changes();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
 
     harness.app.world_mut().entity_mut(entity).remove::<Real>();
     harness.flush();
 
     // 第 1 tick：还没到 grace，不降。
     harness.tick();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
     assert!(harness.take_changes().is_empty());
 
     // 第 2 tick：到点，降一档（Data -> None）。
     harness.tick();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::None
+    );
     assert_eq!(
         harness.take_changes(),
         vec![ResidencyChanged {
@@ -621,13 +677,23 @@ fn demote_steps_one_level_per_grace() {
 
     harness.tick();
     harness.take_changes();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Render);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Render
+    );
 
-    harness.app.world_mut().entity_mut(entity).remove::<ObserverTag>();
+    harness
+        .app
+        .world_mut()
+        .entity_mut(entity)
+        .remove::<ObserverTag>();
     harness.flush();
 
     harness.tick();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
     assert_eq!(
         harness.take_changes(),
         vec![ResidencyChanged {
@@ -639,7 +705,10 @@ fn demote_steps_one_level_per_grace() {
     );
 
     harness.tick();
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::None
+    );
     assert_eq!(
         harness.take_changes(),
         vec![ResidencyChanged {
@@ -662,14 +731,20 @@ fn request_after_grace_deadline_cancels_demotion() {
     harness.flush();
 
     harness.ticks(2);
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
 
     // 防抖期内又出现请求：取消降级。
     harness.app.world_mut().entity_mut(entity).insert(Real);
     harness.flush();
     harness.ticks(3);
 
-    assert_eq!(harness.table().target(body(id), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(id), key(0, 0, 0)),
+        Residency::Data
+    );
     assert!(harness.table().is_requested(body(id), key(0, 0, 0)));
 }
 
@@ -686,8 +761,14 @@ fn pin_namespaces_do_not_collide() {
 
     harness.tick();
 
-    assert_eq!(harness.table().target(body(101), key(1, 0, 0)), Residency::Data);
-    assert_eq!(harness.table().target(body(101), key(2, 0, 0)), Residency::Render);
+    assert_eq!(
+        harness.table().target(body(101), key(1, 0, 0)),
+        Residency::Data
+    );
+    assert_eq!(
+        harness.table().target(body(101), key(2, 0, 0)),
+        Residency::Render
+    );
     {
         let pins = harness.app.world().resource::<PinRequests>();
         assert_eq!(
@@ -703,7 +784,11 @@ fn pin_namespaces_do_not_collide() {
     }
 
     // 撤销 namespace 1 只影响它自己。
-    harness.app.world_mut().resource_mut::<PinRequests>().unpin_all(1, 7);
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<PinRequests>()
+        .unpin_all(1, 7);
     harness.tick();
     assert!(harness
         .table()
@@ -712,13 +797,22 @@ fn pin_namespaces_do_not_collide() {
             id: 7
         })
         .is_empty());
-    assert_eq!(harness.table().target(body(101), key(2, 0, 0)), Residency::Render);
+    assert_eq!(
+        harness.table().target(body(101), key(2, 0, 0)),
+        Residency::Render
+    );
 
     // 防抖到期后 namespace 1 的块降回 None。
     harness.tick();
     harness.tick();
-    assert_eq!(harness.table().target(body(101), key(1, 0, 0)), Residency::None);
-    assert_eq!(harness.table().target(body(101), key(2, 0, 0)), Residency::Render);
+    assert_eq!(
+        harness.table().target(body(101), key(1, 0, 0)),
+        Residency::None
+    );
+    assert_eq!(
+        harness.table().target(body(101), key(2, 0, 0)),
+        Residency::Render
+    );
 }
 
 #[test]
@@ -730,7 +824,10 @@ fn unsaved_edit_mark_and_clear_hold_data_level() {
     });
 
     harness.tick();
-    assert_eq!(harness.table().target(body(102), key(3, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(102), key(3, 0, 0)),
+        Residency::Data
+    );
     assert_eq!(
         harness.table().requests_of(RequestSource::UnsavedEdit),
         &[(body(102), key(3, 0, 0))]
@@ -746,7 +843,10 @@ fn unsaved_edit_mark_and_clear_hold_data_level() {
         .table()
         .requests_of(RequestSource::UnsavedEdit)
         .is_empty());
-    assert_eq!(harness.table().target(body(102), key(3, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(102), key(3, 0, 0)),
+        Residency::None
+    );
     assert_eq!(
         harness.take_changes(),
         vec![
@@ -791,7 +891,10 @@ fn multiple_sources_take_max_and_are_independent() {
     }
 
     harness.tick();
-    assert_eq!(harness.table().target(body(103), key(0, 0, 0)), Residency::Render);
+    assert_eq!(
+        harness.table().target(body(103), key(0, 0, 0)),
+        Residency::Render
+    );
     assert_eq!(
         harness
             .table()
@@ -803,13 +906,27 @@ fn multiple_sources_take_max_and_are_independent() {
     );
 
     // 撤销 Render 来源后，Data 来源仍然把块钉在 Data。
-    harness.app.world_mut().resource_mut::<PinRequests>().unpin_all(2, 1);
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<PinRequests>()
+        .unpin_all(2, 1);
     harness.tick();
-    assert_eq!(harness.table().target(body(103), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(103), key(0, 0, 0)),
+        Residency::Data
+    );
 
-    harness.app.world_mut().resource_mut::<PinRequests>().unpin_all(1, 1);
+    harness
+        .app
+        .world_mut()
+        .resource_mut::<PinRequests>()
+        .unpin_all(1, 1);
     harness.tick();
-    assert_eq!(harness.table().target(body(103), key(0, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(103), key(0, 0, 0)),
+        Residency::None
+    );
 }
 
 // ───────────────────────────── 内存压力 ─────────────────────────────
@@ -823,14 +940,20 @@ fn pressure_blocks_upgrade_and_counts() {
     harness.tick();
 
     // 目标档位不变、没有升级消息，只把这次升级记进统计。
-    assert_eq!(harness.table().target(body(70), key(0, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(70), key(0, 0, 0)),
+        Residency::None
+    );
     assert!(harness.take_changes().is_empty());
     assert_eq!(harness.stats().deferred_upgrades, 1);
 
     // 压力仍在：下一 tick 再记一次（槽位被重新标脏，不会卡死）。
     harness.tick();
     assert_eq!(harness.stats().deferred_upgrades, 2);
-    assert_eq!(harness.table().target(body(70), key(0, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(70), key(0, 0, 0)),
+        Residency::None
+    );
 }
 
 #[test]
@@ -840,7 +963,10 @@ fn upgrade_resumes_after_pressure_clears() {
     harness.spawn_real(71, pos_voxels(0, 0, 0));
 
     harness.tick();
-    assert_eq!(harness.table().target(body(71), key(0, 0, 0)), Residency::None);
+    assert_eq!(
+        harness.table().target(body(71), key(0, 0, 0)),
+        Residency::None
+    );
     assert!(harness.take_changes().is_empty());
     assert_eq!(harness.stats().deferred_upgrades, 1);
 
@@ -848,7 +974,10 @@ fn upgrade_resumes_after_pressure_clears() {
     harness.set_pressure(10, 100);
     harness.tick();
 
-    assert_eq!(harness.table().target(body(71), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(71), key(0, 0, 0)),
+        Residency::Data
+    );
     assert_eq!(
         harness.take_changes(),
         vec![ResidencyChanged {
@@ -886,7 +1015,10 @@ fn demotion_is_not_blocked_by_pressure() {
         .unpin_all(9, 3);
     harness.tick();
 
-    assert_eq!(harness.table().target(body(74), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(74), key(0, 0, 0)),
+        Residency::Data
+    );
     assert_eq!(
         harness.take_changes(),
         vec![ResidencyChanged {
@@ -907,7 +1039,10 @@ fn no_pressure_resource_keeps_upgrading() {
 
     harness.tick();
 
-    assert_eq!(harness.table().target(body(75), key(0, 0, 0)), Residency::Data);
+    assert_eq!(
+        harness.table().target(body(75), key(0, 0, 0)),
+        Residency::Data
+    );
     assert_eq!(
         harness.take_changes(),
         vec![ResidencyChanged {
@@ -935,4 +1070,3 @@ fn fill_percent_is_saturating() {
     assert!(!MemoryPressure::new(79, 100).is_over(80));
     assert!(MemoryPressure::new(80, 100).is_over(80));
 }
-

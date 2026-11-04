@@ -1340,9 +1340,7 @@ mod tests {
         let keys = [key(0, 0, 0), key(1, 0, 0), key(2, 0, 0)];
         let store = SaveStore::new(config(&dir));
         for (index, k) in keys.iter().enumerate() {
-            store
-                .write(b, *k, record(index as u8 + 1))
-                .expect("写缓冲");
+            store.write(b, *k, record(index as u8 + 1)).expect("写缓冲");
         }
 
         store.quiesce(Duration::from_secs(5)).expect("屏障应成功");
@@ -1371,7 +1369,9 @@ mod tests {
         let store = SaveStore::new(config(&dir));
 
         let started = Instant::now();
-        store.quiesce(Duration::from_secs(5)).expect("空闲屏障应成功");
+        store
+            .quiesce(Duration::from_secs(5))
+            .expect("空闲屏障应成功");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "没有在途写时必须立即返回，不能等超时"
@@ -1435,7 +1435,9 @@ mod tests {
         store.write(b, k, record(1)).expect("写缓冲");
 
         let started = Instant::now();
-        let error = store.quiesce(Duration::from_millis(200)).expect_err("必须失败");
+        let error = store
+            .quiesce(Duration::from_millis(200))
+            .expect_err("必须失败");
         assert_eq!(error, QuiesceError::WorkerDead, "线程已退出且还有脏块");
         assert!(
             started.elapsed() < Duration::from_millis(100),
@@ -1675,10 +1677,7 @@ mod tests {
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(store.stats().tombstones, 0);
         assert_eq!(read_region(&paths, b, k).expect("读 region"), None);
-        assert!(
-            !paths.body_dir(b).exists(),
-            "no-op 删除不应创建 body 目录"
-        );
+        assert!(!paths.body_dir(b).exists(), "no-op 删除不应创建 body 目录");
     }
 
     #[test]
@@ -1957,7 +1956,10 @@ mod tests {
         let first = store.write(b, key(0, 0, 0), record(1)).expect("写缓冲");
         let second = store.write(b, key(1, 0, 0), record(2)).expect("写缓冲");
         let third = store.write(b, key(0, 0, 0), record(3)).expect("写缓冲");
-        assert!(second > first, "不同块也必须共用一条递增序列：{first} -> {second}");
+        assert!(
+            second > first,
+            "不同块也必须共用一条递增序列：{first} -> {second}"
+        );
         assert!(third > second, "同块覆盖要换新号：{second} -> {third}");
         // 删除也取同一条序列的号。
         let deleted = store.delete(b, key(1, 0, 0)).expect("标删除");
@@ -1994,7 +1996,11 @@ mod tests {
         let before_delete = store.committed_version(b, k).expect("写成功必须确认");
 
         let version = store.delete(b, k).expect("标删除");
-        assert_eq!(store.committed_version(b, k), Some(before_delete), "删除没落盘前不确认");
+        assert_eq!(
+            store.committed_version(b, k),
+            Some(before_delete),
+            "删除没落盘前不确认"
+        );
         assert!(!store.is_committed(b, k, version), "删除没落盘前不能算确认");
         store.flush();
         pump(&store);
