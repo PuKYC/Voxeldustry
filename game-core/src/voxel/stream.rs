@@ -829,6 +829,24 @@ impl std::fmt::Display for SettleError {
     }
 }
 
+/// [settle_chunks] 的全部系统参数。
+#[derive(SystemParam)]
+pub struct SettleParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    config: Res<'w, VoxelStreamConfig>,
+    gen: ResMut<'w, GenTable>,
+    wanted: ResMut<'w, StreamWanted>,
+    index: Option<ResMut<'w, StableEntityIndex>>,
+    allocator: Option<ResMut<'w, StableIdAllocator>>,
+    volumes: Query<'w, 's, &'static mut VoxVolume>,
+    interner: ResMut<'w, VoxelInterner>,
+    world: WorldInputs<'w>,
+    groups: ResMut<'w, RenderGroups>,
+    reached: MessageWriter<'w, ChunkReached>,
+    staging: Staging<'w>,
+    stats: ResMut<'w, StreamStats>,
+}
+
 /// 系统 5：结算暂存块——26 邻提案门 → 全序裁决 → realize 落体素 → 装容器 → 定稿。
 ///
 /// 只处理**上一次运行**就已经暂存的块（[StagedChunk::observed]）：同一条 chain
@@ -838,46 +856,31 @@ impl std::fmt::Display for SettleError {
 ///
 /// 邻居门是「提案环」的惰性实现：提案是纯函数，现算即满足「所有可能与本块重叠
 /// 的提案都已存在」，本轮不排 tick 等待。
-#[allow(clippy::too_many_arguments)]
-pub fn settle_chunks(
-    mut commands: Commands,
-    config: Res<VoxelStreamConfig>,
-    mut gen: ResMut<GenTable>,
-    mut wanted: ResMut<StreamWanted>,
-    mut index: Option<ResMut<StableEntityIndex>>,
-    mut allocator: Option<ResMut<StableIdAllocator>>,
-    mut volumes: Query<&'static mut VoxVolume>,
-    mut interner: ResMut<VoxelInterner>,
-    world: WorldInputs,
-    mut groups: ResMut<RenderGroups>,
-    mut reached: MessageWriter<ChunkReached>,
-    mut staging: Staging,
-    mut stats: ResMut<StreamStats>,
-) {
+pub fn settle_chunks(mut p: SettleParams) {
     // 先把所有暂存块标成「看见过」，再挑出上一次就已标记的来结算。
-    for pair in collect_ready(&mut staging, config.max_resolve_per_tick) {
-        let Some(staged_chunk) = staging.staged.0.remove(&pair) else {
+    for pair in collect_ready(&mut p.staging, p.config.max_resolve_per_tick) {
+        let Some(staged_chunk) = p.staging.staged.0.remove(&pair) else {
             continue;
         };
         let StagedChunk {
             tree, proposals, ..
         } = staged_chunk;
 
-        // 树放进 Option 槽：成功时被装进容器，失败时留给唯一出口 [fail_staged]。
+        // 树放进 Option 槽：成功时被装进容器，失败时留给唯一出口 fail_staged。
         let mut tree = Some(tree);
         let settled = {
             let mut ctx = SettleCtx {
-                interner: &mut interner,
-                wanted: &wanted,
-                index: index.as_deref(),
+                interner: &mut p.interner,
+                wanted: &p.wanted,
+                index: p.index.as_deref(),
             };
             settle_one(
                 pair,
                 proposals,
                 &mut tree,
-                &mut volumes,
-                &mut staging,
-                &world,
+                &mut p.volumes,
+                &mut p.staging,
+                &p.world,
                 &mut ctx,
             )
         };
@@ -887,35 +890,46 @@ pub fn settle_chunks(
                 pair,
                 level,
                 raw,
-                &mut allocator,
-                index.as_deref_mut(),
-                &mut commands,
-                &mut groups,
-                &mut reached,
-                &mut gen,
-                &mut wanted,
-                &mut stats,
+                &mut p.allocator,
+                p.index.as_deref_mut(),
+                &mut p.commands,
+                &mut p.groups,
+                &mut p.reached,
+                &mut p.gen,
+                &mut p.wanted,
+                &mut p.stats,
             ),
             Err(error) => {
-                error!("{error}");
-                // 树一定还在槽里：装容器是 [settle_one] 的最后一步。
+                // 树一定还在槽里：装容器是 settle_one 的最后一步。
                 if let Some(tree) = tree.take() {
-                    fail_staged(
-                        pair,
-                        tree,
-                        &mut interner,
-                        &mut gen,
-                        &mut wanted,
-                        &mut staging,
-                    );
+                    abandon_settled(pair, error, tree, &mut p);
                 }
             }
         }
     }
 
-    stats.queued = wanted.0.len();
-    stats.staged = staging.staged.0.len();
+    p.stats.queued = p.wanted.0.len();
+    p.stats.staged = p.staging.staged.0.len();
 }
+
+/// 结算失败的统一出口：打日志，再把暂存树交回 fail_staged 释放。
+fn abandon_settled(
+    pair: (BodyKey, ChunkKey),
+    error: SettleError,
+    tree: VoxTree<u8>,
+    p: &mut SettleParams,
+) {
+    error!("{error}");
+    fail_staged(
+        pair,
+        tree,
+        &mut p.interner,
+        &mut p.gen,
+        &mut p.wanted,
+        &mut p.staging,
+    );
+}
+
 /// 单块结算要用的世界侧引用。
 ///
 /// 只收没有 Bevy 生命周期参数的纯借用：Query / [Staging] / [WorldInputs] 各自带
