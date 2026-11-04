@@ -11,6 +11,7 @@
 //! 视野差集使用排序后的实体列表计算，避免频繁创建和哈希 `HashSet`。
 //! 查询缓冲区和事件缓冲区会跨帧复用，以降低每帧堆分配压力。
 use bevy::{
+    ecs::query::QueryFilter,
     platform::collections::{hash_map::Entry, HashMap, HashSet},
     prelude::*,
 };
@@ -48,7 +49,7 @@ impl AoiObserver {
     }
 }
 
-/// 修正非法半径。///
+/// 修正非法半径。
 /// `NaN` 和负数会回退为零。
 /// 正无穷允许使用，通常会使观察者成为全局观察者。
 fn sanitize_radius(radius: f32) -> f32 {
@@ -97,7 +98,7 @@ pub struct AoIManager {
     chunk_to_observers: HashMap<IVec3, HashSet<Entity>>,
 
     /// 全局观察者集合。
-    ///    /// 全局观察者会在任何全局空间变化发生时更新。
+    /// 全局观察者会在任何全局空间变化发生时更新。
     global_observers: HashSet<Entity>,
 
     /// 本帧需要更新的观察者集合。
@@ -202,9 +203,14 @@ impl<A: SpatialAnchor> Plugin for AoIPlugin<A> {
 
 /// 每帧增量更新 AOI。
 ///
-/// 该系统先清理失效观察者，再根据空间变化和观察者自身变化标记脏观察者。
-/// 随后只重新查询脏观察者的视野，并通过排序差集生成进入和离开消息。
-/// 不排除观察者自身
+/// 输入：本帧空间变化（[`SpatialChanges`]）、空间索引与观察者组件查询。
+/// 输出：无返回值；写入 [`AoIManager`] 维护的可见目标集合。
+/// 副作用：清理已失效观察者、更新区块反向索引与全局观察者集合，
+/// 并发送 [`EntityEntered`] / [`EntityLeft`] 消息。
+///
+/// 分三步执行：先收集需要重算的脏观察者，再对每个观察者查询当前可见集
+/// 并与旧可见集做差分，最后把新可见集与注册信息写回并批量发出事件。
+/// 不排除观察者自身。
 #[allow(clippy::too_many_arguments)]
 pub fn update_aoi<A: SpatialAnchor>(
     mut manager: ResMut<AoIManager>,
@@ -232,12 +238,45 @@ pub fn update_aoi<A: SpatialAnchor>(
 
     m.entered_buffer.clear();
     m.left_buffer.clear();
+
+    // 第一步：清理失效观察者并收集本帧的脏观察者集合。
+    let mut dirty = collect_dirty_observers(
+        m,
+        &changes,
+        &changed_observers,
+        &invalid_observers,
+        &mut removed_observers,
+    );
+
+    // 第二、三步：逐个查询可见集、与旧集合做差分，并写回状态。
+    update_dirty_observers(m, &index, &observers, &mut dirty);
+
+    m.dirty_observers = dirty;
+
+    flush_events(m, &mut ev_entered, &mut ev_left);
+}
+
+/// 第一步：清理已失效的观察者，并汇总本帧需要重算的观察者。
+///
+/// 脏观察者来自三处：空间索引的全局/区块级变化、观察者自身组件变化、
+/// 以及全局脏标记。返回已从 `m.dirty_observers` 取出的集合。
+fn collect_dirty_observers<A, F>(
+    m: &mut AoIManager,
+    changes: &SpatialChanges,
+    changed_observers: &Query<Entity, F>,
+    invalid_observers: &Query<Entity, (With<AoiObserver>, Without<A>)>,
+    removed_observers: &mut RemovedComponents<AoiObserver>,
+) -> HashSet<Entity>
+where
+    A: SpatialAnchor,
+    F: QueryFilter,
+{
     // 先清理已经移除 AoiObserver 的观察者。
     for entity in removed_observers.read() {
         remove_observer(m, entity);
     }
 
-    // 再清理仍然有 AoiObserver，但已经失去 GlobalTransform 的观察者。
+    // 再清理仍然有 AoiObserver，但已经失去锚点的观察者。
     for entity in invalid_observers.iter() {
         remove_observer(m, entity);
     }
@@ -258,112 +297,170 @@ pub fn update_aoi<A: SpatialAnchor>(
         m.dirty_observers.insert(entity);
     }
 
+    mem::take(&mut m.dirty_observers)
+}
+
+/// 第二、三步：对每个脏观察者查询当前可见集、做差分并写回。
+///
+/// 查询缓冲区跨观察者复用，循环结束后归还给 [`AoIManager`]。
+fn update_dirty_observers<A: SpatialAnchor>(
+    m: &mut AoIManager,
+    index: &SpatialIndex,
+    observers: &Query<(Entity, &A, &AoiObserver)>,
+    dirty: &mut HashSet<Entity>,
+) {
     let mut buffer = mem::take(&mut m.query_buffer);
-    let mut dirty = mem::take(&mut m.dirty_observers);
 
     for observer in dirty.drain() {
         let Ok((_, anchor, obs)) = observers.get(observer) else {
             continue;
         };
 
-        let center = anchor.anchor_point();
-        let radius = sanitize_radius(obs.radius);
+        refresh_observer(
+            m,
+            index,
+            observer,
+            anchor.anchor_point(),
+            sanitize_radius(obs.radius),
+            &mut buffer,
+        );
+    }
 
-        buffer.clear();
-        index.query_radius_into(center, radius, &mut buffer);
+    m.query_buffer = buffer;
+}
 
-        buffer.sort_unstable_by(|a, b| a.to_bits().cmp(&b.to_bits()));
-        buffer.dedup();
+/// 重算单个观察者的可见集，并在空间状态变化时刷新区块注册。
+///
+/// 结果写入 `buffer` 与 `m` 的观察者状态；进入/离开事件只写入缓冲区。
+fn refresh_observer(
+    m: &mut AoIManager,
+    index: &SpatialIndex,
+    observer: Entity,
+    center: Vec3,
+    radius: f32,
+    buffer: &mut Vec<Entity>,
+) {
+    buffer.clear();
+    index.query_radius_into(center, radius, buffer);
 
-        // 只有观察者自身空间状态变化时才重新注册区块。
-        // 如果仅目标变化，不需要反复注销/注册 chunk_to_observers。
-        let needs_reregister = match m.observers.get(&observer) {
-            Some(state) => state.center != center || state.radius != radius,
-            None => true,
-        };
+    buffer.sort_unstable_by(|a, b| a.to_bits().cmp(&b.to_bits()));
+    buffer.dedup();
 
-        let mut new_registration: Option<(bool, Vec<IVec3>)> = None;
+    // 只有观察者自身空间状态变化时才重新注册区块。
+    // 如果仅目标变化，不需要反复注销/注册 chunk_to_observers。
+    let needs_reregister = match m.observers.get(&observer) {
+        Some(state) => state.center != center || state.radius != radius,
+        None => true,
+    };
 
-        if needs_reregister {
-            // 先取出旧注册信息，避免后续同时借用 observers 和 chunk_to_observers。
-            let old_data = m.observers.get_mut(&observer).map(|state| {
-                let old_global = state.global;
-                let old_chunks = mem::take(&mut state.chunks);
-                (old_global, old_chunks)
-            });
+    let new_registration =
+        needs_reregister.then(|| reregister_observer(m, index, observer, center, radius));
 
-            if let Some((old_global, old_chunks)) = old_data {
-                if old_global {
-                    m.global_observers.remove(&observer);
-                }
+    apply_visibility(m, observer, center, radius, buffer, new_registration);
+}
 
-                for chunk in old_chunks {
-                    remove_observer_from_chunk(&mut m.chunk_to_observers, chunk, observer);
-                }
-            }
+/// 重新计算观察者覆盖的区块，并更新全局观察者集合与区块反向索引。
+///
+/// 返回 `(is_global, chunks)`；`is_global` 为真时 `chunks` 为空。
+fn reregister_observer(
+    m: &mut AoIManager,
+    index: &SpatialIndex,
+    observer: Entity,
+    center: Vec3,
+    radius: f32,
+) -> (bool, Vec<IVec3>) {
+    // 先取出旧注册信息，避免后续同时借用 observers 和 chunk_to_observers。
+    let old_data = m.observers.get_mut(&observer).map(|state| {
+        let old_global = state.global;
+        let old_chunks = mem::take(&mut state.chunks);
+        (old_global, old_chunks)
+    });
 
-            let chunks_opt =
-                index.chunks_in_radius_limited(center, radius, MAX_OBSERVER_REGISTERED_CHUNKS);
-
-            let is_global = chunks_opt.is_none();
-            let chunks_vec = chunks_opt.unwrap_or_default();
-
-            if is_global {
-                m.global_observers.insert(observer);
-            } else {
-                for chunk in &chunks_vec {
-                    m.chunk_to_observers
-                        .entry(*chunk)
-                        .or_default()
-                        .insert(observer);
-                }
-            }
-
-            new_registration = Some((is_global, chunks_vec));
+    if let Some((old_global, old_chunks)) = old_data {
+        if old_global {
+            m.global_observers.remove(&observer);
         }
 
-        match m.observers.entry(observer) {
-            Entry::Occupied(mut occupied) => {
-                let state = occupied.get_mut();
-                if let Some((is_global, chunks_vec)) = new_registration {
-                    state.center = center;
-                    state.radius = radius;
-                    state.global = is_global;
-                    state.chunks = chunks_vec;
-                }
-
-                diff_sorted(
-                    &state.targets,
-                    &buffer,
-                    observer,
-                    &mut m.entered_buffer,
-                    &mut m.left_buffer,
-                );
-
-                state.targets.clear();
-                state.targets.extend_from_slice(&buffer);
-            }
-            Entry::Vacant(vacant) => {
-                let (is_global, chunks_vec) = new_registration.unwrap_or_default();
-
-                for &entity in buffer.iter() {
-                    m.entered_buffer.push(EntityEntered { observer, entity });
-                }
-
-                vacant.insert(ObserverState {
-                    center,
-                    radius,
-                    targets: buffer.clone(),
-                    chunks: chunks_vec,
-                    global: is_global,
-                });
-            }
+        for chunk in old_chunks {
+            remove_observer_from_chunk(&mut m.chunk_to_observers, chunk, observer);
         }
     }
 
-    m.dirty_observers = dirty;
-    m.query_buffer = buffer;
+    let chunks_opt = index.chunks_in_radius_limited(center, radius, MAX_OBSERVER_REGISTERED_CHUNKS);
 
+    let is_global = chunks_opt.is_none();
+    let chunks_vec = chunks_opt.unwrap_or_default();
+
+    if is_global {
+        m.global_observers.insert(observer);
+    } else {
+        for chunk in &chunks_vec {
+            m.chunk_to_observers
+                .entry(*chunk)
+                .or_default()
+                .insert(observer);
+        }
+    }
+
+    (is_global, chunks_vec)
+}
+
+/// 第三步：把新可见集与注册信息写回观察者状态，并把差集写入事件缓冲区。
+///
+/// 新观察者直接为全部可见目标生成进入事件；已有观察者与旧集合做排序差集。
+fn apply_visibility(
+    m: &mut AoIManager,
+    observer: Entity,
+    center: Vec3,
+    radius: f32,
+    buffer: &[Entity],
+    new_registration: Option<(bool, Vec<IVec3>)>,
+) {
+    match m.observers.entry(observer) {
+        Entry::Occupied(mut occupied) => {
+            let state = occupied.get_mut();
+            if let Some((is_global, chunks_vec)) = new_registration {
+                state.center = center;
+                state.radius = radius;
+                state.global = is_global;
+                state.chunks = chunks_vec;
+            }
+
+            diff_sorted(
+                &state.targets,
+                buffer,
+                observer,
+                &mut m.entered_buffer,
+                &mut m.left_buffer,
+            );
+
+            state.targets.clear();
+            state.targets.extend_from_slice(buffer);
+        }
+        Entry::Vacant(vacant) => {
+            let (is_global, chunks_vec) = new_registration.unwrap_or_default();
+
+            for &entity in buffer.iter() {
+                m.entered_buffer.push(EntityEntered { observer, entity });
+            }
+
+            vacant.insert(ObserverState {
+                center,
+                radius,
+                targets: buffer.to_vec(),
+                chunks: chunks_vec,
+                global: is_global,
+            });
+        }
+    }
+}
+
+/// 批量发出本帧积累的进入/离开事件，并清空事件缓冲区。
+fn flush_events(
+    m: &mut AoIManager,
+    ev_entered: &mut MessageWriter<EntityEntered>,
+    ev_left: &mut MessageWriter<EntityLeft>,
+) {
     if !m.entered_buffer.is_empty() {
         ev_entered.write_batch(m.entered_buffer.drain(..));
     }
