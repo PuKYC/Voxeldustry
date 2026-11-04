@@ -20,6 +20,7 @@
 //! 单机本地。没有预测回滚、掉落物、背包；当前方块先是资源里的一个写死值
 //! （[`SelectedBlock`]），以后接物品系统时替换读取来源即可。
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use game_engine::input::actions::ActionId;
 use game_engine::input::SimulationTick;
@@ -124,34 +125,47 @@ impl Plugin for BlockEditPlugin {
     }
 }
 
-/// 每 tick：拾取 + 写交互提示 + 消费 break/place 边沿。
-#[allow(clippy::too_many_arguments)]
-pub fn block_edit_system(
-    tick: Res<SimulationTick>,
-    config: Res<BlockEditConfig>,
-    selected: Res<SelectedBlock>,
-    mut cooldown: ResMut<BlockEditCooldown>,
-    interner: Res<VoxelInterner>,
-    cameras: Query<&Transform, With<CameraFlag>>,
-    mut players: Query<
+/// 方块编辑系统的参数包：把 9 个参数折成一个 [SystemParam]。
+#[derive(SystemParam)]
+pub struct BlockEditParams<'w, 's> {
+    tick: Res<'w, SimulationTick>,
+    config: Res<'w, BlockEditConfig>,
+    selected: Res<'w, SelectedBlock>,
+    cooldown: ResMut<'w, BlockEditCooldown>,
+    interner: Res<'w, VoxelInterner>,
+    cameras: Query<'w, 's, &'static Transform, With<CameraFlag>>,
+    players: Query<
+        'w,
+        's,
         (
             Entity,
-            &Transform,
-            &ResolvedInput,
-            Option<&mut InteractionHint>,
+            &'static Transform,
+            &'static ResolvedInput,
+            Option<&'static mut InteractionHint>,
         ),
         With<LocalPlayer>,
     >,
-    mut bodies: Query<(Entity, &VoxVolume, &GlobalTransform, &mut VoxelChangeBuffer)>,
-    mut commands: Commands,
-) {
-    let hit = cameras.iter().next().and_then(|camera| {
+    bodies: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static VoxVolume,
+            &'static GlobalTransform,
+            &'static mut VoxelChangeBuffer,
+        ),
+    >,
+    commands: Commands<'w, 's>,
+}
+
+pub fn block_edit_system(mut p: BlockEditParams) {
+    let hit = p.cameras.iter().next().and_then(|camera| {
         let ray = VoxelRay::from_transform(camera)?;
         pick_nearest(
-            interner.inner(),
+            p.interner.inner(),
             ray,
-            config.reach_m,
-            bodies
+            p.config.reach_m,
+            p.bodies
                 .iter()
                 .map(|(entity, volume, transform, _)| (entity, volume, transform)),
         )
@@ -172,7 +186,7 @@ pub fn block_edit_system(
         },
     };
     let mut actor: Option<(Vec3, PlayerInput)> = None;
-    for (entity, transform, input, hint) in &mut players {
+    for (entity, transform, input, hint) in &mut p.players {
         if actor.is_none() {
             actor = Some((transform.translation, input.0));
         }
@@ -184,7 +198,7 @@ pub fn block_edit_system(
             }
             None => {
                 // 手搭的本地玩家可能没挂提示；补上，最迟下一 tick 生效。
-                commands.entity(entity).insert(next_hint);
+                p.commands.entity(entity).insert(next_hint);
             }
         }
     }
@@ -195,34 +209,35 @@ pub fn block_edit_system(
     let Some((player_feet, input)) = actor else {
         return;
     };
-    if !cooldown.is_ready(tick.0, config.cooldown_ticks) {
+    if !p.cooldown.is_ready(p.tick.0, p.config.cooldown_ticks) {
         return;
     }
 
     // ── 2. 破坏：命中格设为空气 ──
     if input.pressed & BREAK_BLOCK_BIT != 0 {
-        if push_edit(&mut bodies, hit.body, hit.voxel, AIR_BLOCK) {
-            cooldown.mark(tick.0);
+        if push_edit(&mut p.bodies, hit.body, hit.voxel, AIR_BLOCK) {
+            p.cooldown.mark(p.tick.0);
         }
         return;
     }
 
     // ── 3. 放置：命中面外一格写当前方块，且不能和玩家碰撞体重叠 ──
     if input.pressed & PLACE_BLOCK_BIT != 0 {
-        if selected.0 == AIR_BLOCK {
+        if p.selected.0 == AIR_BLOCK {
             return;
         }
         let target = hit.voxel + hit.normal;
         // 触及距离内一般都有 chunk；若目标落在尚未生成的区域，不要 push 一个
         // 注定缺失的目标（apply 阶段会 debug_assert），直接跳过放置。
-        let target_chunk_exists = bodies
+        let target_chunk_exists = p
+            .bodies
             .get(hit.body)
             .ok()
             .is_some_and(|(_, volume, _, _)| chunk_exists(volume, target));
         if !target_chunk_exists {
             return;
         }
-        let Some((voxel_size, body_transform)) = body_info(&bodies, hit.body) else {
+        let Some((voxel_size, body_transform)) = body_info(&p.bodies, hit.body) else {
             return;
         };
         if placement_overlaps_player(
@@ -230,8 +245,8 @@ pub fn block_edit_system(
             target,
             voxel_size,
             player_feet,
-            config.player_radius_m,
-            config.player_height_m,
+            p.config.player_radius_m,
+            p.config.player_height_m,
         ) {
             debug!(
                 "block placement rejected: target {:?} overlaps player at {:?}",
@@ -239,8 +254,8 @@ pub fn block_edit_system(
             );
             return;
         }
-        if push_edit(&mut bodies, hit.body, target, selected.0) {
-            cooldown.mark(tick.0);
+        if push_edit(&mut p.bodies, hit.body, target, p.selected.0) {
+            p.cooldown.mark(p.tick.0);
         }
     }
 }
