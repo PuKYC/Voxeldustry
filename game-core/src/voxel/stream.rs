@@ -118,7 +118,7 @@
 //! [PendingUnloads] 落盘——内容还没定稿，没有可落盘的东西（文档 §8）。
 //! `VoxTree` 没有 `Drop`：每条失败/丢弃路径都必须 [release_tree]。
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap};
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -846,7 +846,7 @@ pub fn settle_chunks(
     mut wanted: ResMut<StreamWanted>,
     mut index: Option<ResMut<StableEntityIndex>>,
     mut allocator: Option<ResMut<StableIdAllocator>>,
-    mut volumes: Query<&mut VoxVolume>,
+    mut volumes: Query<&'static mut VoxVolume>,
     mut interner: ResMut<VoxelInterner>,
     world: WorldInputs,
     mut groups: ResMut<RenderGroups>,
@@ -854,10 +854,176 @@ pub fn settle_chunks(
     mut staging: Staging,
     mut stats: ResMut<StreamStats>,
 ) {
-    let budget = config.max_resolve_per_tick;
-
     // 先把所有暂存块标成「看见过」，再挑出上一次就已标记的来结算。
-    let mut ready: Vec<(BodyKey, ChunkKey)> = Vec::new();
+    for pair in collect_ready(&mut staging, config.max_resolve_per_tick) {
+        let Some(staged_chunk) = staging.staged.0.remove(&pair) else {
+            continue;
+        };
+        let StagedChunk {
+            tree, proposals, ..
+        } = staged_chunk;
+
+        // 树放进 Option 槽：成功时被装进容器，失败时留给唯一出口 [fail_staged]。
+        let mut tree = Some(tree);
+        let settled = {
+            let mut ctx = SettleCtx {
+                interner: &mut interner,
+                wanted: &wanted,
+                index: index.as_deref(),
+            };
+            settle_one(
+                pair,
+                proposals,
+                &mut tree,
+                &mut volumes,
+                &mut staging,
+                &world,
+                &mut ctx,
+            )
+        };
+
+        match settled {
+            Ok(Settled { level, raw }) => finish_chunk(
+                pair,
+                level,
+                raw,
+                &mut allocator,
+                index.as_deref_mut(),
+                &mut commands,
+                &mut groups,
+                &mut reached,
+                &mut gen,
+                &mut wanted,
+                &mut stats,
+            ),
+            Err(error) => {
+                error!("{error}");
+                // 树一定还在槽里：装容器是 [settle_one] 的最后一步。
+                if let Some(tree) = tree.take() {
+                    fail_staged(
+                        pair,
+                        tree,
+                        &mut interner,
+                        &mut gen,
+                        &mut wanted,
+                        &mut staging,
+                    );
+                }
+            }
+        }
+    }
+
+    stats.queued = wanted.0.len();
+    stats.staged = staging.staged.0.len();
+}
+/// 单块结算要用的世界侧引用。
+///
+/// 只收没有 Bevy 生命周期参数的纯借用：Query / [Staging] / [WorldInputs] 各自带
+/// 独立的系统生命周期，塞进同一个结构体会让编译器要求它们相等，因此它们作为
+/// [settle_one] 的独立参数传入。
+struct SettleCtx<'a> {
+    interner: &'a mut VoxelInterner,
+    wanted: &'a StreamWanted,
+    index: Option<&'a StableEntityIndex>,
+}
+
+/// 单块结算成功的产物：目标档位 + 该档位抽出的原始体素载荷。
+struct Settled {
+    level: Residency,
+    raw: Option<Vec<u8>>,
+}
+
+/// 结算单个暂存块：邻居门 → 全序裁决 → realize → 装容器 → 抽载荷。
+///
+/// 失败时**不动** `tree`：装容器是最后一步，此前的任何错误都让树留在槽里，
+/// 由外层唯一出口 [fail_staged] 释放（`VoxTree` 没有 `Drop`，漏一次就泄漏节点）。
+fn settle_one(
+    pair: (BodyKey, ChunkKey),
+    proposals: Vec<ProposalRecord>,
+    tree: &mut Option<VoxTree<u8>>,
+    volumes: &mut Query<&'static mut VoxVolume>,
+    staging: &mut Staging<'_>,
+    world: &WorldInputs<'_>,
+    ctx: &mut SettleCtx<'_>,
+) -> Result<Settled, SettleError> {
+    let (body, key) = pair;
+    let Some(entity) = body_entity(ctx.index, body) else {
+        return Err(SettleError::BodyMissing { body, key });
+    };
+    let Ok(mut volume) = volumes.get_mut(entity) else {
+        return Err(SettleError::VolumeMissing { entity, key });
+    };
+
+    // 邻居门：常量里就是 26 个邻块，按邻键升序排列（无自身）。
+    let mut union = proposals;
+    for offset in NEIGHBOUR_OFFSETS {
+        let neighbour = ChunkKey::new(key.x + offset.x, key.y + offset.y, key.z + offset.z);
+        let neighbour_pair = (body, neighbour);
+        if let btree_map::Entry::Vacant(slot) = staging.cache.0.entry(neighbour_pair) {
+            let computed =
+                match (world.registry.as_deref(), world.seed.as_deref()) {
+                    (Some(registry), Some(seed)) => registry
+                        .propose_chunk(seed.0, neighbour)
+                        .map_err(|error| SettleError::NeighbourProposal {
+                            key,
+                            neighbour,
+                            error,
+                        })?,
+                    // 有注册表却没有种子：提案不可复现，按错误放弃。
+                    (Some(_), None) => {
+                        return Err(SettleError::SeedMissing {
+                            key,
+                            neighbour: Some(neighbour),
+                        });
+                    }
+                    // 没有注册表 = 没有物体：邻块提案是空，
+                    // cache 里也记成空，省掉后续重复判断。
+                    (None, _) => Vec::new(),
+                };
+            slot.insert(computed);
+        }
+        if let Some(cached) = staging.cache.0.get(&neighbour_pair) {
+            union.extend(cached.iter().copied());
+        }
+    }
+
+    let winners = arbitrate(&union);
+
+    // 没有注册表 = 没有物体：winners 必为空，realize 直接跳过。
+    if let Some(registry) = world.registry.as_deref() {
+        let Some(seed) = world.seed.as_deref() else {
+            return Err(SettleError::SeedMissing {
+                key,
+                neighbour: None,
+            });
+        };
+        let owned = tree.as_mut().expect("realize 之前树必须还在槽里");
+        realize_chunk(
+            registry,
+            seed.0,
+            key,
+            &winners,
+            owned,
+            ctx.interner.inner_mut(),
+        )
+        .map_err(|error| SettleError::Realize { key, error })?;
+    }
+
+    let level = ctx.wanted.0.get(&pair).copied().unwrap_or(Residency::Data);
+    let owned = tree.take().expect("装容器之前树必须还在槽里");
+    // 装容器：防御式先取旧树（insert_chunk 覆盖会 debug_assert!）。
+    let old = volume.take_chunk_raw(&key);
+    volume.insert_chunk(key, owned);
+    release_tree(ctx.interner, old);
+    let raw = extract_block_raw(&volume, ctx.interner, key, level);
+    Ok(Settled { level, raw })
+}
+
+/// 把暂存块标成「看见过」，挑出上一次就已标记、本 tick 可以结算的块。
+///
+/// 预算按 tick 截断（`Pending` 也占一个名额，见 [VoxelStreamConfig::max_resolve_per_tick]）。
+fn collect_ready(staging: &mut Staging<'_>, budget: usize) -> Vec<(BodyKey, ChunkKey)> {
+    let mut ready = Vec::new();
     for (pair, chunk) in staging.staged.0.iter_mut() {
         if chunk.observed {
             ready.push(*pair);
@@ -866,153 +1032,7 @@ pub fn settle_chunks(
         }
     }
     ready.truncate(budget);
-
-    'settle: for pair in ready {
-        let (body, key) = pair;
-        let Some(staged_chunk) = staging.staged.0.remove(&pair) else {
-            continue;
-        };
-        let StagedChunk {
-            tree, proposals, ..
-        } = staged_chunk;
-
-        let Some(entity) = body_entity(index.as_deref(), body) else {
-            error!("stream: body {body:?} 找不到实体，放弃区块 {key:?}");
-            fail_staged(
-                pair,
-                tree,
-                &mut interner,
-                &mut gen,
-                &mut wanted,
-                &mut staging,
-            );
-            continue 'settle;
-        };
-        let Ok(mut volume) = volumes.get_mut(entity) else {
-            error!("stream: 实体 {entity:?} 没有 VoxVolume，放弃区块 {key:?}");
-            fail_staged(
-                pair,
-                tree,
-                &mut interner,
-                &mut gen,
-                &mut wanted,
-                &mut staging,
-            );
-            continue 'settle;
-        };
-
-        // 邻居门：常量里就是 26 个邻块，按邻键升序排列（无自身）。
-        let mut union = proposals;
-        for offset in NEIGHBOUR_OFFSETS {
-            let neighbour = ChunkKey::new(key.x + offset.x, key.y + offset.y, key.z + offset.z);
-            let neighbour_pair = (body, neighbour);
-            if !staging.cache.0.contains_key(&neighbour_pair) {
-                let computed = match (world.registry.as_deref(), world.seed.as_deref()) {
-                    (Some(registry), Some(seed)) => {
-                        match registry.propose_chunk(seed.0, neighbour) {
-                            Ok(computed) => computed,
-                            Err(error) => {
-                                error!(
-                                    "stream: 邻块 {neighbour:?} 提案失败，放弃区块 {key:?}：{error}"
-                                );
-                                fail_staged(
-                                    pair,
-                                    tree,
-                                    &mut interner,
-                                    &mut gen,
-                                    &mut wanted,
-                                    &mut staging,
-                                );
-                                continue 'settle;
-                            }
-                        }
-                    }
-                    // 有注册表却没有种子：提案不可复现，按错误放弃。
-                    (Some(_), None) => {
-                        error!("stream: WorldSeed 资源缺失，算不出邻块 {neighbour:?} 的提案");
-                        fail_staged(
-                            pair,
-                            tree,
-                            &mut interner,
-                            &mut gen,
-                            &mut wanted,
-                            &mut staging,
-                        );
-                        continue 'settle;
-                    }
-                    // 没有注册表 = 没有物体：邻块提案是空，
-                    // cache 里也记成空，省掉后续重复判断。
-                    (None, _) => Vec::new(),
-                };
-                staging.cache.0.insert(neighbour_pair, computed);
-            }
-            if let Some(cached) = staging.cache.0.get(&neighbour_pair) {
-                union.extend(cached.iter().copied());
-            }
-        }
-
-        let winners = arbitrate(&union);
-
-        // 没有注册表 = 没有物体：winners 必为空，realize 直接跳过。
-        let mut tree = tree;
-        if let Some(registry) = world.registry.as_deref() {
-            let Some(seed) = world.seed.as_deref() else {
-                error!("stream: WorldSeed 资源缺失，无法 realize 区块 {key:?}");
-                fail_staged(
-                    pair,
-                    tree,
-                    &mut interner,
-                    &mut gen,
-                    &mut wanted,
-                    &mut staging,
-                );
-                continue 'settle;
-            };
-            if let Err(error) = realize_chunk(
-                registry,
-                seed.0,
-                key,
-                &winners,
-                &mut tree,
-                interner.inner_mut(),
-            ) {
-                error!("stream: 区块 {key:?} realize 失败，放弃：{error}");
-                fail_staged(
-                    pair,
-                    tree,
-                    &mut interner,
-                    &mut gen,
-                    &mut wanted,
-                    &mut staging,
-                );
-                continue 'settle;
-            }
-        }
-
-        // 装容器：防御式先取旧树（insert_chunk 覆盖会 debug_assert!）。
-        let old = volume.take_chunk_raw(&key);
-        volume.insert_chunk(key, tree);
-        release_tree(&mut interner, old);
-
-        let level = wanted.0.get(&pair).copied().unwrap_or(Residency::Data);
-        let raw = extract_block_raw(&volume, &interner, key, level);
-        finish_chunk(
-            pair,
-            level,
-            raw,
-            &mut allocator,
-            index.as_deref_mut(),
-            &mut commands,
-            &mut groups,
-            &mut reached,
-            &mut gen,
-            &mut wanted,
-            &mut stats,
-        );
-    }
-
-    stats.queued = wanted.0.len();
-    stats.staged = staging.staged.0.len();
+    ready
 }
 
 /// 结算失败的统一出口：清缓存、释放暂存树、放弃请求。
