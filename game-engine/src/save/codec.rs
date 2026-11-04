@@ -1218,26 +1218,85 @@ fn decode_record(
         1,
     )?;
 
-    let content = if flags & 1 != 0 {
-        let len_offset = reader.offset();
-        let content_len = reader.read_u32_at(path, "content_len")?;
-        expect_max(
+    let content = decode_content(&mut reader, path, flags)?;
+
+    let proposals = decode_proposals(&mut reader, path, base)?;
+
+    let entities = decode_entities(&mut reader, path, seen_entities)?;
+
+    if reader.remaining() != 0 {
+        return Err(SaveError::new(
             path,
-            "content_len",
-            len_offset,
-            "content_len",
-            u64::from(content_len),
-            u64::from(MAX_RECORD_LEN),
-        )?;
-        Some(
-            reader
-                .take_at(&path, "content", u32_len(content_len))?
-                .to_vec(),
-        )
-    } else {
-        None
+            reader.offset(),
+            SaveErrorKind::TrailingBytes {
+                extra: reader.remaining(),
+            },
+        ));
+    }
+
+    if content.is_some() && !proposals.is_empty() {
+        return Err(SaveError::new(
+            field_path(path, "proposal_count"),
+            base,
+            SaveErrorKind::InvalidCombination {
+                what: "content with proposals",
+            },
+        ));
+    }
+
+    let record = ChunkRecord {
+        generator_version,
+        content,
+        proposals,
+        entities,
     };
 
+    if record.is_empty() {
+        return Err(SaveError::new(
+            path,
+            base,
+            SaveErrorKind::InvalidCombination {
+                what: "empty record must not be written",
+            },
+        ));
+    }
+
+    Ok(record)
+}
+
+/// 解码可选的 content 段（§4）：flags bit0 置位时存在，先校验长度再取字节。
+fn decode_content(
+    reader: &mut Reader<'_>,
+    path: &str,
+    flags: u16,
+) -> Result<Option<Vec<u8>>, SaveError> {
+    if flags & 1 == 0 {
+        return Ok(None);
+    }
+
+    let len_offset = reader.offset();
+    let content_len = reader.read_u32_at(path, "content_len")?;
+    expect_max(
+        path,
+        "content_len",
+        len_offset,
+        "content_len",
+        u64::from(content_len),
+        u64::from(MAX_RECORD_LEN),
+    )?;
+    Ok(Some(
+        reader
+            .take_at(path, "content", u32_len(content_len))?
+            .to_vec(),
+    ))
+}
+
+/// 解码 proposal 表（§4），校验边界与 (feature_type, seq) 严格升序。
+fn decode_proposals(
+    reader: &mut Reader<'_>,
+    path: &str,
+    base: usize,
+) -> Result<Vec<ProposalRecord>, SaveError> {
     let proposal_count = u32_len(reader.read_u32_at(path, "proposal_count")?);
     if proposal_count > reader.remaining() / PROPOSAL_RECORD_LEN {
         return Err(SaveError::new(
@@ -1313,6 +1372,15 @@ fn decode_record(
         proposals.push(proposal);
     }
 
+    Ok(proposals)
+}
+
+/// 解码实体表（§4），校验 id 升序、类型非 0、payload 合法且 region 内不重复。
+fn decode_entities(
+    reader: &mut Reader<'_>,
+    path: &str,
+    seen_entities: &mut BTreeSet<u64>,
+) -> Result<Vec<EntityRecord>, SaveError> {
     let entity_count = u32_len(reader.read_u32_at(path, "entity_count")?);
     // 每条实体至少 16 B（id + type + payload_len），先按上限判断再分配。
     if entity_count > reader.remaining() / 16 {
@@ -1382,44 +1450,7 @@ fn decode_record(
         });
     }
 
-    if reader.remaining() != 0 {
-        return Err(SaveError::new(
-            path,
-            reader.offset(),
-            SaveErrorKind::TrailingBytes {
-                extra: reader.remaining(),
-            },
-        ));
-    }
-
-    if content.is_some() && !proposals.is_empty() {
-        return Err(SaveError::new(
-            field_path(path, "proposal_count"),
-            base,
-            SaveErrorKind::InvalidCombination {
-                what: "content with proposals",
-            },
-        ));
-    }
-
-    let record = ChunkRecord {
-        generator_version,
-        content,
-        proposals,
-        entities,
-    };
-
-    if record.is_empty() {
-        return Err(SaveError::new(
-            path,
-            base,
-            SaveErrorKind::InvalidCombination {
-                what: "empty record must not be written",
-            },
-        ));
-    }
-
-    Ok(record)
+    Ok(entities)
 }
 
 /// 单独编码一条 ChunkRecord 记录体（§3.1），不含 region 头/索引。
