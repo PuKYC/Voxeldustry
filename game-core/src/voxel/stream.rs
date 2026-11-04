@@ -148,7 +148,7 @@ use crate::voxel::terrain::generation::WorldGenerator;
 use crate::voxel::terrain::{
     unload_chunk, TerrainConfig, TerrainGeneratedBlocks, TerrainNeighborBlocks,
 };
-use crate::voxel::{arbitrate, realize_chunk, WorldFeatureRegistry};
+use crate::voxel::{arbitrate, realize_chunk, FeatureError, WorldFeatureRegistry};
 use crate::world::WorldSeed;
 
 /// 流式加载配置。
@@ -744,6 +744,90 @@ const NEIGHBOUR_OFFSETS: [IVec3; 26] = [
     IVec3::new(1, 1, 0),
     IVec3::new(1, 1, 1),
 ];
+
+/// 单块结算的失败原因。
+///
+/// 每个变体对应旧实现里一条「放弃这个块」的分支；[`Display`](std::fmt::Display)
+/// 逐字复现旧实现 `error!` 打的那句话（含 `stream:` 前缀），所以统一的失败出口
+/// 只要 `error!("{error}")` 一次，日志内容与原来一致。
+#[derive(Debug)]
+pub enum SettleError {
+    /// 找不到 body 实体，没有容器可装。
+    BodyMissing {
+        /// 找不到实体的 body。
+        body: BodyKey,
+        /// 被放弃的区块。
+        key: ChunkKey,
+    },
+    /// body 实体上没有 [VoxVolume] 组件。
+    VolumeMissing {
+        /// 缺组件的实体。
+        entity: Entity,
+        /// 被放弃的区块。
+        key: ChunkKey,
+    },
+    /// 邻块提案算不出来。
+    NeighbourProposal {
+        /// 被放弃的区块。
+        key: ChunkKey,
+        /// 算不出提案的邻块。
+        neighbour: ChunkKey,
+        /// 注册表给出的原因。
+        error: FeatureError,
+    },
+    /// 有注册表却没有 [WorldSeed]：提案 / realize 不可复现。
+    SeedMissing {
+        /// 当前结算的区块。
+        key: ChunkKey,
+        /// `Some` 是算不出提案的邻块；`None` 是 realize 前发现缺种子。
+        neighbour: Option<ChunkKey>,
+    },
+    /// realize 失败。
+    Realize {
+        /// 被放弃的区块。
+        key: ChunkKey,
+        /// 注册表给出的原因。
+        error: FeatureError,
+    },
+}
+
+impl std::fmt::Display for SettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BodyMissing { body, key } => {
+                write!(f, "stream: body {body:?} 找不到实体，放弃区块 {key:?}")
+            }
+            Self::VolumeMissing { entity, key } => {
+                write!(
+                    f,
+                    "stream: 实体 {entity:?} 没有 VoxVolume，放弃区块 {key:?}"
+                )
+            }
+            Self::NeighbourProposal {
+                key,
+                neighbour,
+                error,
+            } => write!(
+                f,
+                "stream: 邻块 {neighbour:?} 提案失败，放弃区块 {key:?}：{error}"
+            ),
+            Self::SeedMissing {
+                neighbour: Some(neighbour),
+                ..
+            } => write!(
+                f,
+                "stream: WorldSeed 资源缺失，算不出邻块 {neighbour:?} 的提案"
+            ),
+            Self::SeedMissing {
+                key,
+                neighbour: None,
+            } => write!(f, "stream: WorldSeed 资源缺失，无法 realize 区块 {key:?}"),
+            Self::Realize { key, error } => {
+                write!(f, "stream: 区块 {key:?} realize 失败，放弃：{error}")
+            }
+        }
+    }
+}
 
 /// 系统 5：结算暂存块——26 邻提案门 → 全序裁决 → realize 落体素 → 装容器 → 定稿。
 ///
