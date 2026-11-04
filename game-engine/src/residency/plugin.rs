@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bevy::prelude::*;
+use bevy::{ecs::system::SystemParam, prelude::*};
 
 use super::Observer as ObserverTag;
 use super::{
@@ -120,67 +120,72 @@ fn apply_chunk_reached(
     }
 }
 
+/// Real 实体请求收集需要的组件组合。
+type AgentRequestData = (
+    Entity,
+    Option<&'static StableEntityId>,
+    &'static ChunkAnchor,
+    Option<&'static WorkSites>,
+    Option<&'static PathCorridor>,
+    Option<&'static BodyRef>,
+);
+
+/// Real 实体「本 tick 有变化」（新增 / 锚点或路径改动）的过滤条件。
+type AgentChangeFilter = (
+    With<Real>,
+    Or<(
+        Added<Real>,
+        Changed<ChunkAnchor>,
+        Changed<WorkSites>,
+        Changed<PathCorridor>,
+    )>,
+);
+
+/// Observer 实体请求收集需要的组件组合。
+type ObserverRequestData = (
+    Entity,
+    Option<&'static StableEntityId>,
+    &'static ChunkAnchor,
+    &'static ObserverTag,
+    Option<&'static BodyRef>,
+);
+
+/// Observer 实体「本 tick 有变化」（新增 / 锚点或标签改动）的过滤条件。
+type ObserverChangeFilter = (
+    With<ObserverTag>,
+    Or<(Added<ObserverTag>, Changed<ChunkAnchor>, Changed<ObserverTag>)>,
+);
+
+/// [`collect_requests`] 的三个实体查询。
+///
+/// 收进一个 `SystemParam` 把参数个数压回阈值内，字段顺序与原参数顺序一致，
+/// 因此 bevy 的访问集不变。
+#[derive(SystemParam)]
+struct RequestQueries<'w, 's> {
+    changed_agents: Query<'w, 's, AgentRequestData, AgentChangeFilter>,
+    all_agents: Query<'w, 's, AgentRequestData, With<Real>>,
+    changed_observers: Query<'w, 's, ObserverRequestData, ObserverChangeFilter>,
+}
+
 /// 收集本 tick 的全部请求变化，整体替换对应来源的快照。
 ///
 /// 来源：Real 实体、Observer 实体、PinRequests、UnsavedEdit* 消息。
 /// 所有 Query 结果先收集进 BTreeMap<RequestSource, _>（键序确定），再应用，
 /// 因此发射顺序与 Query 遍历顺序无关。
-#[allow(clippy::too_many_arguments)]
 fn collect_requests(
     mut table: ResMut<ResidencyTable>,
     mut pins: ResMut<PinRequests>,
-    changed_agents: Query<
-        (
-            Entity,
-            Option<&StableEntityId>,
-            &ChunkAnchor,
-            Option<&WorkSites>,
-            Option<&PathCorridor>,
-            Option<&BodyRef>,
-        ),
-        (
-            With<Real>,
-            Or<(
-                Added<Real>,
-                Changed<ChunkAnchor>,
-                Changed<WorkSites>,
-                Changed<PathCorridor>,
-            )>,
-        ),
-    >,
-    all_agents: Query<
-        (
-            Entity,
-            Option<&StableEntityId>,
-            &ChunkAnchor,
-            Option<&WorkSites>,
-            Option<&PathCorridor>,
-            Option<&BodyRef>,
-        ),
-        With<Real>,
-    >,
-    changed_observers: Query<
-        (
-            Entity,
-            Option<&StableEntityId>,
-            &ChunkAnchor,
-            &ObserverTag,
-            Option<&BodyRef>,
-        ),
-        (
-            With<ObserverTag>,
-            Or<(
-                Added<ObserverTag>,
-                Changed<ChunkAnchor>,
-                Changed<ObserverTag>,
-            )>,
-        ),
-    >,
+    queries: RequestQueries,
     mut removed_work_sites: RemovedComponents<WorkSites>,
     mut removed_corridors: RemovedComponents<PathCorridor>,
     mut unsaved_mark: MessageReader<UnsavedEditMark>,
     mut unsaved_clear: MessageReader<UnsavedEditClear>,
 ) {
+    let RequestQueries {
+        changed_agents,
+        all_agents,
+        changed_observers,
+    } = queries;
     let tick = table.begin_tick();
     let mut plans: BTreeMap<RequestSource, BTreeMap<(BodyKey, ChunkKey), Residency>> =
         BTreeMap::new();

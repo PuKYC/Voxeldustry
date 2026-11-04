@@ -161,7 +161,6 @@ impl<S: GameSpec> Clone for BackendChannels<S> {
 /// - `ctrl_rx`: 控制指令接收端。
 /// - `life_tx`: 生命周期消息发送端。
 /// - `session`: 会话 id，随每条消息回传。
-#[allow(clippy::too_many_arguments)]
 pub fn run_headless<S: GameSpec, M: GameModule<S>>(
     config: EngineConfig,
     module: M,

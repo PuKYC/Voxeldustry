@@ -145,7 +145,6 @@ impl PresentationVisibility {
 ///
 /// 本地玩家通过 `LocalPlayer` **标记组件**定位，而不是从 `AoIManager`
 /// 内部状态里反查 —— 否则「谁是本地玩家」和「谁是 AOI 观察者」会被绑死。
-#[allow(clippy::too_many_arguments)]
 pub fn refresh_visibility(
     mut visibility: ResMut<PresentationVisibility>,
     aoi: Option<Res<AoIManager>>,
