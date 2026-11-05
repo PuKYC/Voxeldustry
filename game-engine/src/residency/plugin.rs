@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bevy::prelude::*;
+use bevy::{ecs::system::SystemParam, prelude::*};
 
 use super::Observer as ObserverTag;
 use super::{
@@ -75,22 +75,23 @@ impl Plugin for ResidencyPlugin {
 
 // ───────────────────────────── Anchor ─────────────────────────────
 
+/// [`update_anchors`] 的查询：锚点重算需要的组件组合。
+type AnchorUpdateData = (
+    Entity,
+    &'static LogicPos,
+    &'static mut ChunkAnchor,
+    Option<&'static StableEntityId>,
+    Option<&'static BodyRef>,
+);
+
+/// [`update_anchors`] 的过滤条件（位置、锚点或 BodyRef 变化）。
+type AnchorUpdateFilter = Or<(Changed<LogicPos>, Added<ChunkAnchor>, Changed<BodyRef>)>;
+
 /// 按 LogicPos 重算 ChunkAnchor（位置、锚点或 BodyRef 变化时算）。
 ///
 /// **只用定点整数**：chunk_of 内部是 i64::div_euclid。禁止 f32 参与块归属。
 /// 过渡期位置来源是 LogicPos；将来 BodyPose 落地后只改这里。
-fn update_anchors(
-    mut anchors: Query<
-        (
-            Entity,
-            &LogicPos,
-            &mut ChunkAnchor,
-            Option<&StableEntityId>,
-            Option<&BodyRef>,
-        ),
-        Or<(Changed<LogicPos>, Added<ChunkAnchor>, Changed<BodyRef>)>,
-    >,
-) {
+fn update_anchors(mut anchors: Query<AnchorUpdateData, AnchorUpdateFilter>) {
     for (entity, pos, mut anchor, id, body_ref) in &mut anchors {
         let Some(body) = body_key_for(entity, id, body_ref) else {
             continue;
@@ -120,67 +121,76 @@ fn apply_chunk_reached(
     }
 }
 
+/// Real 实体请求收集需要的组件组合。
+type AgentRequestData = (
+    Entity,
+    Option<&'static StableEntityId>,
+    &'static ChunkAnchor,
+    Option<&'static WorkSites>,
+    Option<&'static PathCorridor>,
+    Option<&'static BodyRef>,
+);
+
+/// Real 实体「本 tick 有变化」（新增 / 锚点或路径改动）的过滤条件。
+type AgentChangeFilter = (
+    With<Real>,
+    Or<(
+        Added<Real>,
+        Changed<ChunkAnchor>,
+        Changed<WorkSites>,
+        Changed<PathCorridor>,
+    )>,
+);
+
+/// Observer 实体请求收集需要的组件组合。
+type ObserverRequestData = (
+    Entity,
+    Option<&'static StableEntityId>,
+    &'static ChunkAnchor,
+    &'static ObserverTag,
+    Option<&'static BodyRef>,
+);
+
+/// Observer 实体「本 tick 有变化」（新增 / 锚点或标签改动）的过滤条件。
+type ObserverChangeFilter = (
+    With<ObserverTag>,
+    Or<(
+        Added<ObserverTag>,
+        Changed<ChunkAnchor>,
+        Changed<ObserverTag>,
+    )>,
+);
+
+/// [`collect_requests`] 的三个实体查询。
+///
+/// 收进一个 `SystemParam` 把参数个数压回阈值内，字段顺序与原参数顺序一致，
+/// 因此 bevy 的访问集不变。
+#[derive(SystemParam)]
+struct RequestQueries<'w, 's> {
+    changed_agents: Query<'w, 's, AgentRequestData, AgentChangeFilter>,
+    all_agents: Query<'w, 's, AgentRequestData, With<Real>>,
+    changed_observers: Query<'w, 's, ObserverRequestData, ObserverChangeFilter>,
+}
+
 /// 收集本 tick 的全部请求变化，整体替换对应来源的快照。
 ///
 /// 来源：Real 实体、Observer 实体、PinRequests、UnsavedEdit* 消息。
 /// 所有 Query 结果先收集进 BTreeMap<RequestSource, _>（键序确定），再应用，
 /// 因此发射顺序与 Query 遍历顺序无关。
-#[allow(clippy::too_many_arguments)]
 fn collect_requests(
     mut table: ResMut<ResidencyTable>,
     mut pins: ResMut<PinRequests>,
-    changed_agents: Query<
-        (
-            Entity,
-            Option<&StableEntityId>,
-            &ChunkAnchor,
-            Option<&WorkSites>,
-            Option<&PathCorridor>,
-            Option<&BodyRef>,
-        ),
-        (
-            With<Real>,
-            Or<(
-                Added<Real>,
-                Changed<ChunkAnchor>,
-                Changed<WorkSites>,
-                Changed<PathCorridor>,
-            )>,
-        ),
-    >,
-    all_agents: Query<
-        (
-            Entity,
-            Option<&StableEntityId>,
-            &ChunkAnchor,
-            Option<&WorkSites>,
-            Option<&PathCorridor>,
-            Option<&BodyRef>,
-        ),
-        With<Real>,
-    >,
-    changed_observers: Query<
-        (
-            Entity,
-            Option<&StableEntityId>,
-            &ChunkAnchor,
-            &ObserverTag,
-            Option<&BodyRef>,
-        ),
-        (
-            With<ObserverTag>,
-            Or<(
-                Added<ObserverTag>,
-                Changed<ChunkAnchor>,
-                Changed<ObserverTag>,
-            )>,
-        ),
-    >,
+    queries: RequestQueries,
     mut removed_work_sites: RemovedComponents<WorkSites>,
     mut removed_corridors: RemovedComponents<PathCorridor>,
     mut unsaved_mark: MessageReader<UnsavedEditMark>,
     mut unsaved_clear: MessageReader<UnsavedEditClear>,
 ) {
+    let RequestQueries {
+        changed_agents,
+        all_agents,
+        changed_observers,
+    } = queries;
     let tick = table.begin_tick();
     let mut plans: BTreeMap<RequestSource, BTreeMap<(BodyKey, ChunkKey), Residency>> =
         BTreeMap::new();
@@ -445,6 +455,15 @@ fn emit_changes(mut table: ResMut<ResidencyTable>, mut writer: MessageWriter<Res
 
 // ───────────────────────────── Gate ─────────────────────────────
 
+/// [`gate_real_entities`] 的查询：门控需要的组件组合。
+type GateAgentData = (
+    Entity,
+    &'static ChunkAnchor,
+    Option<&'static WorkSites>,
+    Option<&'static PathCorridor>,
+    Option<&'static AwaitingChunks>,
+);
+
 /// 给「所需区块还没全部到达 Data」的 Real 实体挂 AwaitingChunks。
 ///
 /// **只读 slot.reached**：同 tick 里流式还没跑（Streaming 在 Residency 之后），
@@ -452,16 +471,7 @@ fn emit_changes(mut table: ResMut<ResidencyTable>, mut writer: MessageWriter<Res
 /// Observer 不门控。
 fn gate_real_entities(
     mut commands: Commands,
-    agents: Query<
-        (
-            Entity,
-            &ChunkAnchor,
-            Option<&WorkSites>,
-            Option<&PathCorridor>,
-            Option<&AwaitingChunks>,
-        ),
-        With<Real>,
-    >,
+    agents: Query<GateAgentData, With<Real>>,
     table: Res<ResidencyTable>,
     mut stats: ResMut<ResidencyStats>,
 ) {

@@ -11,7 +11,7 @@
 //! 视野差集使用排序后的实体列表计算，避免频繁创建和哈希 `HashSet`。
 //! 查询缓冲区和事件缓冲区会跨帧复用，以降低每帧堆分配压力。
 use bevy::{
-    ecs::query::QueryFilter,
+    ecs::{query::QueryFilter, system::SystemParam},
     platform::collections::{hash_map::Entry, HashMap, HashSet},
     prelude::*,
 };
@@ -201,6 +201,34 @@ impl<A: SpatialAnchor> Plugin for AoIPlugin<A> {
     }
 }
 
+/// 观察者自身状态变化（锚点增删改、[`AoiObserver`] 增删改）的过滤条件。
+type ChangedObserversFilter<A> = (
+    With<AoiObserver>,
+    Or<(
+        Added<A>,
+        Changed<A>,
+        Added<AoiObserver>,
+        Changed<AoiObserver>,
+    )>,
+);
+
+/// [`update_aoi`] 的全部系统参数。
+///
+/// 收进一个 `SystemParam` 而不是平铺 9 个参数；字段顺序与原参数顺序一致，
+/// 因此 bevy 的访问集（资源读写 / 查询冲突）不变。
+#[derive(SystemParam)]
+pub struct AoIUpdate<'w, 's, A: SpatialAnchor> {
+    manager: ResMut<'w, AoIManager>,
+    index: Res<'w, SpatialIndex>,
+    changes: Res<'w, SpatialChanges>,
+    observers: Query<'w, 's, (Entity, &'static A, &'static AoiObserver)>,
+    changed_observers: Query<'w, 's, Entity, ChangedObserversFilter<A>>,
+    invalid_observers: Query<'w, 's, Entity, (With<AoiObserver>, Without<A>)>,
+    removed_observers: RemovedComponents<'w, 's, AoiObserver>,
+    ev_entered: MessageWriter<'w, EntityEntered>,
+    ev_left: MessageWriter<'w, EntityLeft>,
+}
+
 /// 每帧增量更新 AOI。
 ///
 /// 输入：本帧空间变化（[`SpatialChanges`]）、空间索引与观察者组件查询。
@@ -211,29 +239,18 @@ impl<A: SpatialAnchor> Plugin for AoIPlugin<A> {
 /// 分三步执行：先收集需要重算的脏观察者，再对每个观察者查询当前可见集
 /// 并与旧可见集做差分，最后把新可见集与注册信息写回并批量发出事件。
 /// 不排除观察者自身。
-#[allow(clippy::too_many_arguments)]
-pub fn update_aoi<A: SpatialAnchor>(
-    mut manager: ResMut<AoIManager>,
-    index: Res<SpatialIndex>,
-    changes: Res<SpatialChanges>,
-    observers: Query<(Entity, &A, &AoiObserver)>,
-    changed_observers: Query<
-        Entity,
-        (
-            With<AoiObserver>,
-            Or<(
-                Added<A>,
-                Changed<A>,
-                Added<AoiObserver>,
-                Changed<AoiObserver>,
-            )>,
-        ),
-    >,
-    invalid_observers: Query<Entity, (With<AoiObserver>, Without<A>)>,
-    mut removed_observers: RemovedComponents<AoiObserver>,
-    mut ev_entered: MessageWriter<EntityEntered>,
-    mut ev_left: MessageWriter<EntityLeft>,
-) {
+pub fn update_aoi<A: SpatialAnchor>(aoi: AoIUpdate<A>) {
+    let AoIUpdate {
+        mut manager,
+        index,
+        changes,
+        observers,
+        changed_observers,
+        invalid_observers,
+        mut removed_observers,
+        mut ev_entered,
+        mut ev_left,
+    } = aoi;
     let m = &mut *manager;
 
     m.entered_buffer.clear();
@@ -343,7 +360,7 @@ fn refresh_observer(
     buffer.clear();
     index.query_radius_into(center, radius, buffer);
 
-    buffer.sort_unstable_by(|a, b| a.to_bits().cmp(&b.to_bits()));
+    buffer.sort_unstable_by_key(|a| a.to_bits());
     buffer.dedup();
 
     // 只有观察者自身空间状态变化时才重新注册区块。

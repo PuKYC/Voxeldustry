@@ -6,8 +6,8 @@ use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
 
 use super::dirty::{VoxelBox, VoxelDirtySet};
-use super::interner::VoxelInterner;
 use super::key::chunk_voxels_per_axis;
+use super::pool::VoxelInterner;
 use super::volume::VoxVolume;
 
 /// 一次体素编辑：体素全局坐标（相对该实体 VoxVolume，即 body_voxel）+ 新值。

@@ -151,18 +151,12 @@ impl BevyAppManager {
     /// `enable_demo = false` 时不挂 `game-core::dev::demo`（生产环境应为 `false`）。
     #[func]
     fn start_bevy_with_config(&mut self, fixed_hz: f64, runner_hz: f64, enable_demo: bool) {
-        self.start_backend(
+        self.start_backend(BevyBackendConfig {
             fixed_hz,
             runner_hz,
             enable_demo,
-            None,
-            None,
-            false,
-            false,
-            false,
-            TerrainMode::Eager,
-            None,
-        );
+            ..BevyBackendConfig::default()
+        });
     }
 
     /// 启动性能测试场景：生成 `entity_count` 个每 tick 移动的实体（取代 demo）。
@@ -172,18 +166,13 @@ impl BevyAppManager {
     #[func]
     fn start_bevy_perf_test(&mut self, fixed_hz: f64, runner_hz: f64, entity_count: i64) {
         let count = usize::try_from(entity_count).unwrap_or(1).max(1);
-        self.start_backend(
+        self.start_backend(BevyBackendConfig {
             fixed_hz,
             runner_hz,
-            false,
-            Some(count),
-            None,
-            false,
-            false,
-            false,
-            TerrainMode::Eager,
-            None,
-        );
+            enable_demo: false,
+            perf_entity_count: Some(count),
+            ..BevyBackendConfig::default()
+        });
     }
 
     /// 启动体素地形 demo：挂 `TerrainConfig::default()`（radius 2 / max_lod 1）。
@@ -199,18 +188,14 @@ impl BevyAppManager {
     /// `start_bevy_voxel_perf(fixed_hz, runner_hz, 0, 0)`（36 子块，≈ 5 s）。
     #[func]
     fn start_bevy_voxel_demo(&mut self, fixed_hz: f64, runner_hz: f64) {
-        self.start_backend(
+        self.start_backend(BevyBackendConfig {
             fixed_hz,
             runner_hz,
-            false,
-            None,
-            Some(TerrainConfig::default()),
-            false,
-            false,
-            true,
-            TerrainMode::Eager,
-            None,
-        );
+            enable_demo: false,
+            terrain: Some(TerrainConfig::default()),
+            voxel_viewer: true,
+            ..BevyBackendConfig::default()
+        });
     }
 
     /// 流式体素场景：地形只建空容器，玩家作为观察者按需加载区块，并启用世界存档。
@@ -229,18 +214,16 @@ impl BevyAppManager {
         // 空字符串 = 纯内存跑流式（不读档、不写盘）：空路径不是合法存档根，
         // 与其让 SavePaths 去拼相对当前工作目录的怪路径，不如明确当成 None。
         let save_dir = save_dir.to_string();
-        self.start_backend(
+        self.start_backend(BevyBackendConfig {
             fixed_hz,
             runner_hz,
-            false,
-            None,
-            Some(TerrainConfig::default()),
-            false,
-            false,
-            true,
-            TerrainMode::Streaming,
-            godot_save_dir(&save_dir),
-        );
+            enable_demo: false,
+            terrain: Some(TerrainConfig::default()),
+            voxel_viewer: true,
+            terrain_mode: TerrainMode::Streaming,
+            save_dir: godot_save_dir(&save_dir),
+            ..BevyBackendConfig::default()
+        });
     }
 
     /// 启动体素性能场景：给定半径 / max_lod 的地形 + 每 tick 移动的观察者。
@@ -263,18 +246,14 @@ impl BevyAppManager {
             max_lod,
             ..TerrainConfig::default()
         };
-        self.start_backend(
+        self.start_backend(BevyBackendConfig {
             fixed_hz,
             runner_hz,
-            false,
-            None,
-            Some(terrain),
-            true,
-            false,
-            false,
-            TerrainMode::Eager,
-            None,
-        );
+            enable_demo: false,
+            terrain: Some(terrain),
+            terrain_perf: true,
+            ..BevyBackendConfig::default()
+        });
     }
 
     /// 启动游戏内容测试场景：静态体素平台（可见 + 碰撞）与带碰撞的玩家。
@@ -282,18 +261,13 @@ impl BevyAppManager {
     /// Godot 侧对应 `test/gameplay_test.tscn`（`BevyClient.mode = gameplay_test`）。
     #[func]
     fn start_bevy_gameplay_test(&mut self, fixed_hz: f64, runner_hz: f64) {
-        self.start_backend(
+        self.start_backend(BevyBackendConfig {
             fixed_hz,
             runner_hz,
-            false,
-            None,
-            None,
-            false,
-            true,
-            false,
-            TerrainMode::Eager,
-            None,
-        );
+            enable_demo: false,
+            gameplay_test: true,
+            ..BevyBackendConfig::default()
+        });
     }
 
     #[func]
@@ -353,7 +327,12 @@ impl BevyAppManager {
     ///
     /// 注意：`u64` 不能跨 gdext FFI，所以这里一律用 `i64`。
     #[func]
-    #[allow(clippy::too_many_arguments)]
+    // 参数个数是 GDScript 侧契约（`BevyClient.submit_input_frame` 一次批量提交
+    // 全部输入）；收成结构体会改变 Godot 绑定签名，故保留为单函数入口。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Godot #[func] 绑定签名，参数个数是对 GDScript 的公开契约"
+    )]
     fn submit_input_frame(
         &mut self,
         held: PackedStringArray,
@@ -550,7 +529,8 @@ impl BevyAppManager {
     #[func]
     fn set_voxel_observer(&mut self, position: Vector3) {
         if let Ok(mut runtime) = self.voxel_lod.lock() {
-            runtime.observer = Some([position.x as f32, position.y as f32, position.z as f32]);
+            // godot 的 `real` 在本工程按单精度（f32）编译，无需再转一次。
+            runtime.observer = Some([position.x, position.y, position.z]);
         }
     }
 
@@ -703,21 +683,11 @@ fn godot_save_dir(dir: &str) -> Option<PathBuf> {
 
 impl BevyAppManager {
     /// 启动后台 Bevy 后端的公共实现（被各 `#[func]` 启动入口复用）。
-    fn start_backend(
-        &mut self,
-        fixed_hz: f64,
-        runner_hz: f64,
-        enable_demo: bool,
-        perf_entity_count: Option<usize>,
-        terrain: Option<TerrainConfig>,
-        terrain_perf: bool,
-        gameplay_test: bool,
-        voxel_viewer: bool,
-        // 末尾追加而不是插在中间：bool 换 bool 位置挪错也会编译通过，
-        // 放末尾能逼每个既有调用点显式写 TerrainMode::Eager / None。
-        terrain_mode: TerrainMode,
-        save_dir: Option<PathBuf>,
-    ) {
+    ///
+    /// 参数收进 [`BevyBackendConfig`]：字段名自解释，调用点不必按位置对齐 10 个
+    /// 参数（bool 换 bool 位置挪错也能编译通过）。`voxel_lod` 由本节点统一注入 ——
+    /// 各启动入口都不持有 LOD 运行时句柄。
+    fn start_backend(&mut self, mut config: BevyBackendConfig) {
         if self.worker.is_some() {
             self.shutdown_blocking();
         }
@@ -731,19 +701,7 @@ impl BevyAppManager {
         self.to_bevy = Some(ctrl_tx);
         self.from_bevy = Some(life_rx);
 
-        let config = BevyBackendConfig {
-            runner_hz,
-            fixed_hz,
-            enable_demo,
-            perf_entity_count,
-            terrain,
-            terrain_perf,
-            gameplay_test,
-            voxel_viewer,
-            voxel_lod: Some(self.voxel_lod.clone()),
-            terrain_mode,
-            save_dir,
-        };
+        config.voxel_lod = Some(self.voxel_lod.clone());
 
         // 跨边界句柄：Godot 主线程留一份，后台线程拿一份克隆（内部是 Arc 共享）。
         let bridge = ClientBridge::with_semantics(session, self.semantics.clone());

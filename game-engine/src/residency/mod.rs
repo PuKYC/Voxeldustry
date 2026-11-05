@@ -144,17 +144,11 @@ pub struct Real;
 ///
 /// `radius` 以体素块为单位，覆盖以锚点为中心的三维球（见 [`observer_chunks`]）。
 /// 同样需要 [`StableEntityId`]（原因见 [`Real`]）。
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[require(ChunkAnchor)]
 pub struct Observer {
     /// 显示半径，单位：体素块。
     pub radius: u8,
-}
-
-impl Default for Observer {
-    fn default() -> Self {
-        Self { radius: 0 }
-    }
 }
 
 /// 实体当前所在的体素块。由 `update_anchors` 从 [`LogicPos`] 推算，业务代码不写它。

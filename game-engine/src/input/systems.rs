@@ -154,6 +154,15 @@ pub fn derive_input_events<A: ActionMap>(
     }
 }
 
+/// 被控实体上输入管线相关组件的组合查询。
+type ControlledInputsData = (
+    Entity,
+    Option<&'static RawResolved>,
+    Option<&'static ResolvedInput>,
+    Option<&'static InputAvailability>,
+    Option<&'static InputBuffer>,
+);
+
 /// 确保被控实体带着输入管线需要的组件。
 ///
 /// 放在 `Update`（不是 `FixedPreUpdate`）：新生成的实体最迟下一帧就能拿到组件，
@@ -161,16 +170,7 @@ pub fn derive_input_events<A: ActionMap>(
 /// 避免「本帧插入、本帧查不到」的延迟陷阱。
 pub fn ensure_input_components(
     mut commands: Commands,
-    query: Query<
-        (
-            Entity,
-            Option<&RawResolved>,
-            Option<&ResolvedInput>,
-            Option<&InputAvailability>,
-            Option<&InputBuffer>,
-        ),
-        With<ControlledBy>,
-    >,
+    query: Query<ControlledInputsData, With<ControlledBy>>,
 ) {
     for (entity, raw, resolved, availability, buffer) in &query {
         if raw.is_none() {
@@ -191,7 +191,6 @@ pub fn ensure_input_components(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy::prelude::*;
 
     use crate::input::snapshot::PlayerInput;
     use crate::math::FixedPoint;

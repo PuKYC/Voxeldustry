@@ -1,6 +1,6 @@
 //! region 记录体（§3.1–§3.3）与组件外层框（§4.1）的编解码。
 
-use super::reader::{field_path, indexed_path, read_u64_at, u32_len, Reader, Writer};
+use super::reader::{field_path, indexed_path, u32_len, Reader, Writer};
 use super::{
     expect_flags_mask, expect_max, expect_nonzero, expect_reserved_zero,
     expect_strictly_increasing, expect_supported,

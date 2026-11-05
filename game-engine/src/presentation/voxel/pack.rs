@@ -132,7 +132,7 @@ pub fn pack_rect_batch(batch: &RectBatch) -> Vec<u64> {
 /// 项是设计要求，最后以 packed 位模式做全序 tie-break，保证出现重复
 /// 键时也逐位确定。
 pub fn pack_rect_stream(batches: &[RectBatch]) -> Vec<u64> {
-    let mut keyed: Vec<(i32, i32, i32, u8, u8, u8, u8, u8, u8, u64)> = Vec::new();
+    let mut keyed: Vec<RectStreamKey> = Vec::new();
     for batch in batches {
         let o = batch.origin;
         for rect in &batch.rects {
@@ -159,12 +159,17 @@ pub fn pack_rect_batch_with_ao(batch: &AoRectBatch) -> Vec<u64> {
     pack_rect_stream_with_ao(std::slice::from_ref(batch))
 }
 
+/// 矩形流的排序键：(origin.x, origin.y, origin.z, plane, dir, material, slice, row, col, packed)。
+///
+/// 前 9 项是设计要求的主键，最后以 packed 位模式做全序 tie-break（重复键也逐位确定）。
+type RectStreamKey = (i32, i32, i32, u8, u8, u8, u8, u8, u8, u64);
+
 /// 把多个 AoRectBatch 打包成确定的 8 B/矩形 u64 流（含 AO）。
 ///
 /// 排序主键与 pack_rect_stream 完全一致；主键相同而 AO 不同时用完整 47 bit 字做
 /// tie-break。AO 全 0 时输出与 pack_rect_stream 逐位相同（向后兼容）。
 pub fn pack_rect_stream_with_ao(batches: &[AoRectBatch]) -> Vec<u64> {
-    let mut keyed: Vec<(i32, i32, i32, u8, u8, u8, u8, u8, u8, u64)> = Vec::new();
+    let mut keyed: Vec<RectStreamKey> = Vec::new();
     for batch in batches {
         let o = batch.origin;
         for (i, rect) in batch.rects.iter().enumerate() {
@@ -193,14 +198,13 @@ mod tests {
     use crate::voxel::chunk_key;
     use voxel::store::Lod;
 
+    /// 构造矩形：把 (row, col) 与 (w, h) 各收成一组，避免 8 个位置参数。
     fn rect(
         plane: u8,
         dir: u8,
         slice: u8,
-        row: u8,
-        col: u8,
-        w: u8,
-        h: u8,
+        [row, col]: [u8; 2],
+        [w, h]: [u8; 2],
         material: u8,
     ) -> RectInstance {
         RectInstance {
@@ -215,7 +219,10 @@ mod tests {
         }
     }
 
-    fn fields(r: &RectInstance) -> (u8, u8, u8, u8, u8, u8, u8, u8) {
+    /// [`fields`] 解出的 8 个矩形字段。
+    type RectFields = (u8, u8, u8, u8, u8, u8, u8, u8);
+
+    fn fields(r: &RectInstance) -> RectFields {
         (r.plane, r.dir, r.slice, r.row, r.col, r.w, r.h, r.material)
     }
 
@@ -233,11 +240,11 @@ mod tests {
             batch(
                 1,
                 vec![
-                    rect(0, 0, 0, 0, 0, 4, 3, 7),
-                    rect(1, 1, 32, 31, 31, 1, 1, 200),
+                    rect(0, 0, 0, [0, 0], [4, 3], 7),
+                    rect(1, 1, 32, [31, 31], [1, 1], 200),
                 ],
             ),
-            batch(0, vec![rect(2, 0, 5, 2, 3, 32, 1, 9)]),
+            batch(0, vec![rect(2, 0, 5, [2, 3], [32, 1], 9)]),
         ];
 
         let a = pack_rect_stream(&batches);
@@ -246,16 +253,15 @@ mod tests {
         assert_eq!(a.len(), 3);
 
         // 每个矩形字段 roundtrip。
-        let full = rect(2, 1, 32, 31, 31, 32, 32, 255);
+        let full = rect(2, 1, 32, [31, 31], [32, 32], 255);
         assert_eq!(fields(&unpack_rect(pack_rect(&full))), fields(&full));
 
         // 多重集相等（排序顺序可能改变）。
-        let mut want: Vec<(u8, u8, u8, u8, u8, u8, u8, u8)> = batches
+        let mut want: Vec<RectFields> = batches
             .iter()
             .flat_map(|b| b.rects.iter().map(fields))
             .collect();
-        let mut got: Vec<(u8, u8, u8, u8, u8, u8, u8, u8)> =
-            a.iter().map(|w| fields(&unpack_rect(*w))).collect();
+        let mut got: Vec<RectFields> = a.iter().map(|w| fields(&unpack_rect(*w))).collect();
         want.sort_unstable();
         got.sort_unstable();
         assert_eq!(want, got);
@@ -265,9 +271,9 @@ mod tests {
     fn pack_matches_mesh_crate_layout() {
         // game-engine 的打包必须与 crates/voxel 的 RectInstance::to_bits 完全一致。
         let cases = [
-            rect(0, 0, 0, 0, 0, 1, 1, 0),
-            rect(1, 1, 17, 3, 5, 7, 9, 42),
-            rect(2, 0, 32, 31, 31, 32, 32, 255),
+            rect(0, 0, 0, [0, 0], [1, 1], 0),
+            rect(1, 1, 17, [3, 5], [7, 9], 42),
+            rect(2, 0, 32, [31, 31], [32, 32], 255),
         ];
         for r in cases.iter() {
             let word = pack_rect(r);
@@ -279,7 +285,7 @@ mod tests {
 
     #[test]
     fn pack_fits_39_bits() {
-        let full = rect(2, 1, 32, 31, 31, 32, 32, 255);
+        let full = rect(2, 1, 32, [31, 31], [32, 32], 255);
         let w = pack_rect(&full);
         assert_eq!(w >> RECT_BITS, 0, "top bits must be zero");
         assert_eq!(w & !((1u64 << RECT_BITS) - 1), 0);
@@ -289,13 +295,13 @@ mod tests {
         // 不同矩形不碰撞。
         assert_ne!(
             pack_rect(&full),
-            pack_rect(&rect(2, 1, 32, 31, 31, 32, 32, 254))
+            pack_rect(&rect(2, 1, 32, [31, 31], [32, 32], 254))
         );
     }
 
     #[test]
     fn ao_lives_in_reserved_bits_and_keeps_39_bits_intact() {
-        let r = rect(2, 1, 32, 31, 31, 32, 32, 255);
+        let r = rect(2, 1, 32, [31, 31], [32, 32], 255);
         let base = pack_rect(&r);
         assert_eq!(base >> RECT_BITS, 0, "39 bit 描述符必须不碰高位");
         for ao in [[0u8; 4], [1, 2, 3, 0], [3, 3, 3, 3], [0, 0, 0, 1]] {
@@ -325,7 +331,10 @@ mod tests {
         let a = AoRectBatch {
             origin: chunk_key(0, 0, 0),
             lod: Lod::new(0),
-            rects: vec![rect(0, 0, 1, 2, 3, 4, 5, 6), rect(0, 0, 1, 2, 3, 4, 5, 6)],
+            rects: vec![
+                rect(0, 0, 1, [2, 3], [4, 5], 6),
+                rect(0, 0, 1, [2, 3], [4, 5], 6),
+            ],
             ao: vec![[3, 3, 3, 3], [0, 1, 2, 3]],
         };
         let words = pack_rect_stream_with_ao(std::slice::from_ref(&a));

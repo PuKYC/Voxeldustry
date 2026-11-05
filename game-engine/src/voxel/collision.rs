@@ -51,8 +51,8 @@ use bevy::prelude::*;
 
 use super::change::VoxelSet;
 use super::hash::chunk_content_hash;
-use super::interner::VoxelInterner;
 use super::key::{chunk_voxels_per_axis, neighbors6};
+use super::pool::VoxelInterner;
 use super::volume::VoxVolume;
 use crate::math::FixedPoint;
 
@@ -581,6 +581,20 @@ fn apply_to_entities(
     }
 }
 
+/// [`sync_voxel_collision_chunks`] 的查询：需要重建碰撞的 root 实体。
+type CollisionRootData = (
+    Entity,
+    &'static VoxVolume,
+    &'static GlobalTransform,
+    Option<&'static RigidBody>,
+);
+
+/// 只有新挂碰撞体、新增或编辑过 VoxVolume 的 root 才算脏。
+type CollisionRootFilter = (
+    With<VoxelCollider>,
+    Or<(Added<VoxVolume>, Changed<VoxVolume>, Added<VoxelCollider>)>,
+);
+
 /// 按 per-chunk 结构哈希把 VoxVolume 同步为一组 chunk 碰撞实体（在 VoxelSet::Collision）。
 ///
 /// 过滤 Added/Changed：新挂 VoxelCollider、新增或编辑 VoxVolume 才进入；
@@ -594,13 +608,7 @@ fn apply_to_entities(
 pub fn sync_voxel_collision_chunks(
     mut commands: Commands,
     interner: Res<VoxelInterner>,
-    roots: Query<
-        (Entity, &VoxVolume, &GlobalTransform, Option<&RigidBody>),
-        (
-            With<VoxelCollider>,
-            Or<(Added<VoxVolume>, Changed<VoxVolume>, Added<VoxelCollider>)>,
-        ),
-    >,
+    roots: Query<CollisionRootData, CollisionRootFilter>,
     mut chunks: ChunkQuery,
 ) {
     let interner = interner.inner();

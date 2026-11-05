@@ -31,10 +31,13 @@ mod change;
 mod collision;
 mod dirty;
 mod hash;
-mod interner;
 mod key;
 mod lazy;
 mod plugin;
+/// interner 的 Bevy Resource 包装。名字刻意避开 `interner` / `memory`：
+/// `pub use ::voxel::store::*` 已把 store 下同名模块重导出到本模块，
+/// 同名私有的 `mod` 会把它遮蔽掉（private item shadows public glob re-export）。
+mod pool;
 mod volume;
 
 pub use aabb::{chunk_aabb, VoxelAabb};
@@ -57,14 +60,14 @@ pub use dirty::{DirtyChunk, VoxelBox, VoxelDirtySet};
 pub use hash::{
     chunk_content_hash, content_hash, count_body_nodes, dec_ref_recursive, release_body,
 };
-pub use interner::{
-    update_voxel_memory_metric, VoxelInterner, VoxelMemoryMetric, DEFAULT_INTERNER_BUDGET_BYTES,
-};
 pub use key::{
     chunk_key, chunk_voxels_per_axis, floor_div, lod_block_origin, lod_block_span, neighbors6,
 };
 pub use lazy::{ChunkGenerator, LazyChunks};
 pub use plugin::VoxelPlugin;
+pub use pool::{
+    update_voxel_memory_metric, VoxelInterner, VoxelMemoryMetric, DEFAULT_INTERNER_BUDGET_BYTES,
+};
 pub use volume::{body_voxel, voxel_scale, world_meters, world_meters_f32, Attachment, VoxVolume};
 
 #[cfg(test)]

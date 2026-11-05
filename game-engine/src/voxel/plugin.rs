@@ -9,7 +9,7 @@ use bevy::prelude::*;
 
 use super::change::{apply_voxel_changes, VoxelChangeBuffer, VoxelSet};
 use super::dirty::VoxelDirtySet;
-use super::interner::{update_voxel_memory_metric, VoxelInterner, VoxelMemoryMetric};
+use super::pool::{update_voxel_memory_metric, VoxelInterner, VoxelMemoryMetric};
 
 /// 注册体素世界层资源、指标与变更系统。
 ///
@@ -27,7 +27,7 @@ impl VoxelPlugin {
 
 impl Default for VoxelPlugin {
     fn default() -> Self {
-        Self::new(super::interner::DEFAULT_INTERNER_BUDGET_BYTES)
+        Self::new(super::pool::DEFAULT_INTERNER_BUDGET_BYTES)
     }
 }
 
