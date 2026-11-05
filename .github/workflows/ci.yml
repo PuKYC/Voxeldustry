@@ -27,7 +27,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Lint：只跑一次（rustfmt / clippy 与平台无关），非阻塞。
+  # Lint：只跑一次（rustfmt / clippy 与平台无关），阻塞门禁。
   # ---------------------------------------------------------------------------
   lint:
     name: Lint
@@ -40,14 +40,14 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
-          # v1 默认 RUSTFLAGS=-D warnings；本仓库尚未清完 warning，故清空。
+          # 仓库 clippy 已清零（2026-11-05）；warning 由下面 clippy 命令的
+          # `-- -D warnings` 显式拒绝，这里清空以避免重复设置 RUSTFLAGS。
           rustflags: ""
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Lint (non-blocking)
-        continue-on-error: true
+      - name: Lint
         run: |
           cargo fmt --all --check
           cargo clippy --workspace --all-targets -- -D warnings
@@ -80,8 +80,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # 与本地口径一致：godot-client-ext 依赖 Godot 运行时，测试环境中
+      # 无法加载 gdext，故排除；该 crate 由下面 gdext/godot job 构建并做冒烟。
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude godot-client-ext
 
   # ---------------------------------------------------------------------------
   # GDExtension：平台矩阵，每个平台并行构建 native 库。
