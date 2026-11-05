@@ -115,12 +115,16 @@ pub fn facing_system(mut query: Query<(&ResolvedInput, &mut Facing)>) {
     }
 }
 
+/// 相机跟随目标：本地玩家（排除相机实体）的位姿。
+type CameraFollowerQuery<'w, 's> =
+    Query<'w, 's, (&'static Transform, &'static Facing), (With<LocalPlayer>, Without<CameraFlag>)>;
+
 /// 系统：相机（`CameraFlag`）读玩家（`LocalPlayer`）的朝向与位置，设置并同步相机。
 ///
 /// 值没变就不写，避免每 tick 都触发 `Changed<CameraView>` / `Changed<Transform>`
 /// 导致无意义的重发。
 pub fn camera_system(
-    players: Query<(&Transform, &Facing), (With<LocalPlayer>, Without<CameraFlag>)>,
+    players: CameraFollowerQuery,
     mut cameras: Query<(&mut Transform, &mut CameraView), With<CameraFlag>>,
 ) {
     // 单人路径：只有一个本地玩家。多个时取第一个（确定性由 Query 迭代序保证不了，

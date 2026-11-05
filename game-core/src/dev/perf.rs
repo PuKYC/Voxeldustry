@@ -507,7 +507,7 @@ mod tests {
             let value = (step * 7) as f32;
             let wrapped = wrap_delta(value, span);
             assert!(
-                wrapped >= -20.0 && wrapped < 20.0,
+                (-20.0..20.0).contains(&wrapped),
                 "wrap 结果越界: {wrapped:?}"
             );
         }

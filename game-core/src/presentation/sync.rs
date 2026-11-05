@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use game_engine::presentation::interp::RenderClockState;
 use game_engine::presentation::pipeline::{
@@ -71,6 +72,33 @@ pub fn collect_component<T: ToPresentation>(
     }
 }
 
+/// 表现层同步的写侧资源包：待发布命令与已下发基线。
+///
+/// collector 与 finalize 都要写这两份资源；折成一个 [SystemParam] 后，
+/// 两个系统的参数个数都不再逼近 clippy 阈值。
+#[derive(SystemParam)]
+pub struct SyncSinks<'w> {
+    /// 待发布命令缓冲。
+    pending: ResMut<'w, CorePendingPresentation>,
+    /// 已下发基线（实体映射 + 组件集合）。
+    baseline: ResMut<'w, CoreSyncBaseline>,
+}
+
+/// 扩展袋收集的读取侧：可见性、schema、袋 / 稳定 ID 查询与移除事件。
+#[derive(SystemParam)]
+pub struct ExtensionBagSources<'w, 's> {
+    /// 本帧可见实体与观察者感知掩码。
+    visibility: Res<'w, PresentationVisibility>,
+    /// 扩展字段 schema（Required 位由它自带）。
+    schema: Res<'w, ExtensionSchema>,
+    /// 带扩展袋的实体。
+    all: Query<'w, 's, (&'static StableEntityId, &'static ExtensionBag)>,
+    /// 稳定 ID 反查。
+    ids: Query<'w, 's, &'static StableEntityId>,
+    /// 本帧被移除的扩展袋组件。
+    removed_bags: RemovedComponents<'w, 's, ExtensionBag>,
+}
+
 /// 扩展袋收集系统。
 ///
 /// **不依赖 `Changed`**：Bevy 里只要可变借用就会标记 Changed（同值写也会被误判），
@@ -78,43 +106,37 @@ pub fn collect_component<T: ToPresentation>(
 /// 一次性覆盖「无变化」「同值写入」「只改观察者感知」三类需求。
 ///
 /// 空袋 / 投影为空：主动发 `Remove` 并清基线（finalize 对非门控 kind 不发 Remove）。
-#[allow(clippy::too_many_arguments)]
 pub fn collect_extension_bag(
-    visibility: Res<PresentationVisibility>,
-    schema: Res<ExtensionSchema>,
     mut last_sent: Local<HashMap<u64, ExtensionPayload>>,
-    all: Query<(&StableEntityId, &ExtensionBag)>,
-    ids: Query<&StableEntityId>,
-    mut removed_bags: RemovedComponents<ExtensionBag>,
-    mut pending: ResMut<CorePendingPresentation>,
-    mut baseline: ResMut<CoreSyncBaseline>,
+    mut src: ExtensionBagSources,
+    mut out: SyncSinks,
 ) {
     // 1) 袋组件被移除：实体仍在且未在同帧重新挂回 -> Remove + 清基线。
-    for entity in removed_bags.read() {
-        if all.get(entity).is_ok() {
+    for entity in src.removed_bags.read() {
+        if src.all.get(entity).is_ok() {
             continue; // 同帧先删后加，视为仍在
         }
-        let Ok(id) = ids.get(entity) else {
+        let Ok(id) = src.ids.get(entity) else {
             continue; // 实体已销毁，交给 finalize 的 Despawn 路径
         };
         last_sent.remove(&id.0);
-        remove_extension_baseline(&mut baseline, &mut pending, id.0);
+        remove_extension_baseline(&mut out.baseline, &mut out.pending, id.0);
     }
 
     // 2) 可见实体：投影 -> 哈希去抖；空投影 -> Remove。
-    for &entity in visibility.entities.iter() {
-        let Ok((id, bag)) = all.get(entity) else {
+    for &entity in src.visibility.entities.iter() {
+        let Ok((id, bag)) = src.all.get(entity) else {
             continue;
         };
-        let in_baseline = baseline.has_component(*id, PayloadKind::Extension);
+        let in_baseline = out.baseline.has_component(*id, PayloadKind::Extension);
         // Required 字段的可见性由 schema 自带 required_bits 决定（观察者掩码单参），
         // 不再读取实体级 CoreRequiredPerception，杜绝「缺载体 -> Fail-Open」。
-        let payload = project(bag, visibility.local_perception, &schema);
+        let payload = project(bag, src.visibility.local_perception, &src.schema);
 
         if payload.fields().is_empty() {
             if in_baseline {
                 last_sent.remove(&id.0);
-                remove_extension_baseline(&mut baseline, &mut pending, id.0);
+                remove_extension_baseline(&mut out.baseline, &mut out.pending, id.0);
             }
             continue;
         }
@@ -122,8 +144,10 @@ pub fn collect_extension_bag(
         // 基线缺失 = 首次进入（或 detach 后重进）-> 必须 Add，不能因哈希相同而跳过。
         if !in_baseline {
             last_sent.insert(id.0, payload.clone());
-            baseline.components.insert((id.0, PayloadKind::Extension));
-            pending.commands.push(PresentationCommand::Add {
+            out.baseline
+                .components
+                .insert((id.0, PayloadKind::Extension));
+            out.pending.commands.push(PresentationCommand::Add {
                 id: *id,
                 payload: SyncPayload::Extension(payload),
             });
@@ -134,7 +158,7 @@ pub fn collect_extension_bag(
             continue; // 投影未变（含同值写入 / 无变化）
         }
         last_sent.insert(id.0, payload.clone());
-        pending.commands.push(PresentationCommand::Update {
+        out.pending.commands.push(PresentationCommand::Update {
             id: *id,
             payload: SyncPayload::Extension(payload),
         });
@@ -143,8 +167,9 @@ pub fn collect_extension_bag(
     // 3) 反查基线：有 Extension 基线但当前查不到袋 -> 清理。
     //    防 RemovedComponents 事件因跳帧丢失导致 Godot 端永久残留。
     {
-        let live: std::collections::HashSet<u64> = all.iter().map(|(id, _)| id.0).collect();
-        let stale: Vec<u64> = baseline
+        let live: std::collections::HashSet<u64> = src.all.iter().map(|(id, _)| id.0).collect();
+        let stale: Vec<u64> = out
+            .baseline
             .components
             .iter()
             .filter(|(sid, kind)| *kind == PayloadKind::Extension && !live.contains(sid))
@@ -152,12 +177,15 @@ pub fn collect_extension_bag(
             .collect();
         for sid in stale {
             last_sent.remove(&sid);
-            remove_extension_baseline(&mut baseline, &mut pending, sid);
+            remove_extension_baseline(&mut out.baseline, &mut out.pending, sid);
         }
     }
 
     // 清理已不在基线的缓存（despawn / detach 后），防无限增长。
-    last_sent.retain(|id, _| baseline.has_component(StableEntityId(*id), PayloadKind::Extension));
+    last_sent.retain(|id, _| {
+        out.baseline
+            .has_component(StableEntityId(*id), PayloadKind::Extension)
+    });
 }
 
 /// 清除扩展袋基线并下发 Remove（幂等：基线没有就不发）。
@@ -212,54 +240,68 @@ pub fn reconcile_extension_baseline(
     }
 }
 
+/// 收尾系统的全部参数：把 10 个参数折成一个 [SystemParam]。
+#[derive(SystemParam)]
+pub struct FinalizeParams<'w, 's> {
+    /// 待发布命令与已下发基线。
+    sinks: SyncSinks<'w>,
+    /// 本帧可见实体与观察者感知掩码。
+    visibility: Res<'w, PresentationVisibility>,
+    /// 稳定 ID 查询。
+    ids: Query<'w, 's, &'static StableEntityId>,
+    /// 实体级必需感知掩码（隐私门控）。
+    required: Query<'w, 's, &'static CoreRequiredPerception>,
+    /// 单槽发布通道。
+    slot: Res<'w, PresentationSlot>,
+    /// 发布运行时状态（tick / seq / 计数）。
+    runtime: ResMut<'w, PresentationRuntime>,
+    /// 当前逻辑 tick。
+    tick: Res<'w, crate::input::SimulationTick>,
+    /// 渲染时钟。
+    clock: Res<'w, RenderClockState>,
+    /// 定步长时钟（发布 timestep）。
+    time: Res<'w, Time<Fixed>>,
+}
+
 /// 收尾系统：Attach / 可见性降级 Remove / Detach / Despawn -> 整理 -> 发布。
-#[allow(clippy::too_many_arguments)]
-pub fn finalize_presentation(
-    mut pending: ResMut<CorePendingPresentation>,
-    mut baseline: ResMut<CoreSyncBaseline>,
-    visibility: Res<PresentationVisibility>,
-    ids: Query<&StableEntityId>,
-    required: Query<&CoreRequiredPerception>,
-    slot: Res<PresentationSlot>,
-    mut runtime: ResMut<PresentationRuntime>,
-    tick: Res<crate::input::SimulationTick>,
-    clock: Res<RenderClockState>,
-    time: Res<Time<Fixed>>,
-) {
-    let mut commands = std::mem::take(&mut pending.commands);
+pub fn finalize_presentation(mut p: FinalizeParams) {
+    let mut commands = std::mem::take(&mut p.sinks.pending.commands);
 
     // 1) Attach：本帧可见、基线还没有 -> 首次进入表现层。
-    for &entity in visibility.entities.iter() {
-        let Ok(id) = ids.get(entity) else {
+    for &entity in p.visibility.entities.iter() {
+        let Ok(id) = p.ids.get(entity) else {
             continue;
         };
-        if baseline.entities.contains_key(&id.0) {
+        if p.sinks.baseline.entities.contains_key(&id.0) {
             continue;
         }
         commands.push(PresentationCommand::Attach { id: *id });
-        baseline.entities.insert(id.0, entity);
+        p.sinks.baseline.entities.insert(id.0, entity);
     }
 
     // 2) 可见性降级 -> Remove（防隐私残留）。
     let mut demoted: Vec<(u64, PayloadKind)> = Vec::new();
-    for &(stable, kind) in baseline.components.iter() {
+    for &(stable, kind) in p.sinks.baseline.components.iter() {
         if !kind.is_perception_gated() {
             continue;
         }
-        if !visibility.ids.contains(&stable) {
+        if !p.visibility.ids.contains(&stable) {
             continue;
         }
-        let Some(&entity) = baseline.entities.get(&stable) else {
+        let Some(&entity) = p.sinks.baseline.entities.get(&stable) else {
             continue;
         };
-        if !memory_path_component_visible(visibility.local_perception, required.get(entity).ok()) {
+        if !memory_path_component_visible(
+            p.visibility.local_perception,
+            p.required.get(entity).ok(),
+        ) {
             demoted.push((stable, kind));
         }
     }
     // 确定性：HashSet 迭代顺序随机，发命令前显式按 (id, kind code) 排序。
     demoted.sort_unstable_by_key(|(stable, kind)| (*stable, kind.code()));
     for (stable, kind) in demoted {
-        baseline.components.remove(&(stable, kind));
+        p.sinks.baseline.components.remove(&(stable, kind));
         commands.push(PresentationCommand::Remove {
             id: StableEntityId(stable),
             kind,
@@ -270,18 +312,20 @@ pub fn finalize_presentation(
     //
     // 确定性：HashMap 迭代随机，必须先按稳定 ID 排序、再按序 push 命令；
     // 否则 compact_commands 的稳定排序会保留随机序，GPF1 字节不可复现。
-    let mut gone: Vec<u64> = baseline
+    let mut gone: Vec<u64> = p
+        .sinks
+        .baseline
         .entities
         .iter()
-        .filter(|(stable, _)| !visibility.ids.contains(stable))
+        .filter(|(stable, _)| !p.visibility.ids.contains(stable))
         .map(|(stable, _)| *stable)
         .collect();
     gone.sort_unstable();
     for &stable in &gone {
-        let Some(&entity) = baseline.entities.get(&stable) else {
+        let Some(&entity) = p.sinks.baseline.entities.get(&stable) else {
             continue;
         };
-        if ids.contains(entity) {
+        if p.ids.contains(entity) {
             commands.push(PresentationCommand::Detach {
                 id: StableEntityId(stable),
             });
@@ -292,8 +336,11 @@ pub fn finalize_presentation(
         }
     }
     for stable in gone {
-        baseline.entities.remove(&stable);
-        baseline.components.retain(|(sid, _)| *sid != stable);
+        p.sinks.baseline.entities.remove(&stable);
+        p.sinks
+            .baseline
+            .components
+            .retain(|(sid, _)| *sid != stable);
     }
 
     // 4) 整理。
@@ -305,24 +352,24 @@ pub fn finalize_presentation(
     }
 
     // 6) 发布。
-    runtime.tick = tick.0;
-    runtime.seq = runtime.seq.wrapping_add(1);
-    runtime.last_commands = commands.len();
-    runtime.render_clock_ms = clock.tick_clock_ms.unwrap_or(0);
+    p.runtime.tick = p.tick.0;
+    p.runtime.seq = p.runtime.seq.wrapping_add(1);
+    p.runtime.last_commands = commands.len();
+    p.runtime.render_clock_ms = p.clock.tick_clock_ms.unwrap_or(0);
 
     let frame = PresentationFrame {
-        session: runtime.session,
-        seq: runtime.seq,
-        tick: runtime.tick,
-        render_clock_ms: runtime.render_clock_ms,
-        timestep_ms: time.timestep().as_secs_f32() * 1000.0,
+        session: p.runtime.session,
+        seq: p.runtime.seq,
+        tick: p.runtime.tick,
+        render_clock_ms: p.runtime.render_clock_ms,
+        timestep_ms: p.time.timestep().as_secs_f32() * 1000.0,
         commands: commands.into(),
     };
 
-    if slot.publish(Arc::new(frame)) {
-        runtime.frames_overwritten = runtime.frames_overwritten.wrapping_add(1);
+    if p.slot.publish(Arc::new(frame)) {
+        p.runtime.frames_overwritten = p.runtime.frames_overwritten.wrapping_add(1);
     }
-    runtime.frames_published = runtime.frames_published.wrapping_add(1);
+    p.runtime.frames_published = p.runtime.frames_published.wrapping_add(1);
 }
 
 #[cfg(test)]

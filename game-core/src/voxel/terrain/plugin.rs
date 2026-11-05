@@ -54,7 +54,7 @@ impl TerrainConfig {
         Self {
             radius_blocks: 0,
             max_lod: 0,
-            seed: 0xC0FF_EE,
+            seed: 0x00C0_FFEE,
             biome: DEFAULT_BIOME,
         }
     }
@@ -65,7 +65,7 @@ impl Default for TerrainConfig {
         Self {
             radius_blocks: 2,
             max_lod: 1,
-            seed: 0xC0FF_EE,
+            seed: 0x00C0_FFEE,
             biome: DEFAULT_BIOME,
         }
     }

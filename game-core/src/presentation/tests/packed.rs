@@ -666,7 +666,7 @@ fn godot_payload_schema_matches_rust_pool_layout() {
                 assert_eq!(i32_fixed, 0, "{name}: EXT_BAG 不应伴随定长 i32 token");
             } else if has_varlen {
                 assert!(
-                    i32_pool.len() >= i32_fixed + 1,
+                    i32_pool.len() > i32_fixed,
                     "{name}: 变长 i32 列表（TAGS/WORDS）至少需要一个 count 槽"
                 );
             } else {

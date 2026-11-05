@@ -281,14 +281,14 @@ fn extract_block_raw_reports_cross_lod_skirt_mask() {
     // 只放被测块自己的实心 base 子块；缺失邻块按空气处理，不影响掩码。
     let mut interner = VoxelInterner::new(4 * 1024 * 1024);
     let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
-    let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH as u8));
+    let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
     tree.fill(interner.inner_mut(), 1);
     volume.insert_chunk(block.origin, tree);
 
     let mut wrapped = WrappedBlockCache::default();
     let mut generated = TerrainGeneratedBlocks::default();
     let mut neighbors = TerrainNeighborBlocks::default();
-    let generator = WorldGenerator::from_seed(0xC0FF_EE);
+    let generator = WorldGenerator::from_seed(0x00C0_FFEE);
     let mut caches = TerrainCaches {
         interner: &mut interner,
         wrapped: &mut wrapped,
@@ -306,6 +306,9 @@ fn extract_block_raw_reports_cross_lod_skirt_mask() {
     );
 }
 
+/// 确定性快照：组键 + 组内逐块 (原点, halo, mask)，均按键升序。
+type GroupSnapshot = Vec<(GroupKey, Vec<(ChunkKey, Vec<u8>, u8)>)>;
+
 #[test]
 fn build_terrain_is_deterministic() {
     let mut first = terrain_app(0, 0);
@@ -314,7 +317,7 @@ fn build_terrain_is_deterministic() {
     second.update();
 
     // 确定性快照：组键 + 组内逐块 (原点, halo, mask)，均按键升序。
-    let group_snapshot = |app: &App| -> Vec<(GroupKey, Vec<(ChunkKey, Vec<u8>, u8)>)> {
+    let group_snapshot = |app: &App| -> GroupSnapshot {
         let groups = app.world().resource::<TerrainGroups>();
         let mut out = Vec::new();
         for (key, entity) in groups.iter() {
@@ -440,7 +443,7 @@ fn release_terrain_body_clears_all_caches_at_nonzero_lod() {
     assert!(!generated.own.is_empty() || !generated.neighbors.is_empty());
 
     let entity = volume_entity(app.world_mut());
-    let generator = WorldGenerator::from_seed(0xC0FF_EE);
+    let generator = WorldGenerator::from_seed(0x00C0_FFEE);
     let key = chunk_key(0, 0, 0);
     let world = app.world_mut();
     world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
@@ -546,7 +549,7 @@ fn spawn_synthetic_volume(app: &mut App, radius: i32, max_lod: u8) {
     let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
     world.resource_scope::<VoxelInterner, _>(|world, mut interner| {
         for key in chunk_keys_to_generate(radius, max_lod) {
-            let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH as u8));
+            let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
             tree.fill(interner.inner_mut(), 1);
             volume.insert_chunk(key, tree);
         }
@@ -854,7 +857,7 @@ fn neighbour_lod_change_rebuilds_group_without_membership_change() {
 #[test]
 fn invalidate_chunk_caches_clears_all_four_instances_and_lod0_reflects_edit() {
     let mut interner = VoxelInterner::new(4 * 1024 * 1024);
-    let generator = WorldGenerator::from_seed(0xC0FF_EE);
+    let generator = WorldGenerator::from_seed(0x00C0_FFEE);
     let key = chunk_key(0, 0, 0);
     let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
     volume.insert_chunk(key, generator.generate_chunk(interner.inner_mut(), key));
@@ -961,7 +964,7 @@ fn invalidate_chunk_caches_clears_all_four_instances_and_lod0_reflects_edit() {
 #[test]
 fn unload_chunk_returns_body_and_caches_to_baseline() {
     let mut interner = VoxelInterner::new(4 * 1024 * 1024);
-    let generator = WorldGenerator::from_seed(0xC0FF_EE);
+    let generator = WorldGenerator::from_seed(0x00C0_FFEE);
     let keys = [chunk_key(0, 0, 0), chunk_key(1, 0, 0)];
     let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
     let baseline = interner.inner().alive_nodes();
@@ -1087,7 +1090,7 @@ fn unload_chunk_cycle_does_not_grow_nodes() {
 #[test]
 fn unload_reload_of_edited_chunk_keeps_content_hash() {
     let mut interner = VoxelInterner::new(4 * 1024 * 1024);
-    let generator = WorldGenerator::from_seed(0xC0FF_EE);
+    let generator = WorldGenerator::from_seed(0x00C0_FFEE);
     let key = chunk_key(0, 0, 0);
     let mut volume = VoxVolume::new(DEFAULT_VOXEL_SIZE);
     let mut wrapped = WrappedBlockCache::default();

@@ -392,6 +392,46 @@ pub struct WorldInputs<'w> {
     pub registry: Option<Res<'w, WorldFeatureRegistry>>,
 }
 
+/// 流式系统共用的写侧资源包。
+///
+/// [intake_residency_changes] / [advance_proposals] / [settle_chunks] 需要的写侧
+/// 资源高度重叠，逐个当参数会撞上 Bevy 16 参数上限；折成一个 [SystemParam]
+/// 后每个系统只剩输入 + 这个包，[demote] / [stage_chunk] / [finish_chunk]
+/// 也统一收 &mut StreamWriters，不再各自铺一长串 &mut 参数。
+#[derive(SystemParam)]
+pub struct StreamWriters<'w, 's> {
+    /// 命令缓冲（spawn/despawn 分组实体）。
+    pub commands: Commands<'w, 's>,
+    /// 生成调度表。
+    pub gen: ResMut<'w, GenTable>,
+    /// 排队中的目标档位。
+    pub wanted: ResMut<'w, StreamWanted>,
+    /// 等待落盘确认的卸载登记。
+    pub pending: ResMut<'w, PendingUnloads>,
+    /// 稳定实体索引（headless 下缺失）。
+    pub index: Option<ResMut<'w, StableEntityIndex>>,
+    /// 稳定 ID 分配器（headless 下缺失）。
+    pub allocator: Option<ResMut<'w, StableIdAllocator>>,
+    /// 各 body 的体素容器。
+    pub volumes: Query<'w, 's, &'static mut VoxVolume>,
+    /// 体素节点池。
+    pub interner: ResMut<'w, VoxelInterner>,
+    /// 表现层包裹块缓存。
+    pub wrapped: ResMut<'w, WrappedBlockCache>,
+    /// 生成过的块缓存。
+    pub generated: ResMut<'w, TerrainGeneratedBlocks>,
+    /// 邻块缓存。
+    pub neighbors: ResMut<'w, TerrainNeighborBlocks>,
+    /// 分组实体索引。
+    pub groups: ResMut<'w, RenderGroups>,
+    /// 暂存区与提案缓存。
+    pub staging: Staging<'w>,
+    /// 统计计数。
+    pub stats: ResMut<'w, StreamStats>,
+    /// 到达消息出口。
+    pub reached: MessageWriter<'w, ChunkReached>,
+}
+
 /// 系统 0：把体素节点池的已用 / 容量写进 [MemoryPressure]。
 ///
 /// 覆盖写（不是累加）：每 tick 都是一份完整快照。驻留层的 `Resolve` 在
@@ -402,24 +442,9 @@ pub fn report_memory_pressure(interner: Res<VoxelInterner>, mut pressure: ResMut
 }
 
 /// 系统 1：把 [ResidencyChanged] 折成队列状态、渲染分组与真正的卸载。
-#[allow(clippy::too_many_arguments)]
 pub fn intake_residency_changes(
-    mut commands: Commands,
     mut changes: MessageReader<ResidencyChanged>,
-    mut gen: ResMut<GenTable>,
-    mut wanted: ResMut<StreamWanted>,
-    mut pending: ResMut<PendingUnloads>,
-    mut reached: MessageWriter<ChunkReached>,
-    mut index: Option<ResMut<StableEntityIndex>>,
-    mut allocator: Option<ResMut<StableIdAllocator>>,
-    mut volumes: Query<&mut VoxVolume>,
-    mut interner: ResMut<VoxelInterner>,
-    mut wrapped: ResMut<WrappedBlockCache>,
-    mut generated: ResMut<TerrainGeneratedBlocks>,
-    mut neighbors: ResMut<TerrainNeighborBlocks>,
-    mut groups: ResMut<RenderGroups>,
-    mut staging: Staging,
-    mut stats: ResMut<StreamStats>,
+    mut io: StreamWriters,
 ) {
     for change in changes.read() {
         let ResidencyChanged {
@@ -433,25 +458,7 @@ pub fn intake_residency_changes(
         // 降档：`to == None` 是真卸载；`Render -> Data` 只是渲染档清理
         //（体素内容保留）。两者都交给 demote，由它按 from/to 分流。
         if to == Residency::None || (from == Residency::Render && to != Residency::Render) {
-            demote(
-                pair,
-                from,
-                to,
-                &mut commands,
-                index.as_deref_mut(),
-                &mut gen,
-                &mut wanted,
-                &mut pending,
-                &mut volumes,
-                &mut interner,
-                &mut wrapped,
-                &mut generated,
-                &mut neighbors,
-                &mut groups,
-                &mut staging.staged,
-                &mut staging.cache,
-                &mut stats,
-            );
+            demote(&mut io, pair, from, to);
             continue;
         }
 
@@ -459,59 +466,47 @@ pub fn intake_residency_changes(
         // 直接撤销登记即可——绝不能释放，也不能再发 ChunkWillUnload。
         // 这一步必须早于下面的 Render 幂等检查，否则一次「Render -> None 未确认
         // 就重新升 Render」的请求会被当成重复 Render 丢掉。
-        let revived = pending.0.remove(&pair).is_some();
+        let revived = io.pending.0.remove(&pair).is_some();
 
         // 幂等：该块已经到过 Render（恒有分组实体）时，重复的 Render 请求
         // 不再入队、不再发第二条 Render 消息。
-        if to == Residency::Render && groups.0.contains_key(&pair) {
+        if to == Residency::Render && io.groups.0.contains_key(&pair) {
             continue;
         }
 
         // 升档：入队（已存在的 Err 不是错误——同一块重复请求是常态），
         // 再用「Wanted 是否新插入」判定这是不是一次新请求，避免重复发
         // ChunkReached。
-        if let Err(error) = gen.enqueue(pair) {
+        if let Err(error) = io.gen.enqueue(pair) {
             debug!("stream: enqueue({body:?}, {key:?}) 被拒绝：{error:?}");
         }
-        let is_new = wanted.0.insert(pair, to).is_none();
+        let is_new = io.wanted.0.insert(pair, to).is_none();
         if !is_new {
             continue;
         }
 
-        let Some(entity) = body_entity(index.as_deref(), body) else {
+        let Some(entity) = body_entity(io.index.as_deref(), body) else {
             continue;
         };
-        let Ok(volume) = volumes.get(entity) else {
+        let Ok(volume) = io.volumes.get(entity) else {
             continue;
         };
         // 快路径条件：树在容器里，且生成态是 Undetermined（地形 Startup /
         // 上一轮装载留下的数据）**或者**这是一次复活（demote 已把 work 置为
         // Cancelled，内容态可能是任意值；树就在容器里，不该再查存档/重生成）。
         if !volume.contains_chunk(&key)
-            || (gen.gen_state(pair) != GenState::Undetermined && !revived)
+            || (io.gen.gen_state(pair) != GenState::Undetermined && !revived)
         {
             continue;
         }
 
         // 数据已在容器里：直接结算，不重生成、不查存档。
         // 快路径同样走 finish_chunk，Render 档才会拿到分组实体。
-        let raw = extract_block_raw(&volume, &interner, key, to);
-        finish_chunk(
-            pair,
-            to,
-            raw,
-            &mut allocator,
-            index.as_deref_mut(),
-            &mut commands,
-            &mut groups,
-            &mut reached,
-            &mut gen,
-            &mut wanted,
-            &mut stats,
-        );
+        let raw = extract_block_raw(volume, &io.interner, key, to);
+        finish_chunk(&mut io, pair, to, raw);
     }
 
-    stats.staged = staging.staged.0.len();
+    io.stats.staged = io.staging.staged.0.len();
 }
 
 /// 系统 4：把排队块推进到「未确定」——生成基础地形 + 本块提案，暂存起来。
@@ -522,37 +517,27 @@ pub fn intake_residency_changes(
 ///
 /// 存档命中且带整块内容的记录仍然一步到位（装块 → [finish_chunk] →
 /// `Determined`）：磁盘上的内容本来就是定稿，不必再走提案环。
-#[allow(clippy::too_many_arguments)]
 pub fn advance_proposals(
-    mut commands: Commands,
     config: Res<VoxelStreamConfig>,
-    mut gen: ResMut<GenTable>,
-    mut wanted: ResMut<StreamWanted>,
     save_store: Option<Res<SaveStore>>,
     persistence: Res<ChunkPersistence>,
-    mut index: Option<ResMut<StableEntityIndex>>,
-    mut allocator: Option<ResMut<StableIdAllocator>>,
-    mut volumes: Query<&mut VoxVolume>,
-    mut interner: ResMut<VoxelInterner>,
     world: WorldInputs,
-    mut reached: MessageWriter<ChunkReached>,
     mut entities_out: MessageWriter<ChunkEntities>,
-    mut groups: ResMut<RenderGroups>,
-    mut staging: Staging,
-    mut stats: ResMut<StreamStats>,
+    mut io: StreamWriters,
 ) {
     let budget = config.max_resolve_per_tick;
     // 跳过已经暂存的块：它们的树与提案已在 [StagedChunks] 里，再生成一次只会
     // 白烧一棵树、还会把 `observed` 重置成 false（`wanted` 要到 settle 才出队，
     // 不跳过就永远结算不了）。
-    let keys: Vec<((BodyKey, ChunkKey), Residency)> = wanted
+    let keys: Vec<((BodyKey, ChunkKey), Residency)> = io
+        .wanted
         .0
         .iter()
-        .filter(|(pair, _)| !staging.staged.0.contains_key(pair))
+        .filter(|(pair, _)| !io.staging.staged.0.contains_key(pair))
         .take(budget)
         .map(|(pair, level)| (*pair, *level))
         .collect();
-    let mut pending = 0usize;
+    let mut pending_count = 0usize;
 
     // 生产装配里落盘就是 SaveStore，ChunkPersistence 是测试 / 替换用的注入点；
     // 两者同时存在时以真实磁盘为准，免得测试替身把生产读路径挡住（见模块文档
@@ -566,40 +551,28 @@ pub fn advance_proposals(
     for (pair, level) in keys {
         let (body, key) = pair;
 
-        let Some(entity) = body_entity(index.as_deref(), body) else {
+        let Some(entity) = body_entity(io.index.as_deref(), body) else {
             // body 没有实体就没有容器：这条请求永远无法完成，记错并出队。
             error!("stream: body {body:?} 找不到实体，放弃区块 {key:?}");
-            drop_request(&mut gen, &mut wanted, pair);
+            drop_request(&mut io.gen, &mut io.wanted, pair);
             continue;
         };
-        let Ok(mut volume) = volumes.get_mut(entity) else {
+        let Ok(mut volume) = io.volumes.get_mut(entity) else {
             error!("stream: 实体 {entity:?} 没有 VoxVolume，放弃区块 {key:?}");
-            drop_request(&mut gen, &mut wanted, pair);
+            drop_request(&mut io.gen, &mut io.wanted, pair);
             continue;
         };
 
         if volume.contains_chunk(&key) {
             // 防御：队列里的块被别的路径装进去了（`insert_chunk` 覆盖会
             // debug_assert），这里只补发完成消息。
-            let raw = extract_block_raw(&volume, &interner, key, level);
-            finish_chunk(
-                pair,
-                level,
-                raw,
-                &mut allocator,
-                index.as_deref_mut(),
-                &mut commands,
-                &mut groups,
-                &mut reached,
-                &mut gen,
-                &mut wanted,
-                &mut stats,
-            );
+            let raw = extract_block_raw(&volume, &io.interner, key, level);
+            finish_chunk(&mut io, pair, level, raw);
             continue;
         }
 
         match lookup(body, key) {
-            StoreLookup::Pending => pending += 1,
+            StoreLookup::Pending => pending_count += 1,
             StoreLookup::Hit(record) => {
                 // 运行期版本过滤。`load_world` 只在启动读档时按
                 // `generator_version` 丢弃旧块；这里从磁盘 / 内存缓冲读回来的
@@ -616,16 +589,7 @@ pub fn advance_proposals(
                         "stream: 区块 {key:?} 存档版本 {} 与当前生成器版本 {} 不一致，重新生成",
                         record.generator_version, config.generator_version
                     );
-                    stage_chunk(
-                        pair,
-                        &mut gen,
-                        &mut wanted,
-                        &mut staging.staged,
-                        &mut staging.cache,
-                        &mut interner,
-                        &world,
-                        &mut stats,
-                    );
+                    stage_chunk(&mut io, pair, &world);
                     continue;
                 }
                 let ChunkRecord {
@@ -637,13 +601,13 @@ pub fn advance_proposals(
                             &mut volume,
                             key,
                             &bytes,
-                            interner.inner_mut(),
+                            io.interner.inner_mut(),
                         ) {
                             Ok(old) => {
-                                release_tree(&mut interner, old);
+                                release_tree(&mut io.interner, old);
                                 // 磁盘内容就是权威编辑结果：标成已编辑，下一次卸载
                                 // 必须继续写 content，不能当未编辑块删成墓碑。
-                                if let Some(dirty) = staging.dirty.as_mut() {
+                                if let Some(dirty) = io.staging.dirty.as_mut() {
                                     dirty.mark_edited_for(Some(body), key, VoxelBox::FULL);
                                 }
                                 // 装块成功后才发；生成路径与空实体不发。
@@ -654,60 +618,30 @@ pub fn advance_proposals(
                                         entities,
                                     });
                                 }
-                                let raw = extract_block_raw(&volume, &interner, key, level);
-                                finish_chunk(
-                                    pair,
-                                    level,
-                                    raw,
-                                    &mut allocator,
-                                    index.as_deref_mut(),
-                                    &mut commands,
-                                    &mut groups,
-                                    &mut reached,
-                                    &mut gen,
-                                    &mut wanted,
-                                    &mut stats,
-                                );
-                                stats.loaded_from_store += 1;
+                                let raw = extract_block_raw(&volume, &io.interner, key, level);
+                                finish_chunk(&mut io, pair, level, raw);
+                                io.stats.loaded_from_store += 1;
                             }
                             Err(error) => {
                                 error!("stream: 存档内容装不进区块 {key:?}：{error}");
-                                drop_request(&mut gen, &mut wanted, pair);
+                                drop_request(&mut io.gen, &mut io.wanted, pair);
                             }
                         }
                     }
                     // 记录存在但没有整块内容（旧版本只写了实体 / 内容被清掉）：
                     // 与 Miss 同样走生成 + 提案，不装空块。
-                    None => stage_chunk(
-                        pair,
-                        &mut gen,
-                        &mut wanted,
-                        &mut staging.staged,
-                        &mut staging.cache,
-                        &mut interner,
-                        &world,
-                        &mut stats,
-                    ),
+                    None => stage_chunk(&mut io, pair, &world),
                 }
             }
             // 没有可用内容：本地生成基础地形 + 本块提案，压进暂存区。
             // 内容态推到 `Undetermined`，容器与 `ChunkReached` 都不动。
-            StoreLookup::Miss => stage_chunk(
-                pair,
-                &mut gen,
-                &mut wanted,
-                &mut staging.staged,
-                &mut staging.cache,
-                &mut interner,
-                &world,
-                &mut stats,
-            ),
+            StoreLookup::Miss => stage_chunk(&mut io, pair, &world),
         }
     }
 
-    stats.queued = wanted.0.len();
-    stats.pending = pending;
-    stats.staged = staging.staged.0.len();
+    io.stats.queued = io.wanted.0.len();
+    io.stats.pending = pending_count;
+    io.stats.staged = io.staging.staged.0.len();
 }
 
 /// 26 邻偏移，按邻键 `(x, y, z)` 升序排好。
@@ -832,19 +766,9 @@ impl std::fmt::Display for SettleError {
 /// [settle_chunks] 的全部系统参数。
 #[derive(SystemParam)]
 pub struct SettleParams<'w, 's> {
-    commands: Commands<'w, 's>,
     config: Res<'w, VoxelStreamConfig>,
-    gen: ResMut<'w, GenTable>,
-    wanted: ResMut<'w, StreamWanted>,
-    index: Option<ResMut<'w, StableEntityIndex>>,
-    allocator: Option<ResMut<'w, StableIdAllocator>>,
-    volumes: Query<'w, 's, &'static mut VoxVolume>,
-    interner: ResMut<'w, VoxelInterner>,
     world: WorldInputs<'w>,
-    groups: ResMut<'w, RenderGroups>,
-    reached: MessageWriter<'w, ChunkReached>,
-    staging: Staging<'w>,
-    stats: ResMut<'w, StreamStats>,
+    io: StreamWriters<'w, 's>,
 }
 
 /// 系统 5：结算暂存块——26 邻提案门 → 全序裁决 → realize 落体素 → 装容器 → 定稿。
@@ -858,8 +782,8 @@ pub struct SettleParams<'w, 's> {
 /// 的提案都已存在」，本轮不排 tick 等待。
 pub fn settle_chunks(mut p: SettleParams) {
     // 先把所有暂存块标成「看见过」，再挑出上一次就已标记的来结算。
-    for pair in collect_ready(&mut p.staging, p.config.max_resolve_per_tick) {
-        let Some(staged_chunk) = p.staging.staged.0.remove(&pair) else {
+    for pair in collect_ready(&mut p.io.staging, p.config.max_resolve_per_tick) {
+        let Some(staged_chunk) = p.io.staging.staged.0.remove(&pair) else {
             continue;
         };
         let StagedChunk {
@@ -870,35 +794,23 @@ pub fn settle_chunks(mut p: SettleParams) {
         let mut tree = Some(tree);
         let settled = {
             let mut ctx = SettleCtx {
-                interner: &mut p.interner,
-                wanted: &p.wanted,
-                index: p.index.as_deref(),
+                interner: &mut p.io.interner,
+                wanted: &p.io.wanted,
+                index: p.io.index.as_deref(),
             };
             settle_one(
                 pair,
                 proposals,
                 &mut tree,
-                &mut p.volumes,
-                &mut p.staging,
+                &mut p.io.volumes,
+                &mut p.io.staging,
                 &p.world,
                 &mut ctx,
             )
         };
 
         match settled {
-            Ok(Settled { level, raw }) => finish_chunk(
-                pair,
-                level,
-                raw,
-                &mut p.allocator,
-                p.index.as_deref_mut(),
-                &mut p.commands,
-                &mut p.groups,
-                &mut p.reached,
-                &mut p.gen,
-                &mut p.wanted,
-                &mut p.stats,
-            ),
+            Ok(Settled { level, raw }) => finish_chunk(&mut p.io, pair, level, raw),
             Err(error) => {
                 // 树一定还在槽里：装容器是 settle_one 的最后一步。
                 if let Some(tree) = tree.take() {
@@ -908,8 +820,8 @@ pub fn settle_chunks(mut p: SettleParams) {
         }
     }
 
-    p.stats.queued = p.wanted.0.len();
-    p.stats.staged = p.staging.staged.0.len();
+    p.io.stats.queued = p.io.wanted.0.len();
+    p.io.stats.staged = p.io.staging.staged.0.len();
 }
 
 /// 结算失败的统一出口：打日志，再把暂存树交回 fail_staged 释放。
@@ -923,10 +835,10 @@ fn abandon_settled(
     fail_staged(
         pair,
         tree,
-        &mut p.interner,
-        &mut p.gen,
-        &mut p.wanted,
-        &mut p.staging,
+        &mut p.io.interner,
+        &mut p.io.gen,
+        &mut p.io.wanted,
+        &mut p.io.staging,
     );
 }
 
@@ -1103,62 +1015,53 @@ fn fail_staged(
 ///
 /// `Render -> Data` 只销毁分组实体 + 失效四份表现层缓存，体素内容原样保留，
 /// 因此**不**进 [PendingUnloads]、**不**发卸载消息、**不**计 `unloaded`。
-#[allow(clippy::too_many_arguments)]
-fn demote(
-    pair: (BodyKey, ChunkKey),
-    from: Residency,
-    to: Residency,
-    commands: &mut Commands<'_, '_>,
-    mut index: Option<&mut StableEntityIndex>,
-    gen: &mut GenTable,
-    wanted: &mut StreamWanted,
-    pending: &mut PendingUnloads,
-    volumes: &mut Query<&mut VoxVolume>,
-    interner: &mut VoxelInterner,
-    wrapped: &mut WrappedBlockCache,
-    generated: &mut TerrainGeneratedBlocks,
-    neighbors: &mut TerrainNeighborBlocks,
-    groups: &mut RenderGroups,
-    staged: &mut StagedChunks,
-    cache: &mut ProposalCache,
-    stats: &mut StreamStats,
-) {
+fn demote(w: &mut StreamWriters, pair: (BodyKey, ChunkKey), from: Residency, to: Residency) {
     let (body, key) = pair;
 
     // 1) 渲染档先退：实体销毁 + 四份表现层缓存失效（体素内容保留）。
     if from == Residency::Render && to != Residency::Render {
-        despawn_render_group(pair, commands, groups, index.as_deref_mut(), stats);
-        wrapped.invalidate_covered(interner.inner_mut(), key);
-        generated.own.invalidate_covered(interner.inner_mut(), key);
-        generated
+        despawn_render_group(
+            pair,
+            &mut w.commands,
+            &mut w.groups,
+            w.index.as_deref_mut(),
+            &mut w.stats,
+        );
+        w.wrapped.invalidate_covered(w.interner.inner_mut(), key);
+        w.generated
+            .own
+            .invalidate_covered(w.interner.inner_mut(), key);
+        w.generated
             .neighbors
-            .invalidate_covered(interner.inner_mut(), key);
-        neighbors.0.invalidate_covered(interner.inner_mut(), key);
+            .invalidate_covered(w.interner.inner_mut(), key);
+        w.neighbors
+            .0
+            .invalidate_covered(w.interner.inner_mut(), key);
     }
 
     // 只是降渲染档（Render -> Data）：数据留在容器里，到此为止。
     if to != Residency::None {
-        if wanted.0.remove(&pair).is_some() {
-            gen.cancel(pair);
-            let _ = gen.reset(pair);
+        if w.wanted.0.remove(&pair).is_some() {
+            w.gen.cancel(pair);
+            let _ = w.gen.reset(pair);
         }
         return;
     }
 
     // 暂存块还没进容器、内容也没定稿：直接丢弃，**不**进 [PendingUnloads]、
     // 不落盘（文档 §8：降档时半成品不能进容器）。
-    if let Some(chunk) = staged.0.remove(&pair) {
-        release_tree(interner, Some(chunk.tree));
-        cache.0.remove(&pair);
-        drop_request(gen, wanted, pair);
+    if let Some(chunk) = w.staging.staged.0.remove(&pair) {
+        release_tree(&mut w.interner, Some(chunk.tree));
+        w.staging.cache.0.remove(&pair);
+        drop_request(&mut w.gen, &mut w.wanted, pair);
         return;
     }
-    cache.0.remove(&pair);
+    w.staging.cache.0.remove(&pair);
 
-    let removed = wanted.0.remove(&pair).is_some();
-    let entity = body_entity(index.as_deref(), body);
+    let removed = w.wanted.0.remove(&pair).is_some();
+    let entity = body_entity(w.index.as_deref(), body);
     let present = entity
-        .and_then(|entity| volumes.get(entity).ok())
+        .and_then(|entity| w.volumes.get(entity).ok())
         .is_some_and(|volume| volume.contains_chunk(&key));
     if !removed && !present {
         return;
@@ -1167,14 +1070,14 @@ fn demote(
     // 去重：同一 pair 已经登记过（同一 tick 里的第二次降档）就什么都不再做。
     // 释放要等 [persist_pending_unloads] 确认落盘，此时树还在容器里，所以
     // `present` 仍然成立，第二次消息必须在这里被挡住。
-    if pending.0.contains_key(&pair) {
+    if w.pending.0.contains_key(&pair) {
         return;
     }
 
     // 只取消生成并登记；消息与释放都推到确认落盘之后
     // （[release_pending_unloads]）。
-    gen.cancel(pair);
-    pending.0.insert(
+    w.gen.cancel(pair);
+    w.pending.0.insert(
         pair,
         PendingUnload {
             from,
@@ -1454,38 +1357,28 @@ fn release_chunk_from_volume(world: &mut World, entity: Option<Entity>, key: Chu
 /// 树**不进**容器（那是 [settle_chunks] 的事），也不发 [ChunkReached]。失败
 ///（缺 [WorldSeed]、提案出错）时立刻 [release_tree] + [drop_request]：`VoxTree`
 /// 没有 `Drop`，漏一条路径就是泄漏节点。
-#[allow(clippy::too_many_arguments)]
-fn stage_chunk(
-    pair: (BodyKey, ChunkKey),
-    gen: &mut GenTable,
-    wanted: &mut StreamWanted,
-    staged: &mut StagedChunks,
-    cache: &mut ProposalCache,
-    interner: &mut VoxelInterner,
-    world: &WorldInputs,
-    stats: &mut StreamStats,
-) {
+fn stage_chunk(w: &mut StreamWriters, pair: (BodyKey, ChunkKey), world: &WorldInputs) {
     let (body, key) = pair;
     let Some(seed) = world.seed.as_deref() else {
         // 没有种子就没有确定性世界：移除而不是无限重试。
         error!("stream: WorldSeed 资源缺失，无法生成区块 {key:?}");
-        drop_request(gen, wanted, pair);
+        drop_request(&mut w.gen, &mut w.wanted, pair);
         return;
     };
     let biome = world
         .terrain
         .as_deref()
         .map_or(DEFAULT_BIOME, |config| config.biome);
-    let tree = WorldGenerator::new(*seed, biome).generate_chunk(interner.inner_mut(), key);
-    stats.generated += 1;
+    let tree = WorldGenerator::new(*seed, biome).generate_chunk(w.interner.inner_mut(), key);
+    w.stats.generated += 1;
 
     let proposals = match world.registry.as_deref() {
         Some(registry) => match registry.propose_chunk(seed.0, key) {
             Ok(proposals) => proposals,
             Err(error) => {
                 error!("stream: 区块 {key:?} 提案失败，放弃：{error}");
-                release_tree(interner, Some(tree));
-                drop_request(gen, wanted, pair);
+                release_tree(&mut w.interner, Some(tree));
+                drop_request(&mut w.gen, &mut w.wanted, pair);
                 return;
             }
         },
@@ -1493,8 +1386,8 @@ fn stage_chunk(
         None => Vec::new(),
     };
     // 缓存是邻居门的输入：先写自己的，等 settle 现算 26 邻时再补齐邻键。
-    cache.0.insert(pair, proposals.clone());
-    staged.0.insert(
+    w.staging.cache.0.insert(pair, proposals.clone());
+    w.staging.staged.0.insert(
         pair,
         StagedChunk {
             tree,
@@ -1502,13 +1395,13 @@ fn stage_chunk(
             observed: false,
         },
     );
-    if let Err(error) = gen.advance(pair, GenState::Undetermined) {
+    if let Err(error) = w.gen.advance(pair, GenState::Undetermined) {
         debug!("stream: advance({body:?}, {key:?}) 被拒绝：{error:?}");
     }
     // 调度态收敛回 Idle：真正的工作已经做完，别让后续系统看到一个没关的 Running。
-    let _ = gen.begin(pair);
-    let _ = gen.finish(pair);
-    stats.proposed += 1;
+    let _ = w.gen.begin(pair);
+    let _ = w.gen.finish(pair);
+    w.stats.proposed += 1;
 }
 
 /// Data 档的**统一出口**：先发 `ChunkReached{Data}`，目标档是 Render 时
@@ -1516,29 +1409,21 @@ fn stage_chunk(
 ///
 /// 四个成功路径（存档命中 / 真生成 / 已在容器快路径 / resolve 防御分支）
 /// 都必须从这里出，否则 Render 档会漏掉分组实体。
-#[allow(clippy::too_many_arguments)]
 fn finish_chunk(
+    w: &mut StreamWriters,
     pair: (BodyKey, ChunkKey),
     level: Residency,
     raw: Option<Vec<u8>>,
-    allocator: &mut Option<ResMut<'_, StableIdAllocator>>,
-    index: Option<&mut StableEntityIndex>,
-    commands: &mut Commands<'_, '_>,
-    groups: &mut RenderGroups,
-    reached: &mut MessageWriter<ChunkReached>,
-    gen: &mut GenTable,
-    wanted: &mut StreamWanted,
-    stats: &mut StreamStats,
 ) {
     let (body, key) = pair;
     // 顺序：Data 消息在前，渲染实体在后，最后才是 Render 消息。
-    settle(gen, pair);
-    reached.write(ChunkReached {
+    settle(&mut w.gen, pair);
+    w.reached.write(ChunkReached {
         body,
         key,
         level: Residency::Data,
     });
-    wanted.0.remove(&pair);
+    w.wanted.0.remove(&pair);
 
     if level != Residency::Render {
         return;
@@ -1548,10 +1433,17 @@ fn finish_chunk(
         debug!("stream: 区块 {key:?} 没有可提取的树，跳过分组产出");
         return;
     };
-    match ensure_render_group(pair, &raw, allocator, index, commands, groups) {
+    match ensure_render_group(
+        pair,
+        &raw,
+        &mut w.allocator,
+        w.index.as_deref_mut(),
+        &mut w.commands,
+        &mut w.groups,
+    ) {
         Ok(true) => {
-            refresh_render_groups(groups, stats);
-            reached.write(ChunkReached {
+            refresh_render_groups(&w.groups, &mut w.stats);
+            w.reached.write(ChunkReached {
                 body,
                 key,
                 level: Residency::Render,

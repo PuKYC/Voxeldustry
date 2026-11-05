@@ -69,7 +69,7 @@ impl WorldGenerator {
     /// - 整块在地表之上 -> 空树（无节点）；
     /// - 否则逐体素 set 地表附近的三层材料。
     pub fn generate_chunk(&self, interner: &mut VoxInterner<u8>, key: ChunkKey) -> VoxTree<u8> {
-        let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH as u8));
+        let mut tree = VoxTree::<u8>::new(MaxDepth::new(CHUNK_DEPTH));
 
         let base_x = key.x * CHUNK_SIZE;
         let base_y = key.y * CHUNK_SIZE;
@@ -170,12 +170,12 @@ impl WorldGenerator {
         let mut surfaces = [[0i32; N]; N];
         let mut min_surface = i32::MAX;
         let mut max_surface = i32::MIN;
-        for cz in 0..N {
-            for cx in 0..N {
+        for (cx, row) in surfaces.iter_mut().enumerate() {
+            for (cz, cell) in row.iter_mut().enumerate() {
                 let x = base_x + (cx as i32) * span + span / 2;
                 let z = base_z + (cz as i32) * span + span / 2;
                 let surface = self.column_surface(x, z);
-                surfaces[cx][cz] = surface;
+                *cell = surface;
                 min_surface = min_surface.min(surface);
                 max_surface = max_surface.max(surface);
             }
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn same_seed_same_chunk_is_bitwise_identical() {
-        let generator = WorldGenerator::from_seed(0xC0FF_EE);
+        let generator = WorldGenerator::from_seed(0x00C0_FFEE);
         let chunk = key(0, 1, 0);
 
         let mut first_interner = test_interner();
@@ -611,7 +611,7 @@ mod tests {
     fn lod_block_top_cell_is_surface_material() {
         use game_engine::voxel::{build_tree_occupancy_lod, voxel_material, FaceNeighbor, Lod};
 
-        let generator = WorldGenerator::from_seed(0xC0FF_EE);
+        let generator = WorldGenerator::from_seed(0x00C0_FFEE);
         let palette = column_palette(generator.biome);
 
         for lod in 1..=3u8 {

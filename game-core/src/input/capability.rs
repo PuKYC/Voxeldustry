@@ -405,6 +405,18 @@ pub fn compute_input_availability(
     }
 }
 
+/// 未受控实体：输入能力通道 + 两份输入快照（可能缺失）。
+type UncontrolledInputQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut InputAvailability,
+        Option<&'static mut RawResolved>,
+        Option<&'static mut ResolvedInput>,
+    ),
+    Without<ControlledBy>,
+>;
+
 /// 失去控制后清零输入能力与输入快照。
 ///
 /// `write_resolved_input` 不检查 `ControlledBy`：实体被解除控制后
@@ -414,16 +426,7 @@ pub fn compute_input_availability(
 ///
 /// 与 `resolve_controlled_entity`（`With<ControlledBy>`）的查询过滤条件不相交，
 /// 调度器可以安全并行。
-pub fn clear_uncontrolled_input(
-    mut query: Query<
-        (
-            &mut InputAvailability,
-            Option<&mut RawResolved>,
-            Option<&mut ResolvedInput>,
-        ),
-        Without<ControlledBy>,
-    >,
-) {
+pub fn clear_uncontrolled_input(mut query: UncontrolledInputQuery) {
     for (mut availability, raw, resolved) in &mut query {
         if *availability != InputAvailability::default() {
             *availability = InputAvailability::default();

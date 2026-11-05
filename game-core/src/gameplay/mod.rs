@@ -9,13 +9,11 @@ mod camera;
 mod death;
 mod movement;
 
-pub use block_edit::{
-    block_edit_system, placement_overlaps_player, BlockEditConfig, BlockEditCooldown,
-    BlockEditPlugin, SelectedBlock, BREAK_BLOCK_BIT, PLACE_BLOCK_BIT,
-};
+#[cfg(test)]
+pub use block_edit::BlockEditConfig;
+pub use block_edit::BlockEditPlugin;
 pub use camera::{
-    camera_system, facing_system, spawn_camera_rig, CameraFlag, CameraPlugin, CameraView, Facing,
-    CAMERA_EYE_HEIGHT, LOOK_SENSITIVITY, PITCH_LIMIT,
+    camera_system, spawn_camera_rig, CameraFlag, CameraPlugin, CameraView, Facing, LOOK_SENSITIVITY,
 };
 pub use death::DeathPlugin;
 pub use movement::{MovementPlugin, Velocity};

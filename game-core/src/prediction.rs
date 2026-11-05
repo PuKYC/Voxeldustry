@@ -2,7 +2,6 @@
 //!
 //! 单人预测 / 回滚链路已实现：
 //!
-//! - [`Predicted`]：标记参与预测 / 回滚的组件（纯表现副作用不挂，避免重演时重复触发）；
 //! - [`Snapshot`]：回滚基线；[`apply_input`] / [`resimulate`]：可脱离 Bevy 单测的纯函数；
 //! - [`record_local_history`] / [`PredictionPlugin`]：每逻辑 tick 写历史并挂引擎回滚时钟。
 //!
@@ -22,13 +21,6 @@ use game_engine::rollback::{
 use crate::gameplay::{Facing, Velocity, LOOK_SENSITIVITY};
 use crate::input::snapshot::PlayerInput;
 use crate::input::SimulationTick;
-
-/// 参与预测/回滚的状态标记。
-///
-/// 受击震屏、粒子特效等纯表现副作用**不挂**此标记，否则回滚重演时会
-/// 重复触发（例如死亡音效播放两次）。
-#[derive(Component, Debug, Default)]
-pub struct Predicted;
 
 /// 预测快照：回滚的基线（参与预测的组件状态）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,6 +97,10 @@ pub fn apply_input(
 }
 
 /// 从快照 + 输入历史重新模拟（回滚重演，L9 Reconciliation 的核心）。
+#[allow(
+    dead_code,
+    reason = "L9 重演入口：纯函数只有单测覆盖，运行时回滚走 RollbackState::step"
+)]
 pub fn resimulate(
     start: Snapshot,
     inputs: impl Iterator<Item = (u32, PlayerInput)>,
@@ -214,7 +210,7 @@ mod tests {
         let mut inputs = Vec::new();
         for tick in 0..100u32 {
             let input = PlayerInput {
-                move_x: if rng.next_u32() % 2 == 0 {
+                move_x: if rng.next_u32().is_multiple_of(2) {
                     FixedPoint::from_num(1)
                 } else {
                     FixedPoint::from_num(-1)

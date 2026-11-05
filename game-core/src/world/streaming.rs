@@ -430,13 +430,19 @@ fn attach_local_player_streaming(
     }
 }
 
+/// 位姿刚变过的本地玩家：同步 `LogicPos` 的目标集合。
+type MovedLocalPlayerQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Transform, &'static mut LogicPos),
+    (With<LocalPlayer>, Changed<Transform>),
+>;
+
 /// 玩家 `Transform` 变化后同步 `LogicPos`（体素归属只读定点）。
 ///
 /// 与 [attach_local_player_streaming] 分开：新玩家由 attach 负责第一份
 /// `LogicPos`，这里只跟随后续移动。
-fn sync_local_player_logic_pos(
-    mut players: Query<(&Transform, &mut LogicPos), (With<LocalPlayer>, Changed<Transform>)>,
-) {
+fn sync_local_player_logic_pos(mut players: MovedLocalPlayerQuery) {
     for (transform, mut logic) in &mut players {
         logic.0 = logic_pos_for_transform(transform.translation).0;
     }
@@ -676,7 +682,7 @@ mod tests {
     #[test]
     fn streaming_boot_keeps_saved_seed_over_config() {
         let dir = TempDir::new("boot_seed");
-        // 第一 App 用默认 TerrainConfig.seed（0xC0FF_EE）落盘，meta.seed 记的就是它。
+        // 第一 App 用默认 TerrainConfig.seed（0x00C0_FFEE）落盘，meta.seed 记的就是它。
         let saved_seed = terrain_app(Some(TerrainMode::Streaming), false)
             .world()
             .resource::<TerrainConfig>()
