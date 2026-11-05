@@ -52,11 +52,11 @@ cargo test --workspace --exclude godot-client-ext
 
 ## 文档入口
 
-- [`docs/项目架构/`](docs/项目架构/)：分层与依赖、线程模型、ECS 与调度、输入链路、表现管线、体素世界与材质、网络与回滚、静态数据与 Mod、构建测试与 CI、Godot UI、当前状态与风险（编号 00-11）。
-- [`docs/ci.md`](docs/ci.md)：工作流、版本固定、发布矩阵、Android 签名、性能门禁与故障排查。
-- [`docs/UI适配改造变更说明.md`](docs/UI适配改造变更说明.md)：一轮 UI 适配改造的变更说明。
+- [`项目架构/`](项目架构/)：分层与依赖、线程模型、ECS 与调度、输入链路、表现管线、体素世界与材质、网络与回滚、静态数据与 Mod、构建测试与 CI、Godot UI、当前状态与风险（编号 00-11）。
+- [`ci.md`](ci.md)：工作流、版本固定、发布矩阵、Android 签名、性能门禁与故障排查。
+- [`UI适配改造变更说明.md`](UI适配改造变更说明.md)：一轮 UI 适配改造的变更说明。
 
-重构类的演进过程目前记录在提交历史（`git log --grep=refactor`）与 `docs/项目架构/11-当前状态与风险.md` 里；`docs/重构/` 目录尚未建立。`docs/待办/` 是本地临时文档目录，已 gitignore，克隆后不存在属正常。
+重构类的演进过程记录在提交历史（`git log --grep=refactor`）与 [`重构/`](重构/) 目录（基线、日志、当前状态与风险）里；横切状态与风险见 [`项目架构/11-当前状态与风险.md`](项目架构/11-当前状态与风险.md)。`docs/待办/` 是本地临时文档目录，已 gitignore，克隆后不存在属正常。
 
 ## 常用命令
 
@@ -67,8 +67,8 @@ cargo test --workspace --exclude godot-client-ext      # 纯 Rust 测试
 cargo bench -p game-core --bench voxel_terrain         # criterion 墙钟基准
 ```
 
-基准分两套：criterion 看墙钟耗时（`mesh_rebuild` / `voxel_rebuild` / `voxel_collider` / `voxel_terrain`），gungraun 统计 Valgrind Callgrind 指令数（`terrain_inst` / `voxel_collider_inst`，仅 Linux，需要 `valgrind` 与版本对齐的 `gungraun-runner`）；具体命令与门禁阈值见 [`docs/ci.md`](docs/ci.md) 第 9 节。
+基准分两套：criterion 看墙钟耗时（`mesh_rebuild` / `voxel_rebuild` / `voxel_collider` / `voxel_terrain`），gungraun 统计 Valgrind Callgrind 指令数（`terrain_inst` / `voxel_collider_inst`，仅 Linux，需要 `valgrind` 与版本对齐的 `gungraun-runner`）；具体命令与门禁阈值见 [`ci.md`](ci.md) 第 9 节。
 
 ## 贡献
 
-提交前检查项、代码规模上限、提交信息格式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+提交前检查项、代码规模上限、提交信息格式见 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。
