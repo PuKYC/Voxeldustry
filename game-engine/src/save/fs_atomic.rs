@@ -5,7 +5,7 @@
 //! 1. 内存里已是完整字节（编码失败根本不到这一层）；
 //! 2. 同目录写 `<final>.tmp`：`create_new` → `write_all` → `sync_all()` → 关闭；
 //! 3. `rename(tmp, final)`（同目录同文件系统，Unix 上原子覆盖）；
-//! 4. 打开父目录 `sync_all()`，让重命名项持久化。
+//! 4. 打开父目录 `sync_all()`，让重命名项持久化（Windows 跳过，见 [`sync_dir`]）。
 //!
 //! 任何一步失败都尽力删除 tmp，**绝不**在最终路径留下半截文件：崩溃窗口里
 //! 只有“旧文件”或“完整新文件”两种状态（§5.2 第 2、3 行）。
@@ -98,6 +98,14 @@ fn create_tmp(tmp: &Path) -> Result<File, SaveError> {
 
 /// 打开父目录并 `sync_all()`，让 rename 项持久化（§5.1 第 4 步）。
 pub(crate) fn sync_dir(dir: &Path) -> Result<(), SaveError> {
+    // Windows 不能对目录句柄做 fsync：`File::open(dir)` 直接 ERROR_ACCESS_DENIED
+    // （os error 5），会让每一次存档写入都失败。NTFS 的目录项变更由文件系统日志
+    // 保证，rename 本身原子；tmp 文件已在第 2 步 `sync_all`，最坏只是回退到旧文件，
+    // 不会出现半截文件。所以这里跳过。
+    if cfg!(windows) {
+        return Ok(());
+    }
+
     let handle = File::open(dir).map_err(|err| io_error(STAGE_OPEN, dir, err))?;
     handle
         .sync_all()
