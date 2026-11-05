@@ -8,12 +8,12 @@ tags:
   - 重构
   - 质量
   - 索引
-source: git 与代码实测 @ refactor/quality acfe12a（2026-11-05）
+source: git 与代码实测 @ refactor/quality d710c44（2026-11-05）
 ---
 
 # 质量重构文档
 
-> 范围：`crates/voxel`、`game-engine`、`game-core`、`godot-client-ext`。代码基线 `1c14c71`，集成分支 `refactor/quality`（tip `acfe12a`）。
+> 范围：`crates/voxel`、`game-engine`、`game-core`、`godot-client-ext`。代码基线 `1c14c71`，集成分支 `refactor/quality`（tip `d710c44`）。
 
 ## 这次重构做什么
 
@@ -29,7 +29,7 @@ source: git 与代码实测 @ refactor/quality acfe12a（2026-11-05）
 
 ## 一句话现状
 
-八个重构单元、三路 clippy 清理与文档都已合入 `refactor/quality`（tip `acfe12a`）：`settle_chunks` 187→55 行，`codec` 3109 行拆成 6 个文件，occupancy / terrain / load / stream / collision / backend / aoi 均完成拆分；907 个测试全绿，`cargo fmt --all --check` 与 `cargo clippy --workspace --all-targets --all-features -- -D warnings` 均退出码 0（clippy 149→0）；`too_many_arguments` 20→1（只保留 Godot `#[func]` 签名契约这一处，带 reason）。CI lint 已改为阻塞门禁。
+八个重构单元、三路 clippy 清理与文档都已合入 `refactor/quality`（tip `d710c44`）：`settle_chunks` 187→55 行，`codec` 3109 行拆成 6 个文件，occupancy / terrain / load / stream / collision / backend / aoi 均完成拆分；929 passed / 12 ignored，`cargo fmt --all --check` 与 `cargo clippy --workspace --all-targets --all-features -- -D warnings` 均退出码 0（clippy 149→0）；`too_many_arguments` 20→1（只保留 Godot `#[func]` 签名契约这一处，带 reason）。CI lint 已改为阻塞门禁。
 
 ## 阅读顺序
 
@@ -45,7 +45,7 @@ source: git 与代码实测 @ refactor/quality acfe12a（2026-11-05）
 | --- | --- |
 | 仓库 | `/home/dptui/ecs_game` |
 | 代码基线 | `1c14c71`（fmt 全量 + clippy.toml + erasing_op 修复） |
-| 集成分支 | `refactor/quality` @ `acfe12a`（含全部重构与门禁提交） |
+| 集成分支 | `refactor/quality` @ `d710c44`（含全部重构与门禁提交） |
 | 本文档分支 | `refactor/docs2` |
 | 收尾分支（已合并） | `refactor/clippy-engine` @ `60a5a33` → `f8e6f8e`；`refactor/clippy-core` @ `62748df` → `acfe12a` |
 
@@ -64,7 +64,7 @@ source: git 与代码实测 @ refactor/quality acfe12a（2026-11-05）
 | 5 clippy（voxel） | `refactor/clippy-voxel` | `15be085` | voxel 52→0 |
 | 5 收尾 | `refactor/clippy-engine`、`refactor/clippy-core` | `f8e6f8e` / `acfe12a` | game-engine / game-core / godot 清零、参数收拢 |
 | 6 文档 | `refactor/docs2` | 本文档提交 | 基线、日志、现状 |
-| 7 CI 门禁 | — | `0722cd1` | lint job 改为阻塞 |
+| 7 CI 门禁 | — | `d710c44` | lint job 改为阻塞，test 口径对齐（`--exclude godot-client-ext`） |
 
 ## 复现命令
 
