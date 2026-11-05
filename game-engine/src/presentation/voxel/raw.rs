@@ -429,7 +429,7 @@ mod tests {
             for y in 0..RAW_DIM as i32 {
                 for x in 0..RAW_DIM as i32 {
                     let r = lcg(&mut state);
-                    if r % 6 == 0 {
+                    if r.is_multiple_of(6) {
                         let material = 1 + (r % 3) as u8;
                         let _ = tree.set(interner, IVec3::new(x, y, z), material);
                     }
@@ -447,7 +447,7 @@ mod tests {
             for cz in 0..span {
                 for cx in 0..span {
                     let idx = (cx + cy * span + cz * span * span) as u64;
-                    if lod >= 2 && idx % 3 != 0 {
+                    if lod >= 2 && !idx.is_multiple_of(3) {
                         continue;
                     }
                     let chunk_seed = seed
@@ -734,7 +734,7 @@ mod tests {
             (1, 0, 1, 0, 0, true, 1),                         // +Y
             (2, 0, 1, 0, 0, true, 1),                         // +Z
         ];
-        for (plane, dir, slice, row, col, dir_pos, layer) in cases {
+        for (plane, dir, slice, row, col, _dir_pos, layer) in cases {
             let expected = brute_face_ao(&blocks, plane, row as i32, col as i32, layer);
             let word = words
                 .iter()
@@ -765,27 +765,6 @@ mod tests {
             })
             .expect("-X 面必须存在");
         assert_ne!(unpack_ao(*neg_x), [3, 3, 3, 3], "-X 面应被棱 / 角邻居压暗");
-    }
-
-    /// 生成一个 origin/lod 的实心邻居块（所有基础子块填 material）。
-    fn solid_block(
-        interner: &mut VoxInterner<u8>,
-        origin: ChunkKey,
-        lod: u8,
-        material: u8,
-    ) -> VoxTree<u8> {
-        let span = 1i32 << lod;
-        let mut chunks: BTreeMap<ChunkKey, VoxTree<u8>> = BTreeMap::new();
-        for cy in 0..span {
-            for cz in 0..span {
-                for cx in 0..span {
-                    let mut chunk = VoxTree::<u8>::new(MaxDepth::new(BASE_DEPTH));
-                    chunk.fill(interner, material);
-                    chunks.insert(key(origin.x + cx, origin.y + cy, origin.z + cz), chunk);
-                }
-            }
-        }
-        wrap_block(&chunks, interner, MeshBlock::new(origin, Lod::new(lod)))
     }
 
     /// 接缝裙边：只在 `skirt_mask` 置位的面出现，判据是「边界格 + 内侧格实心

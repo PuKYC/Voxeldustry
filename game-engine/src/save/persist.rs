@@ -93,6 +93,9 @@ pub trait PersistComponent: Component + Serialize + DeserializeOwned {
     const STABLE_TYPE_ID: StableTypeId;
 }
 
+/// 组件编码函数：实体上有该组件就编出负载，没有就返回 `Ok(None)`。
+type EncodeFn = fn(&World, Entity) -> Result<Option<Vec<u8>>, SaveError>;
+
 /// 一条注册项：编码函数 + 解码后延迟插入的闭包工厂。
 ///
 /// 用函数指针而不是 `Box<dyn ...>`，注册表可以 `Send + Sync` 且无生命周期参数。
@@ -100,7 +103,7 @@ struct PersistEntry {
     /// `std::any::type_name`，只用于日志与错误信息。
     name: &'static str,
     /// 实体上有这个组件就编出负载，没有就返回 `Ok(None)`。
-    encode: fn(&World, Entity) -> Result<Option<Vec<u8>>, SaveError>,
+    encode: EncodeFn,
     /// 解码负载，返回「以后往实体上插」的闭包；解码失败不产生闭包。
     stage: fn(&[u8]) -> Result<StagedComponent, SaveError>,
 }

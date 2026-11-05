@@ -13,7 +13,7 @@ use super::key::chunk_voxels_per_axis;
 /// 一岛 / 一船 / 一结构 = 一个 VoxVolume 组件。
 ///
 /// - chunks 用 BTreeMap 而不是 HashMap：遍历 / 序列化 / 哈希全部按 ChunkKey
-/// 升序 -> 天然确定（L3）。
+///   升序 -> 天然确定（L3）。
 /// - voxel_size 是运行期字段，数值由 game-core 提供；引擎不知道 0.45 m。
 #[derive(Component)]
 pub struct VoxVolume {

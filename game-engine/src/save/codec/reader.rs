@@ -115,10 +115,6 @@ impl<'a> Reader<'a> {
         self.take(len, &field_path(path, field))
     }
 
-    pub(crate) fn read_u8_at(&mut self, path: &str, field: &str) -> Result<u8, SaveError> {
-        self.u8(&field_path(path, field))
-    }
-
     pub(crate) fn read_u16_at(&mut self, path: &str, field: &str) -> Result<u16, SaveError> {
         self.u16(&field_path(path, field))
     }
@@ -133,10 +129,6 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn read_i32_at(&mut self, path: &str, field: &str) -> Result<i32, SaveError> {
         self.i32(&field_path(path, field))
-    }
-
-    pub(crate) fn read_i64_at(&mut self, path: &str, field: &str) -> Result<i64, SaveError> {
-        self.i64(&field_path(path, field))
     }
 
     pub(crate) fn u8(&mut self, path: &str) -> Result<u8, SaveError> {

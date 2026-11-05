@@ -75,22 +75,23 @@ impl Plugin for ResidencyPlugin {
 
 // ───────────────────────────── Anchor ─────────────────────────────
 
+/// [`update_anchors`] 的查询：锚点重算需要的组件组合。
+type AnchorUpdateData = (
+    Entity,
+    &'static LogicPos,
+    &'static mut ChunkAnchor,
+    Option<&'static StableEntityId>,
+    Option<&'static BodyRef>,
+);
+
+/// [`update_anchors`] 的过滤条件（位置、锚点或 BodyRef 变化）。
+type AnchorUpdateFilter = Or<(Changed<LogicPos>, Added<ChunkAnchor>, Changed<BodyRef>)>;
+
 /// 按 LogicPos 重算 ChunkAnchor（位置、锚点或 BodyRef 变化时算）。
 ///
 /// **只用定点整数**：chunk_of 内部是 i64::div_euclid。禁止 f32 参与块归属。
 /// 过渡期位置来源是 LogicPos；将来 BodyPose 落地后只改这里。
-fn update_anchors(
-    mut anchors: Query<
-        (
-            Entity,
-            &LogicPos,
-            &mut ChunkAnchor,
-            Option<&StableEntityId>,
-            Option<&BodyRef>,
-        ),
-        Or<(Changed<LogicPos>, Added<ChunkAnchor>, Changed<BodyRef>)>,
-    >,
-) {
+fn update_anchors(mut anchors: Query<AnchorUpdateData, AnchorUpdateFilter>) {
     for (entity, pos, mut anchor, id, body_ref) in &mut anchors {
         let Some(body) = body_key_for(entity, id, body_ref) else {
             continue;
@@ -153,7 +154,11 @@ type ObserverRequestData = (
 /// Observer 实体「本 tick 有变化」（新增 / 锚点或标签改动）的过滤条件。
 type ObserverChangeFilter = (
     With<ObserverTag>,
-    Or<(Added<ObserverTag>, Changed<ChunkAnchor>, Changed<ObserverTag>)>,
+    Or<(
+        Added<ObserverTag>,
+        Changed<ChunkAnchor>,
+        Changed<ObserverTag>,
+    )>,
 );
 
 /// [`collect_requests`] 的三个实体查询。
@@ -450,6 +455,15 @@ fn emit_changes(mut table: ResMut<ResidencyTable>, mut writer: MessageWriter<Res
 
 // ───────────────────────────── Gate ─────────────────────────────
 
+/// [`gate_real_entities`] 的查询：门控需要的组件组合。
+type GateAgentData = (
+    Entity,
+    &'static ChunkAnchor,
+    Option<&'static WorkSites>,
+    Option<&'static PathCorridor>,
+    Option<&'static AwaitingChunks>,
+);
+
 /// 给「所需区块还没全部到达 Data」的 Real 实体挂 AwaitingChunks。
 ///
 /// **只读 slot.reached**：同 tick 里流式还没跑（Streaming 在 Residency 之后），
@@ -457,16 +471,7 @@ fn emit_changes(mut table: ResMut<ResidencyTable>, mut writer: MessageWriter<Res
 /// Observer 不门控。
 fn gate_real_entities(
     mut commands: Commands,
-    agents: Query<
-        (
-            Entity,
-            &ChunkAnchor,
-            Option<&WorkSites>,
-            Option<&PathCorridor>,
-            Option<&AwaitingChunks>,
-        ),
-        With<Real>,
-    >,
+    agents: Query<GateAgentData, With<Real>>,
     table: Res<ResidencyTable>,
     mut stats: ResMut<ResidencyStats>,
 ) {

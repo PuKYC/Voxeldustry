@@ -720,7 +720,7 @@ struct StoreState {
 
 fn flush_due(config: &SaveConfig, state: &StoreState) -> bool {
     let interval = config.flush_interval_ticks;
-    interval <= 1 || state.tick % interval == 0
+    interval <= 1 || state.tick.is_multiple_of(interval)
 }
 
 /// 应用一条后台结果（⇔ `Poll` 的单条动作）。

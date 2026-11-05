@@ -167,7 +167,7 @@ mod tests {
     fn chunk_aabb_matches_chunk_bounding_box() {
         let a = chunk_aabb(::voxel::ChunkKey::new(2, -1, 0));
         let s = super::super::key::chunk_voxels_per_axis();
-        assert_eq!(a.min, [2 * s, -1 * s, 0]);
+        assert_eq!(a.min, [2 * s, -s, 0]);
         assert_eq!(a.size(), [s, s, s]);
         assert!(a.contains([2 * s, -s, 0]));
         assert!(!a.contains([2 * s - 1, -s, 0]));

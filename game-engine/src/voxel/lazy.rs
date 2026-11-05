@@ -1,6 +1,6 @@
 //! 懒生成机制：生成逻辑在 game-core，引擎只缓存。
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 use voxel::store::{ChunkKey, VoxInterner, VoxTree};
 
@@ -63,9 +63,9 @@ impl LazyChunks {
     where
         G: ChunkGenerator + ?Sized,
     {
-        if !self.cache.contains_key(&key) {
+        if let Entry::Vacant(slot) = self.cache.entry(key) {
             let tree = generator.generate(key, interner);
-            self.cache.insert(key, tree);
+            slot.insert(tree);
         }
         self.cache.get(&key).expect("刚刚插入")
     }
@@ -82,9 +82,9 @@ impl LazyChunks {
     {
         let mut added = 0;
         for &key in keys {
-            if !self.cache.contains_key(&key) {
+            if let Entry::Vacant(slot) = self.cache.entry(key) {
                 let tree = generator.generate(key, interner);
-                self.cache.insert(key, tree);
+                slot.insert(tree);
                 added += 1;
             }
         }
