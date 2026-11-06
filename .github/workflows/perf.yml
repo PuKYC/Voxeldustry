@@ -191,20 +191,107 @@ jobs:
             gungraun-${{ runner.os }}-
 
       # PR 只读基线；main 上先比较、通过了再更新基线。
+      # 每个 bench 各自落盘日志，并且不因第一个失败就跳过第二个，方便一次看全。
       - name: Run instruction benchmarks
         id: inst
         # 第一次在 CI 上真正跑通并稳定后再删掉这一行，让它变成强门禁。
         continue-on-error: true
         run: |
           set -euo pipefail
+          mkdir -p target/perf-ir
           if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             flag="--save-baseline=ci"
           else
             flag="--baseline=ci"
           fi
           echo "gungraun 参数: ${flag}"
-          cargo bench -p game-core --bench terrain_inst -- "${flag}"
-          cargo bench -p game-engine --features voxel,physics --bench voxel_collider_inst -- "${flag}"
+          echo "flag=${flag}" >> "$GITHUB_OUTPUT"
+
+          rc=0
+          cargo bench -p game-core --bench terrain_inst -- "${flag}" 2>&1 \
+            | tee target/perf-ir/terrain_inst.log || rc=$?
+          cargo bench -p game-engine --features voxel,physics --bench voxel_collider_inst -- "${flag}" 2>&1 \
+            | tee target/perf-ir/voxel_collider_inst.log || rc=$?
+
+          echo "instruction benchmarks exit code: ${rc}"
+          exit "${rc}"
+
+      # 无论成功失败都把结果渲染到 job summary，PR 页面和 Actions 页面都能直接看到。
+      - name: Write instruction summary
+        if: always()
+        run: |
+          shopt -s nullglob
+          {
+            echo "## Gungraun instruction counts"
+            echo ""
+            if [ -n "${{ steps.inst.outputs.flag }}" ]; then
+              echo "参数：\`${{ steps.inst.outputs.flag }}\`"
+              echo ""
+            fi
+            logs=(target/perf-ir/*.log)
+            if [ ${#logs[@]} -eq 0 ]; then
+              echo "_没有日志，benchmark 可能未运行。_"
+            fi
+            for f in "${logs[@]}"; do
+              echo "### $(basename "$f" .log)"
+              echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload instruction logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inst-${{ github.run_id }}
+          path: target/perf-ir/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # 单独一条评论，用隐藏 marker 定位并原地更新，避免和 bench 的 `--edit-last` 互抢。
+      - name: Comment instruction result on PR
+        if: >-
+          always() && github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/perf-ir
+          body_file="target/perf-ir/comment.md"
+          shopt -s nullglob
+          logs=(target/perf-ir/*.log)
+          {
+            echo "<!-- perf-instructions -->"
+            echo "## Gungraun instruction counts"
+            echo ""
+            if [ -n "${{ steps.inst.outputs.flag }}" ]; then
+              echo "参数：\`${{ steps.inst.outputs.flag }}\`"
+              echo ""
+            fi
+            if [ ${#logs[@]} -eq 0 ]; then
+              echo "_没有日志，benchmark 可能未运行。_"
+            fi
+            for f in "${logs[@]}"; do
+              echo "### $(basename "$f" .log)"
+              echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } > "$body_file"
+
+          comment_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- perf-instructions -->")) | .id' \
+            | head -n1 || true)
+
+          if [ -n "${comment_id:-}" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" -F body=@"${body_file}"
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@"${body_file}"
+          fi
 
       # 只保存跑成功的基线：没通过就说明有回归或环境问题，别把坏数据写成新基线。
       - name: Save instruction baseline
@@ -213,4 +300,3 @@ jobs:
         with:
           path: ${{ env.GUNGRAUN_HOME }}
           key: gungraun-${{ runner.os }}-${{ github.run_id }}
-
