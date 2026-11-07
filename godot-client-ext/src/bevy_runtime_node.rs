@@ -64,6 +64,12 @@ pub struct BevyAppManager {
 
     /// 体素 LOD 运行期句柄：Godot 主线程写，后台 Bevy 线程经 VoxelLodHandle 读。
     voxel_lod: Arc<Mutex<VoxelLodRuntime>>,
+
+    /// 内存软上限运行期句柄（百分比）：Godot 主线程写，驻留系统读。
+    ///
+    /// 外层 None = 不覆盖（沿用配置）；Some(None) = 关闭上限；
+    /// Some(Some(p)) = 覆盖为 p%。测试用它制造 / 解除内存压力。
+    memory_soft_limit: MemoryLimitHandle,
 }
 
 #[godot_api]
@@ -81,6 +87,7 @@ impl INode for BevyAppManager {
             last_tick_clock_ms: 0,
             last_timestep_ms: 0.0,
             voxel_lod: Arc::new(Mutex::new(VoxelLodRuntime::default())),
+            memory_soft_limit: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -665,6 +672,59 @@ impl BevyAppManager {
         out.set("unknown_actions", bridge.unknown_actions() as i64);
         out.set("dropped_events", bridge.dropped_events() as i64);
         out.set("input_suspended", bridge.input.is_suspended());
+        out.set(
+            "streaming",
+            &presentation_bridge::streaming_diagnostics_to_dictionary(&bridge.diagnostics()),
+        );
+        out
+    }
+
+    /// 流式 / 驻留诊断快照（Bevy 侧每帧在 Last 集合抄一份，这里只读共享槽）。
+    ///
+    /// 返回 { stream: {...}, residency: {...}, memory: {...} }；
+    /// **未装配那一层时对应子字典为空字典**（0 是合法值，空字典才表示「没跑」）。
+    /// 后台未启动 / 已停止时返回空字典。
+    #[func]
+    fn streaming_diagnostics(&self) -> VarDictionary {
+        let Some(bridge) = self.bridge.clone() else {
+            return VarDictionary::new();
+        };
+        presentation_bridge::streaming_diagnostics_to_dictionary(&bridge.diagnostics())
+    }
+
+    /// 运行期覆盖内存软上限（百分比，0..=100）；传负数撤销覆盖。
+    ///
+    /// 撤销后立刻回到 ResidencyConfig::memory_soft_limit 的配置值
+    /// （覆盖是「读时生效」，不改写配置）。
+    #[func]
+    fn set_memory_soft_limit(&self, percent: i64) {
+        let handle = MemorySoftLimitOverride::from_handle(self.memory_soft_limit.clone());
+        if percent < 0 {
+            handle.clear();
+        } else {
+            handle.set_percent(Some(u32::try_from(percent).unwrap_or(100).min(100)));
+        }
+    }
+
+    /// 当前内存软上限覆盖：{ override: bool, percent: int }（percent=-1 表示关闭上限）。
+    #[func]
+    fn get_memory_soft_limit(&self) -> VarDictionary {
+        let handle = MemorySoftLimitOverride::from_handle(self.memory_soft_limit.clone());
+        let mut out = VarDictionary::new();
+        match handle.get() {
+            None => {
+                out.set("override", false);
+                out.set("percent", -1i64);
+            }
+            Some(None) => {
+                out.set("override", true);
+                out.set("percent", -1i64);
+            }
+            Some(Some(percent)) => {
+                out.set("override", true);
+                out.set("percent", i64::from(percent));
+            }
+        }
         out
     }
 }
@@ -702,6 +762,7 @@ impl BevyAppManager {
         self.from_bevy = Some(life_rx);
 
         config.voxel_lod = Some(self.voxel_lod.clone());
+        config.memory_soft_limit = Some(self.memory_soft_limit.clone());
 
         // 跨边界句柄：Godot 主线程留一份，后台线程拿一份克隆（内部是 Arc 共享）。
         let bridge = ClientBridge::with_semantics(session, self.semantics.clone());

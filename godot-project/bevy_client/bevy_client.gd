@@ -11,6 +11,7 @@ enum Mode {
 	VOXEL_DEMO,    ## 路径 B 体素演示：start_bevy_voxel_demo
 	VOXEL_PERF,    ## 路径 B 体素性能场景：start_bevy_voxel_perf
 	GAMEPLAY_TEST, ## 游戏内容测试场景：start_bevy_gameplay_test
+	STREAMING,     ## 世界 + 体素流式：start_bevy_streaming
 }
 
 @export var manager_path: NodePath = ^"/root/BevyAppManager"
@@ -23,13 +24,16 @@ enum Mode {
 @export_group("Mode")
 ## 启动模式：demo=实体演示；voxel_demo=路径 B 体素演示；voxel_perf=体素性能场景。
 ## 新入口带 has_method 前向兼容：扩展里没有该方法时回退到实体演示。
-@export_enum("demo", "voxel_demo", "voxel_perf", "gameplay_test") var mode: int = Mode.DEMO
+@export_enum("demo", "voxel_demo", "voxel_perf", "gameplay_test", "streaming") var mode: int = Mode.DEMO
 ## voxel_perf：水平方向 mesh 块半径（块），传给 start_bevy_voxel_perf。
 @export_range(0, 16, 1) var voxel_radius_blocks: int = 2
 ## voxel_perf：最高 LOD（0..=3），传给 start_bevy_voxel_perf。
 @export_range(0, 3, 1) var voxel_max_lod: int = 0
 ## voxel_perf：LOD 距离阈值（米，x/y/z = 三档），运行期可调。
 @export var voxel_lod_thresholds: Vector3 = Vector3(32.0, 64.0, 128.0)
+## streaming：世界存档目录（绝对路径）。空串 = 不落盘（每次全生成）。
+## 传了目录时，后端启动会先尝试载入存档，命中则复用，不再重新生成地形。
+@export var save_dir: String = ""
 ## 路径 B：AO 总强度（1.0 = 当前观感、默认开启；0.0 = 完全关闭）。启动时写入 VoxelMeshNode。
 @export_range(0.0, 1.0, 0.01) var voxel_ao_strength: float = 1.0
 ## 路径 B：AO 曲线指数（1.0 = 当前观感；>1 加深，<1 减淡）。
@@ -189,6 +193,12 @@ func _start_backend() -> void:
 			else:
 				push_warning("[BevyClient] 扩展缺少 start_bevy_gameplay_test()，回退到实体演示")
 				_start_entity_backend()
+		Mode.STREAMING:
+			if _mgr.has_method("start_bevy_streaming"):
+				_mgr.start_bevy_streaming(fixed_hz, runner_hz, save_dir)
+			else:
+				push_warning("[BevyClient] 扩展缺少 start_bevy_streaming()，回退到实体演示")
+				_start_entity_backend()
 		_:
 			_start_entity_backend()
 
@@ -266,6 +276,32 @@ func voxel_lod_for_distance(distance: float) -> int:
 	if _mgr != null and _mgr.has_method("voxel_lod_for_distance"):
 		return int(_mgr.voxel_lod_for_distance(distance))
 	return 0
+
+
+## 流式场景：运行期覆盖驻留的内存软上限（百分比 0..=100）；传负数撤销覆盖。
+## 撤销后立刻回到引擎配置值（覆盖是读时生效，不改写配置）。
+func set_memory_soft_limit(percent: int) -> void:
+	if _mgr != null and _mgr.has_method("set_memory_soft_limit"):
+		_mgr.set_memory_soft_limit(percent)
+
+
+## 流式场景：当前内存软上限覆盖 { override: bool, percent: int }（percent=-1 = 关闭上限）。
+func memory_soft_limit() -> Dictionary:
+	if _mgr != null and _mgr.has_method("get_memory_soft_limit"):
+		var info: Variant = _mgr.get_memory_soft_limit()
+		if info is Dictionary:
+			return info as Dictionary
+	return {}
+
+
+## 流式 / 驻留诊断快照：{ stream: {...}, residency: {...}, memory: {...} }。
+## 未装配那一层时对应子字典为空；扩展缺方法时整体返回空字典。
+func streaming_diagnostics() -> Dictionary:
+	if _mgr != null and _mgr.has_method("streaming_diagnostics"):
+		var snapshot: Variant = _mgr.streaming_diagnostics()
+		if snapshot is Dictionary:
+			return snapshot as Dictionary
+	return {}
 
 
 ## 业务扩展：按 key 订阅 EXT 字段（转发给 PayloadCodec）。

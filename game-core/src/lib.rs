@@ -13,6 +13,7 @@
 //! | --- | --- |
 //! | [`app`] / [`spec`] / [`mods`] | 引擎绑定：`CoreGame` 装配 / `CoreSpec` + [`spec::ClientBridge`] / mod 集合 |
 //! | [`bevy_backend`] | 后台 Bevy 线程入口（FFI） |
+//! | [`diagnostics`] | 流式 / 驻留诊断快照（跨线程只读） |
 //! | `gameplay` | 玩法层（阶段集 + movement / death） |
 //! | [`input`] | 动作表与能力通道 |
 //! | [`privacy`] | 隐私组件与 `CorePrivacyScope` |
@@ -27,6 +28,8 @@
 pub mod app;
 pub mod bevy_backend;
 mod dev;
+/// 流式 / 驻留诊断快照（Bevy 每帧抄一份，Godot 另一线程读取）。
+pub mod diagnostics;
 mod gameplay;
 pub mod input;
 /// 中立扩展字段袋（逻辑侧容器，见模块文档的分层说明）。

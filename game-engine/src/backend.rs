@@ -11,6 +11,7 @@
 
 use std::marker::PhantomData;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bevy::app::AppExit;
@@ -20,7 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::bridge::ClientBridge;
 use crate::presentation::pipeline::PresentationRuntime;
-use crate::spec::GameSpec;
+use crate::spec::{GameDiagnostics, GameSpec};
 
 /// 一个游戏的默认装配单元。
 ///
@@ -146,6 +147,29 @@ impl<S: GameSpec> Clone for BackendChannels<S> {
     }
 }
 
+/// 诊断快照的写端（Bevy 侧）。
+///
+/// 与 [`ClientBridge`] 共享同一个 `Arc<Mutex<_>>`：采集系统在每帧末尾写入，
+/// FFI 适配层在另一线程随时读取。
+#[derive(Resource)]
+struct DiagnosticsSink<D: GameDiagnostics>(Arc<Mutex<D>>);
+
+/// 每帧末尾采集一次诊断快照（`Last` 调度，此时玩法与流式系统都已跑完）。
+///
+/// 用独占系统是因为快照通常要同时读多个 Resource；采集只做拷贝，不改变世界。
+fn capture_diagnostics<D: GameDiagnostics>(world: &mut World) {
+    let snapshot = D::capture(world);
+    let Some(sink) = world.get_resource::<DiagnosticsSink<D>>() else {
+        return;
+    };
+    let handle = Arc::clone(&sink.0);
+    let mut slot = match handle.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = snapshot;
+}
+
 /// 后台 Bevy App 的通用主入口。
 ///
 /// 装配 `app`、启动主循环并阻塞到退出。正常退出返回 [`ExitCode::SUCCESS`]，
@@ -204,12 +228,17 @@ fn build_app<S: GameSpec, M: GameModule<S>>(
     app.insert_resource(bridge.events.clone());
     app.insert_resource(bridge.semantics.clone());
     app.insert_resource(PresentationRuntime::with_session(session));
+    app.insert_resource(DiagnosticsSink::<S::Diagnostics>(
+        bridge.diagnostics_handle(),
+    ));
 
     // 2. 基础插件。
     app.add_plugins(MinimalPlugins);
 
     // 3. 游戏装配。
     app.add_plugins(GameModulePlugin::<S, M>::new(module));
+    // 3.5 诊断快照：每帧末尾把 World 里的诊断资源抄进共享快照。
+    app.add_systems(Last, capture_diagnostics::<S::Diagnostics>);
 
     // 4. 时间与物理步长。
     app.insert_resource(Time::<Fixed>::from_hz(config.fixed_hz));

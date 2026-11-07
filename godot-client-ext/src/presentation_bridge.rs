@@ -21,6 +21,7 @@ use godot::builtin::{
 };
 use godot::prelude::*;
 
+use game_core::diagnostics::{MemoryPressure, ResidencyStats, StreamingDiagnostics};
 use game_core::input::control::InputSourceId;
 use game_core::input::raw::RawInputFrame;
 use game_core::presentation::event::{PresentationEvent, TimedPresentationEvent};
@@ -30,6 +31,8 @@ use game_core::presentation::semantics;
 use game_core::presentation::{PresentationCommand, PresentationFrame};
 use game_core::static_data::item;
 use game_core::static_data::prototype;
+use game_core::voxel::StreamStats;
+use game_core::world::streaming::WorldLoadReport;
 
 /// 动作表 → `Array[Dictionary]`，每项 `{ name, bit, channel? }`。
 ///
@@ -577,6 +580,104 @@ pub fn packed_frame_to_dictionary(data: &PackedByteArray) -> VarDictionary {
             VarDictionary::new()
         }
     }
+}
+
+// ─────────────── 流式 / 驻留诊断快照（跨线程只读） ───────────────
+
+/// 流式 / 驻留诊断快照 → `Dictionary`。
+///
+/// ```text
+/// {
+///   stream:    { queued, pending, loaded_from_store, generated, proposed, unloaded,
+///                pending_unloads, render_groups, staged },
+///   residency: { none_chunks, data_chunks, render_chunks, deferred_upgrades, awaiting_entities },
+///   memory:    { used_nodes, capacity_nodes, fill_percent },
+/// }
+/// ```
+///
+/// 未装配的层给**空字典**而不是全 0 的字典：0 是合法统计值（例如刚启动时
+/// `render_groups == 0`），只有空字典才表示「这层没跑」。
+///
+/// 数值语义见 `game_core::voxel::StreamStats` / `game_engine::residency::ResidencyStats`；
+/// 本函数只做机械搬运（u64 / usize 一律转 i64）。
+pub fn streaming_diagnostics_to_dictionary(snapshot: &StreamingDiagnostics) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    out.set(
+        "stream",
+        &stream_stats_to_dictionary(snapshot.stream.as_ref()),
+    );
+    out.set(
+        "residency",
+        &residency_stats_to_dictionary(snapshot.residency.as_ref()),
+    );
+    out.set(
+        "memory",
+        &memory_pressure_to_dictionary(snapshot.memory.as_ref()),
+    );
+    out.set(
+        "world",
+        &world_load_report_to_dictionary(snapshot.world.as_ref()),
+    );
+    // 缺失时给 -1：0 是「没有任何编辑」的合法值，不能拿它表示「没装配」。
+    out.set(
+        "edited_chunks",
+        snapshot.edited_chunks.map_or(-1, |count| count as i64),
+    );
+    out
+}
+
+fn stream_stats_to_dictionary(stats: Option<&StreamStats>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    let Some(stats) = stats else {
+        return out;
+    };
+    out.set("queued", stats.queued as i64);
+    out.set("pending", stats.pending as i64);
+    out.set("loaded_from_store", stats.loaded_from_store as i64);
+    out.set("generated", stats.generated as i64);
+    out.set("proposed", stats.proposed as i64);
+    out.set("unloaded", stats.unloaded as i64);
+    out.set("pending_unloads", stats.pending_unloads as i64);
+    out.set("render_groups", stats.render_groups as i64);
+    out.set("staged", stats.staged as i64);
+    out
+}
+
+fn residency_stats_to_dictionary(stats: Option<&ResidencyStats>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    let Some(stats) = stats else {
+        return out;
+    };
+    out.set("none_chunks", stats.none_chunks as i64);
+    out.set("data_chunks", stats.data_chunks as i64);
+    out.set("render_chunks", stats.render_chunks as i64);
+    out.set("deferred_upgrades", stats.deferred_upgrades as i64);
+    out.set("awaiting_entities", stats.awaiting_entities as i64);
+    out
+}
+
+fn memory_pressure_to_dictionary(pressure: Option<&MemoryPressure>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    let Some(pressure) = pressure else {
+        return out;
+    };
+    out.set("used_nodes", pressure.used_nodes as i64);
+    out.set("capacity_nodes", pressure.capacity_nodes as i64);
+    out.set("fill_percent", i64::from(pressure.fill_percent()));
+    out
+}
+
+fn world_load_report_to_dictionary(report: Option<&WorldLoadReport>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    let Some(report) = report else {
+        return out;
+    };
+    out.set("loaded", report.loaded_from_save);
+    out.set("bodies", report.bodies as i64);
+    out.set("chunks", report.chunks as i64);
+    out.set("entities", report.entities as i64);
+    out.set("stale_chunks", report.stale_chunks as i64);
+    out
 }
 
 #[cfg(test)]

@@ -92,11 +92,12 @@ use game_engine::residency::{
 };
 use game_engine::save::{PersistPlugin, SaveConfig, SavePaths, SavePlugin, SaveStore};
 
+use crate::gameplay::Velocity;
 use crate::input::control::LocalPlayer;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
 use crate::voxel::stream::{VoxelStreamConfig, VoxelStreamPlugin};
-use crate::voxel::terrain::{attach_terrain_body, TerrainConfig, TerrainStats};
+use crate::voxel::terrain::{attach_terrain_body, TerrainConfig, TerrainStats, VoxelLodHandle};
 use crate::voxel::{
     FeaturePlugin, TreeFeature, WorldFeature, WorldFeatureAppExt, WorldFeatureRegistry,
 };
@@ -128,6 +129,38 @@ impl Default for StreamingPlayerConfig {
     }
 }
 
+/// 标记资源：让「LOD 观察者」位置驱动本地玩家的流式锚点。
+///
+/// 只由 dev 观察者入口（`TerrainMode::Streaming` + `voxel_viewer`，即
+/// `start_bevy_streaming`）插入。原因：`voxel_viewer` 只 spawn 玩家，不带任何
+/// 输入位移系统，玩家出生后只受重力；没有本系统时「移动相机」最多改 LOD 档位，
+/// 改不了驻留锚点，世界流式永远不会卸载块，也就无法从 Godot 侧验证升降档。
+///
+/// 真实玩法有自己的控制器写 `Transform`，不该被相机瞬移，所以本资源是显式
+/// opt-in，而不是流式模式的默认行为（见 [follow_observer_streaming_player]）。
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObserverDrivenStreamingPlayer;
+
+/// 启动引导的读档结果（诊断 / 测试用）。
+///
+/// 重进世界要看这里，而不是流的 store-hit 计数：[load_world] 已经把存档块**直接
+/// 装进容器**，这些块不经过 `SaveStore::lookup`，所以 `StreamStats::
+/// loaded_from_store` 在「刚读档启动」时恒为 0。要区分「从档恢复」与「新世界」，
+/// 只能看引导系统自己的结果。
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorldLoadReport {
+    /// 是否从存档恢复（world.meta 存在且读档成功）。
+    pub loaded_from_save: bool,
+    /// 读档恢复的 body 数。
+    pub bodies: usize,
+    /// 读档读到的块记录数（含 content = None，即需要重新生成的块）。
+    pub chunks: usize,
+    /// 读档应用的实体记录数。
+    pub entities: usize,
+    /// 因 generator_version 不匹配而丢弃内容的块数。
+    pub stale_chunks: usize,
+}
+
 /// 把驻留 / 流式 / 世界区块 /（可选）存档管线接进 App。
 ///
 /// 依赖：先装 crate::voxel::GameVoxelPlugin 与 crate::voxel::terrain::TerrainPlugin
@@ -150,6 +183,8 @@ impl Plugin for StreamingWorldPlugin {
         }
 
         app.init_resource::<StreamingPlayerConfig>();
+        // 诊断快照读它：重进世界时「是否从档恢复」只有这里知道。
+        app.init_resource::<WorldLoadReport>();
 
         // 顺序不能反：WorldChunkPlugin 在 build 里断言 ChunkReached / ChunkWillUnload /
         // ChunkEntities 三条消息已存在，而它们分别由 ResidencyPlugin / VoxelStreamPlugin 注册。
@@ -183,10 +218,30 @@ impl Plugin for StreamingWorldPlugin {
 
         // 玩家观察者必须在 Anchor 之前补齐 LogicPos / BodyRef / Observer，
         // 否则第一 tick 的 update_anchors 看不到这些组件，请求要滞后一 tick。
+        //
+        // follow 夹在 attach 与 sync 之间：先补身份，再把外部观察者位置写成
+        // Transform，最后让 sync 在同 tick 内把 LogicPos 跟上（否则驻留会晚一 tick
+        // 才看到新位置）。follow 只在 [ObserverDrivenStreamingPlayer] 存在时跑。
         app.add_systems(
             FixedUpdate,
-            (attach_local_player_streaming, sync_local_player_logic_pos)
+            (
+                attach_local_player_streaming,
+                follow_observer_streaming_player
+                    .run_if(resource_exists::<ObserverDrivenStreamingPlayer>),
+                sync_local_player_logic_pos,
+            )
                 .chain()
+                .in_set(GameTickSet::Residency)
+                .before(ResidencySet::Anchor),
+        );
+        // 物理侧的速度清零单独成系统（avian 的 LinearVelocity 只在 physics
+        // feature 下存在，不能塞进上面的元组）。与 follow 无关的顺序依赖：
+        // 它只写速度，不读 Transform。
+        #[cfg(feature = "physics")]
+        app.add_systems(
+            FixedUpdate,
+            freeze_observer_streaming_player_velocity
+                .run_if(resource_exists::<ObserverDrivenStreamingPlayer>)
                 .in_set(GameTickSet::Residency)
                 .before(ResidencySet::Anchor),
         );
@@ -286,6 +341,16 @@ fn bootstrap_streaming_world(world: &mut World) {
                     loaded.stats.entities,
                     loaded.stats.orphan_regions,
                 );
+                // 诊断用：重进世界要先看「是否从档恢复、恢复了多少块」。流的
+                // store-hit 计数在这里恒为 0（load_world 直接装容器），不能拿它
+                // 判断存档有没有生效。
+                world.insert_resource(WorldLoadReport {
+                    loaded_from_save: true,
+                    bodies: loaded.stats.bodies,
+                    chunks: loaded.stats.chunks,
+                    entities: loaded.stats.entities,
+                    stale_chunks: loaded.stats.stale_chunks,
+                });
                 // 孤儿回收放在读档成功之后：坏档旁边可能还有能手工抢救的目录，
                 // 读不动就什么都别删。默认策略是 Keep，删除必须显式开启。
                 reclaim_after_load(world, &paths);
@@ -445,6 +510,56 @@ type MovedLocalPlayerQuery<'w, 's> = Query<
 fn sync_local_player_logic_pos(mut players: MovedLocalPlayerQuery) {
     for (transform, mut logic) in &mut players {
         logic.0 = logic_pos_for_transform(transform.translation).0;
+    }
+}
+
+/// 把 [VoxelLodHandle] 里的观察者位置写成玩家 `Transform`。
+///
+/// 只在 [ObserverDrivenStreamingPlayer] 存在时注册（显式 opt-in）。observer 为
+/// `None`（Godot 还没推过位置）时不动，避免把一个正常走动的玩家吸到原点。
+///
+/// 写 `Transform` 等价于瞬移：avian 的 `transform_to_position` 会把
+/// GlobalTransform 的变化写回 `Position`。同时清掉玩法速度，免得瞬移前后
+/// 的重力 / 碰撞速度累积成「起飞」。
+fn follow_observer_streaming_player(
+    lod: Option<Res<VoxelLodHandle>>,
+    mut players: Query<(&mut Transform, Option<&mut Velocity>), With<LocalPlayer>>,
+) {
+    // 锁只在这一步持有：Godot 主线程写 observer 时会短暂争用，不能跨系统持有。
+    let Some([x, y, z]) = lod.as_deref().and_then(observer_position) else {
+        return;
+    };
+    let target = Vec3::new(x, y, z);
+    for (mut transform, velocity) in &mut players {
+        transform.translation = target;
+        if let Some(mut velocity) = velocity {
+            velocity.linear = Vec3::ZERO;
+        }
+    }
+}
+
+/// 读当前 observer 覆写值（[VoxelLodHandle] 内部锁，poison 用 into_inner）。
+fn observer_position(handle: &VoxelLodHandle) -> Option<[f32; 3]> {
+    match handle.0.lock() {
+        Ok(runtime) => runtime.observer,
+        Err(poisoned) => poisoned.into_inner().observer,
+    }
+}
+
+/// 物理侧：观察者驱动的玩家不参与重力 / 碰撞速度累积（只清速度，不碰位置）。
+///
+/// 只在 observer 真的推过位置时清速度：没被观察者钉住的玩家仍要走正常的
+/// 重力 / 碰撞（否则玩家会一直浮在出生点上方，连脚下的方块都够不到）。
+#[cfg(feature = "physics")]
+fn freeze_observer_streaming_player_velocity(
+    lod: Option<Res<VoxelLodHandle>>,
+    mut players: Query<&mut game_engine::voxel::LinearVelocity, With<LocalPlayer>>,
+) {
+    if lod.as_deref().and_then(observer_position).is_none() {
+        return;
+    }
+    for mut velocity in &mut players {
+        velocity.0 = Vec3::ZERO;
     }
 }
 

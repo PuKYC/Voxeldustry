@@ -37,6 +37,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 
@@ -606,6 +607,66 @@ impl Default for ResidencyConfig {
             // 实测前先给保守值：0.5 秒（60 Hz）。
             demote_grace_ticks: 30,
             memory_soft_limit: None,
+        }
+    }
+}
+
+/// 内存软上限的跨线程共享句柄（FFI 写、Bevy 读）。
+///
+/// 三层语义：
+/// - `None`：不覆盖，沿用 [`ResidencyConfig::memory_soft_limit`]；
+/// - `Some(None)`：强制关闭限制；
+/// - `Some(Some(p))`：强制用 `p`（百分比 0–100，写入时已夹紧）。
+pub type MemorySoftLimitHandle = Arc<Mutex<Option<Option<u32>>>>;
+
+/// 内存软上限的运行期覆盖（Godot 主线程写、Bevy 每 tick 读）。
+///
+/// 与 [`ResidencyConfig`] 的关系是「覆盖」而非「改写」：覆盖撤销后立刻回到
+/// 装配时的配置值，不改动配置资源本身（因此不影响其它读配置的系统）。
+///
+/// 用法：宿主持有 [`MemorySoftLimitHandle`]（或本资源）在任意线程调用
+/// `set` / `clear`；Bevy 侧把本资源插入 World 即可，未插入时行为与之前完全一致。
+#[derive(Resource, Debug, Clone, Default)]
+pub struct MemorySoftLimitOverride(MemorySoftLimitHandle);
+
+impl MemorySoftLimitOverride {
+    /// 从共享句柄构造（FFI 侧持有同一份 `Arc`）。
+    #[must_use]
+    pub fn from_handle(handle: MemorySoftLimitHandle) -> Self {
+        Self(handle)
+    }
+
+    /// 取出共享句柄（与资源共享同一份状态）。
+    #[must_use]
+    pub fn handle(&self) -> MemorySoftLimitHandle {
+        Arc::clone(&self.0)
+    }
+
+    /// 写入覆盖值（`None` = 撤销覆盖，回到配置值）。
+    pub fn set(&self, limit: Option<Option<u32>>) {
+        let clamped = limit.map(|inner| inner.map(|percent| percent.min(100)));
+        match self.0.lock() {
+            Ok(mut slot) => *slot = clamped,
+            Err(poisoned) => *poisoned.into_inner() = clamped,
+        }
+    }
+
+    /// 按百分比覆盖（0–100，自动夹紧）；`None` = 撤销覆盖。
+    pub fn set_percent(&self, percent: Option<u32>) {
+        self.set(percent.map(Some));
+    }
+
+    /// 撤销覆盖，回到装配时的配置值。
+    pub fn clear(&self) {
+        self.set(None);
+    }
+
+    /// 读取当前覆盖值。
+    #[must_use]
+    pub fn get(&self) -> Option<Option<u32>> {
+        match self.0.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
         }
     }
 }

@@ -11,9 +11,9 @@ use bevy::{ecs::system::SystemParam, prelude::*};
 use super::Observer as ObserverTag;
 use super::{
     body_key_for, chunk_of, observer_chunks, AwaitingChunks, BodyRef, ChunkAnchor, ChunkReached,
-    GameTickSet, LogicPos, MemoryPressure, PathCorridor, PinRequests, Real, RequestSource,
-    Residency, ResidencyChanged, ResidencyConfig, ResidencySet, ResidencyStats, ResidencyTable,
-    UnsavedEditClear, UnsavedEditMark, WorkSites,
+    GameTickSet, LogicPos, MemoryPressure, MemorySoftLimitOverride, PathCorridor, PinRequests,
+    Real, RequestSource, Residency, ResidencyChanged, ResidencyConfig, ResidencySet,
+    ResidencyStats, ResidencyTable, UnsavedEditClear, UnsavedEditMark, WorkSites,
 };
 use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
@@ -331,16 +331,27 @@ fn observer_snapshot(anchor: &ChunkAnchor, radius: u8) -> BTreeMap<(BodyKey, Chu
 /// 内存压力（[`MemoryPressure`]，流式层每 tick 写入）只影响**升级**：
 /// `memory_soft_limit` 已配置且填充率超限时，升级只记录、不兑现。降级
 /// 与同档刷新照旧；压力消失后被扣下的升级在下一 tick 自动兑现。
+/// 上限本身可被 [`MemorySoftLimitOverride`] 在运行期覆盖（Godot 测试用）。
 fn resolve_levels(
     mut table: ResMut<ResidencyTable>,
     config: Res<ResidencyConfig>,
     mut stats: ResMut<ResidencyStats>,
     pressure: Option<Res<MemoryPressure>>,
+    limit_override: Option<Res<MemorySoftLimitOverride>>,
 ) {
     let tick = table.tick;
 
+    // 运行期覆盖优先于配置：None = 沿用配置 / Some(None) = 关闭 / Some(Some(p)) = 该上限。
+    let limit = match limit_override
+        .as_deref()
+        .and_then(MemorySoftLimitOverride::get)
+    {
+        Some(limit) => limit,
+        None => config.memory_soft_limit,
+    };
+
     // 压力在整轮 Resolve 里是同一个快照，循环外算一次即可。
-    let blocked = match (config.memory_soft_limit, pressure.as_deref()) {
+    let blocked = match (limit, pressure.as_deref()) {
         (Some(limit), Some(p)) => p.is_over(limit),
         _ => false,
     };

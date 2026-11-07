@@ -6,7 +6,7 @@
 //! 泛型于 GameSpec：载荷 / 事件 / 语义注册表由游戏侧绑定。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::input::control::InputSourceId;
 use crate::input::raw::RawInputFrame;
@@ -29,6 +29,10 @@ pub struct ClientBridge<S: GameSpec> {
     session: u64,
     submitted_frames: Arc<AtomicU64>,
     unknown_actions: Arc<AtomicU64>,
+    /// 诊断快照（Bevy 每帧写、Godot 随时读）。
+    ///
+    /// Godot 与 Bevy 不在同一线程，不能读 World，所以诊断只以纯数据快照过界。
+    diagnostics: Arc<Mutex<S::Diagnostics>>,
 }
 
 impl<S: GameSpec> Clone for ClientBridge<S> {
@@ -41,6 +45,7 @@ impl<S: GameSpec> Clone for ClientBridge<S> {
             session: self.session,
             submitted_frames: Arc::clone(&self.submitted_frames),
             unknown_actions: Arc::clone(&self.unknown_actions),
+            diagnostics: Arc::clone(&self.diagnostics),
         }
     }
 }
@@ -66,6 +71,7 @@ impl<S: GameSpec> ClientBridge<S> {
             session,
             submitted_frames: Arc::new(AtomicU64::new(0)),
             unknown_actions: Arc::new(AtomicU64::new(0)),
+            diagnostics: Arc::new(Mutex::new(S::Diagnostics::default())),
         }
     }
 
@@ -143,6 +149,21 @@ impl<S: GameSpec> ClientBridge<S> {
         self.unknown_actions.load(Ordering::Relaxed)
     }
 
+    /// 另一线程：读取最近一帧诊断快照。
+    ///
+    /// 快照在 Bevy 的每帧末尾刷新，因此读到的永远是「上一帧结束时的状态」。
+    pub fn diagnostics(&self) -> S::Diagnostics {
+        match self.diagnostics.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Bevy 侧：拿可写快照句柄，交给诊断采集系统。
+    pub(crate) fn diagnostics_handle(&self) -> Arc<Mutex<S::Diagnostics>> {
+        Arc::clone(&self.diagnostics)
+    }
+
     /// 会话切换时清理残留（重启 Bevy 前调用）。语义注册表保留。
     pub fn reset(&self, session: u64) -> Self {
         Self {
@@ -153,6 +174,7 @@ impl<S: GameSpec> ClientBridge<S> {
             session,
             submitted_frames: Arc::new(AtomicU64::new(0)),
             unknown_actions: Arc::new(AtomicU64::new(0)),
+            diagnostics: Arc::new(Mutex::new(S::Diagnostics::default())),
         }
     }
 }

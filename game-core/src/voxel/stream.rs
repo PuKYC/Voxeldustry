@@ -179,7 +179,7 @@ impl Default for VoxelStreamConfig {
 }
 
 /// 流式加载统计（每 tick 由 [advance_proposals] / [settle_chunks] 刷新）。
-#[derive(Resource, Debug, Default, PartialEq, Eq)]
+#[derive(Resource, Debug, Default, Clone, PartialEq, Eq)]
 pub struct StreamStats {
     /// 当前等待结算的区块数（[StreamWanted] 长度）。
     pub queued: usize,

@@ -10,15 +10,21 @@ use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use game_engine::backend::{self, EngineConfig, GameModule};
+use game_engine::residency::MemorySoftLimitHandle;
 
 use crate::app::CoreGame;
 use crate::dev::demo::DemoPlugin;
 use crate::spec::{ClientBridge, CoreSpec};
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
+use crate::world::streaming::ObserverDrivenStreamingPlayer;
 use crate::world::SaveRoot;
 
 // 消息类型由引擎定义，重导出保持 godot 侧路径不变。
 pub use game_engine::backend::{BevyControlMsg, BevyLifecycleMsg, FromBevy};
+// 内存软上限句柄同理：FFI 只依赖 game-core，不直接依赖 game-engine。
+pub use game_engine::residency::{
+    MemorySoftLimitHandle as MemoryLimitHandle, MemorySoftLimitOverride,
+};
 
 /// 后台 Bevy 实例的配置参数。
 #[derive(Debug, Clone)]
@@ -56,6 +62,12 @@ pub struct BevyBackendConfig {
     /// None 时一条存盘路径都不接：ChunkPersistence 保持 NoStore，
     /// 启动不读、运行不写，完全不碰磁盘（headless / 单测）。
     pub save_dir: Option<PathBuf>,
+    /// 内存软上限的运行期句柄（Godot 写、Bevy 读）。
+    ///
+    /// Some 时把 [MemorySoftLimitOverride] 插进 World，覆盖
+    /// [game_engine::residency::ResidencyConfig::memory_soft_limit]；
+    /// None 时行为与未加该字段前完全一致（沿用插件配置）。
+    pub memory_soft_limit: Option<MemorySoftLimitHandle>,
 }
 
 impl Default for BevyBackendConfig {
@@ -73,6 +85,7 @@ impl Default for BevyBackendConfig {
             // 两个新开关都取「零变化」的默认值：旧入口不需要知道它们存在。
             terrain_mode: TerrainMode::Eager,
             save_dir: None,
+            memory_soft_limit: None,
         }
     }
 }
@@ -93,6 +106,7 @@ struct CoreGameModule {
     voxel_lod: Option<Arc<Mutex<VoxelLodRuntime>>>,
     terrain_mode: TerrainMode,
     save_dir: Option<PathBuf>,
+    memory_soft_limit: Option<MemorySoftLimitHandle>,
 }
 
 impl GameModule<CoreSpec> for CoreGameModule {
@@ -119,6 +133,22 @@ impl GameModule<CoreSpec> for CoreGameModule {
         app.insert_resource(self.terrain_mode);
         if let Some(dir) = &self.save_dir {
             app.insert_resource(SaveRoot(dir.clone()));
+        }
+        // 内存软上限覆盖：与 VoxelLodHandle 同一模式（Godot 主线程写共享句柄）。
+        if let Some(handle) = &self.memory_soft_limit {
+            app.insert_resource(MemorySoftLimitOverride::from_handle(handle.clone()));
+        }
+        // dev 观察者入口（流式 + voxel_viewer，即 start_bevy_streaming）没有输入
+        // 位移系统：玩家出生后只会受重力，驻留锚点固定在出生点，世界流式永远
+        // 不卸载块。这条件装配一条「相机 / 观察者驱动玩家」的 dev 通道，让 Godot
+        // 侧推 set_voxel_observer 就能驱动驻留。真实玩法入口（demo / gameplay_test）
+        // 有自己的控制器，不能开：否则相机一推玩家就被瞬移。
+        if self.terrain_mode == TerrainMode::Streaming
+            && self.voxel_viewer
+            && !self.enable_demo
+            && !self.gameplay_test
+        {
+            app.insert_resource(ObserverDrivenStreamingPlayer);
         }
         CoreGame.build(app);
         if self.terrain_perf {
@@ -167,6 +197,7 @@ pub fn run_bevy_backend(
             voxel_lod: config.voxel_lod,
             terrain_mode: config.terrain_mode,
             save_dir: config.save_dir,
+            memory_soft_limit: config.memory_soft_limit,
         },
         bridge,
         ctrl_rx,
@@ -192,6 +223,7 @@ mod tests {
             voxel_lod: None,
             terrain_mode,
             save_dir,
+            memory_soft_limit: None,
         }
     }
 

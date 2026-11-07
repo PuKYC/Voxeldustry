@@ -3,7 +3,7 @@
 //! 所有「换游戏就需要换」的类型都收在这里；引擎内部只认这些关联类型。
 //! 遵守 rule of two：只有出现第二种真实实现、或明确要由 mod 替换的接缝才泛型化。
 
-use bevy::prelude::Resource;
+use bevy::prelude::{Resource, World};
 
 use crate::input::actions::{ActionMap, EmptyActions};
 use crate::presentation::event::PresentationEventData;
@@ -20,8 +20,27 @@ pub trait GameSpec: Send + Sync + 'static {
     type Event: PresentationEventData;
     /// 运行期语义注册表（mod 基石）。引擎不关心其内部形状。
     type Semantics: Resource + Clone + Send + Sync + 'static;
+    /// 运行期诊断快照（供 FFI 适配层在另一线程读取）。
+    ///
+    /// 快照在 Bevy 线程每帧采集一次，只做拷贝，不参与任何玩法逻辑。
+    /// 不需要诊断的游戏绑定 `()`。
+    type Diagnostics: GameDiagnostics;
     /// 逻辑定步频率。
     const FIXED_HZ: u32;
+}
+
+/// 运行期诊断快照：从 World 抄一份纯数据，交给另一线程读取。
+///
+/// Godot 与 Bevy 不在同一线程，不能直接读 World；实现者应只读取自己的诊断
+/// 资源，并在资源缺失时返回空快照（而不是伪造 0，因为 0 是合法值）。
+pub trait GameDiagnostics: Clone + Default + Send + Sync + 'static {
+    /// 从 World 采集一帧快照。
+    fn capture(world: &mut World) -> Self;
+}
+
+/// 不采集任何诊断（默认绑定用）。
+impl GameDiagnostics for () {
+    fn capture(_world: &mut World) {}
 }
 
 /// 空载荷值（默认绑定用）。
@@ -127,5 +146,6 @@ impl GameSpec for DefaultSpec {
     type Payload = NoPayload;
     type Event = NoEvent;
     type Semantics = NoSemantics;
+    type Diagnostics = ();
     const FIXED_HZ: u32 = crate::sim::DEFAULT_FIXED_HZ;
 }

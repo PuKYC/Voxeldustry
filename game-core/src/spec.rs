@@ -7,6 +7,7 @@
 use game_engine::bridge::ClientBridge as GenericClientBridge;
 use game_engine::spec::GameSpec;
 
+use crate::diagnostics::StreamingDiagnostics;
 use crate::input::actions::CoreActions;
 use crate::presentation::semantics::SemanticRegistry;
 use crate::presentation::{PresentationEvent, SyncPayload};
@@ -19,6 +20,7 @@ impl GameSpec for CoreSpec {
     type Payload = SyncPayload;
     type Event = PresentationEvent;
     type Semantics = SemanticRegistry;
+    type Diagnostics = StreamingDiagnostics;
     const FIXED_HZ: u32 = 60;
 }
 
