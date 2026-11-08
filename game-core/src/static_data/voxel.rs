@@ -10,6 +10,9 @@
 //! 依赖方向：本模块只依赖 game_engine；**不依赖 presentation / godot**。
 //! Game 数值一律以 FixedPoint（I40F24）或整数表达，避免 f32 进入逻辑层。
 
+use std::borrow::Cow;
+use std::sync::RwLock;
+
 use bevy::prelude::*;
 use game_engine::math::FixedPoint;
 
@@ -110,6 +113,146 @@ pub fn is_solid_block(id: u8) -> bool {
     block_def(id).is_some_and(|b| b.solid)
 }
 
+// ── 数据驱动方块对象（JSONC）─────────────────────────────────────────────
+
+/// JSONC 中的方块对象定义。
+///
+/// 这是**数据层**的方块条目；BLOCK_TABLE 是核心 0..=7 的编译期契约。
+/// 核心 id 0..=7 必须与 BLOCK_TABLE 同名同 id；mod 条目按名字哈希分配
+/// id（>= 10000），加载时再映射到 8..=255 的空闲 u8 槽位。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoxelObjectDef {
+    pub id: u32,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub solid: bool,
+    /// 可被替换（草、雪层等）。
+    #[serde(default)]
+    pub replaceable: bool,
+    /// 可作为支撑面（可放火把 / 实体）。
+    #[serde(default = "default_true", alias = "supports", alias = "support_face")]
+    pub support: bool,
+    /// 是否参与碰撞。
+    #[serde(default = "default_true")]
+    pub collision: bool,
+    /// 世界体素值使用的 u8 槽位；加载时由 assign_block_slots 分配。
+    #[serde(skip)]
+    pub slot: u8,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl VoxelObjectDef {
+    /// 世界体素值使用的 u8 槽位（加载时已分配）。
+    pub fn block_id(&self) -> Option<u8> {
+        Some(self.slot)
+    }
+}
+
+/// 给方块表分配 u8 调色板槽位：核心 id 0..=7 固定用同值槽位，其余条目
+/// 按表顺序取 8..=255 的最小空闲槽。超过 256 个方块直接报错。
+pub fn assign_block_slots(blocks: &mut [VoxelObjectDef]) -> Result<(), String> {
+    let mut used = [false; 256];
+    for block in blocks.iter_mut() {
+        if block.id <= u32::from(u8::MAX) {
+            let slot = block.id as u8;
+            if used[usize::from(slot)] {
+                return Err(format!("方块槽位重复：id {}", block.id));
+            }
+            used[usize::from(slot)] = true;
+            block.slot = slot;
+        }
+    }
+    let mut next_free = 8usize;
+    for block in blocks.iter_mut() {
+        if block.id <= u32::from(u8::MAX) {
+            continue;
+        }
+        while next_free < used.len() && used[next_free] {
+            next_free += 1;
+        }
+        if next_free >= used.len() {
+            return Err("方块调色板只有 256 个槽位，mod 方块过多".to_string());
+        }
+        used[next_free] = true;
+        block.slot = next_free as u8;
+        next_free += 1;
+    }
+    Ok(())
+}
+
+impl super::JsoncTable for VoxelObjectDef {
+    type Def = Self;
+    const FILE: &'static str = "voxel_objects.jsonc";
+    const ROOT_KEY: &'static str = "blocks";
+
+    fn key(def: &Self::Def) -> &str {
+        &def.name
+    }
+
+    fn validate(defs: &[Self::Def]) -> Result<(), String> {
+        if defs.is_empty() {
+            return Err("方块对象表为空".to_string());
+        }
+        let mut previous_id = None;
+        let mut names = std::collections::HashSet::new();
+        for def in defs {
+            if let Some(previous) = previous_id {
+                if def.id <= previous {
+                    return Err(format!(
+                        "方块对象必须按 id 严格升序：{}（id {}）出现在 id {} 之后",
+                        def.name, def.id, previous
+                    ));
+                }
+            }
+            previous_id = Some(def.id);
+            if def.name.is_empty() {
+                return Err(format!("id {} 的方块名字为空", def.id));
+            }
+            if !names.insert(def.name.as_str()) {
+                return Err(format!("方块名字重复：{}", def.name));
+            }
+            if def.name.contains(':') {
+                let expected = game_engine::ids::mod_hash_id(&def.name);
+                if def.id != expected {
+                    return Err(format!(
+                        "mod 方块 {} 的 id 必须是 mod_hash_id = {}，实际 {}",
+                        def.name, expected, def.id
+                    ));
+                }
+            } else if def.id > game_engine::ids::CORE_ID_MAX {
+                return Err(format!(
+                    "核心方块 {} 的 id 越界：{}（非命名空间 id 必须 <= {}）",
+                    def.name,
+                    def.id,
+                    game_engine::ids::CORE_ID_MAX
+                ));
+            }
+            if def.id == u32::from(AIR_BLOCK) && (def.solid || def.support || def.collision) {
+                return Err("air 必须是 solid=false / support=false / collision=false".to_string());
+            }
+        }
+
+        // 核心 0..=7 的 id / 名字是导出契约，必须与 BLOCK_TABLE 一致。
+        for block in BLOCK_TABLE {
+            let found = defs
+                .iter()
+                .find(|def| def.id == u32::from(block.id))
+                .ok_or_else(|| format!("缺少核心方块 id {}（{}）", block.id, block.name))?;
+            if found.name != block.name {
+                return Err(format!(
+                    "核心方块 id {} 名字必须是 {}，实际 {}",
+                    block.id, block.name, found.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── 生物群系表 ────────────────────────────────────────────────────────────
 
 /// 生物群系 id（游戏语义 world::BiomeId 即对本类型的重导出）。
@@ -120,10 +263,10 @@ pub struct BiomeId(pub u8);
 pub const DEFAULT_BIOME: BiomeId = BiomeId(0);
 
 /// 生物群系定义。高度参数以**体素**为单位，供生成函数做定点噪声基线。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BiomeDef {
     pub id: BiomeId,
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// 地表基线高度（世界体素 Y）。
     pub base_height: i32,
     /// 噪声振幅（±体素数）。
@@ -133,10 +276,53 @@ pub struct BiomeDef {
     pub stone_block: u8,
 }
 
+impl BiomeDef {
+    /// 生成器只需要的纯数据切片（不含名字）。
+    pub fn shape(&self) -> BiomeShape {
+        BiomeShape::from(self)
+    }
+}
+
+/// 生成器使用的生物群系形状；Copy，避免每列查表。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BiomeShape {
+    pub id: BiomeId,
+    pub base_height: i32,
+    pub amplitude: i32,
+    pub surface_block: u8,
+    pub subsurface_block: u8,
+    pub stone_block: u8,
+}
+
+impl BiomeShape {
+    /// 未知生物群系 id 的兜底形状，与 meadow 一致。
+    pub const FALLBACK: Self = Self {
+        id: BiomeId(0),
+        base_height: 64,
+        amplitude: 8,
+        surface_block: GRASS_BLOCK,
+        subsurface_block: DIRT_BLOCK,
+        stone_block: STONE_BLOCK,
+    };
+}
+
+impl From<&BiomeDef> for BiomeShape {
+    fn from(def: &BiomeDef) -> Self {
+        Self {
+            id: def.id,
+            base_height: def.base_height,
+            amplitude: def.amplitude,
+            surface_block: def.surface_block,
+            subsurface_block: def.subsurface_block,
+            stone_block: def.stone_block,
+        }
+    }
+}
+
 pub const BIOME_TABLE: &[BiomeDef] = &[
     BiomeDef {
         id: BiomeId(0),
-        name: "meadow",
+        name: Cow::Borrowed("meadow"),
         base_height: 64,
         amplitude: 8,
         surface_block: GRASS_BLOCK,
@@ -145,7 +331,7 @@ pub const BIOME_TABLE: &[BiomeDef] = &[
     },
     BiomeDef {
         id: BiomeId(1),
-        name: "forest",
+        name: Cow::Borrowed("forest"),
         base_height: 68,
         amplitude: 10,
         surface_block: GRASS_BLOCK,
@@ -154,7 +340,7 @@ pub const BIOME_TABLE: &[BiomeDef] = &[
     },
     BiomeDef {
         id: BiomeId(2),
-        name: "desert",
+        name: Cow::Borrowed("desert"),
         base_height: 60,
         amplitude: 6,
         surface_block: SAND_BLOCK,
@@ -163,7 +349,7 @@ pub const BIOME_TABLE: &[BiomeDef] = &[
     },
     BiomeDef {
         id: BiomeId(3),
-        name: "tundra",
+        name: Cow::Borrowed("tundra"),
         base_height: 66,
         amplitude: 12,
         surface_block: SNOW_BLOCK,
@@ -175,6 +361,138 @@ pub const BIOME_TABLE: &[BiomeDef] = &[
 /// 按 id 查生物群系定义。
 pub fn biome_def(id: BiomeId) -> Option<&'static BiomeDef> {
     BIOME_TABLE.iter().find(|b| b.id == id)
+}
+
+/// 运行期已加载的生物群系形状；生成器在 const 表之外优先读这里。
+static BIOME_SHAPES: RwLock<Vec<BiomeShape>> = RwLock::new(Vec::new());
+
+/// 成功加载/重载后安装生物群系形状；失败时保留旧值。
+pub fn install_biome_shapes(shapes: Vec<BiomeShape>) {
+    *BIOME_SHAPES.write().expect("biome shapes lock") = shapes;
+}
+
+/// 按 id 取运行期形状；尚未加载时回退 const 表。
+pub fn biome_shape(id: BiomeId) -> Option<BiomeShape> {
+    if let Ok(shapes) = BIOME_SHAPES.read() {
+        if let Some(shape) = shapes.iter().find(|shape| shape.id == id) {
+            return Some(*shape);
+        }
+    }
+    biome_def(id).map(BiomeShape::from)
+}
+
+/// JSONC 中的生物群系定义；方块字段写稳定名字，加载时解析成槽位。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BiomeDefFile {
+    pub id: u8,
+    pub name: String,
+    pub base_height: i32,
+    pub amplitude: i32,
+    pub surface_block: String,
+    pub subsurface_block: String,
+    pub stone_block: String,
+}
+
+impl super::JsoncTable for BiomeDefFile {
+    type Def = Self;
+    const FILE: &'static str = "biomes.jsonc";
+    const ROOT_KEY: &'static str = "biomes";
+
+    fn key(def: &Self::Def) -> &str {
+        &def.name
+    }
+
+    fn validate(defs: &[Self::Def]) -> Result<(), String> {
+        if defs.is_empty() {
+            return Err("生物群系表为空".to_string());
+        }
+        let mut previous_id = None;
+        let mut names = std::collections::HashSet::new();
+        for def in defs {
+            if let Some(previous) = previous_id {
+                if def.id <= previous {
+                    return Err(format!(
+                        "生物群系必须按 id 严格升序：{}（id {}）出现在 id {} 之后",
+                        def.name, def.id, previous
+                    ));
+                }
+            }
+            previous_id = Some(def.id);
+            if def.name.is_empty() {
+                return Err(format!("id {} 的生物群系名字为空", def.id));
+            }
+            if !names.insert(def.name.as_str()) {
+                return Err(format!("生物群系名字重复：{}", def.name));
+            }
+            if def.base_height.abs() > 1_000_000 {
+                return Err(format!(
+                    "{} 的 base_height 越界：{}",
+                    def.name, def.base_height
+                ));
+            }
+            if def.amplitude < 0 {
+                return Err(format!("{} 的 amplitude 必须 >= 0", def.name));
+            }
+            for block in [&def.surface_block, &def.subsurface_block, &def.stone_block] {
+                if block.is_empty() {
+                    return Err(format!("{} 引用了空方块名字", def.name));
+                }
+            }
+        }
+        for biome in BIOME_TABLE {
+            let found = defs
+                .iter()
+                .find(|def| u32::from(def.id) == u32::from(biome.id.0))
+                .ok_or_else(|| format!("缺少核心生物群系 id {}（{}）", biome.id.0, biome.name))?;
+            if found.name != biome.name {
+                return Err(format!(
+                    "核心生物群系 id {} 名字必须是 {}，实际 {}",
+                    biome.id.0, biome.name, found.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 把生物群系的方块名字解析成调色板槽位。
+pub fn resolve_biomes(
+    files: Vec<BiomeDefFile>,
+    blocks: &[VoxelObjectDef],
+) -> Result<Vec<BiomeDef>, String> {
+    let by_name: std::collections::HashMap<&str, u8> = blocks
+        .iter()
+        .map(|block| (block.name.as_str(), block.block_id().unwrap_or(0)))
+        .collect();
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        let surface_block = *by_name.get(file.surface_block.as_str()).ok_or_else(|| {
+            format!(
+                "{} 的 surface_block({}) 不存在",
+                file.name, file.surface_block
+            )
+        })?;
+        let subsurface_block = *by_name.get(file.subsurface_block.as_str()).ok_or_else(|| {
+            format!(
+                "{} 的 subsurface_block({}) 不存在",
+                file.name, file.subsurface_block
+            )
+        })?;
+        let stone_block = *by_name
+            .get(file.stone_block.as_str())
+            .ok_or_else(|| format!("{} 的 stone_block({}) 不存在", file.name, file.stone_block))?;
+        out.push(BiomeDef {
+            id: BiomeId(file.id),
+            name: Cow::Owned(file.name),
+            base_height: file.base_height,
+            amplitude: file.amplitude,
+            surface_block,
+            subsurface_block,
+            stone_block,
+        });
+    }
+    Ok(out)
 }
 
 // ── 体素边长（写进 VoxVolume.voxel_size）──────────────────────────────────

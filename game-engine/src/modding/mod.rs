@@ -42,6 +42,41 @@ pub struct ModManifest {
     pub conflicts: &'static [&'static str],
 }
 
+/// 一层 mod 静态数据补丁（原始 JSONC 文本，解析由消费方负责）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectLayer {
+    pub mod_id: &'static str,
+    /// 拓扑排序后的加载序号；同号时按 `mod_id` 稳定排序。
+    pub load_order: u32,
+    pub src: &'static str,
+}
+
+/// mod 登记的静态数据补丁层，按确定性顺序重放。
+#[derive(Resource, Default, Debug)]
+pub struct ObjectLayers {
+    layers: Vec<ObjectLayer>,
+}
+
+impl ObjectLayers {
+    pub fn add(&mut self, layer: ObjectLayer) {
+        self.layers.push(layer);
+        self.layers
+            .sort_by(|a, b| (a.load_order, a.mod_id).cmp(&(b.load_order, b.mod_id)));
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ObjectLayer> {
+        self.layers.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+}
+
 /// 可被 mod 替换的引擎策略（M5）。
 ///
 /// 策略方法不得读取时钟 / 线程 / 全局可变状态，否则确定性破功。
@@ -144,15 +179,22 @@ pub struct ModContext<'a, S: GameSpec> {
     app: &'a mut App,
     data: &'a mut DataRegistry,
     order: u32,
+    mod_id: &'static str,
     _spec: PhantomData<S>,
 }
 
 impl<'a, S: GameSpec> ModContext<'a, S> {
-    pub(crate) fn new(app: &'a mut App, data: &'a mut DataRegistry, order: u32) -> Self {
+    pub(crate) fn new(
+        app: &'a mut App,
+        data: &'a mut DataRegistry,
+        order: u32,
+        mod_id: &'static str,
+    ) -> Self {
         Self {
             app,
             data,
             order,
+            mod_id,
             _spec: PhantomData,
         }
     }
@@ -168,6 +210,21 @@ impl<'a, S: GameSpec> ModContext<'a, S> {
 
     pub fn data(&mut self) -> &mut DataRegistry {
         self.data
+    }
+
+    /// 登记一层静态数据补丁文本（JSONC）。
+    ///
+    /// 文本在 mod 的 `install` 期间登记；game-core 的静态数据层在重载时
+    /// 按 `(load_order, mod_id)` 重放，所以热重载不会丢掉 mod 修改。
+    /// 补丁文档的 schema 由消费方定义（game-core 认 `table` + `patch`）。
+    pub fn add_object_layer(&mut self, src: &'static str) {
+        self.app.init_resource::<ObjectLayers>();
+        let mut layers = self.app.world_mut().resource_mut::<ObjectLayers>();
+        layers.add(ObjectLayer {
+            mod_id: self.mod_id,
+            load_order: self.order,
+            src,
+        });
     }
 
     /// M3：把一个系统加到引擎的命名阶段。
@@ -338,7 +395,7 @@ impl<S: GameSpec> Mods<S> {
         for (load_order, &position) in order.iter().enumerate() {
             let module = &self.mods[position];
             module.register_data(data);
-            let mut context = ModContext::new(app, data, load_order as u32);
+            let mut context = ModContext::new(app, data, load_order as u32, module.manifest().id);
             module.install(&mut context);
         }
 
@@ -454,6 +511,52 @@ mod tests {
         app.world_mut().run_schedule(FixedUpdate);
         let count = app.world().resource::<Counter>().0;
         assert_eq!(count, 1, "系统必须在 EngineSet::Motion 阶段运行一次");
+    }
+
+    static LAYER_LATE: ModManifest = ModManifest {
+        id: "z_layer",
+        version: 1,
+        engine_api: 1,
+        load_after: &["a_layer"],
+        conflicts: &[],
+    };
+    static LAYER_EARLY: ModManifest = ModManifest {
+        id: "a_layer",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        conflicts: &[],
+    };
+
+    struct LayerMod(&'static ModManifest, &'static str);
+
+    impl Mod<DefaultSpec> for LayerMod {
+        fn manifest(&self) -> &'static ModManifest {
+            self.0
+        }
+        fn install(&self, context: &mut ModContext<'_, DefaultSpec>) {
+            context.add_object_layer(self.1);
+        }
+    }
+
+    #[test]
+    fn object_layers_record_mod_order_and_sort() {
+        let mut app = app_with_sets();
+        let mut data = DataRegistry::new();
+        Mods::<DefaultSpec>::new()
+            .push(LayerMod(&LAYER_LATE, "late"))
+            .push(LayerMod(&LAYER_EARLY, "early"))
+            .apply(&mut app, &mut data)
+            .unwrap();
+
+        let layers = app.world().resource::<ObjectLayers>();
+        let entries: Vec<(&str, &str)> = layers
+            .iter()
+            .map(|layer| (layer.mod_id, layer.src))
+            .collect();
+        assert_eq!(entries, vec![("a_layer", "early"), ("z_layer", "late")]);
+        assert_eq!(layers.iter().next().unwrap().load_order, 0);
+        assert_eq!(layers.iter().nth(1).unwrap().load_order, 1);
     }
 
     #[test]

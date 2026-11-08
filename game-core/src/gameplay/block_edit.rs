@@ -25,7 +25,8 @@ use bevy::prelude::*;
 use game_engine::input::actions::ActionId;
 use game_engine::input::SimulationTick;
 use game_engine::voxel::{
-    chunk_voxels_per_axis, ChunkKey, VoxVolume, VoxelChangeBuffer, VoxelInterner, VoxelSet,
+    chunk_voxels_per_axis, ChunkKey, VoxInterner, VoxOpsRead, VoxVolume, VoxelChangeBuffer,
+    VoxelInterner, VoxelSet,
 };
 
 use crate::gameplay::{camera_system, CameraFlag, GameplaySet};
@@ -35,7 +36,8 @@ use crate::presentation::payload::{
     InteractionHint, INTERACTION_TARGET_BLOCK, INTERACTION_TARGET_NONE,
 };
 use crate::static_data::voxel::{AIR_BLOCK, GRASS_BLOCK};
-use crate::voxel::pick::{pick_nearest, VoxelRay, DEFAULT_PICK_DISTANCE_M};
+use crate::static_data::ObjectTables;
+use crate::voxel::pick::{pick_nearest_with_tables, VoxelRay, DEFAULT_PICK_DISTANCE_M};
 
 /// `break_block` 的通道位（见 `input::actions::ACTION_TABLE`）。
 pub const BREAK_BLOCK_BIT: u64 = 1 << 9;
@@ -131,6 +133,7 @@ pub struct BlockEditParams<'w, 's> {
     tick: Res<'w, SimulationTick>,
     config: Res<'w, BlockEditConfig>,
     selected: Res<'w, SelectedBlock>,
+    tables: Res<'w, ObjectTables>,
     cooldown: ResMut<'w, BlockEditCooldown>,
     interner: Res<'w, VoxelInterner>,
     cameras: Query<'w, 's, &'static Transform, With<CameraFlag>>,
@@ -161,13 +164,14 @@ pub struct BlockEditParams<'w, 's> {
 pub fn block_edit_system(mut p: BlockEditParams) {
     let hit = p.cameras.iter().next().and_then(|camera| {
         let ray = VoxelRay::from_transform(camera)?;
-        pick_nearest(
+        pick_nearest_with_tables(
             p.interner.inner(),
             ray,
             p.config.reach_m,
             p.bodies
                 .iter()
                 .map(|(entity, volume, transform, _)| (entity, volume, transform)),
+            &p.tables,
         )
     });
 
@@ -229,12 +233,25 @@ pub fn block_edit_system(mut p: BlockEditParams) {
         let target = hit.voxel + hit.normal;
         // 触及距离内一般都有 chunk；若目标落在尚未生成的区域，不要 push 一个
         // 注定缺失的目标（apply 阶段会 debug_assert），直接跳过放置。
-        let target_chunk_exists = p
-            .bodies
-            .get(hit.body)
-            .ok()
-            .is_some_and(|(_, volume, _, _)| chunk_exists(volume, target));
-        if !target_chunk_exists {
+        let Some((_, volume, _, _)) = p.bodies.get(hit.body).ok() else {
+            return;
+        };
+        if !chunk_exists(volume, target) {
+            return;
+        }
+        let current = read_block(volume, p.interner.inner(), target);
+        if !p
+            .tables
+            .block(current)
+            .is_some_and(|block| block.block_id() == Some(AIR_BLOCK) || block.replaceable)
+        {
+            return;
+        }
+        if !has_support_neighbor(volume, p.interner.inner(), target, &p.tables) {
+            debug!(
+                "block placement rejected: target {:?} has no supporting neighbor",
+                target
+            );
             return;
         }
         let Some((voxel_size, body_transform)) = body_info(&p.bodies, hit.body) else {
@@ -281,6 +298,46 @@ fn body_info(
 ) -> Option<(f32, GlobalTransform)> {
     let (_, volume, transform, _) = bodies.get(body).ok()?;
     Some((volume.voxel_size.to_num::<f32>(), *transform))
+}
+
+/// 读一个体素值；chunk 存在但树里没有该格时按空气处理。
+fn read_block(volume: &VoxVolume, interner: &VoxInterner<u8>, voxel: IVec3) -> u8 {
+    let axis = chunk_voxels_per_axis();
+    let key = ChunkKey::new(
+        voxel.x.div_euclid(axis),
+        voxel.y.div_euclid(axis),
+        voxel.z.div_euclid(axis),
+    );
+    let local = IVec3::new(
+        voxel.x.rem_euclid(axis),
+        voxel.y.rem_euclid(axis),
+        voxel.z.rem_euclid(axis),
+    );
+    volume
+        .get_chunk(&key)
+        .and_then(|tree| tree.get(interner, local))
+        .unwrap_or(AIR_BLOCK)
+}
+
+/// 六个正交邻居里至少一个在运行期表里声明 support = true。
+fn has_support_neighbor(
+    volume: &VoxVolume,
+    interner: &VoxInterner<u8>,
+    voxel: IVec3,
+    tables: &ObjectTables,
+) -> bool {
+    const OFFSETS: [IVec3; 6] = [
+        IVec3::new(-1, 0, 0),
+        IVec3::new(1, 0, 0),
+        IVec3::new(0, -1, 0),
+        IVec3::new(0, 1, 0),
+        IVec3::new(0, 0, -1),
+        IVec3::new(0, 0, 1),
+    ];
+    OFFSETS.iter().any(|offset| {
+        let neighbor = read_block(volume, interner, voxel + *offset);
+        tables.block(neighbor).is_some_and(|block| block.support)
+    })
 }
 
 fn chunk_exists(volume: &VoxVolume, voxel: IVec3) -> bool {
@@ -388,6 +445,13 @@ mod tests {
         app.insert_resource(Time::<Fixed>::from_hz(60.0));
         app.insert_resource(SimulationTick(0));
         app.insert_resource(interner);
+        let tables = crate::static_data::load_object_tables(
+            &crate::static_data::ObjectTableSources::default(),
+            &game_engine::modding::ObjectLayers::default(),
+            1,
+        )
+        .expect("embedded object tables must load");
+        app.insert_resource(tables);
         app.add_plugins(VoxelPlugin::default());
         app.insert_resource(BlockEditConfig {
             reach_m: 10.0,

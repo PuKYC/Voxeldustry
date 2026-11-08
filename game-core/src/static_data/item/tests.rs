@@ -15,7 +15,7 @@ fn item_ids_and_names_are_unique() {
     ids.dedup();
     assert_eq!(before, ids.len(), "物品 id 重复");
 
-    let mut names: Vec<&str> = ITEM_TABLE.iter().map(|d| d.name).collect();
+    let mut names: Vec<&str> = ITEM_TABLE.iter().map(|d| d.name.as_ref()).collect();
     let before = names.len();
     names.sort_unstable();
     names.dedup();
@@ -99,7 +99,7 @@ fn tag_index_build_is_deterministic() {
     let a = ItemTagIndex::build(ITEM_TABLE);
     let b = ItemTagIndex::build(ITEM_TABLE);
     for def in ITEM_TABLE {
-        for tag in def.tags {
+        for tag in def.tags.iter() {
             assert_eq!(a.items_with(*tag), b.items_with(*tag));
             let items = a.items_with(*tag);
             for window in items.windows(2) {
@@ -181,14 +181,20 @@ fn item_tag_consts_match_table() {
 #[test]
 fn item_definition_consistency() {
     for def in ITEM_TABLE {
-        assert!(def.max_stack >= 1, "{} 的 max_stack 不能为 0", def.name);
+        assert!(def.mass_grams > 0, "{} 的 mass_grams 不能为 0", def.name);
+        assert!(
+            def.stack_capacity_grams >= def.mass_grams,
+            "{} 的堆叠容量不能小于单件质量",
+            def.name
+        );
+        assert!(def.max_stack() >= 1, "{} 的堆叠数量不能为 0", def.name);
 
-        // stackable 标签 <=> max_stack > 1（max_stack 为权威）。
+        // stackable 标签 <=> 按质量/容量算出的堆叠数量 > 1。
         let has_stackable = def.tags.contains(&ITEM_TAG_STACKABLE);
         assert_eq!(
             has_stackable,
-            def.max_stack > 1,
-            "{} 的 stackable 标签与 max_stack 矛盾",
+            def.max_stack() > 1,
+            "{} 的 stackable 标签与质量/容量矛盾",
             def.name
         );
 
@@ -256,22 +262,56 @@ fn unknown_subcategory_falls_back() {
     assert!(item_subcategory_def(ItemSubCategoryId(999_999)).is_none());
     assert!(item_subcategory_parent(ItemSubCategoryId(999_999)).is_none());
 
+    let tables =
+        crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
+            .expect("embedded tables load");
+
     let unknown_stack = ItemStack {
         item: ItemTypeId(999_999),
         count: 1,
         instance: ItemInstanceData::default(),
     };
-    assert_eq!(unknown_stack.category(), ItemCategory::Other);
-    assert!(!unknown_stack.has_tag(ITEM_TAG_DROPPABLE));
-    assert!(unknown_stack.def().is_none());
+    assert_eq!(unknown_stack.category(&tables), ItemCategory::Other);
+    assert!(!unknown_stack.has_tag(ITEM_TAG_DROPPABLE, &tables));
+    assert!(unknown_stack.def(&tables).is_none());
 
     let known_stack = ItemStack {
         item: ItemTypeId(1),
         count: 3,
         instance: ItemInstanceData::default(),
     };
-    assert_eq!(known_stack.category(), ItemCategory::Material);
-    assert!(known_stack.has_tag(ITEM_TAG_STACKABLE));
+    assert_eq!(known_stack.category(&tables), ItemCategory::Material);
+    assert!(known_stack.has_tag(ITEM_TAG_STACKABLE, &tables));
+    assert_eq!(
+        known_stack.def(&tables).map(|def| def.name.as_ref()),
+        Some("iron_ingot")
+    );
+}
+
+/// 堆叠数量由单件质量与一叠容量算出，核心物品保持原上限。
+#[test]
+fn stack_limit_comes_from_mass_and_capacity() {
+    let expected = [(1, 64), (2, 1), (3, 16), (4, 64), (5, 1)];
+    for (id, limit) in expected {
+        let def = item_def(ItemTypeId(id)).expect("core item exists");
+        assert_eq!(def.max_stack(), limit, "{} 的堆叠上限", def.name);
+        assert_eq!(
+            def.stack_capacity_grams,
+            def.mass_grams * u32::from(limit),
+            "{} 的容量被堆叠取整浪费",
+            def.name
+        );
+    }
+
+    let tables =
+        crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
+            .expect("embedded tables load");
+    let stack = ItemStack {
+        item: ItemTypeId(1),
+        count: 10,
+        instance: ItemInstanceData::default(),
+    };
+    assert_eq!(stack.total_mass_grams(&tables), Some(1_000));
 }
 
 /// 附加：FFI 快照与表长度一致，标签输出升序。

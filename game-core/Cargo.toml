@@ -11,6 +11,7 @@ fixed = { workspace = true }
 rand_pcg = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true }
+serde_json = "1"
 bevy_replicon = { workspace = true, optional = true }
 rstar = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -27,7 +28,6 @@ net = ["dep:bevy_replicon", "game-engine/net"]
 physics = ["game-engine/physics"]
 
 [dev-dependencies]
-serde_json = "1"
 criterion = { workspace = true }
 gungraun = { workspace = true }
 

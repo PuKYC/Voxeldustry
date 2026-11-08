@@ -7,6 +7,8 @@ extends Control
 ## - signal ui_scale_changed(value: float)：UI 缩放滑条（0.8 .. 1.3）；
 ## - signal debug_overlay_requested(enabled: bool)：调试层开关（仅 debug 构建显示）；
 ## - signal debug_scheme_requested(scheme: int)：强制输入方案（仅 debug 构建显示）；
+## - signal reload_object_tables_requested：重载后端静态表（仅 debug 构建显示，
+##   pause_menu 不自持 manager，由 UiRoot 调 BevyAppManager.reload_object_tables()）；
 ## - 期 3 设置区信号（UiRoot 负责写 UiState + 落盘 + 立即应用）：
 ##   action_layout_changed(value: int) / button_scale_changed(value: float) /
 ##   button_opacity_changed(value: float) / left_handed_changed(value: bool) /
@@ -24,6 +26,8 @@ signal resume_requested
 signal ui_scale_changed(value: float)
 signal debug_overlay_requested(enabled: bool)
 signal debug_scheme_requested(scheme: int)
+## 静态表重载：只发信号，Bevy 调用由 UiRoot 负责。
+signal reload_object_tables_requested
 ## 期 3 设置区信号。
 signal action_layout_changed(value: int)
 signal button_scale_changed(value: float)
@@ -37,6 +41,8 @@ const SCALE_STEP := 0.05
 const TOUCH_SLIDER_SCRIPT := preload("res://ui/widgets/touch_slider.gd")
 const SETTINGS_BUTTON_MIN_SIZE := Vector2(380, 50)
 const SETTINGS_SLIDER_MIN_SIZE := Vector2(380, 64)
+## 调试区按钮与场景里 DebugOverlayButton / ForceTouchButton 一致。
+const DEBUG_BUTTON_MIN_SIZE := Vector2(380, 58)
 
 ## 仅测试 / 手工预览用：强制显示调试入口（默认跟随 OS.is_debug_build()）。
 @export var force_show_debug: bool = false
@@ -57,6 +63,8 @@ const SETTINGS_SLIDER_MIN_SIZE := Vector2(380, 64)
 
 ## 调试层当前状态（与 UiRoot 同步，只影响按钮文案）。
 var _overlay_enabled := false
+## 调试区「重载静态表」按钮（代码创建，唯一名不在场景里，用访问器给测试）。
+var _reload_tables_button: Button = null
 
 ## 期 3 设置控件（代码创建；唯一名不在场景里，用访问器给测试）。
 var _action_layout_button: Button = null
@@ -97,6 +105,8 @@ func _ready() -> void:
 	_debug_back_button.pressed.connect(_on_debug_back_pressed)
 	_debug_overlay_button.pressed.connect(_on_debug_overlay_pressed)
 	_force_touch_button.pressed.connect(_on_force_touch_pressed)
+	# 调试区：先建控件再连信号（与设置区一致）。
+	_build_debug_controls()
 	_refresh_debug_texts()
 	# 期 3 设置区：先建控件，再同步初值（同步不触发信号）。
 	_build_settings_controls()
@@ -332,6 +342,10 @@ func joystick_mode_button() -> Button:
 	return _joystick_mode_button
 
 
+func reload_tables_button() -> Button:
+	return _reload_tables_button
+
+
 ## name -> 控件，供测试按名字取（也方便文档 / 冒烟断言）。
 func settings_controls() -> Dictionary:
 	return {
@@ -365,6 +379,23 @@ func apply_debug_visibility() -> void:
 		_debug_panel.visible = false
 
 
+## 调试区控件在 _ready 里代码创建后插到 %DebugBackButton 之前（Back 永远在最底部）。
+## 面板本身只有 debug 构建能通过 %DebugButton 打开，这里不再额外判构建类型，
+## 否则测试运行期改 force_show_debug 会拿不到控件。
+func _build_debug_controls() -> void:
+	if _debug_panel == null or _debug_back_button == null:
+		return
+	_reload_tables_button = Button.new()
+	_reload_tables_button.name = "ReloadTablesButton"
+	_reload_tables_button.text = "Reload Static Tables"
+	_reload_tables_button.custom_minimum_size = DEBUG_BUTTON_MIN_SIZE
+	_reload_tables_button.pressed.connect(_on_reload_tables_pressed)
+	_debug_panel.add_child(_reload_tables_button)
+	var back_index := _debug_back_button.get_index()
+	if back_index >= 0:
+		_debug_panel.move_child(_reload_tables_button, back_index)
+
+
 func _on_debug_pressed() -> void:
 	_settings_panel.visible = false
 	_debug_panel.visible = true
@@ -383,6 +414,11 @@ func _on_debug_overlay_pressed() -> void:
 	_overlay_enabled = not _overlay_enabled
 	_refresh_debug_texts()
 	debug_overlay_requested.emit(_overlay_enabled)
+
+
+## 重载静态表：pause_menu 没有 manager 引用，只发信号（UiRoot 负责调 Bevy 并打印状态）。
+func _on_reload_tables_pressed() -> void:
+	reload_object_tables_requested.emit()
 
 
 ## 强制方案：在 TOUCH / KBM 之间切，方便桌面预览触屏 UI 或手机接键盘时回到键鼠。

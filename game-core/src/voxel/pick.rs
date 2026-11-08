@@ -27,6 +27,8 @@
 use bevy::prelude::*;
 use game_engine::voxel::{chunk_voxels_per_axis, ChunkKey, VoxInterner, VoxOpsRead, VoxVolume};
 
+use crate::static_data::ObjectTables;
+
 /// 拾取射线的默认最大距离（米）。
 pub const DEFAULT_PICK_DISTANCE_M: f32 = 6.0;
 
@@ -111,6 +113,36 @@ pub fn raycast_volume(
     ray: VoxelRay,
     max_distance: f32,
 ) -> Option<VolumeHit> {
+    raycast_volume_filtered(volume, interner, transform, ray, max_distance, |value| {
+        value != u8::default()
+    })
+}
+
+/// 按运行期方块表的 solid 字段判定命中；未知槽位视为非实心。
+pub fn raycast_volume_with_tables(
+    volume: &VoxVolume,
+    interner: &VoxInterner<u8>,
+    transform: &GlobalTransform,
+    ray: VoxelRay,
+    max_distance: f32,
+    tables: &ObjectTables,
+) -> Option<VolumeHit> {
+    raycast_volume_filtered(volume, interner, transform, ray, max_distance, |value| {
+        tables.block(value).is_some_and(|block| block.solid)
+    })
+}
+
+fn raycast_volume_filtered<F>(
+    volume: &VoxVolume,
+    interner: &VoxInterner<u8>,
+    transform: &GlobalTransform,
+    ray: VoxelRay,
+    max_distance: f32,
+    solid: F,
+) -> Option<VolumeHit>
+where
+    F: Fn(u8) -> bool + Copy,
+{
     if volume.is_empty()
         || !max_distance.is_finite()
         || max_distance < 0.0
@@ -136,7 +168,7 @@ pub fn raycast_volume(
     let mut voxel = local_origin.floor().as_ivec3();
 
     // 起点已在实心格内：立即命中，法线朝射线来向的主轴。
-    if is_solid(volume, interner, voxel) {
+    if is_solid(volume, interner, voxel, solid) {
         return Some(VolumeHit {
             voxel,
             normal: entry_normal(local_direction),
@@ -180,7 +212,7 @@ pub fn raycast_volume(
         voxel[axis] += step[axis];
         t_max[axis] += t_delta[axis];
 
-        if is_solid(volume, interner, voxel) {
+        if is_solid(volume, interner, voxel, solid) {
             let mut normal = IVec3::ZERO;
             normal[axis] = -step[axis];
             return Some(VolumeHit {
@@ -204,10 +236,40 @@ pub fn pick_nearest<'a>(
     max_distance: f32,
     bodies: impl IntoIterator<Item = (Entity, &'a VoxVolume, &'a GlobalTransform)>,
 ) -> Option<VoxelPickHit> {
+    pick_nearest_filtered(interner, ray, max_distance, bodies, |value| {
+        value != u8::default()
+    })
+}
+
+/// 按运行期方块表拾取最近的实心体素。
+pub fn pick_nearest_with_tables<'a>(
+    interner: &VoxInterner<u8>,
+    ray: VoxelRay,
+    max_distance: f32,
+    bodies: impl IntoIterator<Item = (Entity, &'a VoxVolume, &'a GlobalTransform)>,
+    tables: &ObjectTables,
+) -> Option<VoxelPickHit> {
+    pick_nearest_filtered(interner, ray, max_distance, bodies, |value| {
+        tables.block(value).is_some_and(|block| block.solid)
+    })
+}
+
+fn pick_nearest_filtered<'a, F>(
+    interner: &VoxInterner<u8>,
+    ray: VoxelRay,
+    max_distance: f32,
+    bodies: impl IntoIterator<Item = (Entity, &'a VoxVolume, &'a GlobalTransform)>,
+    solid: F,
+) -> Option<VoxelPickHit>
+where
+    F: Fn(u8) -> bool + Copy,
+{
     let mut best: Option<VoxelPickHit> = None;
 
     for (entity, volume, transform) in bodies {
-        let Some(hit) = raycast_volume(volume, interner, transform, ray, max_distance) else {
+        let Some(hit) =
+            raycast_volume_filtered(volume, interner, transform, ray, max_distance, solid)
+        else {
             continue;
         };
         let candidate = VoxelPickHit {
@@ -232,7 +294,10 @@ pub fn pick_nearest<'a>(
 }
 
 /// 把 body 局部体素坐标映射到 chunk / 块内坐标后读树。
-fn is_solid(volume: &VoxVolume, interner: &VoxInterner<u8>, voxel: IVec3) -> bool {
+fn is_solid<F>(volume: &VoxVolume, interner: &VoxInterner<u8>, voxel: IVec3, solid: F) -> bool
+where
+    F: Fn(u8) -> bool,
+{
     let axis = chunk_voxels_per_axis();
     let key = ChunkKey::new(
         voxel.x.div_euclid(axis),
@@ -247,7 +312,7 @@ fn is_solid(volume: &VoxVolume, interner: &VoxInterner<u8>, voxel: IVec3) -> boo
     volume
         .get_chunk(&key)
         .and_then(|tree| tree.get(interner, local))
-        .is_some_and(|value| value != u8::default())
+        .is_some_and(solid)
 }
 
 /// 起点在实心格内时，取射线主方向的反向轴作为进入面法线。

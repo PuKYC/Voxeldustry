@@ -31,6 +31,7 @@ use game_core::presentation::semantics;
 use game_core::presentation::{PresentationCommand, PresentationFrame};
 use game_core::static_data::item;
 use game_core::static_data::prototype;
+use game_core::static_data::ObjectTables;
 use game_core::voxel::StreamStats;
 use game_core::world::streaming::WorldLoadReport;
 
@@ -81,9 +82,16 @@ pub fn input_channels_to_variant() -> Array<VarDictionary> {
 }
 
 /// 原型表 → `Array[Dictionary]`，每项 `{ prototype_id, name, version }`。
-pub fn prototype_table_to_variant() -> Array<VarDictionary> {
+///
+/// `tables` 为运行期表（含热重载 / mod 改动）；None 时回退到编译期 const 表，
+/// 供 Bevy 启动完成前的查询使用。
+pub fn prototype_table_to_variant(tables: Option<&ObjectTables>) -> Array<VarDictionary> {
+    let rows: Vec<(u32, &str, u32)> = match tables {
+        Some(tables) => tables.prototype_table_rows(),
+        None => prototype::prototype_table_snapshot(),
+    };
     let mut out: Array<VarDictionary> = Array::new();
-    for (id, name, version) in prototype::prototype_table_snapshot() {
+    for (id, name, version) in rows {
         let mut row = VarDictionary::new();
         row.set("prototype_id", i64::from(id));
         row.set("name", name);
@@ -94,21 +102,29 @@ pub fn prototype_table_to_variant() -> Array<VarDictionary> {
 }
 
 /// 物品定义表 → Array[Dictionary]，每项
-/// { item_id, name, category, category_name, sub_category, tags, max_stack, prototype_id, version }。
+/// { item_id, name, category, category_name, sub_category, tags, max_stack,
+///   mass_grams, stack_capacity_grams, prototype_id, version }。
+/// max_stack 是由质量/容量算出的兼容字段。
 ///
 /// tags 由逻辑层统一升序输出；Godot 只做集合判断，不判断业务规则。
-pub fn item_table_to_variant() -> Array<VarDictionary> {
+pub fn item_table_to_variant(tables: Option<&ObjectTables>) -> Array<VarDictionary> {
+    let rows: Vec<item::ItemTableRow> = match tables {
+        Some(tables) => tables.item_table_rows(),
+        None => item::item_table_snapshot(),
+    };
     let mut out: Array<VarDictionary> = Array::new();
-    for row in item::item_table_snapshot() {
+    for row in rows {
         let mut dict = VarDictionary::new();
         dict.set("item_id", i64::from(row.item_id));
-        dict.set("name", row.name);
+        dict.set("name", row.name.as_ref());
         dict.set("category", i64::from(row.category));
         dict.set("category_name", row.category_name);
         dict.set("sub_category", i64::from(row.sub_category));
         let tags: Vec<i32> = row.tags.iter().map(|tag| *tag as i32).collect();
         dict.set("tags", &PackedInt32Array::from(&tags[..]));
         dict.set("max_stack", i64::from(row.max_stack));
+        dict.set("mass_grams", i64::from(row.mass_grams));
+        dict.set("stack_capacity_grams", i64::from(row.stack_capacity_grams));
         dict.set("prototype_id", i64::from(row.prototype_id));
         dict.set("version", i64::from(row.version));
         out.push(&dict);
@@ -208,8 +224,8 @@ const VOXEL_TABLE_KEYS: [&str; 2] = ["voxel_size", "block_names"];
 ///
 /// 边界铁律：方块 id / 名字表在 game-core（static_data::voxel），本文件只做
 /// 机械搬运；**外观与材质都不在 Rust**。
-pub fn voxel_table_to_variant() -> VarDictionary {
-    let data = voxel_table_data();
+pub fn voxel_table_to_variant(tables: Option<&ObjectTables>) -> VarDictionary {
+    let data = voxel_table_data(tables);
     let [key_voxel_size, key_block_names] = VOXEL_TABLE_KEYS;
 
     let names: Vec<GString> = data
@@ -234,13 +250,25 @@ struct VoxelTableData {
     block_names: Vec<String>,
 }
 
-fn voxel_table_data() -> VoxelTableData {
+fn voxel_table_data(tables: Option<&ObjectTables>) -> VoxelTableData {
     use game_core::static_data::voxel::{block_name, VOXEL_SIZE_METERS};
 
     // block id -> 名字；未使用的 id 导出空串（Godot 侧按空名跳过）。
-    let block_names: Vec<String> = (0..=u8::MAX)
-        .map(|id| block_name(id).map_or_else(String::new, String::from))
-        .collect();
+    // 运行期表只填 <=255 的槽位；mod 新增的命名空间方块 id >= 10000，不进调色板。
+    let block_names: Vec<String> = match tables {
+        Some(tables) => {
+            let mut names = vec![String::new(); 256];
+            for block in tables.blocks() {
+                if let Some(id) = block.block_id() {
+                    names[id as usize] = block.name.clone();
+                }
+            }
+            names
+        }
+        None => (0..=u8::MAX)
+            .map(|id| block_name(id).map_or_else(String::new, String::from))
+            .collect(),
+    };
 
     VoxelTableData {
         voxel_size: VOXEL_SIZE_METERS as f32,
@@ -697,7 +725,7 @@ mod tests {
             "导出键集合固定为两项"
         );
 
-        let data = voxel_table_data();
+        let data = voxel_table_data(None);
         assert!((data.voxel_size - 0.45).abs() < 1e-6, "voxel_size = 0.45 m");
         assert_eq!(
             data.block_names.len(),
@@ -719,6 +747,22 @@ mod tests {
         // 未使用的 block id 导出空串（Godot 侧按空名跳过/回退）。
         for id in [8usize, 42, 200, 255] {
             assert_eq!(data.block_names[id], "", "未知 block id {id} 应为空串");
+        }
+    }
+
+    /// 运行期 ObjectTables（JSONC 加载结果）必须导出与 const 表相同的契约。
+    #[test]
+    fn voxel_table_data_from_runtime_tables_matches_contract() {
+        let tables =
+            game_core::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
+                .expect("embedded tables load");
+        let data = voxel_table_data(Some(&tables));
+        assert_eq!(data.block_names.len(), 256);
+        let expected = [
+            "air", "stone", "dirt", "grass", "sand", "snow", "wood", "leaf",
+        ];
+        for (id, want) in expected.iter().enumerate() {
+            assert_eq!(data.block_names[id], *want);
         }
     }
 }

@@ -15,6 +15,8 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use godot::builtin::{
     Array, PackedByteArray, PackedFloat32Array, PackedInt64Array, PackedStringArray, VarDictionary,
 };
+#[cfg(debug_assertions)]
+use godot::classes::FileAccess;
 use godot::prelude::*;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,6 +25,9 @@ use std::thread::{self, JoinHandle};
 use game_core::bevy_backend::*;
 use game_core::presentation::semantics::SemanticRegistry;
 use game_core::spec::ClientBridge;
+use game_core::static_data::ObjectTablesHandle;
+#[cfg(debug_assertions)]
+use game_core::static_data::ReloadObjectTables;
 use game_core::voxel::terrain::{
     nearest_block_distance_m, TerrainConfig, TerrainMode, VoxelLodRuntime,
 };
@@ -70,6 +75,9 @@ pub struct BevyAppManager {
     /// 外层 None = 不覆盖（沿用配置）；Some(None) = 关闭上限；
     /// Some(Some(p)) = 覆盖为 p%。测试用它制造 / 解除内存压力。
     memory_soft_limit: MemoryLimitHandle,
+
+    /// 静态数据表句柄：Godot 写重载请求 / 读当前表；后台 Bevy 在 FixedUpdate 应用。
+    object_tables: ObjectTablesHandle,
 }
 
 #[godot_api]
@@ -88,6 +96,7 @@ impl INode for BevyAppManager {
             last_timestep_ms: 0.0,
             voxel_lod: Arc::new(Mutex::new(VoxelLodRuntime::default())),
             memory_soft_limit: Arc::new(Mutex::new(None)),
+            object_tables: ObjectTablesHandle::default(),
         }
     }
 
@@ -473,7 +482,76 @@ impl BevyAppManager {
     /// `presentation_bridge::voxel_table_to_variant`。
     #[func]
     fn get_voxel_table(&self) -> VarDictionary {
-        presentation_bridge::voxel_table_to_variant()
+        let tables = self.object_tables.current();
+        presentation_bridge::voxel_table_to_variant(tables.as_ref())
+    }
+
+    // ───────────────────── 静态表热重载（dev） ─────────────────────
+
+    /// 从 `user://tables/` 读取四张覆盖表并排队重载。
+    ///
+    /// 文件不存在时该表沿用嵌入版本；读取与解析分离：**文件读取在 Godot 侧，
+    /// Rust 只解析字符串**。请求在下一个 FixedUpdate（tick 边界）生效，
+    /// 返回 `{ generation, last_error, reload_enabled }`（generation 是**应用前**的值，
+    /// tick 之后才会变）。
+    #[cfg(debug_assertions)]
+    #[func]
+    fn reload_object_tables(&self) -> VarDictionary {
+        self.object_tables.queue_reload(ReloadObjectTables {
+            voxel_src: read_user_table("voxel_objects.jsonc"),
+            biome_src: read_user_table("biomes.jsonc"),
+            entity_src: read_user_table("entity_objects.jsonc"),
+            item_src: read_user_table("item_placement.jsonc"),
+        });
+        self.object_tables_status()
+    }
+
+    /// 直接以字符串提交四张覆盖表（空串 = 沿用嵌入版本）。调试 / 单测入口，
+    /// 与 [reload_object_tables] 走同一条 tick 边界重载路径。
+    #[cfg(debug_assertions)]
+    #[func]
+    fn reload_object_tables_from_strings(
+        &self,
+        voxel_src: GString,
+        biome_src: GString,
+        entity_src: GString,
+        item_src: GString,
+    ) -> VarDictionary {
+        let source = |text: GString| {
+            let text = text.to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        };
+        self.object_tables.queue_reload(ReloadObjectTables {
+            voxel_src: source(voxel_src),
+            biome_src: source(biome_src),
+            entity_src: source(entity_src),
+            item_src: source(item_src),
+        });
+        self.object_tables_status()
+    }
+
+    /// 当前静态表状态：`{ generation, last_error, reload_enabled }`。
+    /// last_error 为空串表示正常。
+    #[func]
+    fn object_tables_status(&self) -> VarDictionary {
+        let mut out = VarDictionary::new();
+        out.set("generation", i64::from(self.object_tables.generation()));
+        let last_error = self.object_tables.last_error().unwrap_or_default();
+        out.set("last_error", last_error.as_str());
+        out.set("reload_enabled", self.object_tables.reload_enabled());
+        out
+    }
+
+    /// 运行期开关：联网会话等场景可临时禁用重载。默认 dev 构建开启、release 关闭；
+    /// release 构建中此方法不编译，开关保持关闭。
+    #[cfg(debug_assertions)]
+    #[func]
+    fn set_object_tables_reload_enabled(&self, enabled: bool) {
+        self.object_tables.set_reload_enabled(enabled);
     }
 
     /// 原始体素 halo → 39 bit 矩形流（调用 game-core mesher 现算）。
@@ -570,14 +648,17 @@ impl BevyAppManager {
     /// Godot 用它把 `prototype_id` 映射到自己的 `PackedScene`。
     #[func]
     fn get_prototype_table(&self) -> Array<VarDictionary> {
-        presentation_bridge::prototype_table_to_variant()
+        let tables = self.object_tables.current();
+        presentation_bridge::prototype_table_to_variant(tables.as_ref())
     }
 
     /// 物品定义表：Array[{ item_id, name, category, category_name, sub_category, tags,
-    /// max_stack, prototype_id, version }]。Godot 只拿 name 查图标 / 场景，不做业务判断。
+    /// max_stack, mass_grams, stack_capacity_grams, prototype_id, version }]。
+    /// Godot 只拿 name 查图标 / 场景，不做业务判断。
     #[func]
     fn get_item_table(&self) -> Array<VarDictionary> {
-        presentation_bridge::item_table_to_variant()
+        let tables = self.object_tables.current();
+        presentation_bridge::item_table_to_variant(tables.as_ref())
     }
 
     /// 品类表：Array[{ id, name }]。封闭核心枚举，mod 不得新增。
@@ -601,6 +682,7 @@ impl BevyAppManager {
     /// 合并入口：{ categories, subcategories, tags, items }，减少跨 FFI 调用次数。
     #[func]
     fn get_item_tables(&self) -> VarDictionary {
+        let tables = self.object_tables.current();
         let mut out = VarDictionary::new();
         out.set(
             "categories",
@@ -611,7 +693,10 @@ impl BevyAppManager {
             &presentation_bridge::item_subcategory_table_to_variant(),
         );
         out.set("tags", &presentation_bridge::item_tag_table_to_variant());
-        out.set("items", &presentation_bridge::item_table_to_variant());
+        out.set(
+            "items",
+            &presentation_bridge::item_table_to_variant(tables.as_ref()),
+        );
         out
     }
 
@@ -741,6 +826,19 @@ fn godot_save_dir(dir: &str) -> Option<PathBuf> {
     }
 }
 
+/// 读 `user://tables/<name>`；文件不存在返回 None（该表沿用嵌入版本）。
+/// 仅 dev 构建：release 不编译文件覆盖路径。
+///
+/// 空文件返回 Some("")：交给 Rust 解析层报错，而不是静默回退到嵌入版本。
+#[cfg(debug_assertions)]
+fn read_user_table(name: &str) -> Option<String> {
+    let path = format!("user://tables/{name}");
+    if !FileAccess::file_exists(path.as_str()) {
+        return None;
+    }
+    Some(FileAccess::get_file_as_string(path.as_str()).to_string())
+}
+
 impl BevyAppManager {
     /// 启动后台 Bevy 后端的公共实现（被各 `#[func]` 启动入口复用）。
     ///
@@ -763,6 +861,7 @@ impl BevyAppManager {
 
         config.voxel_lod = Some(self.voxel_lod.clone());
         config.memory_soft_limit = Some(self.memory_soft_limit.clone());
+        config.object_tables = Some(self.object_tables.clone());
 
         // 跨边界句柄：Godot 主线程留一份，后台线程拿一份克隆（内部是 Arc 共享）。
         let bridge = ClientBridge::with_semantics(session, self.semantics.clone());

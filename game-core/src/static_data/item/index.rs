@@ -22,7 +22,7 @@ impl ItemTagIndex {
     pub fn build(table: &[ItemDef]) -> Self {
         let mut by_tag: HashMap<ItemTagId, Vec<ItemTypeId>> = HashMap::new();
         for def in table {
-            for tag in def.tags {
+            for tag in def.tags.iter() {
                 by_tag.entry(*tag).or_default().push(ItemTypeId(def.id));
             }
         }

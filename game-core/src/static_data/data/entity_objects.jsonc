@@ -1,0 +1,24 @@
+{
+  // 实体对象表：核心原型 1..=3 与 20..=24，30 是可放置火把。
+  "version": 1,
+  "prototypes": [
+    { "id": 1, "name": "player", "version": 1 },
+    { "id": 2, "name": "drifter", "version": 1 },
+    { "id": 3, "name": "gated_drifter", "version": 1 },
+    { "id": 20, "name": "iron_ingot_drop", "version": 1 },
+    { "id": 21, "name": "wooden_sword_drop", "version": 1 },
+    { "id": 22, "name": "health_potion_drop", "version": 1 },
+    { "id": 23, "name": "torch_drop", "version": 1 },
+    { "id": 24, "name": "ancient_relic_drop", "version": 1 },
+    {
+      "id": 30,
+      "name": "torch_placed",
+      "version": 1,
+      "placement": {
+        "anchor": "voxel",
+        "footprint": [1, 1, 1],
+        "requires_support": true
+      }
+    }
+  ]
+}

@@ -223,6 +223,8 @@ func _instantiate_optional() -> void:
 				pause_menu.debug_overlay_requested.connect(_on_debug_overlay_requested)
 			if pause_menu.has_signal("debug_scheme_requested"):
 				pause_menu.debug_scheme_requested.connect(_on_debug_scheme_requested)
+			if pause_menu.has_signal("reload_object_tables_requested"):
+				pause_menu.reload_object_tables_requested.connect(_on_reload_object_tables_requested)
 			_connect_pause_settings()
 
 	debug_overlay = DEBUG_OVERLAY_SCRIPT.new()
@@ -670,6 +672,21 @@ func _on_debug_overlay_requested(enabled: bool) -> void:
 
 func _on_debug_scheme_requested(scheme: int) -> void:
 	_set_scheme(scheme)
+
+
+## 暂停菜单 Debug 区「Reload Static Tables」：调 BevyAppManager 重载静态表。
+## 注意 reload_object_tables() 只是排队，generation 是本 tick 应用前的值（按钮文案不跟随它）。
+func _on_reload_object_tables_requested() -> void:
+	var manager := _get_manager()
+	if manager == null or not manager.has_method("reload_object_tables"):
+		push_warning("[UiRoot] BevyAppManager 不支持重载静态表")
+		return
+	var status: Dictionary = manager.reload_object_tables()
+	var err := String(status.get("last_error", ""))
+	if err.is_empty():
+		print("[UiRoot] 静态表重载已排队，generation=%d" % int(status.get("generation", 0)))
+	else:
+		push_warning("[UiRoot] 静态表重载失败：%s" % err)
 
 
 func _exit_tree() -> void:

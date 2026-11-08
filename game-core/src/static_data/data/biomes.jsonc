@@ -1,0 +1,41 @@
+// 生物群系基础层。方块字段写方块对象表里的稳定名字，加载时解析成调色板槽位。
+{
+  "biomes": [
+    {
+      "id": 0,
+      "name": "meadow",
+      "base_height": 64,
+      "amplitude": 8,
+      "surface_block": "grass",
+      "subsurface_block": "dirt",
+      "stone_block": "stone"
+    },
+    {
+      "id": 1,
+      "name": "forest",
+      "base_height": 68,
+      "amplitude": 10,
+      "surface_block": "grass",
+      "subsurface_block": "dirt",
+      "stone_block": "stone"
+    },
+    {
+      "id": 2,
+      "name": "desert",
+      "base_height": 60,
+      "amplitude": 6,
+      "surface_block": "sand",
+      "subsurface_block": "sand",
+      "stone_block": "stone"
+    },
+    {
+      "id": 3,
+      "name": "tundra",
+      "base_height": 66,
+      "amplitude": 12,
+      "surface_block": "snow",
+      "subsurface_block": "dirt",
+      "stone_block": "stone"
+    }
+  ]
+}

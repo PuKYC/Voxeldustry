@@ -19,9 +19,7 @@ use game_engine::voxel::{
     VoxOpsBulkWrite, VoxOpsWrite, VoxTree, CHUNK_DEPTH, MAX_ALLOWED_DEPTH,
 };
 
-use crate::static_data::voxel::{
-    biome_def, BiomeId, AIR_BLOCK, DEFAULT_BIOME, DIRT_BLOCK, GRASS_BLOCK, STONE_BLOCK,
-};
+use crate::static_data::voxel::{biome_shape, BiomeId, BiomeShape, AIR_BLOCK, DEFAULT_BIOME};
 use crate::voxel::lod::MAX_LOD;
 use crate::world::WorldSeed;
 
@@ -47,20 +45,22 @@ pub struct WorldGenerator {
 }
 
 impl WorldGenerator {
-    pub const fn new(seed: WorldSeed, biome: BiomeId) -> Self {
+    pub fn new(seed: WorldSeed, biome: BiomeId) -> Self {
         Self { seed, biome }
     }
 
-    pub const fn from_seed(seed: u64) -> Self {
-        Self {
-            seed: WorldSeed(seed),
-            biome: DEFAULT_BIOME,
-        }
+    pub fn from_seed(seed: u64) -> Self {
+        Self::new(WorldSeed(seed), DEFAULT_BIOME)
     }
 
-    pub const fn with_biome(mut self, biome: BiomeId) -> Self {
+    pub fn with_biome(mut self, biome: BiomeId) -> Self {
         self.biome = biome;
         self
+    }
+
+    /// 当前生物群系形状。每次读取全局形状表，所以热重载后新生成的块立即用新参数。
+    pub fn shape(&self) -> BiomeShape {
+        biome_shape(self.biome).unwrap_or(BiomeShape::FALLBACK)
     }
 
     /// 生成一个子块。
@@ -75,14 +75,20 @@ impl WorldGenerator {
         let base_y = key.y * CHUNK_SIZE;
         let base_z = key.z * CHUNK_SIZE;
 
-        let palette = column_palette(self.biome);
+        let shape = self.shape();
+        let palette = column_palette(shape);
 
         // 先扫描整块的表面高度范围，决定能否整体塌陷 / 是否全空气。
         let mut min_surface = i32::MAX;
         let mut max_surface = i32::MIN;
         for local_z in 0..CHUNK_SIZE {
             for local_x in 0..CHUNK_SIZE {
-                let surface = self.column_surface(base_x + local_x, base_z + local_z);
+                let surface = column_height(
+                    self.seed.0,
+                    shape,
+                    (base_x + local_x) as i64,
+                    (base_z + local_z) as i64,
+                );
                 min_surface = min_surface.min(surface);
                 max_surface = max_surface.max(surface);
             }
@@ -101,7 +107,12 @@ impl WorldGenerator {
 
         for local_z in 0..CHUNK_SIZE {
             for local_x in 0..CHUNK_SIZE {
-                let surface = self.column_surface(base_x + local_x, base_z + local_z);
+                let surface = column_height(
+                    self.seed.0,
+                    shape,
+                    (base_x + local_x) as i64,
+                    (base_z + local_z) as i64,
+                );
                 for local_y in 0..CHUNK_SIZE {
                     let depth = surface - 1 - (base_y + local_y);
                     let block = if depth < 0 {
@@ -158,7 +169,8 @@ impl WorldGenerator {
         let depth = CHUNK_DEPTH + lod;
         let mut tree = VoxTree::<u8>::new(MaxDepth::new(depth));
         let span = 1i32 << lod;
-        let palette = column_palette(self.biome);
+        let shape = self.shape();
+        let palette = column_palette(shape);
 
         let base_x = origin.x * CHUNK_SIZE;
         let base_y = origin.y * CHUNK_SIZE;
@@ -174,7 +186,7 @@ impl WorldGenerator {
             for (cz, cell) in row.iter_mut().enumerate() {
                 let x = base_x + (cx as i32) * span + span / 2;
                 let z = base_z + (cz as i32) * span + span / 2;
-                let surface = self.column_surface(x, z);
+                let surface = column_height(self.seed.0, shape, x as i64, z as i64);
                 *cell = surface;
                 min_surface = min_surface.min(surface);
                 max_surface = max_surface.max(surface);
@@ -248,7 +260,7 @@ impl WorldGenerator {
 
     /// 世界体素坐标 (x, z) 的地表高度：第一层空气的 Y。
     pub fn column_surface(&self, x: i32, z: i32) -> i32 {
-        column_height(self.seed.0, self.biome, x as i64, z as i64)
+        column_height(self.seed.0, self.shape(), x as i64, z as i64)
     }
 }
 
@@ -280,18 +292,11 @@ struct ColumnPalette {
     stone: u8,
 }
 
-fn column_palette(biome: BiomeId) -> ColumnPalette {
-    match biome_def(biome) {
-        Some(def) => ColumnPalette {
-            surface: def.surface_block,
-            subsurface: def.subsurface_block,
-            stone: def.stone_block,
-        },
-        None => ColumnPalette {
-            surface: GRASS_BLOCK,
-            subsurface: DIRT_BLOCK,
-            stone: STONE_BLOCK,
-        },
+fn column_palette(shape: BiomeShape) -> ColumnPalette {
+    ColumnPalette {
+        surface: shape.surface_block,
+        subsurface: shape.subsurface_block,
+        stone: shape.stone_block,
     }
 }
 
@@ -441,11 +446,8 @@ fn value_noise(seed: u64, x: i64, z: i64, cell: i64) -> FixedPoint {
 }
 
 /// 单个世界列的定点高度函数（体素整数）。
-fn column_height(seed: u64, biome: BiomeId, x: i64, z: i64) -> i32 {
-    let (base_height, amplitude) = match biome_def(biome) {
-        Some(def) => (def.base_height, def.amplitude),
-        None => (64, 8),
-    };
+fn column_height(seed: u64, shape: BiomeShape, x: i64, z: i64) -> i32 {
+    let (base_height, amplitude) = (shape.base_height, shape.amplitude);
 
     let coarse = value_noise(seed, x, z, NOISE_CELL_COARSE);
     let fine = value_noise(seed ^ 0xA24B_AED4_963E_E407, x, z, NOISE_CELL_FINE);
@@ -612,7 +614,7 @@ mod tests {
         use game_engine::voxel::{build_tree_occupancy_lod, voxel_material, FaceNeighbor, Lod};
 
         let generator = WorldGenerator::from_seed(0x00C0_FFEE);
-        let palette = column_palette(generator.biome);
+        let palette = column_palette(generator.shape());
 
         for lod in 1..=3u8 {
             let span = 1 << lod;

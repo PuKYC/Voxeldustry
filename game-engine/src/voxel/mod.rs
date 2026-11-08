@@ -52,9 +52,10 @@ pub use change::{
 };
 #[cfg(feature = "physics")]
 pub use collision::{
-    build_chunk_voxels, build_voxel_collider, cleanup_voxel_colliders, collect_chunk_solid_voxels,
+    build_chunk_voxels, build_chunk_voxels_with_solidity, build_voxel_collider,
+    cleanup_voxel_colliders, collect_chunk_solid_voxels, collect_chunk_solid_voxels_with_solidity,
     collect_solid_voxels, collect_surface_voxels, sync_voxel_collision_chunks,
-    voxel_size_meters_f32, VoxelCollider, VoxelCollisionChunk, VoxelCollisionPlugin,
+    voxel_size_meters_f32, VoxelCollider, VoxelCollisionChunk, VoxelCollisionPlugin, VoxelSolidity,
 };
 pub use dirty::{DirtyChunk, VoxelBox, VoxelDirtySet};
 pub use hash::{

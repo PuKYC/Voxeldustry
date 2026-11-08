@@ -1,0 +1,62 @@
+{
+  // 物品定义 + 放置目标。places 用名字引用，加载时解析成 id。
+  "version": 1,
+  "items": [
+    {
+      "id": 1,
+      "name": "iron_ingot",
+      "category": 1,
+      "sub_category": 0,
+      "tags": [1, 3],
+      "mass_grams": 100,
+      "stack_capacity_grams": 6400,
+      "world_prototype": 20,
+      "version": 1
+    },
+    {
+      "id": 2,
+      "name": "wooden_sword",
+      "category": 2,
+      "sub_category": 0,
+      "tags": [2, 3],
+      "mass_grams": 1500,
+      "stack_capacity_grams": 1500,
+      "world_prototype": 21,
+      "version": 1
+    },
+    {
+      "id": 3,
+      "name": "health_potion",
+      "category": 4,
+      "sub_category": 0,
+      "tags": [1, 3, 4],
+      "mass_grams": 250,
+      "stack_capacity_grams": 4000,
+      "world_prototype": 22,
+      "version": 1
+    },
+    {
+      "id": 4,
+      "name": "torch",
+      "category": 5,
+      "sub_category": 0,
+      "tags": [1, 2, 3, 10, 11],
+      "mass_grams": 50,
+      "stack_capacity_grams": 3200,
+      "world_prototype": 23,
+      "version": 1,
+      "places": { "kind": "entity", "name": "torch_placed" }
+    },
+    {
+      "id": 5,
+      "name": "ancient_relic",
+      "category": 7,
+      "sub_category": 0,
+      "tags": [6, 14],
+      "mass_grams": 5000,
+      "stack_capacity_grams": 5000,
+      "world_prototype": 24,
+      "version": 1
+    }
+  ]
+}

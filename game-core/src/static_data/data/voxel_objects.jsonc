@@ -1,0 +1,71 @@
+{
+  // 方块对象表：id 0..=7 与 game-core 的 BLOCK_TABLE 对齐（名字是导出契约）。
+  // solid / support / collision 是逻辑字段，材质仍由 Godot 侧绑定。
+  "version": 1,
+  "blocks": [
+    {
+      "id": 0,
+      "name": "air",
+      "solid": false,
+      "replaceable": true,
+      "support": false,
+      "collision": false
+    },
+    {
+      "id": 1,
+      "name": "stone",
+      "solid": true,
+      "replaceable": false,
+      "support": true,
+      "collision": true
+    },
+    {
+      "id": 2,
+      "name": "dirt",
+      "solid": true,
+      "replaceable": false,
+      "support": true,
+      "collision": true
+    },
+    {
+      "id": 3,
+      "name": "grass",
+      "solid": true,
+      "replaceable": true,
+      "support": true,
+      "collision": true
+    },
+    {
+      "id": 4,
+      "name": "sand",
+      "solid": true,
+      "replaceable": false,
+      "support": true,
+      "collision": true
+    },
+    {
+      "id": 5,
+      "name": "snow",
+      "solid": true,
+      "replaceable": true,
+      "support": true,
+      "collision": true
+    },
+    {
+      "id": 6,
+      "name": "wood",
+      "solid": true,
+      "replaceable": false,
+      "support": true,
+      "collision": true
+    },
+    {
+      "id": 7,
+      "name": "leaf",
+      "solid": true,
+      "replaceable": true,
+      "support": false,
+      "collision": true
+    }
+  ]
+}

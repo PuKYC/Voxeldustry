@@ -15,6 +15,7 @@ use game_engine::residency::MemorySoftLimitHandle;
 use crate::app::CoreGame;
 use crate::dev::demo::DemoPlugin;
 use crate::spec::{ClientBridge, CoreSpec};
+use crate::static_data::ObjectTablesHandle;
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
 use crate::world::streaming::ObserverDrivenStreamingPlayer;
 use crate::world::SaveRoot;
@@ -68,6 +69,11 @@ pub struct BevyBackendConfig {
     /// [game_engine::residency::ResidencyConfig::memory_soft_limit]；
     /// None 时行为与未加该字段前完全一致（沿用插件配置）。
     pub memory_soft_limit: Option<MemorySoftLimitHandle>,
+    /// 静态数据表的跨线程句柄（Godot 写重载请求 / 读当前表；Bevy 在 tick 边界应用）。
+    ///
+    /// Some 时在 CoreGame.build 之前把它插进 World；[StaticDataPlugin]
+    /// 会复用这个句柄发布启动表与后续重载，Godot 侧因此能看到同一份数据。
+    pub object_tables: Option<ObjectTablesHandle>,
 }
 
 impl Default for BevyBackendConfig {
@@ -86,6 +92,7 @@ impl Default for BevyBackendConfig {
             terrain_mode: TerrainMode::Eager,
             save_dir: None,
             memory_soft_limit: None,
+            object_tables: None,
         }
     }
 }
@@ -107,6 +114,7 @@ struct CoreGameModule {
     terrain_mode: TerrainMode,
     save_dir: Option<PathBuf>,
     memory_soft_limit: Option<MemorySoftLimitHandle>,
+    object_tables: Option<ObjectTablesHandle>,
 }
 
 impl GameModule<CoreSpec> for CoreGameModule {
@@ -137,6 +145,11 @@ impl GameModule<CoreSpec> for CoreGameModule {
         // 内存软上限覆盖：与 VoxelLodHandle 同一模式（Godot 主线程写共享句柄）。
         if let Some(handle) = &self.memory_soft_limit {
             app.insert_resource(MemorySoftLimitOverride::from_handle(handle.clone()));
+        }
+        // 静态表句柄必须早于 CoreGame.build：StaticDataPlugin 的 init_resource
+        // 不会覆盖已有资源，启动表会直接发布进 Godot 持有的这份句柄。
+        if let Some(handle) = &self.object_tables {
+            app.insert_resource(handle.clone());
         }
         // dev 观察者入口（流式 + voxel_viewer，即 start_bevy_streaming）没有输入
         // 位移系统：玩家出生后只会受重力，驻留锚点固定在出生点，世界流式永远
@@ -198,6 +211,7 @@ pub fn run_bevy_backend(
             terrain_mode: config.terrain_mode,
             save_dir: config.save_dir,
             memory_soft_limit: config.memory_soft_limit,
+            object_tables: config.object_tables,
         },
         bridge,
         ctrl_rx,
@@ -224,7 +238,37 @@ mod tests {
             terrain_mode,
             save_dir,
             memory_soft_limit: None,
+            object_tables: None,
         }
+    }
+
+    /// 静态表句柄复用：Godot 在起线程前持有 ObjectTablesHandle，
+    /// CoreGameModule 必须先把它塞进 App，StaticDataPlugin 的 init_resource
+    /// 才会沿用它；否则 Godot 的 current() 永远是 None。
+    #[test]
+    fn object_tables_handle_is_reused_by_static_data_plugin() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(20),
+        ));
+
+        let handle = crate::static_data::ObjectTablesHandle::default();
+        let mut module = module(TerrainMode::Eager, None);
+        module.object_tables = Some(handle.clone());
+        module.build(&mut app);
+        app.world_mut().run_schedule(Startup);
+
+        let published = handle.current().expect("启动后句柄必须已发布静态表");
+        assert_eq!(published.generation(), 1);
+        assert_eq!(
+            app.world()
+                .resource::<crate::static_data::ObjectTables>()
+                .generation(),
+            1,
+            "StaticDataPlugin 必须写入同一个 App 资源"
+        );
     }
 
     /// 装配顺序回归：TerrainMode / SaveRoot 必须赶在 CoreGame.build 之前进 App，
