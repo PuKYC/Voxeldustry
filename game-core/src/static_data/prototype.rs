@@ -20,15 +20,6 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct PrototypeId(pub u32);
 
-#[derive(Clone, Copy, Debug)]
-pub struct PrototypeDef {
-    pub id: u32,
-    pub name: &'static str,
-    pub version: u32,
-    /// 放置规格（数据表可覆盖；核心常量给默认值）。
-    pub placement: PlacementSpec,
-}
-
 /// 实体落位锚点。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,15 +158,15 @@ impl super::JsoncTable for EntityObjectDef {
                 .map_err(|error| format!("{}: {error}", def.name))?;
         }
 
-        for prototype in PROTOTYPE_TABLE {
+        for &(id, name) in CORE_ENTITIES {
             let found = defs
                 .iter()
-                .find(|def| def.id == prototype.id)
-                .ok_or_else(|| format!("缺少核心实体 id {}（{}）", prototype.id, prototype.name))?;
-            if found.name != prototype.name {
+                .find(|def| def.id == id)
+                .ok_or_else(|| format!("缺少核心实体 id {id}（{name}）"))?;
+            if found.name != name {
                 return Err(format!(
-                    "核心实体 id {} 名字必须是 {}，实际 {}",
-                    prototype.id, prototype.name, found.name
+                    "核心实体 id {id} 名字必须是 {name}，实际 {}",
+                    found.name
                 ));
             }
         }
@@ -183,77 +174,13 @@ impl super::JsoncTable for EntityObjectDef {
     }
 }
 
-/// 原型表。
+/// 游戏运行**必须存在**的核心实体契约：`(id, name)`。
 ///
-/// **这是静态配置，不是每实例状态**：100 个同类野怪共享同一份默认值，
-/// `Attach` 只需要传「跟默认值不同的部分」。
-///
-/// - `1..=3`：核心实体原型；
-/// - `20..=24`：`static_data::item` 的掉落物 / 手持原型（`ItemDef::world_prototype`）。
-///   **物品 -> 原型是单向引用**：实体原型不需要知道自己是哪种物品。
-pub const PROTOTYPE_TABLE: &[PrototypeDef] = &[
-    PrototypeDef {
-        id: 1,
-        name: "player",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    PrototypeDef {
-        id: 2,
-        name: "drifter",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    PrototypeDef {
-        id: 3,
-        name: "gated_drifter",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    // ── 物品掉落物 / 手持原型（与 ITEM_TABLE.world_prototype 对齐，T11 校验）──
-    PrototypeDef {
-        id: 20,
-        name: "iron_ingot_drop",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    PrototypeDef {
-        id: 21,
-        name: "wooden_sword_drop",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    PrototypeDef {
-        id: 22,
-        name: "health_potion_drop",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    PrototypeDef {
-        id: 23,
-        name: "torch_drop",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    PrototypeDef {
-        id: 24,
-        name: "ancient_relic_drop",
-        version: 1,
-        placement: PlacementSpec::DEFAULT,
-    },
-    // ── 放置出来的实体（物品 places 指向这里）────────────────────────────
-    PrototypeDef {
-        id: 30,
-        name: "torch_placed",
-        version: 1,
-        placement: PlacementSpec {
-            anchor: PlacementAnchor::Voxel,
-            footprint: [1, 1, 1],
-            offset: [0, 0, 0],
-            requires_support: true,
-        },
-    },
-];
+/// 只收 Rust 代码里直接按 id 引用的实体（`dev/spawn.rs` 用 1、`dev/perf.rs` 用 2、
+/// `presentation/sync.rs` 用 3）。`version` / `placement` 以及掉落物、放置物等其它
+/// 实体都只存在于 `entity_objects.jsonc`（及其 mod 补丁层），物品对实体的引用由
+/// `ObjectTables::from_parts` 的跨表校验负责，不在这里重复登记。
+pub const CORE_ENTITIES: &[(u32, &str)] = &[(1, "player"), (2, "drifter"), (3, "gated_drifter")];
 
 /// 挂在实体上的原型引用。
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -265,48 +192,67 @@ impl Prototype {
     }
 }
 
-pub fn prototype_def(id: PrototypeId) -> Option<&'static PrototypeDef> {
-    PROTOTYPE_TABLE.iter().find(|def| def.id == id.0)
-}
-
-pub fn prototype_name(id: PrototypeId) -> Option<&'static str> {
-    prototype_def(id).map(|def| def.name)
-}
-
-/// 供 Godot 启动时拉取并校验自己的场景表。
-///
-/// 返回 `(prototype_id, name, version)`。
-pub fn prototype_table_snapshot() -> Vec<(u32, &'static str, u32)> {
-    PROTOTYPE_TABLE
-        .iter()
-        .map(|def| (def.id, def.name, def.version))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// T3：原型 id / 名字唯一。
+    /// 核心契约本身：id / 名字唯一，且 id 落在核心区间。
     #[test]
-    fn prototype_ids_and_names_are_unique() {
-        let mut ids: Vec<u32> = PROTOTYPE_TABLE.iter().map(|d| d.id).collect();
+    fn core_entities_are_unique_and_in_core_range() {
+        let mut ids: Vec<u32> = CORE_ENTITIES.iter().map(|(id, _)| *id).collect();
         ids.sort_unstable();
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len());
+        assert!(ids.iter().all(|id| *id != 0 && *id <= game_engine::ids::CORE_ID_MAX));
 
-        let mut names: Vec<&str> = PROTOTYPE_TABLE.iter().map(|d| d.name).collect();
+        let mut names: Vec<&str> = CORE_ENTITIES.iter().map(|(_, name)| *name).collect();
         names.sort_unstable();
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len());
     }
 
+    /// 内嵌的 entity_objects.jsonc 必须满足核心契约（走完整加载流水线）。
     #[test]
-    fn snapshot_roundtrips() {
-        assert_eq!(prototype_name(PrototypeId(1)), Some("player"));
-        assert!(prototype_name(PrototypeId(999)).is_none());
-        assert_eq!(prototype_table_snapshot().len(), PROTOTYPE_TABLE.len());
+    fn embedded_entity_table_satisfies_core_contract() {
+        let tables = crate::static_data::load_object_tables(
+            &Default::default(),
+            &Default::default(),
+            1,
+        )
+        .expect("embedded tables load");
+        for &(id, name) in CORE_ENTITIES {
+            let def = tables.entity(PrototypeId(id)).expect("核心实体存在");
+            assert_eq!(def.name, name);
+        }
+    }
+
+    /// 用户/mod 改掉或删掉核心实体时，校验必须拒绝。
+    #[test]
+    fn validate_rejects_missing_or_renamed_core_entity() {
+        use crate::static_data::JsoncTable;
+
+        let full: Vec<EntityObjectDef> = CORE_ENTITIES
+            .iter()
+            .map(|&(id, name)| EntityObjectDef {
+                id,
+                name: name.to_string(),
+                version: 1,
+                placement: PlacementSpec::default(),
+            })
+            .collect();
+        assert!(EntityObjectDef::validate(&full).is_ok());
+
+        let missing: Vec<EntityObjectDef> = full.iter().skip(1).cloned().collect();
+        assert!(EntityObjectDef::validate(&missing)
+            .unwrap_err()
+            .contains("缺少核心实体"));
+
+        let mut renamed = full.clone();
+        renamed[0].name = "hero".to_string();
+        assert!(EntityObjectDef::validate(&renamed)
+            .unwrap_err()
+            .contains("名字必须是"));
     }
 }

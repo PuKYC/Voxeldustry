@@ -30,7 +30,6 @@ use game_core::presentation::payload::{ExtValue, SyncPayload};
 use game_core::presentation::semantics;
 use game_core::presentation::{PresentationCommand, PresentationFrame};
 use game_core::static_data::item;
-use game_core::static_data::prototype;
 use game_core::static_data::ObjectTables;
 use game_core::voxel::StreamStats;
 use game_core::world::streaming::WorldLoadReport;
@@ -83,12 +82,24 @@ pub fn input_channels_to_variant() -> Array<VarDictionary> {
 
 /// 原型表 → `Array[Dictionary]`，每项 `{ prototype_id, name, version }`。
 ///
-/// `tables` 为运行期表（含热重载 / mod 改动）；None 时回退到编译期 const 表，
-/// 供 Bevy 启动完成前的查询使用。
+/// `tables` 为运行期表（含热重载 / mod 改动）；None 时回退到内嵌基础层
+/// （`entity_objects.jsonc`），供 Bevy 启动完成前的查询使用。
 pub fn prototype_table_to_variant(tables: Option<&ObjectTables>) -> Array<VarDictionary> {
+    let embedded: ObjectTables;
     let rows: Vec<(u32, &str, u32)> = match tables {
         Some(tables) => tables.prototype_table_rows(),
-        None => prototype::prototype_table_snapshot(),
+        None => match game_core::static_data::load_object_tables(
+            &Default::default(),
+            &Default::default(),
+            0,
+        ) {
+            Ok(loaded) => {
+                embedded = loaded;
+                embedded.prototype_table_rows()
+            }
+            // 内嵌表是编译期打包的，正常不会失败；失败时给空表，不在桥接层 panic。
+            Err(_) => Vec::new(),
+        },
     };
     let mut out: Array<VarDictionary> = Array::new();
     for (id, name, version) in rows {

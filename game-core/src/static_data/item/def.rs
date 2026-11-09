@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::static_data::prototype::{prototype_def, PrototypeId};
+use crate::static_data::prototype::PrototypeId;
 
 use super::category::ItemCategory;
 use super::subcategory::ItemSubCategoryId;
@@ -181,15 +181,8 @@ impl crate::static_data::JsoncTable for ItemDefFile {
                     def.name
                 ));
             }
-            // 核心原型引用在这里能查；mod 原型留给 ObjectTables 交叉校验。
-            if def.world_prototype <= game_engine::ids::CORE_ID_MAX
-                && prototype_def(PrototypeId(def.world_prototype)).is_none()
-            {
-                return Err(format!(
-                    "{} 的 world_prototype({}) 不存在",
-                    def.name, def.world_prototype
-                ));
-            }
+            // world_prototype / places 指向的实体是否存在，由 ObjectTables::from_parts
+            // 的跨表校验统一负责（对着运行期实体表查，含 mod 层）。
         }
 
         for core in ITEM_TABLE {
@@ -246,7 +239,7 @@ impl ItemDef {
 
 /// 核心物品表（ID 1..=999，只增不改）。
 ///
-/// world_prototype 指向 PROTOTYPE_TABLE 的掉落物原型（T11 校验悬空引用）。
+/// world_prototype 指向 `entity_objects.jsonc` 里的掉落物原型（T11 校验悬空引用）。
 pub const ITEM_TABLE: &[ItemDef] = &[
     ItemDef {
         id: 1,

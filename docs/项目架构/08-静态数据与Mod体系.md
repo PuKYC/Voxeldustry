@@ -80,7 +80,7 @@ source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现"
   } }
 ```
 
-核心原型 1/2/3、20..24 必须保留；`prototype_table_snapshot()` 仍只导出 `(id, name, version)`。
+Rust 代码里硬引用的核心实体 1（player）/ 2（drifter）/ 3（gated_drifter）必须保留，且名字不可改；契约登记在 `prototype.rs` 的 `CORE_ENTITIES`（只有 `(id, name)`），由 `EntityObjectDef::validate` 检查。`version` / `placement` 与 20..24、30 等其它实体只以 jsonc 为准；物品对实体的引用由 `ObjectTables::from_parts` 的跨表校验负责。导出给 Godot 的 `(id, name, version)` 来自运行期表，启动前回退到内嵌 jsonc。
 
 ### 生物群系
 

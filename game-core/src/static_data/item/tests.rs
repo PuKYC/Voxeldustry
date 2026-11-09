@@ -1,5 +1,4 @@
 use super::*;
-use crate::static_data::prototype::prototype_def;
 use game_engine::ids::{detect_id_collisions, CORE_ID_MAX};
 use game_engine::ids::{partition_of, IdEntry};
 
@@ -112,10 +111,12 @@ fn tag_index_build_is_deterministic() {
 /// T11：每个 world_prototype 都能查到原型（防悬空引用）。
 #[test]
 fn world_prototype_references_exist() {
+    let tables = crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
+        .expect("embedded tables load");
     for def in ITEM_TABLE {
         assert!(
-            prototype_def(def.world_prototype).is_some(),
-            "{} 的 world_prototype({}) 在 PROTOTYPE_TABLE 中不存在",
+            tables.entity(def.world_prototype).is_some(),
+            "{} 的 world_prototype({}) 在 entity_objects.jsonc 中不存在",
             def.name,
             def.world_prototype.0
         );
