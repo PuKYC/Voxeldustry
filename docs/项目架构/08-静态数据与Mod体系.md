@@ -102,7 +102,7 @@ Rust 代码里硬引用的核心实体 1（player）/ 2（drifter）/ 3（gated_
 ```
 
 加载时解析成 `PlacedObject::{Block(u8), VoxelObject(u32), Entity(PrototypeId)}`。
-`placeable` 标签与 `places` 必须同时存在；核心物品 1..=5 名字不可改。
+`placeable` 标签与 `places` 必须同时存在。物品定义完全以 `item_placement.jsonc`（及其 mod 补丁层）为准：Rust 侧不保留核心物品 id 契约，运行期查不到的物品按未知物品安全降级。
 
 每个物品用两个质量字段描述堆叠：
 

@@ -185,18 +185,6 @@ impl crate::static_data::JsoncTable for ItemDefFile {
             // 的跨表校验统一负责（对着运行期实体表查，含 mod 层）。
         }
 
-        for core in ITEM_TABLE {
-            let found = defs
-                .iter()
-                .find(|def| def.id == core.id)
-                .ok_or_else(|| format!("缺少核心物品 id {}（{}）", core.id, core.name))?;
-            if found.name != core.name {
-                return Err(format!(
-                    "核心物品 id {} 名字必须是 {}，实际 {}",
-                    core.id, core.name, found.name
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -237,98 +225,6 @@ impl ItemDef {
     }
 }
 
-/// 核心物品表（ID 1..=999，只增不改）。
-///
-/// world_prototype 指向 `entity_objects.jsonc` 里的掉落物原型（T11 校验悬空引用）。
-pub const ITEM_TABLE: &[ItemDef] = &[
-    ItemDef {
-        id: 1,
-        name: Cow::Borrowed("iron_ingot"),
-        category: ItemCategory::Material,
-        sub_category: ItemSubCategoryId::NONE,
-        tags: Cow::Borrowed(&[ITEM_TAG_STACKABLE, ITEM_TAG_DROPPABLE]),
-        mass_grams: 100,
-        stack_capacity_grams: 6_400,
-        world_prototype: PrototypeId(20),
-        version: 1,
-        places: None,
-    },
-    ItemDef {
-        id: 2,
-        name: Cow::Borrowed("wooden_sword"),
-        category: ItemCategory::Weapon,
-        sub_category: ItemSubCategoryId::NONE,
-        tags: Cow::Borrowed(&[ITEM_TAG_EQUIPPABLE, ITEM_TAG_DROPPABLE]),
-        mass_grams: 1_500,
-        stack_capacity_grams: 1_500,
-        world_prototype: PrototypeId(21),
-        version: 1,
-        places: None,
-    },
-    ItemDef {
-        id: 3,
-        name: Cow::Borrowed("health_potion"),
-        category: ItemCategory::Consumable,
-        sub_category: ItemSubCategoryId::NONE,
-        tags: Cow::Borrowed(&[ITEM_TAG_STACKABLE, ITEM_TAG_DROPPABLE, ITEM_TAG_CONSUMABLE]),
-        mass_grams: 250,
-        stack_capacity_grams: 4_000,
-        world_prototype: PrototypeId(22),
-        version: 1,
-        places: None,
-    },
-    ItemDef {
-        id: 4,
-        name: Cow::Borrowed("torch"),
-        category: ItemCategory::Tool,
-        sub_category: ItemSubCategoryId::NONE,
-        // 6.6：stackable 标签 <=> 按质量/容量算出的堆叠数量 > 1。
-        tags: Cow::Borrowed(&[
-            ITEM_TAG_STACKABLE,
-            ITEM_TAG_EQUIPPABLE,
-            ITEM_TAG_DROPPABLE,
-            ITEM_TAG_PLACEABLE,
-            ITEM_TAG_FUEL,
-        ]),
-        mass_grams: 50,
-        stack_capacity_grams: 3_200,
-        world_prototype: PrototypeId(23),
-        version: 1,
-        places: Some(PlacedObject::Entity(PrototypeId(30))),
-    },
-    ItemDef {
-        id: 5,
-        name: Cow::Borrowed("ancient_relic"),
-        category: ItemCategory::Quest,
-        sub_category: ItemSubCategoryId::NONE,
-        tags: Cow::Borrowed(&[ITEM_TAG_QUEST_ITEM, ITEM_TAG_UNIQUE]),
-        mass_grams: 5_000,
-        stack_capacity_grams: 5_000,
-        world_prototype: PrototypeId(24),
-        version: 1,
-        places: None,
-    },
-];
-
-/// 按 ID 查定义（表按 id 升序，二分查找）。未知返回 None，不 panic。
-pub fn item_def(id: ItemTypeId) -> Option<&'static ItemDef> {
-    ITEM_TABLE
-        .binary_search_by_key(&id.0, |def| def.id)
-        .ok()
-        .map(|index| &ITEM_TABLE[index])
-}
-
-pub fn item_name(id: ItemTypeId) -> Option<&'static str> {
-    item_def(id).map(|def| def.name.as_ref())
-}
-
-/// 该物品定义是否带某标签（tags 升序，二分查找）。未定义物品视为不带任何标签。
-pub fn item_has_tag(id: ItemTypeId, tag: ItemTagId) -> bool {
-    item_def(id)
-        .map(|def| def.tags.binary_search(&tag).is_ok())
-        .unwrap_or(false)
-}
-
 /// FFI 用的物品定义行（纯数据，无行为）。
 #[derive(Clone, Debug)]
 pub struct ItemTableRow {
@@ -344,24 +240,4 @@ pub struct ItemTableRow {
     pub stack_capacity_grams: u32,
     pub prototype_id: u32,
     pub version: u32,
-}
-
-/// 物品定义表快照（逻辑层输出统一升序，Godot 只做集合判断）。
-pub fn item_table_snapshot() -> Vec<ItemTableRow> {
-    ITEM_TABLE
-        .iter()
-        .map(|def| ItemTableRow {
-            item_id: def.id,
-            name: def.name.clone(),
-            category: def.category.as_u8(),
-            category_name: def.category.as_str(),
-            sub_category: def.sub_category.0,
-            tags: def.tags.iter().map(|tag| tag.0).collect(),
-            max_stack: def.max_stack(),
-            mass_grams: def.mass_grams,
-            stack_capacity_grams: def.stack_capacity_grams,
-            prototype_id: def.world_prototype.0,
-            version: def.version,
-        })
-        .collect()
 }

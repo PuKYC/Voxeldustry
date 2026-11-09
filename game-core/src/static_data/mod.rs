@@ -1299,7 +1299,6 @@ mod tests {
         ] {
             assert_eq!(tables.block(id).map(|def| def.name.as_str()), Some(name));
         }
-        assert_eq!(tables.items().len(), item::ITEM_TABLE.len());
         let torch = tables.item(ItemTypeId(4)).expect("torch");
         assert_eq!(torch.places, Some(PlacedObject::Entity(PrototypeId(30))));
         assert!(tables.entity(PrototypeId(30)).is_some());

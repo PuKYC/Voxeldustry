@@ -17,7 +17,7 @@ use crate::input::control::{InputSourceId, LocalPlayer};
 use crate::input::SimulationTick;
 use crate::presentation::payload::PresentationState;
 use crate::presentation::PresentedTransform;
-use crate::static_data::prototype::Prototype;
+use crate::static_data::prototype::{Prototype, PROTOTYPE_DRIFTER};
 use game_engine::identity::StableIdWorldExt;
 use game_engine::spatial::Size;
 
@@ -80,7 +80,7 @@ fn spawn_perf_world(world: &mut World) {
             Transform::from_xyz(x as f32, 0.0, z as f32),
             // 没有 `Size` 就进不了空间索引，会永远落在玩家 AOI 之外。
             Size(None),
-            Prototype::new(2),
+            Prototype::new(PROTOTYPE_DRIFTER),
             PresentationState::idle().with_locomotion(1),
             PresentedTransform::default(),
             PerfMotion {

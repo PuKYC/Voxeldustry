@@ -393,7 +393,7 @@ mod tests {
     /// 走普通 Add 通道下发，并写进组件基线。
     #[test]
     fn prototype_is_collected_as_a_normal_payload() {
-        use crate::static_data::prototype::Prototype;
+        use crate::static_data::prototype::{Prototype, PROTOTYPE_GATED_DRIFTER};
 
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
@@ -404,7 +404,7 @@ mod tests {
 
         let entity = app
             .world_mut()
-            .spawn((StableEntityId(7), Prototype::new(3)))
+            .spawn((StableEntityId(7), Prototype::new(PROTOTYPE_GATED_DRIFTER)))
             .id();
         {
             let mut vis = app.world_mut().resource_mut::<PresentationVisibility>();
@@ -421,7 +421,7 @@ mod tests {
                 payload: SyncPayload::Prototype(value),
             } => {
                 assert_eq!(id.0, 7);
-                assert_eq!(value.0, 3);
+                assert_eq!(value.0, PROTOTYPE_GATED_DRIFTER);
             }
             other => panic!("原型必须作为普通 Add 下发，实际 {other:?}"),
         }

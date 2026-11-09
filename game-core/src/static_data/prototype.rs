@@ -174,13 +174,28 @@ impl super::JsoncTable for EntityObjectDef {
     }
 }
 
+/// 玩家实体原型（`player`）。
+pub const PROTOTYPE_PLAYER: u32 = 1;
+
+/// 游荡实体原型（`drifter`）。
+pub const PROTOTYPE_DRIFTER: u32 = 2;
+
+/// 带门控的游荡实体原型（`gated_drifter`）。
+pub const PROTOTYPE_GATED_DRIFTER: u32 = 3;
+
 /// 游戏运行**必须存在**的核心实体契约：`(id, name)`。
 ///
-/// 只收 Rust 代码里直接按 id 引用的实体（`dev/spawn.rs` 用 1、`dev/perf.rs` 用 2、
-/// `presentation/sync.rs` 用 3）。`version` / `placement` 以及掉落物、放置物等其它
-/// 实体都只存在于 `entity_objects.jsonc`（及其 mod 补丁层），物品对实体的引用由
+/// 只收 Rust 代码里直接按 id 引用的实体，且 id 一律引用上面的常量
+/// （`dev/spawn.rs` 用 [`PROTOTYPE_PLAYER`]、`dev/perf.rs` 用
+/// [`PROTOTYPE_DRIFTER`]、`presentation/sync.rs` 用 [`PROTOTYPE_GATED_DRIFTER`]）。
+/// `version` / `placement` 以及掉落物、放置物等其它实体都只存在于
+/// `entity_objects.jsonc`（及其 mod 补丁层），物品对实体的引用由
 /// `ObjectTables::from_parts` 的跨表校验负责，不在这里重复登记。
-pub const CORE_ENTITIES: &[(u32, &str)] = &[(1, "player"), (2, "drifter"), (3, "gated_drifter")];
+pub const CORE_ENTITIES: &[(u32, &str)] = &[
+    (PROTOTYPE_PLAYER, "player"),
+    (PROTOTYPE_DRIFTER, "drifter"),
+    (PROTOTYPE_GATED_DRIFTER, "gated_drifter"),
+];
 
 /// 挂在实体上的原型引用。
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -204,7 +219,9 @@ mod tests {
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len());
-        assert!(ids.iter().all(|id| *id != 0 && *id <= game_engine::ids::CORE_ID_MAX));
+        assert!(ids
+            .iter()
+            .all(|id| *id != 0 && *id <= game_engine::ids::CORE_ID_MAX));
 
         let mut names: Vec<&str> = CORE_ENTITIES.iter().map(|(_, name)| *name).collect();
         names.sort_unstable();
@@ -216,12 +233,9 @@ mod tests {
     /// 内嵌的 entity_objects.jsonc 必须满足核心契约（走完整加载流水线）。
     #[test]
     fn embedded_entity_table_satisfies_core_contract() {
-        let tables = crate::static_data::load_object_tables(
-            &Default::default(),
-            &Default::default(),
-            1,
-        )
-        .expect("embedded tables load");
+        let tables =
+            crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
+                .expect("embedded tables load");
         for &(id, name) in CORE_ENTITIES {
             let def = tables.entity(PrototypeId(id)).expect("核心实体存在");
             assert_eq!(def.name, name);

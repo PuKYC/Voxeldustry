@@ -23,7 +23,7 @@ use crate::presentation::event::{PresentationEvent, SoundId};
 use crate::presentation::payload::PresentationState;
 use crate::presentation::{PresentationEventQueue, PresentedTransform};
 use crate::privacy::{CoreRequiredPerception, ExactHealth};
-use crate::static_data::prototype::Prototype;
+use crate::static_data::prototype::{Prototype, PROTOTYPE_DRIFTER, PROTOTYPE_GATED_DRIFTER};
 use game_engine::identity::{StableEntityId, StableIdWorldExt};
 use game_engine::rng::RngState;
 use game_engine::spatial::Size;
@@ -99,7 +99,11 @@ fn spawn_demo_world(world: &mut World) {
         //   1 → 需要玩家没有的感知位（血量永不下发）
         //   2 → 根本没有血量组件
         let privacy = index % 3;
-        let prototype = if privacy == 2 { 2 } else { 3 };
+        let prototype = if privacy == 2 {
+            PROTOTYPE_DRIFTER
+        } else {
+            PROTOTYPE_GATED_DRIFTER
+        };
 
         let speed = 1.0 + (index % 4) as f32;
         let span = (30 + (index % 5) * 10) as f32;

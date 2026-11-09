@@ -1,20 +1,38 @@
 use super::*;
+use crate::static_data::ObjectTables;
 use game_engine::ids::{detect_id_collisions, CORE_ID_MAX};
 use game_engine::ids::{partition_of, IdEntry};
 
-/// T4：物品 id / 名字唯一，且表按 id 升序（item_def 二分查找的前提）。
+/// 加载内嵌静态表；`item_placement.jsonc` 是物品数据的唯一来源。
+fn embedded_tables() -> ObjectTables {
+    crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
+        .expect("embedded tables load")
+}
+
+/// 按物品 id 查标签（tags 升序，二分查找）；未定义物品视为不带任何标签。
+fn has_tag(tables: &ObjectTables, id: u32, tag: ItemTagId) -> bool {
+    ItemStack {
+        item: ItemTypeId(id),
+        count: 1,
+        instance: ItemInstanceData::default(),
+    }
+    .has_tag(tag, tables)
+}
+
+/// T4：物品 id / 名字唯一，且表按 id 升序（表内二分查找的前提）。
 #[test]
 fn item_ids_and_names_are_unique() {
-    let mut ids: Vec<u32> = ITEM_TABLE.iter().map(|d| d.id).collect();
+    let tables = embedded_tables();
+    let mut ids: Vec<u32> = tables.items().iter().map(|d| d.id).collect();
     for window in ids.windows(2) {
-        assert!(window[0] < window[1], "ITEM_TABLE 必须按 id 升序");
+        assert!(window[0] < window[1], "物品表必须按 id 升序");
     }
     let before = ids.len();
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(before, ids.len(), "物品 id 重复");
 
-    let mut names: Vec<&str> = ITEM_TABLE.iter().map(|d| d.name.as_ref()).collect();
+    let mut names: Vec<&str> = tables.items().iter().map(|d| d.name.as_ref()).collect();
     let before = names.len();
     names.sort_unstable();
     names.dedup();
@@ -24,7 +42,8 @@ fn item_ids_and_names_are_unique() {
 /// T5：每个 ItemDef.tags 严格升序、无重复。
 #[test]
 fn item_tags_are_sorted_ascending() {
-    for def in ITEM_TABLE {
+    let tables = embedded_tables();
+    for def in tables.items() {
         for window in def.tags.windows(2) {
             assert!(
                 window[0] < window[1],
@@ -77,27 +96,30 @@ fn category_is_closed_and_roundtrips() {
 /// T8：未定义 id 返回 None，不 panic。
 #[test]
 fn unknown_item_lookup_is_none_not_panic() {
-    assert!(item_def(ItemTypeId(0)).is_none());
-    assert!(item_def(ItemTypeId(999)).is_none());
-    assert!(item_name(ItemTypeId(999)).is_none());
-    assert!(!item_has_tag(ItemTypeId(999), ITEM_TAG_DROPPABLE));
+    let tables = embedded_tables();
+    assert!(tables.item(ItemTypeId(0)).is_none());
+    assert!(tables.item(ItemTypeId(999)).is_none());
+    assert!(tables.item_by_name("no_such_item").is_none());
+    assert!(!has_tag(&tables, 999, ITEM_TAG_DROPPABLE));
 }
 
-/// T9：标签命中 / 未命中正确（二分查找）。
+/// T9：标签命中 / 未命中正确（tags 升序 + 二分查找）。
 #[test]
-fn item_has_tag_uses_binary_search() {
-    assert!(item_has_tag(ItemTypeId(1), ITEM_TAG_STACKABLE));
-    assert!(item_has_tag(ItemTypeId(1), ITEM_TAG_DROPPABLE));
-    assert!(!item_has_tag(ItemTypeId(1), ITEM_TAG_EQUIPPABLE));
-    assert!(!item_has_tag(ItemTypeId(1), ItemTagId(9999)));
+fn item_tag_lookup_uses_binary_search() {
+    let tables = embedded_tables();
+    assert!(has_tag(&tables, 1, ITEM_TAG_STACKABLE));
+    assert!(has_tag(&tables, 1, ITEM_TAG_DROPPABLE));
+    assert!(!has_tag(&tables, 1, ITEM_TAG_EQUIPPABLE));
+    assert!(!has_tag(&tables, 1, ItemTagId(9999)));
 }
 
 /// T10：同样输入构建两次，items_with 结果逐位一致且升序。
 #[test]
 fn tag_index_build_is_deterministic() {
-    let a = ItemTagIndex::build(ITEM_TABLE);
-    let b = ItemTagIndex::build(ITEM_TABLE);
-    for def in ITEM_TABLE {
+    let tables = embedded_tables();
+    let a = ItemTagIndex::build(tables.items());
+    let b = ItemTagIndex::build(tables.items());
+    for def in tables.items() {
         for tag in def.tags.iter() {
             assert_eq!(a.items_with(*tag), b.items_with(*tag));
             let items = a.items_with(*tag);
@@ -111,9 +133,8 @@ fn tag_index_build_is_deterministic() {
 /// T11：每个 world_prototype 都能查到原型（防悬空引用）。
 #[test]
 fn world_prototype_references_exist() {
-    let tables = crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
-        .expect("embedded tables load");
-    for def in ITEM_TABLE {
+    let tables = embedded_tables();
+    for def in tables.items() {
         assert!(
             tables.entity(def.world_prototype).is_some(),
             "{} 的 world_prototype({}) 在 entity_objects.jsonc 中不存在",
@@ -181,7 +202,8 @@ fn item_tag_consts_match_table() {
 /// T15：6.6 的全部一致性规则。
 #[test]
 fn item_definition_consistency() {
-    for def in ITEM_TABLE {
+    let tables = embedded_tables();
+    for def in tables.items() {
         assert!(def.mass_grams > 0, "{} 的 mass_grams 不能为 0", def.name);
         assert!(
             def.stack_capacity_grams >= def.mass_grams,
@@ -249,7 +271,8 @@ fn subcategory_parent_is_core_and_matches() {
         assert_ne!(partition_of(def.id), game_engine::ids::IdPartition::None);
     }
 
-    for def in ITEM_TABLE {
+    let tables = embedded_tables();
+    for def in tables.items() {
         if def.sub_category != ItemSubCategoryId::NONE {
             let sub = item_subcategory_def(def.sub_category).expect("物品引用了不存在的子品类");
             assert_eq!(def.category, sub.parent);
@@ -263,9 +286,7 @@ fn unknown_subcategory_falls_back() {
     assert!(item_subcategory_def(ItemSubCategoryId(999_999)).is_none());
     assert!(item_subcategory_parent(ItemSubCategoryId(999_999)).is_none());
 
-    let tables =
-        crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
-            .expect("embedded tables load");
+    let tables = embedded_tables();
 
     let unknown_stack = ItemStack {
         item: ItemTypeId(999_999),
@@ -289,12 +310,13 @@ fn unknown_subcategory_falls_back() {
     );
 }
 
-/// 堆叠数量由单件质量与一叠容量算出，核心物品保持原上限。
+/// 堆叠数量由单件质量与一叠容量算出（抽样校验内嵌物品的已知上限）。
 #[test]
 fn stack_limit_comes_from_mass_and_capacity() {
+    let tables = embedded_tables();
     let expected = [(1, 64), (2, 1), (3, 16), (4, 64), (5, 1)];
     for (id, limit) in expected {
-        let def = item_def(ItemTypeId(id)).expect("core item exists");
+        let def = tables.item(ItemTypeId(id)).expect("core item exists");
         assert_eq!(def.max_stack(), limit, "{} 的堆叠上限", def.name);
         assert_eq!(
             def.stack_capacity_grams,
@@ -304,9 +326,6 @@ fn stack_limit_comes_from_mass_and_capacity() {
         );
     }
 
-    let tables =
-        crate::static_data::load_object_tables(&Default::default(), &Default::default(), 1)
-            .expect("embedded tables load");
     let stack = ItemStack {
         item: ItemTypeId(1),
         count: 10,
@@ -327,8 +346,9 @@ fn snapshots_match_tables() {
         item_subcategory_table_snapshot().len(),
         ITEM_SUBCATEGORY_TABLE.len()
     );
-    let rows = item_table_snapshot();
-    assert_eq!(rows.len(), ITEM_TABLE.len());
+    let tables = embedded_tables();
+    let rows = tables.item_table_rows();
+    assert_eq!(rows.len(), tables.items().len());
     for row in &rows {
         for window in row.tags.windows(2) {
             assert!(window[0] < window[1]);

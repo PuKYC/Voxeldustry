@@ -119,9 +119,21 @@ pub fn prototype_table_to_variant(tables: Option<&ObjectTables>) -> Array<VarDic
 ///
 /// tags 由逻辑层统一升序输出；Godot 只做集合判断，不判断业务规则。
 pub fn item_table_to_variant(tables: Option<&ObjectTables>) -> Array<VarDictionary> {
+    let embedded: ObjectTables;
     let rows: Vec<item::ItemTableRow> = match tables {
         Some(tables) => tables.item_table_rows(),
-        None => item::item_table_snapshot(),
+        None => match game_core::static_data::load_object_tables(
+            &Default::default(),
+            &Default::default(),
+            0,
+        ) {
+            Ok(loaded) => {
+                embedded = loaded;
+                embedded.item_table_rows()
+            }
+            // 内嵌表是编译期打包的，正常不会失败；失败时给空表，不在桥接层 panic。
+            Err(_) => Vec::new(),
+        },
     };
     let mut out: Array<VarDictionary> = Array::new();
     for row in rows {

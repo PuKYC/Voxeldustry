@@ -29,7 +29,9 @@ macro_rules! spawn_local_player {
             Transform::from_translation(position),
             // `Size` 是进空间索引（也就是 AOI 可见性）的必要条件。
             game_engine::spatial::Size(None),
-            crate::static_data::prototype::Prototype::new(1),
+            crate::static_data::prototype::Prototype::new(
+                crate::static_data::prototype::PROTOTYPE_PLAYER,
+            ),
             crate::presentation::payload::PresentationState::idle(),
             crate::input::control::LocalPlayer,
             crate::privacy::PerceptionMask(0b0001),
