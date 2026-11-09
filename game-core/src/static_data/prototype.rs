@@ -74,7 +74,7 @@ impl PlacementSpec {
     };
 
     fn validate(&self) -> Result<(), String> {
-        if self.footprint.iter().any(|side| *side == 0) {
+        if self.footprint.contains(&0) {
             return Err("placement.footprint 的三个分量都必须 >= 1".to_string());
         }
         if self.offset.iter().any(|value| value.unsigned_abs() > 1024) {

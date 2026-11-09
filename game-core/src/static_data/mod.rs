@@ -75,7 +75,7 @@ pub fn strip_jsonc(input: &str) -> String {
             '/' => match chars.peek().copied() {
                 Some('/') => {
                     chars.next();
-                    while let Some(inner) = chars.next() {
+                    for inner in chars.by_ref() {
                         if inner == '\n' {
                             without_comments.push('\n');
                             break;
@@ -120,14 +120,7 @@ pub fn strip_jsonc(input: &str) -> String {
                 }
             }
             ',' => {
-                let mut lookahead = chars.clone();
-                let mut next = None;
-                while let Some(candidate) = lookahead.next() {
-                    if !candidate.is_whitespace() {
-                        next = Some(candidate);
-                        break;
-                    }
-                }
+                let next = chars.clone().find(|candidate| !candidate.is_whitespace());
                 if !matches!(next, Some('}') | Some(']')) {
                     out.push(ch);
                 }
@@ -590,7 +583,7 @@ impl ObjectTables {
                 ("subsurface_block", def.subsurface_block),
                 ("stone_block", def.stone_block),
             ] {
-                if block_by_slot.get(&slot).is_none() {
+                if !block_by_slot.contains_key(&slot) {
                     return Err(format!(
                         "{} 的 {}({}) 不在方块对象表里",
                         def.name, role, slot
@@ -631,30 +624,25 @@ impl ObjectTables {
             }
             match item.places {
                 None => {}
-                Some(PlacedObject::Block(id)) => {
-                    if block_by_slot.get(&id).is_none() {
-                        return Err(format!(
-                            "{} 的 places.block({}) 不在方块对象表里",
-                            item.name, id
-                        ));
-                    }
+                Some(PlacedObject::Block(id)) if !block_by_slot.contains_key(&id) => {
+                    return Err(format!(
+                        "{} 的 places.block({}) 不在方块对象表里",
+                        item.name, id
+                    ));
                 }
-                Some(PlacedObject::VoxelObject(id)) => {
-                    if !block_by_id.contains_key(&id) {
-                        return Err(format!(
-                            "{} 的 places.voxel_object({}) 不在方块对象表里",
-                            item.name, id
-                        ));
-                    }
+                Some(PlacedObject::VoxelObject(id)) if !block_by_id.contains_key(&id) => {
+                    return Err(format!(
+                        "{} 的 places.voxel_object({}) 不在方块对象表里",
+                        item.name, id
+                    ));
                 }
-                Some(PlacedObject::Entity(id)) => {
-                    if !entity_by_id.contains_key(&id.0) {
-                        return Err(format!(
-                            "{} 的 places.entity({}) 不在实体对象表里",
-                            item.name, id.0
-                        ));
-                    }
+                Some(PlacedObject::Entity(id)) if !entity_by_id.contains_key(&id.0) => {
+                    return Err(format!(
+                        "{} 的 places.entity({}) 不在实体对象表里",
+                        item.name, id.0
+                    ));
                 }
+                _ => {}
             }
         }
 
@@ -1331,9 +1319,7 @@ mod tests {
     #[test]
     fn mod_patch_can_add_namespaced_entity_and_item() {
         let entity_id = mod_hash_id("mymod:lantern");
-        let entity_patch = format!(
-            r#"{{"version":1,"table":"entity_objects","patch":[{{"name":"mymod:lantern","add":{{"version":1,"placement":{{"anchor":"voxel","footprint":[1,1,1],"requires_support":true}}}}}}]}}"#
-        );
+        let entity_patch = r#"{"version":1,"table":"entity_objects","patch":[{"name":"mymod:lantern","add":{"version":1,"placement":{"anchor":"voxel","footprint":[1,1,1],"requires_support":true}}}]}"#;
         let item_patch = format!(
             r#"{{"version":1,"table":"item_placement","patch":[{{"name":"mymod:lantern_item","add":{{"category":5,"sub_category":0,"tags":[3,10],"mass_grams":1000,"stack_capacity_grams":1000,"world_prototype":{entity_id},"version":1,"places":{{"kind":"entity","name":"mymod:lantern"}}}}}}]}}"#
         );
@@ -1341,7 +1327,7 @@ mod tests {
         layers.add(ObjectLayer {
             mod_id: "mymod",
             load_order: 0,
-            src: Box::leak(entity_patch.into_boxed_str()),
+            src: entity_patch,
         });
         layers.add(ObjectLayer {
             mod_id: "mymod",
