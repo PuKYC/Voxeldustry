@@ -210,13 +210,16 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 
 ## Mod 清单
 
-`ModManifest` 声明 `id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`。
+`ModManifest` 声明 `id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`params`。
 
 - `load_after`：硬依赖，缺失报 `MissingDependency`，同时作为拓扑排序边。
 - `load_after_optional`：可选依赖，存在时排在自己之前，缺失不报错。
 - `conflicts`：单向声明，对方存在即报 `Conflict`。
 - `exclusive_groups`：同一组最多加载一个 mod，冲突报 `ExclusiveGroup`。
 - `engine_api` 是整数版本，只增不改。
+- `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。
+
+参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` 负责这个装配点。
 
 ## 改内容时的落点
 

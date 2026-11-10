@@ -15,8 +15,13 @@
 //! 关键判断：Bevy 调度不支持运行期删除 / 替换已注册系统，因此「替换行为」
 //! 一律抽成 Strategy trait 换资源，而不是从调度里抠系统。
 
+pub mod params;
 pub mod registry;
 
+pub use params::{
+    ModParamsPlugin, ParamEntry, ParamError, ParamScope, ParamSpec, ParamTable, ParamType,
+    VisibleIf, WorldParamsFrozen,
+};
 pub use registry::{NamedEntry, OverridePriority, Registry, RegistryEntry, RegistryError};
 
 use std::collections::HashMap;
@@ -44,6 +49,8 @@ pub struct ModManifest {
     pub conflicts: &'static [&'static str],
     /// 互斥组：同一组内最多加载一个 mod。
     pub exclusive_groups: &'static [&'static str],
+    /// 插件参数 schema；key 在 mod 内局部，落盘时拼 `<mod_id>.<key>`。
+    pub params: &'static [ParamSpec],
 }
 
 /// 一层 mod 静态数据补丁（原始 JSONC 文本，解析由消费方负责）。
@@ -94,6 +101,7 @@ pub enum ModError {
     Conflict { a: String, b: String },
     ExclusiveGroup { group: String, a: String, b: String },
     DuplicateId { id: String },
+    Param(ParamError),
 }
 
 impl std::fmt::Display for ModError {
@@ -110,14 +118,21 @@ impl std::fmt::Display for ModError {
                 write!(f, "mod {a} 与 {b} 同属互斥组 {group}")
             }
             ModError::DuplicateId { id } => write!(f, "mod id 重复：{id}"),
+            ModError::Param(error) => write!(f, "mod 参数表错误：{error}"),
         }
+    }
+}
+
+impl From<ParamError> for ModError {
+    fn from(error: ParamError) -> Self {
+        ModError::Param(error)
     }
 }
 
 impl std::error::Error for ModError {}
 
 /// 运行期数据注册表：按 domain 分组，底层复用通用 Registry。
-#[derive(Default)]
+#[derive(Default, Resource)]
 pub struct DataRegistry {
     domains: HashMap<String, Registry<NamedEntry>>,
 }
@@ -480,6 +495,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     struct BumpMod;
@@ -501,6 +517,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
     static MB: ModManifest = ModManifest {
         id: "b",
@@ -510,6 +527,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     struct LogMod(&'static ModManifest, &'static str);
@@ -554,6 +572,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
     static LAYER_EARLY: ModManifest = ModManifest {
         id: "a_layer",
@@ -563,6 +582,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     struct LayerMod(&'static ModManifest, &'static str);
@@ -617,6 +637,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &["cb"],
         exclusive_groups: &[],
+        params: &[],
     };
     static CONFLICT_B: ModManifest = ModManifest {
         id: "cb",
@@ -626,6 +647,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     #[test]
@@ -647,6 +669,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     #[test]
@@ -667,6 +690,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
     static OPTIONAL_HOST: ModManifest = ModManifest {
         id: "opt_host",
@@ -676,6 +700,7 @@ mod tests {
         load_after_optional: &["opt_guest"],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     #[test]
@@ -699,6 +724,7 @@ mod tests {
         load_after_optional: &["opt_ghost"],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     #[test]
@@ -722,6 +748,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &["renderer"],
+        params: &[],
     };
     static GROUP_B: ModManifest = ModManifest {
         id: "group_b",
@@ -731,6 +758,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &["renderer"],
+        params: &[],
     };
 
     #[test]
@@ -768,6 +796,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
     static CYCLE_B: ModManifest = ModManifest {
         id: "cycle_b",
@@ -777,6 +806,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     #[test]
@@ -842,6 +872,7 @@ mod tests {
         load_after_optional: &[],
         conflicts: &[],
         exclusive_groups: &[],
+        params: &[],
     };
 
     struct PatchMod;

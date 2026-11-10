@@ -1171,6 +1171,7 @@ mod tests {
             load_after_optional: &[],
             conflicts: &[],
             exclusive_groups: &[],
+            params: &[],
         };
 
     struct LayerTestMod;
