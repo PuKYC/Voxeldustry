@@ -1168,7 +1168,9 @@ mod tests {
             version: 1,
             engine_api: 1,
             load_after: &[],
+            load_after_optional: &[],
             conflicts: &[],
+            exclusive_groups: &[],
         };
 
     struct LayerTestMod;

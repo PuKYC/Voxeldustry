@@ -36,10 +36,14 @@ pub struct ModManifest {
     pub version: u32,
     /// 目标引擎 API 版本（semver 简化版：整数，只增不改）。
     pub engine_api: u32,
-    /// 必须在自己之前加载的 mod id。
+    /// 硬依赖：必须存在，且加载在自己之前。
     pub load_after: &'static [&'static str],
+    /// 可选依赖：存在时加载在自己之前；缺失不报错。
+    pub load_after_optional: &'static [&'static str],
     /// 与本 mod 冲突的 mod id。
     pub conflicts: &'static [&'static str],
+    /// 互斥组：同一组内最多加载一个 mod。
+    pub exclusive_groups: &'static [&'static str],
 }
 
 /// 一层 mod 静态数据补丁（原始 JSONC 文本，解析由消费方负责）。
@@ -88,6 +92,7 @@ pub enum ModError {
     MissingDependency { module: String, missing: String },
     CircularDependency { module: String },
     Conflict { a: String, b: String },
+    ExclusiveGroup { group: String, a: String, b: String },
     DuplicateId { id: String },
 }
 
@@ -101,6 +106,9 @@ impl std::fmt::Display for ModError {
                 write!(f, "mod 加载顺序存在环：{module}")
             }
             ModError::Conflict { a, b } => write!(f, "mod {a} 与 {b} 冲突"),
+            ModError::ExclusiveGroup { group, a, b } => {
+                write!(f, "mod {a} 与 {b} 同属互斥组 {group}")
+            }
             ModError::DuplicateId { id } => write!(f, "mod id 重复：{id}"),
         }
     }
@@ -324,8 +332,9 @@ impl<S: GameSpec> Mods<S> {
         self.mods.iter().map(|module| module.manifest()).collect()
     }
 
-    /// 按 load_after 做确定性拓扑排序（同层按 id 字典序），校验 conflicts，
-    /// 依次 register_data + install，并返回 mod_set_hash。
+    /// 按 load_after / load_after_optional 做确定性拓扑排序（同层按 id 字典序），
+    /// 校验 conflicts 与 exclusive_groups，依次 register_data + install，
+    /// 并返回 mod_set_hash。
     pub fn apply(self, app: &mut App, data: &mut DataRegistry) -> Result<u64, ModError> {
         let count = self.mods.len();
 
@@ -337,6 +346,7 @@ impl<S: GameSpec> Mods<S> {
             }
         }
 
+        let mut group_members: HashMap<&'static str, &'static str> = HashMap::new();
         for module in self.mods.iter() {
             let manifest = module.manifest();
             for other in manifest.conflicts {
@@ -345,6 +355,17 @@ impl<S: GameSpec> Mods<S> {
                         a: manifest.id.to_string(),
                         b: (*other).to_string(),
                     });
+                }
+            }
+            for group in manifest.exclusive_groups {
+                if let Some(previous) = group_members.insert(group, manifest.id) {
+                    if previous != manifest.id {
+                        return Err(ModError::ExclusiveGroup {
+                            group: (*group).to_string(),
+                            a: previous.to_string(),
+                            b: manifest.id.to_string(),
+                        });
+                    }
                 }
             }
             for dependency in manifest.load_after {
@@ -365,6 +386,12 @@ impl<S: GameSpec> Mods<S> {
                 let dependency_index = index[dependency];
                 edges[dependency_index].push(position);
                 indegree[position] += 1;
+            }
+            for dependency in module.manifest().load_after_optional {
+                if let Some(&dependency_index) = index.get(dependency) {
+                    edges[dependency_index].push(position);
+                    indegree[position] += 1;
+                }
             }
         }
 
@@ -450,7 +477,9 @@ mod tests {
         version: 1,
         engine_api: 1,
         load_after: &[],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     struct BumpMod;
@@ -469,14 +498,18 @@ mod tests {
         version: 1,
         engine_api: 1,
         load_after: &["b"],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
     static MB: ModManifest = ModManifest {
         id: "b",
         version: 1,
         engine_api: 1,
         load_after: &[],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     struct LogMod(&'static ModManifest, &'static str);
@@ -518,14 +551,18 @@ mod tests {
         version: 1,
         engine_api: 1,
         load_after: &["a_layer"],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
     static LAYER_EARLY: ModManifest = ModManifest {
         id: "a_layer",
         version: 1,
         engine_api: 1,
         load_after: &[],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     struct LayerMod(&'static ModManifest, &'static str);
@@ -577,14 +614,18 @@ mod tests {
         version: 1,
         engine_api: 1,
         load_after: &[],
+        load_after_optional: &[],
         conflicts: &["cb"],
+        exclusive_groups: &[],
     };
     static CONFLICT_B: ModManifest = ModManifest {
         id: "cb",
         version: 1,
         engine_api: 1,
         load_after: &[],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     #[test]
@@ -603,7 +644,9 @@ mod tests {
         version: 1,
         engine_api: 1,
         load_after: &["nonexistent"],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     #[test]
@@ -616,19 +659,124 @@ mod tests {
         assert!(matches!(result, Err(ModError::MissingDependency { .. })));
     }
 
+    static OPTIONAL_GUEST: ModManifest = ModManifest {
+        id: "opt_guest",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+    };
+    static OPTIONAL_HOST: ModManifest = ModManifest {
+        id: "opt_host",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &["opt_guest"],
+        conflicts: &[],
+        exclusive_groups: &[],
+    };
+
+    #[test]
+    fn optional_dependency_orders_when_present() {
+        let mut app = app_with_sets();
+        app.init_resource::<OrderLog>();
+        let mut data = DataRegistry::new();
+        Mods::<DefaultSpec>::new()
+            .push(LogMod(&OPTIONAL_HOST, "host"))
+            .push(LogMod(&OPTIONAL_GUEST, "guest"))
+            .apply(&mut app, &mut data)
+            .unwrap();
+        assert_eq!(app.world().resource::<OrderLog>().0, vec!["guest", "host"]);
+    }
+
+    static OPTIONAL_ORPHAN: ModManifest = ModManifest {
+        id: "opt_orphan",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &["opt_ghost"],
+        conflicts: &[],
+        exclusive_groups: &[],
+    };
+
+    #[test]
+    fn optional_dependency_missing_is_allowed() {
+        let mut app = app_with_sets();
+        app.init_resource::<OrderLog>();
+        let mut data = DataRegistry::new();
+        let hash = Mods::<DefaultSpec>::new()
+            .push(LogMod(&OPTIONAL_ORPHAN, "orphan"))
+            .apply(&mut app, &mut data)
+            .unwrap();
+        assert_ne!(hash, 0);
+        assert_eq!(app.world().resource::<OrderLog>().0, vec!["orphan"]);
+    }
+
+    static GROUP_A: ModManifest = ModManifest {
+        id: "group_a",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &["renderer"],
+    };
+    static GROUP_B: ModManifest = ModManifest {
+        id: "group_b",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &["renderer"],
+    };
+
+    #[test]
+    fn exclusive_group_rejects_second_member() {
+        let mut app = app_with_sets();
+        let mut data = DataRegistry::new();
+        let result = Mods::<DefaultSpec>::new()
+            .push(SimpleMod(&GROUP_A))
+            .push(SimpleMod(&GROUP_B))
+            .apply(&mut app, &mut data);
+        match result {
+            Err(ModError::ExclusiveGroup { group, a, b }) => {
+                assert_eq!(group, "renderer");
+                assert_eq!((a.as_str(), b.as_str()), ("group_a", "group_b"));
+            }
+            other => panic!("期望 ExclusiveGroup，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exclusive_group_with_one_member_is_allowed() {
+        let mut app = app_with_sets();
+        let mut data = DataRegistry::new();
+        let result = Mods::<DefaultSpec>::new()
+            .push(SimpleMod(&GROUP_A))
+            .apply(&mut app, &mut data);
+        assert!(result.is_ok());
+    }
+
     static CYCLE_A: ModManifest = ModManifest {
         id: "cycle_a",
         version: 1,
         engine_api: 1,
         load_after: &["cycle_b"],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
     static CYCLE_B: ModManifest = ModManifest {
         id: "cycle_b",
         version: 1,
         engine_api: 1,
         load_after: &["cycle_a"],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     #[test]
@@ -691,7 +839,9 @@ mod tests {
         version: 1,
         engine_api: 1,
         load_after: &[],
+        load_after_optional: &[],
         conflicts: &[],
+        exclusive_groups: &[],
     };
 
     struct PatchMod;
