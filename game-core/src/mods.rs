@@ -69,7 +69,7 @@ impl Mod<CoreSpec> for CoreGameplayMod {
     }
 }
 
-/// 默认 mod 集合（当前为空，保留装配点）。
+/// 默认 mod 集合（当前为空；Godot 后端与 CoreGame 的默认装配都用它）。
 pub fn default_core_mods() -> CoreMods {
     CoreMods::new()
 }

@@ -221,6 +221,8 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 
 参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` 负责这个装配点。
 
+后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
+
 ## 改内容时的落点
 
 | 想改什么 | 改哪里 |

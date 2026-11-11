@@ -26,6 +26,7 @@ pub use registry::{NamedEntry, OverridePriority, Registry, RegistryEntry, Regist
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::ScheduleSystem;
@@ -315,13 +316,32 @@ pub struct DefinitionPatch {
 }
 
 /// 启动期一次性的 mod 集合（冷路径，允许 dyn；不进热路径）。
+///
+/// 内部用 `Arc` 持有 mod，因此集合本身可以廉价克隆；一次装配消耗的是
+/// 集合里的 `Arc`，不会消耗 mod 实例。mod 实现应视为无状态描述符。
 pub struct Mods<S: GameSpec> {
-    mods: Vec<Box<dyn Mod<S>>>,
+    mods: Vec<Arc<dyn Mod<S>>>,
+}
+
+impl<S: GameSpec> Clone for Mods<S> {
+    fn clone(&self) -> Self {
+        Self {
+            mods: self.mods.clone(),
+        }
+    }
 }
 
 impl<S: GameSpec> Default for Mods<S> {
     fn default() -> Self {
         Self { mods: Vec::new() }
+    }
+}
+
+impl<S: GameSpec> std::fmt::Debug for Mods<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mods")
+            .field("len", &self.mods.len())
+            .finish()
     }
 }
 
@@ -331,7 +351,7 @@ impl<S: GameSpec> Mods<S> {
     }
 
     pub fn push<M: Mod<S>>(mut self, module: M) -> Self {
-        self.mods.push(Box::new(module));
+        self.mods.push(Arc::new(module));
         self
     }
 

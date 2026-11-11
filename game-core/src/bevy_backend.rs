@@ -3,6 +3,7 @@
 //! runner / 通道 / 生命周期在 game-engine::backend；这里只提供本游戏的
 //! 配置、demo / perf / 体素地形组合与 FFI 入口。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +15,7 @@ use game_engine::residency::MemorySoftLimitHandle;
 
 use crate::app::CoreGame;
 use crate::dev::demo::DemoPlugin;
+use crate::mods::{default_core_mods, CoreMods};
 use crate::spec::{ClientBridge, CoreSpec};
 use crate::static_data::ObjectTablesHandle;
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
@@ -74,6 +76,12 @@ pub struct BevyBackendConfig {
     /// Some 时在 CoreGame.build 之前把它插进 World；[StaticDataPlugin]
     /// 会复用这个句柄发布启动表与后续重载，Godot 侧因此能看到同一份数据。
     pub object_tables: Option<ObjectTablesHandle>,
+    /// 编译期 native mod 集合。默认 [`default_core_mods`]；Godot 入口无法从
+    /// GDScript 构造 `dyn Mod`，需要注入 mod 时由 Rust 侧在启动前写入。
+    pub mods: CoreMods,
+    /// 参数覆盖（全 key `<mod_id>.<key>`）。在 mod `install` 之前解析校验；
+    /// 世界参数随后在 `PostStartup` 冻结。默认空表。
+    pub param_overrides: BTreeMap<String, i64>,
 }
 
 impl Default for BevyBackendConfig {
@@ -93,6 +101,8 @@ impl Default for BevyBackendConfig {
             save_dir: None,
             memory_soft_limit: None,
             object_tables: None,
+            mods: default_core_mods(),
+            param_overrides: BTreeMap::new(),
         }
     }
 }
@@ -100,7 +110,7 @@ impl Default for BevyBackendConfig {
 /// CoreGame + 可选 demo / perf / 体素地形的装饰模块。
 ///
 /// 装配顺序：先插入 TerrainConfig / VoxelLodHandle / [TerrainMode] / [SaveRoot]，
-/// 再 CoreGame.build —— TerrainPlugin 在 build 时读 TerrainMode 决定生成策略，
+/// 再 CoreGame.build_with_mods —— TerrainPlugin 在 build 时读 TerrainMode 决定生成策略，
 /// StreamingWorldPlugin 在同一遍 build 里读 SaveRoot 决定是否接存档层；
 /// 顺序反了两个资源都还是默认值（Eager / 不落盘），而且不会有任何报错。
 struct CoreGameModule {
@@ -115,6 +125,8 @@ struct CoreGameModule {
     save_dir: Option<PathBuf>,
     memory_soft_limit: Option<MemorySoftLimitHandle>,
     object_tables: Option<ObjectTablesHandle>,
+    mods: CoreMods,
+    param_overrides: BTreeMap<String, i64>,
 }
 
 impl GameModule<CoreSpec> for CoreGameModule {
@@ -163,7 +175,9 @@ impl GameModule<CoreSpec> for CoreGameModule {
         {
             app.insert_resource(ObserverDrivenStreamingPlayer);
         }
-        CoreGame.build(app);
+        CoreGame
+            .build_with_mods(app, self.mods.clone(), &self.param_overrides)
+            .expect("mod 集合与参数覆盖必须有效");
         if self.terrain_perf {
             let config = *app.world().resource::<TerrainConfig>();
             app.add_plugins(crate::dev::perf::VoxelPerfPlugin::new(config));
@@ -212,6 +226,8 @@ pub fn run_bevy_backend(
             save_dir: config.save_dir,
             memory_soft_limit: config.memory_soft_limit,
             object_tables: config.object_tables,
+            mods: config.mods,
+            param_overrides: config.param_overrides,
         },
         bridge,
         ctrl_rx,
@@ -223,6 +239,7 @@ pub fn run_bevy_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use game_engine::modding::{Mod, ModManifest, ParamScope, ParamSpec, ParamTable, ParamType};
     use std::time::Duration;
 
     /// 只关心装配顺序：其它装饰字段全关，避免把 demo / perf / 观察者一起拉起来。
@@ -239,7 +256,68 @@ mod tests {
             save_dir,
             memory_soft_limit: None,
             object_tables: None,
+            mods: default_core_mods(),
+            param_overrides: BTreeMap::new(),
         }
+    }
+
+    static BACKEND_PARAM: ModManifest = ModManifest {
+        id: "test:backend",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+        params: &[ParamSpec {
+            key: "radius",
+            ty: ParamType::Int {
+                min: 1,
+                max: 16,
+                step: 1,
+            },
+            default: 4,
+            scope: ParamScope::World,
+            group: "test",
+            visible_if: None,
+        }],
+    };
+
+    struct BackendParamMod;
+
+    impl Mod<CoreSpec> for BackendParamMod {
+        fn manifest(&self) -> &'static ModManifest {
+            &BACKEND_PARAM
+        }
+    }
+
+    /// 后端配置必须真的把 mod 集合与参数覆盖送进 CoreGame 装配，
+    /// 而不是只把字段存下来。
+    #[test]
+    fn backend_module_applies_mods_and_param_overrides() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(20),
+        ));
+
+        let mut module = module(TerrainMode::Eager, None);
+        module.mods = CoreMods::new().push(BackendParamMod);
+        module
+            .param_overrides
+            .insert("test:backend.radius".to_string(), 9);
+        module.build(&mut app);
+
+        assert_eq!(
+            app.world()
+                .resource::<ParamTable>()
+                .get_mod("test:backend", "radius")
+                .unwrap()
+                .value,
+            9,
+            "BevyBackendConfig 的 mods / param_overrides 必须进入 ParamTable"
+        );
     }
 
     /// 静态表句柄复用：Godot 在起线程前持有 ObjectTablesHandle，
