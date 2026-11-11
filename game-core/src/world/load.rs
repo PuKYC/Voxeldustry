@@ -31,8 +31,9 @@ use bevy::prelude::{warn, Entity, Resource, World};
 
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
+use game_engine::input::ResolvedActions;
 use game_engine::math::{FixedPoint, Vec3F};
-use game_engine::modding::ParamTable;
+use game_engine::modding::{AppliedModSet, ParamTable};
 use game_engine::residency::ChunkAnchor;
 use game_engine::save::{
     install_chunk, read_region, read_world_meta, reclaim_orphans, region_of, regions_on_disk,
@@ -167,6 +168,8 @@ fn build_plan(
     generator_version: u32,
 ) -> Result<Plan, SaveError> {
     validate_meta(&meta)?;
+    validate_meta_mods(world, &meta)?;
+    validate_meta_actions(world, &meta)?;
     validate_meta_params(world, &meta)?;
 
     let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
@@ -339,6 +342,97 @@ fn validate_meta_params(world: &World, meta: &WorldMeta) -> Result<(), SaveError
         .get_resource::<ParamTable>()
         .ok_or_else(|| missing_resource("ParamTable"))?;
     table.validate_saved(&meta.params).map_err(param_error)
+}
+
+/// 阶段一：存档里的 mod 清单必须与本次装配逐项一致（数量 / id / 版本）。
+///
+/// 两边都按 id 升序；空清单且世界没有 `AppliedModSet` 时放行（老存档 / 老测试）。
+fn validate_meta_mods(world: &World, meta: &WorldMeta) -> Result<(), SaveError> {
+    let Some(applied) = world.get_resource::<AppliedModSet>() else {
+        return if meta.mods.is_empty() {
+            Ok(())
+        } else {
+            Err(missing_resource("AppliedModSet"))
+        };
+    };
+    let saved = &meta.mods;
+    let current = &applied.mods;
+    let common = saved.len().min(current.len());
+    for index in 0..common {
+        let (saved_mod, current_mod) = (&saved[index], &current[index]);
+        if saved_mod.id != current_mod.id {
+            return Err(if saved_mod.id < current_mod.id {
+                mod_error(SaveErrorKind::MissingMod {
+                    id: saved_mod.id.clone(),
+                })
+            } else {
+                mod_error(SaveErrorKind::UnexpectedMod {
+                    id: current_mod.id.clone(),
+                })
+            });
+        }
+        if saved_mod.version != current_mod.version {
+            return Err(mod_error(SaveErrorKind::ModVersionMismatch {
+                id: saved_mod.id.clone(),
+                saved: saved_mod.version,
+                current: current_mod.version,
+            }));
+        }
+    }
+    if let Some(extra) = saved.get(common) {
+        return Err(mod_error(SaveErrorKind::MissingMod {
+            id: extra.id.clone(),
+        }));
+    }
+    if let Some(extra) = current.get(common) {
+        return Err(mod_error(SaveErrorKind::UnexpectedMod {
+            id: extra.id.clone(),
+        }));
+    }
+    Ok(())
+}
+
+/// 阶段一：存档冻结的动作表必须与当前 `ResolvedActions` 完全一致。
+///
+/// `meta.actions` 按 name 升序，动作表本身按「core 在前、mod 按分配顺序」排列，
+/// 所以先按 name 归一化再逐项比对（name / action / channel_bit 全部敏感）。
+/// 未发布前不做旧档兼容：缺动作表段（动作表写进 meta 之前的 v2）一律拒绝。
+fn validate_meta_actions(world: &World, meta: &WorldMeta) -> Result<(), SaveError> {
+    let Some(resolved) = world.get_resource::<ResolvedActions>() else {
+        return if meta.actions.is_empty() {
+            Ok(())
+        } else {
+            Err(missing_resource("ResolvedActions"))
+        };
+    };
+    let mut current: Vec<(&str, u32, u32)> = resolved
+        .table()
+        .iter()
+        .map(|def| (def.name, def.action.0, def.channel_bit))
+        .collect();
+    current.sort_by(|a, b| a.0.cmp(b.0));
+    if current.len() != meta.actions.len() {
+        return Err(action_error(SaveErrorKind::ActionCountMismatch {
+            expected: meta.actions.len(),
+            found: current.len(),
+        }));
+    }
+    for (saved, (name, action, channel_bit)) in meta.actions.iter().zip(current) {
+        if saved.name != name || saved.action != action || saved.channel_bit != channel_bit {
+            return Err(action_error(SaveErrorKind::ActionTableMismatch {
+                name: saved.name.clone(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn mod_error(kind: SaveErrorKind) -> SaveError {
+    SaveError::semantic("load.meta.mods", kind)
+}
+
+fn action_error(kind: SaveErrorKind) -> SaveError {
+    SaveError::semantic("load.meta.actions", kind)
 }
 
 /// 阶段二：把已校验的世界参数写回 `ParamTable`（必须在 `WorldParamsFrozen` 之前）。

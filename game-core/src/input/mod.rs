@@ -18,8 +18,9 @@ pub use game_engine::input::{control, events, raw, snapshot, staging};
 // 不对外公开：外部/未来 Mod 请从 `input::control`、`input::capability` 等
 // 子模块路径导入，或直接依赖 `game_engine::input`，不要再依赖这份顶层平铺。
 pub use actions::{
-    action_of_bit, action_table_snapshot, channel_bit_of, mask_of_name, mask_of_names, name_of_bit,
-    CoreActions, ACTION_TABLE,
+    action_of_bit, action_table_snapshot, action_table_snapshot_active, active_actions,
+    channel_bit_of, mask_of_name, mask_of_names, name_of_bit, publish_active_actions, CoreActions,
+    ACTION_TABLE,
 };
 pub use capability::{
     all_actions_mask, attack_mask, availability_mask, break_block_mask, channel_mask,
@@ -27,7 +28,8 @@ pub use capability::{
     derive_interact_requests, flight_mask, glide_mask, input_channels, interact_mask, jump_mask,
     look_allowed, move_mask, place_block_mask, rooted_mask, sprint_mask, stunned_mask,
     AttackChannel, BreakBlockChannel, ChannelSet, FlightChannel, GlideChannel, InputChannelDef,
-    InteractChannel, JumpChannel, LookChannel, MoveChannel, PlaceBlockChannel, Rooted,
+    InteractChannel, JumpChannel, LookChannel, ModActionChannel, MoveChannel, PlaceBlockChannel,
+    Rooted,
     SprintChannel, Stunned, INPUT_CHANNEL_TABLE,
 };
 pub(crate) use game_engine::input::{InputSet, InteractRequest, SimulationTick};

@@ -160,6 +160,8 @@ func _ready() -> void:
 	if enable_input:
 		input.setup(_mgr, source_id)
 
+	if _mgr.has_signal("bev_started"):
+		_mgr.bev_started.connect(_on_bevy_started)
 	if _mgr.has_signal("bev_error"):
 		_mgr.bev_error.connect(_on_bevy_error)
 	if _mgr.has_signal("bev_stopped"):
@@ -379,6 +381,13 @@ func _on_entity_state_changed(e: EntityData) -> void:
 
 func _on_entity_released(e: EntityData, reason: int) -> void:
 	entity_removed.emit(e, reason)
+
+
+## 后端启动 = App 装配完成：此时 Rust 侧已发布全局动作表（含 mod 动作），
+## 补注册一次，mod 动作才会进 Godot 的 InputMap。
+func _on_bevy_started() -> void:
+	if enable_input:
+		input.refresh_actions()
 
 
 func _on_bevy_error(message: String) -> void:

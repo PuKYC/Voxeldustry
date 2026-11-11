@@ -35,11 +35,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use bevy::prelude::{Entity, World};
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableIdAllocator};
+use game_engine::input::ResolvedActions;
 use game_engine::modding::ParamTable;
 use game_engine::save::{
     capture as capture_snapshot, export_chunk, read_region, region_of, write_region,
-    write_world_meta, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord, ModRecord,
-    OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths, WorldMeta,
+    write_world_meta, ActionRecord, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord,
+    ModRecord, OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths,
+    WorldMeta,
 };
 use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelDirtySet, VoxelInterner};
 
@@ -223,6 +225,24 @@ pub fn capture_world(
         None => (Vec::new(), Vec::new()),
     };
 
+    // 动作表同理：装配过 mod 的会话有 `ResolvedActions`，直接搭 World 的单测没有，写空表。
+    let actions = match world.get_resource::<ResolvedActions>() {
+        Some(resolved) => {
+            let mut actions: Vec<ActionRecord> = resolved
+                .table()
+                .iter()
+                .map(|def| ActionRecord {
+                    name: def.name.to_string(),
+                    action: def.action.0,
+                    channel_bit: def.channel_bit,
+                })
+                .collect();
+            actions.sort_by(|a, b| a.name.cmp(&b.name));
+            actions
+        }
+        None => Vec::new(),
+    };
+
     Ok(WorldCapture {
         meta: WorldMeta {
             seed,
@@ -231,6 +251,7 @@ pub fn capture_world(
             bodies: body_table,
             mods,
             params,
+            actions,
         },
         regions,
     })
@@ -518,6 +539,7 @@ mod tests {
                 bodies: BTreeMap::new(),
                 mods: Vec::new(),
                 params: Vec::new(),
+                actions: Vec::new(),
             }
         );
         assert!(capture.regions.is_empty(), "空世界不产生 region");

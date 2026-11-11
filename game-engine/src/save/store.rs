@@ -754,6 +754,7 @@ mod tests {
             bodies: table,
             mods: Vec::new(),
             params: Vec::new(),
+            actions: Vec::new(),
         }
     }
 
@@ -1120,6 +1121,7 @@ mod tests {
             bodies: BTreeMap::new(),
             mods: Vec::new(),
             params: Vec::new(),
+            actions: Vec::new(),
         };
         let target = write_world_meta(&paths, &meta).expect("写 world.meta");
 

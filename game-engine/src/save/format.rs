@@ -18,7 +18,8 @@ pub const WORLD_MAGIC: [u8; 8] = *b"VXWORLD\0";
 pub const REGION_MAGIC: [u8; 8] = *b"VXREGION";
 /// 当前世界格式版本；未来只升不降（§2 偏移 8 / §6.1）。
 ///
-/// v2 在 body 表之后追加「mod 清单 + 世界参数」段；v1 存档仍可读。
+/// v2 在 body 表之后追加「mod 清单 + 世界参数 + 动作表」段；v1 存档仍可读，
+/// 早期 v2（无动作表段）按空表解码。
 pub const FORMAT_VERSION: u16 = 2;
 /// 仍可读取的最低格式版本（§6.1 支持区间 `MIN_SUPPORTED..=CURRENT`）。
 pub const MIN_SUPPORTED_FORMAT_VERSION: u16 = 1;
@@ -46,6 +47,10 @@ pub const MAX_PARAM_COUNT: u32 = 4_096;
 pub const MAX_MOD_ID_LEN: u16 = 255;
 /// 参数全 key 的 UTF-8 字节长度上限。
 pub const MAX_PARAM_KEY_LEN: u16 = 255;
+/// v2 动作表条数上限。
+pub const MAX_ACTION_COUNT: u32 = 4_096;
+/// 动作名的 UTF-8 字节长度上限。
+pub const MAX_ACTION_NAME_LEN: u16 = 64;
 /// 单 region 区块数上限（§3 偏移 12）。
 pub const MAX_CHUNK_COUNT: u32 = 64;
 /// 单条记录体长度上限（§0）。
@@ -188,6 +193,17 @@ pub struct ModRecord {
     pub version: u32,
 }
 
+/// v2 动作表里的一条记录：动作名 → 动作 ID / 通道位的冻结映射。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionRecord {
+    /// 动作名（全局唯一，按 name 严格升序写盘/读盘）。
+    pub name: String,
+    /// 动作 ID；核心为 1..=15，mod 为 1000..=9999。
+    pub action: u32,
+    /// 通道位（< MAX_INPUT_CHANNELS）。
+    pub channel_bit: u32,
+}
+
 /// world.meta 的内存形态（§2）。
 ///
 /// bodies 用 BTreeMap 保证按 BodyKey 严格升序写盘/读盘，不看任何 HashMap 顺序（§8）。
@@ -206,6 +222,9 @@ pub struct WorldMeta {
     pub mods: Vec<ModRecord>,
     /// v2：随存档保存的世界参数，按全 key 严格升序；v1 解码结果为空。
     pub params: Vec<ParamRecord>,
+    /// v2：随存档冻结的动作表（含 mod 动作），按 name 严格升序；
+    /// v1 解码结果为空，v2 缺该段即坏档。
+    pub actions: Vec<ActionRecord>,
 }
 
 impl WorldMeta {

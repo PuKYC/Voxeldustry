@@ -8,8 +8,8 @@ use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
 use crate::modding::ParamRecord;
 use crate::save::format::{
-    digest, AttachTag, BodyKind, BodyRecord, ChunkRecord, ComponentRecord, EntityRecord, ModRecord,
-    RegionFile, WorldMeta, BODY_RECORD_LEN,
+    digest, ActionRecord, AttachTag, BodyKind, BodyRecord, ChunkRecord, ComponentRecord,
+    EntityRecord, ModRecord, RegionFile, WorldMeta, BODY_RECORD_LEN,
 };
 use crate::streaming::ProposalRecord;
 use ::voxel::ChunkKey;
@@ -68,6 +68,7 @@ fn golden_world_meta() -> WorldMeta {
         bodies,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     }
 }
 
@@ -207,15 +208,15 @@ const GOLDEN_WORLD_META_HEX: &str = concat!(
     "dceb34f1",
 );
 
-/// v2 黄金字节：v1 的 body 表后追加空的「mod 清单 + 世界参数」段（8 B 全 0）。
-/// 总长 172 B = 48 + 2 × 54 + 8 + 8。
+/// v2 黄金字节：v1 的 body 表后追加空的「mod 清单 + 世界参数 + 动作表」段（12 B 全 0）。
+/// 总长 176 B = 48 + 2 × 54 + 12 + 8。
 const GOLDEN_WORLD_META_V2_HEX: &str = concat!(
     "5658574f524c44000200300001000000efcdab89674523013930000000000000",
     "4000000000000000020000000000000001000000000000000201000000000000",
     "8001000000000000000000000000000000000000000000000000000000000300",
     "0000000000000300000000000000000207010000000000010000000000000000",
     "0000000000000000000000000000000000000000000000000000000000000000",
-    "0000000071f84410cd32b20f",
+    "000000000000000024009508ec51f722",
 );
 
 /// v1 黄金字节：同一份规格 §3 的布局（format_version = 1）。
@@ -254,7 +255,7 @@ const GOLDEN_REGION_V2_HEX: &str = concat!(
 fn world_meta_roundtrip() {
     let meta = golden_world_meta();
     let bytes = encode_world_meta(&meta).expect("world.meta 必须可编码");
-    assert_eq!(bytes.len(), 48 + 2 * 54 + 8 + 8);
+    assert_eq!(bytes.len(), 48 + 2 * 54 + 12 + 8);
     assert_eq!(u16_at(&bytes, W_HEADER_LEN), WORLD_HEADER_LEN);
     assert_eq!(u16_at(&bytes, W_CODEC_ID), CODEC_ID);
     assert_eq!(u16_at(&bytes, W_FORMAT_VERSION), FORMAT_VERSION);
@@ -289,13 +290,14 @@ fn world_meta_empty_body_table_roundtrip() {
         bodies: BTreeMap::new(),
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let bytes = encode_world_meta(&meta).expect("空 body 表合法");
-    assert_eq!(bytes.len(), 48 + 8 + 8);
+    assert_eq!(bytes.len(), 48 + 12 + 8);
     assert_eq!(u32_at(&bytes, W_BODY_COUNT), 0);
     assert_eq!(decode_world_meta(&bytes).expect("空 body 表合法"), meta);
-    assert_eq!(&bytes[48..56], &[0u8; 8], "空扩展段");
-    assert_eq!(&bytes[56..64], &digest(&bytes[..56]).to_le_bytes());
+    assert_eq!(&bytes[48..60], &[0u8; 12], "空的 mods/params/actions 段");
+    assert_eq!(&bytes[60..68], &digest(&bytes[..60]).to_le_bytes());
 }
 
 #[test]
@@ -376,7 +378,7 @@ fn region_empty_roundtrip() {
 #[test]
 fn golden_world_meta_bytes_match_spec_v2() {
     let bytes = encode_world_meta(&golden_world_meta()).expect("world.meta 必须可编码");
-    assert_eq!(bytes.len(), 172);
+    assert_eq!(bytes.len(), 176);
     assert_eq!(bytes.len() * 2, GOLDEN_WORLD_META_V2_HEX.len());
     assert_eq!(hex(&bytes), GOLDEN_WORLD_META_V2_HEX);
     assert_eq!(
@@ -425,11 +427,59 @@ fn world_meta_v2_extension_roundtrip() {
             value: 2500,
         },
     ];
+    meta.actions = vec![
+        ActionRecord {
+            name: "attack".to_string(),
+            action: 9,
+            channel_bit: 8,
+        },
+        ActionRecord {
+            name: "mod.build".to_string(),
+            action: 1000,
+            channel_bit: 15,
+        },
+    ];
 
     let bytes = encode_world_meta(&meta).expect("v2 扩展必须可编码");
     let decoded = decode_world_meta(&bytes).expect("v2 扩展必须可解码");
     assert_eq!(decoded, meta);
     assert_eq!(encode_world_meta(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn world_meta_v2_without_actions_segment_is_rejected() {
+    let mut meta = golden_world_meta();
+    meta.mods = vec![ModRecord {
+        id: "core.data".to_string(),
+        version: 2,
+    }];
+    meta.params = vec![ParamRecord {
+        key: "island.flag".to_string(),
+        ty: 0,
+        scale: 0,
+        value: 1,
+    }];
+
+    let bytes = encode_world_meta(&meta).expect("v2 扩展必须可编码");
+    // 空动作表段只有 4 B 的 action_count，位于摘要之前；裁掉它再重算摘要，
+    // 就得到一份「有 mods/params、没有 actions 段」的字节。v2 起该段必填，
+    // 未发布前不做旧档兼容，必须拒绝。
+    let cut = bytes.len() - DIGEST_LEN - 4;
+    assert_eq!(&bytes[cut..cut + 4], &[0u8; 4]);
+    let mut legacy = bytes[..cut].to_vec();
+    let checksum = digest(&legacy);
+    legacy.extend_from_slice(&checksum.to_le_bytes());
+
+    let error = decode_world_meta(&legacy).expect_err("缺动作表段的 v2 必须拒绝");
+    assert!(
+        error.to_string().contains("action_count"),
+        "错误应指向动作表段，实际：{error}"
+    );
+    assert!(
+        matches!(error.kind(), crate::save::SaveErrorKind::Truncated { .. }),
+        "缺段应报截断，实际：{:?}",
+        error.kind()
+    );
 }
 
 #[test]
@@ -467,6 +517,35 @@ fn world_meta_v2_extension_rejects_bad_records() {
     meta.params[0].scale = 10;
     let err = encode_world_meta(&meta).expect_err("非定点参数不得有 scale");
     assert!(err.to_string().contains("scale on non-Fixed"), "{err}");
+
+    meta.params.clear();
+    meta.actions = vec![
+        ActionRecord {
+            name: "b".to_string(),
+            action: 1000,
+            channel_bit: 15,
+        },
+        ActionRecord {
+            name: "a".to_string(),
+            action: 1001,
+            channel_bit: 16,
+        },
+    ];
+    let err = encode_world_meta(&meta).expect_err("动作名顺序错必须拒绝");
+    assert!(err.to_string().contains("string order"), "{err}");
+
+    meta.actions = vec![ActionRecord {
+        name: "a".to_string(),
+        action: 0,
+        channel_bit: 15,
+    }];
+    let err = encode_world_meta(&meta).expect_err("动作 ID 0 必须拒绝");
+    assert!(err.to_string().contains("action id"), "{err}");
+
+    meta.actions[0].action = 1000;
+    meta.actions[0].channel_bit = 64;
+    let err = encode_world_meta(&meta).expect_err("通道位超界必须拒绝");
+    assert!(err.to_string().contains("channel_bit"), "{err}");
 }
 
 #[test]
@@ -517,7 +596,7 @@ fn assert_region_rejects(bytes: &[u8], marker: &str) {
 #[test]
 fn world_meta_header_corruption_is_rejected() {
     let bytes = world_meta_fixture_bytes();
-    assert_eq!(bytes.len(), 172);
+    assert_eq!(bytes.len(), 176);
 
     let cases: [(usize, u8, &str); 10] = [
         (0, 0x01, "magic"),
@@ -612,9 +691,10 @@ fn world_meta_body_count_limit_and_extremes() {
         bodies,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let bytes = encode_world_meta(&meta).expect("65536 条 body 合法");
-    assert_eq!(bytes.len(), 48 + 65_536 * 54 + 8 + 8);
+    assert_eq!(bytes.len(), 48 + 65_536 * 54 + 12 + 8);
     let decoded = decode_world_meta(&bytes).expect("65536 条 body 合法");
     assert_eq!(decoded.body_count(), MAX_BODY_COUNT);
     assert_eq!(decoded.bodies.len(), 65_536);
@@ -648,6 +728,7 @@ fn world_meta_body_count_limit_and_extremes() {
         bodies: tiny,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let encoded = encode_world_meta(&extreme).expect("极值合法");
     assert_eq!(decode_world_meta(&encoded).expect("极值合法"), extreme);
@@ -664,6 +745,7 @@ fn world_meta_body_count_limit_and_extremes() {
             bodies: map,
             mods: Vec::new(),
             params: Vec::new(),
+            actions: Vec::new(),
         };
         let err = encode_world_meta(&bad).expect_err("voxel_size <= 0 必须拒绝");
         assert!(err.to_string().contains("voxel_size"), "{err}");
@@ -693,6 +775,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         bodies: map,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("键不一致必须拒绝");
     assert!(err.to_string().contains("body map key"), "{err}");
@@ -708,6 +791,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         bodies: map,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("悬空 attach_to 必须拒绝");
     assert!(err.to_string().contains("attach_to body"), "{err}");
@@ -724,6 +808,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         bodies: map,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("非 body attach 的 attach_to 必须拒绝");
     assert!(err.to_string().contains("attach_to"), "{err}");
@@ -740,6 +825,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         bodies: map,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("attach_to = 0 必须拒绝");
     assert!(err.to_string().contains("attach_to"), "{err}");
@@ -1434,6 +1520,7 @@ fn non_island_fields_are_normalized_on_write() {
         bodies,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
 
     if cfg!(debug_assertions) {
@@ -1493,6 +1580,7 @@ fn ship_with_body_attach_is_rejected_on_write() {
         bodies,
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
 
     let err = encode_world_meta(&meta).expect_err("Ship 不得 attach_tag = Body");

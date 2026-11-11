@@ -18,7 +18,7 @@ use bevy::prelude::*;
 
 use crate::identity::{StableEntityId, StableEntityIndex};
 
-use super::actions::{ActionMap, MAX_INPUT_CHANNELS};
+use super::actions::{ActionMap, ResolvedActions, MAX_INPUT_CHANNELS};
 use super::capability::InputAvailability;
 use super::control::{ControlledBy, ControlsEntity, InputSource, InputSourceId};
 use super::events::{InputActionPressed, InputActionReleased};
@@ -113,18 +113,25 @@ pub fn record_input_history(
 /// 具体游戏若有额外语义事件（如交互请求），在游戏侧向
 /// [`super::InputSet::Events`] 追加自己的系统。
 pub fn derive_input_events<A: ActionMap>(
+    resolved_actions: Option<Res<ResolvedActions>>,
     tick: Res<SimulationTick>,
     query: Query<(&StableEntityId, &ResolvedInput)>,
     mut pressed_writer: MessageWriter<InputActionPressed>,
     mut released_writer: MessageWriter<InputActionReleased>,
 ) {
+    // 装配过动作表就用它（含 mod 动作），否则回退到编译期表 A。
+    let resolved_actions = resolved_actions.as_deref();
     let mut pressed_msgs = Vec::new();
     let mut released_msgs = Vec::new();
 
     for (id, resolved) in &query {
         for bit in 0..MAX_INPUT_CHANNELS {
             let bit_mask = 1u64 << bit;
-            let Some(action) = A::action_of_bit(bit) else {
+            let action = match resolved_actions {
+                Some(resolved_actions) => resolved_actions.action_of_bit(bit),
+                None => A::action_of_bit(bit),
+            };
+            let Some(action) = action else {
                 continue;
             };
 

@@ -150,6 +150,7 @@ mod tests {
             group: "test",
             visible_if: None,
         }],
+        actions: &[],
     };
 
     struct ParamMod;

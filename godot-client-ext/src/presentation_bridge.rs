@@ -2,7 +2,8 @@
 //!
 //! 本文件里不允许出现任何业务判断：
 //!
-//! - 「动作名 → 通道位」的查表在 `game_core::input::raw::RawInputFrame::from_names`；
+//! - 「动作名 → 通道位」的查表在 `game_core::input::raw::RawInputFrame::from_names`
+//!   （装配了 mod 时走 `from_names_with_table` + 全局动作表）；
 //! - 「组件 → 载荷」的翻译在 `game_core::presentation::payload::ToPresentation`；
 //! - 「该不该显示」的过滤在 `game_core::presentation::sync`。
 //!
@@ -40,7 +41,7 @@ use game_core::world::streaming::WorldLoadReport;
 /// `channel` 是可选键（只有归属某个输入通道的动作才有）：老脚本会忽略它。
 pub fn action_table_to_variant() -> Array<VarDictionary> {
     let mut out: Array<VarDictionary> = Array::new();
-    for (name, bit) in game_core::input::action_table_snapshot() {
+    for (name, bit) in game_core::input::action_table_snapshot_active() {
         let mut row = VarDictionary::new();
         row.set("name", name);
         row.set("bit", i64::from(bit));
@@ -328,7 +329,11 @@ pub fn build_raw_input_frame(
     let pressed = packed_strings_to_vec(pressed);
     let released = packed_strings_to_vec(released);
 
-    RawInputFrame::from_names::<game_core::input::actions::CoreActions>(
+    // 用运行期全局表：装配了 mod 的会话才能翻译 mod 动作名。未发布时
+    // `active_actions()` 退回核心表，与旧行为一致。
+    let table = game_core::input::active_actions();
+    RawInputFrame::from_names_with_table(
+        &table,
         as_strs(&held),
         as_strs(&pressed),
         as_strs(&released),

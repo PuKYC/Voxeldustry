@@ -87,9 +87,82 @@ pub fn action_table_snapshot() -> Vec<(&'static str, u32)> {
     CoreActions::snapshot()
 }
 
+// ───────────────────────── 运行期全局动作表 ─────────────────────────
+
+use std::sync::{Arc, RwLock};
+
+/// 本次装配的全局动作表（已发布时含 mod 动作）。
+///
+/// `get_action_table` / `submit_input_frame` 在 Godot 线程上调用，拿不到 Bevy
+/// `World`，所以装配成功后把表发布到这里；进程内只有一个 App，不做多世界
+/// 隔离。未发布时（纯服务端 / 单测）一律退回核心表，行为与从前一致。
+static ACTIVE_ACTIONS: RwLock<Option<Arc<[ActionDef]>>> = RwLock::new(None);
+
+/// 发布本次装配的动作表（含 mod 动作）。
+///
+/// 由后端在 `build_with_mods` 成功后调用一次；重复调用以后一次为准。
+pub fn publish_active_actions(resolved: &game_engine::input::ResolvedActions) {
+    let table: Arc<[ActionDef]> = Arc::from(resolved.table());
+    match ACTIVE_ACTIONS.write() {
+        Ok(mut slot) => *slot = Some(table),
+        Err(poisoned) => *poisoned.into_inner() = Some(table),
+    }
+}
+
+/// 当前全局动作表：已发布则含 mod 动作，否则退回核心表。
+pub fn active_actions() -> Arc<[ActionDef]> {
+    let published = match ACTIVE_ACTIONS.read() {
+        Ok(slot) => (*slot).clone(),
+        Err(poisoned) => (*poisoned.into_inner()).clone(),
+    };
+    published.unwrap_or_else(|| Arc::from(ACTION_TABLE))
+}
+
+/// 同 [`action_table_snapshot`]，但已发布的全局表优先（含 mod 动作）。
+pub fn action_table_snapshot_active() -> Vec<(&'static str, u32)> {
+    active_actions()
+        .iter()
+        .map(|def| (def.name, def.channel_bit))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发布后的全局表必须带上 mod 动作，且查询接口与之一致。
+    ///
+    /// 只读写本模块的全局，不影响其它用例（它们都直接走 `CoreActions`）。
+    #[test]
+    fn published_table_includes_mod_actions() {
+        let mods: &[(&'static str, &'static [&'static str])] =
+            &[("demo", &["demo_action", "demo_other"])];
+        let resolved =
+            game_engine::input::ResolvedActions::resolve(CoreActions::table(), mods)
+                .expect("演示动作表必须可解析");
+        publish_active_actions(&resolved);
+
+        let active = active_actions();
+        assert_eq!(active.len(), ACTION_TABLE.len() + 2);
+        assert!(active.iter().any(|def| def.name == "demo_action"));
+        assert_eq!(
+            action_table_snapshot_active().len(),
+            ACTION_TABLE.len() + 2,
+            "Godot 拉取的表必须与全局表同长"
+        );
+    }
+
+    /// 不带 mod 时，运行期解析表必须与静态 ACTION_TABLE 逐位相同。
+    #[test]
+    fn resolved_without_mods_matches_static_table() {
+        let resolved = game_engine::input::ResolvedActions::resolve(CoreActions::table(), &[])
+            .expect("core 表必须可解析");
+        assert_eq!(resolved.table(), ACTION_TABLE);
+        for def in ACTION_TABLE {
+            assert_eq!(resolved.lookup(def.name), Some(*def));
+        }
+        assert_eq!(resolved.snapshot(), action_table_snapshot());
+    }
 
     #[test]
     fn table_is_consistent() {

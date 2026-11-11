@@ -33,6 +33,7 @@ use bevy::ecs::system::ScheduleSystem;
 use bevy::prelude::*;
 
 use crate::ids::fnv1a32;
+use crate::input::actions::{ActionMap, ActionResolveError, ResolvedActions};
 use crate::sim::EngineSet;
 use crate::spec::GameSpec;
 
@@ -52,6 +53,26 @@ pub struct ModManifest {
     pub exclusive_groups: &'static [&'static str],
     /// 插件参数 schema；key 在 mod 内局部，落盘时拼 `<mod_id>.<key>`。
     pub params: &'static [ParamSpec],
+    /// 本 mod 声明的输入动作名；空则 `&[]`。
+    ///
+    /// 名字在装配期解析成全局动作表（id / 通道位），随存档冻结。
+    pub actions: &'static [&'static str],
+}
+
+/// 一个生效 mod 的标识（id + version）。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModRef {
+    pub id: String,
+    pub version: u32,
+}
+
+/// 本次装配实际生效的 mod 集合；读档时与 `world.meta.mods` 逐项比对。
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppliedModSet {
+    /// 与 [Mods::apply] 返回值相同的 mod_set_hash。
+    pub mod_set_hash: u64,
+    /// 按 id 升序。
+    pub mods: Vec<ModRef>,
 }
 
 /// 一层 mod 静态数据补丁（原始 JSONC 文本，解析由消费方负责）。
@@ -103,6 +124,7 @@ pub enum ModError {
     ExclusiveGroup { group: String, a: String, b: String },
     DuplicateId { id: String },
     Param(ParamError),
+    Actions(ActionResolveError),
 }
 
 impl std::fmt::Display for ModError {
@@ -120,6 +142,7 @@ impl std::fmt::Display for ModError {
             }
             ModError::DuplicateId { id } => write!(f, "mod id 重复：{id}"),
             ModError::Param(error) => write!(f, "mod 参数表错误：{error}"),
+            ModError::Actions(error) => write!(f, "mod 动作表解析失败：{error}"),
         }
     }
 }
@@ -461,13 +484,33 @@ impl<S: GameSpec> Mods<S> {
             module.install(&mut context);
         }
 
+        let mut mod_actions: Vec<(&'static str, &'static [&'static str])> =
+            Vec::with_capacity(count);
+        let mut applied: Vec<ModRef> = Vec::with_capacity(count);
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for &position in &order {
             let manifest = self.mods[position].manifest();
+            mod_actions.push((manifest.id, manifest.actions));
+            applied.push(ModRef {
+                id: manifest.id.to_string(),
+                version: manifest.version,
+            });
             let token = format!("{}:{}", manifest.id, manifest.version);
             hash ^= u64::from(fnv1a32(token.as_bytes()));
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
+
+        // 动作表在建档时解析一次，随存档冻结：core 表来自本 spec 的 ActionMap，
+        // mod 动作由各 manifest 声明。失败是装配错误，不是运行期降级。
+        let resolved = ResolvedActions::resolve(S::Actions::table(), &mod_actions)
+            .map_err(ModError::Actions)?;
+        applied.sort_by(|a, b| a.id.cmp(&b.id));
+        app.insert_resource(resolved);
+        app.insert_resource(AppliedModSet {
+            mod_set_hash: hash,
+            mods: applied,
+        });
+
         Ok(hash)
     }
 }
@@ -516,6 +559,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     struct BumpMod;
@@ -538,6 +582,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
     static MB: ModManifest = ModManifest {
         id: "b",
@@ -548,6 +593,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     struct LogMod(&'static ModManifest, &'static str);
@@ -593,6 +639,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
     static LAYER_EARLY: ModManifest = ModManifest {
         id: "a_layer",
@@ -603,6 +650,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     struct LayerMod(&'static ModManifest, &'static str);
@@ -658,6 +706,7 @@ mod tests {
         conflicts: &["cb"],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
     static CONFLICT_B: ModManifest = ModManifest {
         id: "cb",
@@ -668,6 +717,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     #[test]
@@ -690,6 +740,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     #[test]
@@ -711,6 +762,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
     static OPTIONAL_HOST: ModManifest = ModManifest {
         id: "opt_host",
@@ -721,6 +773,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     #[test]
@@ -745,6 +798,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     #[test]
@@ -769,6 +823,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &["renderer"],
         params: &[],
+        actions: &[],
     };
     static GROUP_B: ModManifest = ModManifest {
         id: "group_b",
@@ -779,6 +834,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &["renderer"],
         params: &[],
+        actions: &[],
     };
 
     #[test]
@@ -817,6 +873,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
     static CYCLE_B: ModManifest = ModManifest {
         id: "cycle_b",
@@ -827,6 +884,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     #[test]
@@ -893,6 +951,7 @@ mod tests {
         conflicts: &[],
         exclusive_groups: &[],
         params: &[],
+        actions: &[],
     };
 
     struct PatchMod;
@@ -923,5 +982,102 @@ mod tests {
             .apply(&mut app, &mut data)
             .unwrap();
         assert_eq!(data.sorted("example")[0].name, "patched");
+    }
+
+    static ACTION_ALPHA: ModManifest = ModManifest {
+        id: "mod.alpha",
+        version: 2,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+        params: &[],
+        actions: &["mod.build"],
+    };
+    static ACTION_ZETA: ModManifest = ModManifest {
+        id: "mod.zeta",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+        params: &[],
+        actions: &["mod.zeta.act"],
+    };
+    static ACTION_CONFLICT: ModManifest = ModManifest {
+        id: "mod.conflict",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+        params: &[],
+        actions: &["mod.build"],
+    };
+
+    /// 装配成功后，动作表与 mod 集合都作为 Resource 留在 App 里，供存档 / 读档比对。
+    #[test]
+    fn apply_installs_resolved_actions_and_applied_mod_set() {
+        let mut app = app_with_sets();
+        let mut data = DataRegistry::new();
+        let hash = Mods::<DefaultSpec>::new()
+            .push(SimpleMod(&ACTION_ZETA))
+            .push(SimpleMod(&ACTION_ALPHA))
+            .apply(&mut app, &mut data)
+            .expect("装配必须成功");
+
+        let applied = app.world().resource::<AppliedModSet>();
+        assert_eq!(applied.mod_set_hash, hash, "资源里的 hash 必须就是返回值");
+        assert_eq!(
+            applied.mods,
+            vec![
+                ModRef {
+                    id: "mod.alpha".to_string(),
+                    version: 2,
+                },
+                ModRef {
+                    id: "mod.zeta".to_string(),
+                    version: 1,
+                },
+            ],
+            "mods 必须按 id 升序"
+        );
+
+        // DefaultSpec 的 core 表是空的，所以第一个 mod 动作拿 bit 0、id 1000。
+        let resolved = app.world().resource::<ResolvedActions>();
+        assert_eq!(
+            resolved.lookup("mod.build").map(|def| def.action.0),
+            Some(1000)
+        );
+        assert_eq!(resolved.channel_bit_of("mod.build"), Some(0));
+        assert_eq!(
+            resolved.lookup("mod.zeta.act").map(|def| def.action.0),
+            Some(1001)
+        );
+        assert_eq!(resolved.channel_bit_of("mod.zeta.act"), Some(1));
+    }
+
+    /// 两个 mod 声明同名动作时装配失败，且不留下半成品资源。
+    #[test]
+    fn apply_rejects_conflicting_action_names() {
+        let mut app = app_with_sets();
+        let mut data = DataRegistry::new();
+        let err = Mods::<DefaultSpec>::new()
+            .push(SimpleMod(&ACTION_ALPHA))
+            .push(SimpleMod(&ACTION_CONFLICT))
+            .apply(&mut app, &mut data)
+            .expect_err("动作重名必须让装配失败");
+        assert!(
+            matches!(
+                err,
+                ModError::Actions(ActionResolveError::DuplicateName { .. })
+            ),
+            "错误应是 ModError::Actions(DuplicateName)，实际是: {err}"
+        );
+        assert!(app.world().get_resource::<ResolvedActions>().is_none());
+        assert!(app.world().get_resource::<AppliedModSet>().is_none());
     }
 }

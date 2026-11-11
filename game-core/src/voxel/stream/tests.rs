@@ -1187,6 +1187,7 @@ fn entity_only_record_survives_unedited_unload() {
         bodies: BTreeMap::new(),
         mods: Vec::new(),
         params: Vec::new(),
+        actions: Vec::new(),
     };
     meta.bodies.insert(
         body,

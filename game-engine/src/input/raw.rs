@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::math::FixedPoint;
 
-use super::actions::ActionMap;
+use super::actions::{ActionDef, ActionMap, MAX_INPUT_CHANNELS};
 
 /// 量化后的轴值：`i16` 表示 `[-1, 1]`。
 ///
@@ -112,12 +112,73 @@ impl RawInputFrame {
         seq: u64,
         render_clock_ms: u64,
     ) -> (Self, Vec<String>) {
+        Self::from_names_by(
+            held,
+            pressed,
+            released,
+            move_raw,
+            look_raw,
+            seq,
+            render_clock_ms,
+            A::mask_of_name,
+        )
+    }
+
+    /// 同 [`Self::from_names`]，但按**运行期动作表**（含 mod 动作）翻译名字。
+    ///
+    /// 装配了 mod 的会话用它；表里查不到的名字照旧进「未知动作名」列表。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "参数与 from_names 逐项对齐，table 是唯一新增参数；拆成结构体会让调用点不再对称"
+    )]
+    pub fn from_names_with_table<'a>(
+        table: &[ActionDef],
+        held: impl IntoIterator<Item = &'a str>,
+        pressed: impl IntoIterator<Item = &'a str>,
+        released: impl IntoIterator<Item = &'a str>,
+        move_raw: (f32, f32),
+        look_raw: (f32, f32),
+        seq: u64,
+        render_clock_ms: u64,
+    ) -> (Self, Vec<String>) {
+        Self::from_names_by(
+            held,
+            pressed,
+            released,
+            move_raw,
+            look_raw,
+            seq,
+            render_clock_ms,
+            |name| {
+                table
+                    .iter()
+                    .find(|def| def.name == name)
+                    .map(|def| 1u64 << (def.channel_bit % MAX_INPUT_CHANNELS))
+            },
+        )
+    }
+
+    /// 名字 → 通道掩码的可注入版本：`mask_of_name` 决定翻译规则。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "与 from_names 的参数逐项对齐，mask_of_name 是唯一注入点"
+    )]
+    fn from_names_by<'a>(
+        held: impl IntoIterator<Item = &'a str>,
+        pressed: impl IntoIterator<Item = &'a str>,
+        released: impl IntoIterator<Item = &'a str>,
+        move_raw: (f32, f32),
+        look_raw: (f32, f32),
+        seq: u64,
+        render_clock_ms: u64,
+        mask_of_name: impl Fn(&str) -> Option<u64>,
+    ) -> (Self, Vec<String>) {
         let mut unknown = Vec::new();
 
         let collect = |names: Vec<&'a str>, unknown: &mut Vec<String>| -> u64 {
             let mut mask = 0u64;
             for name in names {
-                match A::mask_of_name(name) {
+                match mask_of_name(name) {
                     Some(bit) => mask |= bit,
                     None => unknown.push(name.to_string()),
                 }
@@ -226,6 +287,38 @@ mod tests {
         assert_eq!(frame.seq, 7);
         assert_eq!(frame.render_clock_ms, 1234);
         assert_eq!(unknown, vec!["totally_unknown".to_string()]);
+    }
+
+    #[test]
+    fn from_names_with_table_translates_mod_actions() {
+        use super::super::actions::{ActionDef, ActionId};
+        const RESOLVED: [ActionDef; 2] = [
+            ActionDef {
+                name: "jump",
+                action: ActionId(5),
+                channel_bit: 4,
+            },
+            ActionDef {
+                name: "mod.build",
+                action: ActionId(1000),
+                channel_bit: 15,
+            },
+        ];
+        let (frame, unknown) = RawInputFrame::from_names_with_table(
+            &RESOLVED,
+            ["mod.build", "jump"],
+            ["mod.build"],
+            ["nope"],
+            (0.0, 0.0),
+            (0.0, 0.0),
+            9,
+            77,
+        );
+        assert_eq!(frame.held, (1 << 15) | (1 << 4));
+        assert_eq!(frame.pressed_latch, 1 << 15);
+        assert_eq!(frame.released_latch, 0);
+        assert_eq!(frame.seq, 9);
+        assert_eq!(unknown, vec!["nope".to_string()]);
     }
 
     #[test]

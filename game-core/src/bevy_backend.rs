@@ -11,6 +11,7 @@ use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
 use game_engine::backend::{self, EngineConfig, GameModule};
+use game_engine::input::ResolvedActions;
 use game_engine::residency::MemorySoftLimitHandle;
 
 use crate::app::CoreGame;
@@ -178,6 +179,11 @@ impl GameModule<CoreSpec> for CoreGameModule {
         CoreGame
             .build_with_mods(app, self.mods.clone(), &self.param_overrides)
             .expect("mod 集合与参数覆盖必须有效");
+        // 发布全局动作表：Godot 线程拿不到 `World`，动作名翻译与动作表查询
+        // 都从这里取，否则 mod 动作在客户端永远「查无此名」。
+        if let Some(resolved) = app.world().get_resource::<ResolvedActions>() {
+            crate::input::publish_active_actions(resolved);
+        }
         if self.terrain_perf {
             let config = *app.world().resource::<TerrainConfig>();
             app.add_plugins(crate::dev::perf::VoxelPerfPlugin::new(config));
@@ -281,6 +287,7 @@ mod tests {
             group: "test",
             visible_if: None,
         }],
+        actions: &[],
     };
 
     struct BackendParamMod;

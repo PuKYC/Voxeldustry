@@ -27,7 +27,10 @@ use std::marker::PhantomData;
 
 use bevy::prelude::*;
 
-pub use actions::{ActionDef, ActionId, ActionMap, ChannelMask, EmptyActions, MAX_INPUT_CHANNELS};
+pub use actions::{
+    ActionDef, ActionId, ActionMap, ActionResolveError, ChannelMask, EmptyActions, ResolvedActions,
+    ACTION_NAME_MAX_BYTES, MAX_INPUT_CHANNELS, MOD_ACTION_ID_BASE, MOD_ACTION_ID_END,
+};
 pub use capability::{InputAvailability, InputDisabled};
 pub use control::{ControlledBy, ControlsEntity, InputSource, InputSourceId, LocalPlayer};
 pub use events::{InputActionPressed, InputActionReleased, InteractRequest, NO_TARGET};

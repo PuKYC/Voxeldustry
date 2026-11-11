@@ -200,6 +200,14 @@ func _register_actions() -> void:
 		InputMap.action_add_event(action_name, event)
 
 
+## 后端启动后补拉一次动作表：`setup()` 跑在 Bevy 启动之前，那时只有核心表；
+## mod 动作要等 App 装配完成、全局表发布后才可见。幂等：已存在的动作不覆盖。
+func refresh_actions() -> void:
+	if _manager == null:
+		return
+	_register_actions()
+
+
 func _make_event(binding: String) -> InputEvent:
 	if KEY_BY_BINDING.has(binding):
 		var key := InputEventKey.new()

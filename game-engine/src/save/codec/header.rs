@@ -3,11 +3,13 @@
 use super::reader::{field_path, indexed_path, read_u64_at, u32_len, Reader, Writer};
 use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
+use crate::input::actions::MAX_INPUT_CHANNELS;
 use crate::modding::ParamRecord;
 use crate::save::format::{
-    digest, AttachTag, BodyKind, BodyRecord, ModRecord, WorldMeta, BODY_RECORD_LEN, CODEC_ID,
-    DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT, MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT,
-    MAX_PARAM_KEY_LEN, MIN_SUPPORTED_FORMAT_VERSION, WORLD_HEADER_LEN, WORLD_MAGIC,
+    digest, ActionRecord, AttachTag, BodyKind, BodyRecord, ModRecord, WorldMeta, BODY_RECORD_LEN,
+    CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_ACTION_COUNT, MAX_ACTION_NAME_LEN, MAX_BODY_COUNT,
+    MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT, MAX_PARAM_KEY_LEN,
+    MIN_SUPPORTED_FORMAT_VERSION, WORLD_HEADER_LEN, WORLD_MAGIC,
 };
 use crate::save::{SaveError, SaveErrorKind};
 use std::collections::BTreeMap;
@@ -185,9 +187,17 @@ pub fn encode_world_meta(meta: &WorldMeta) -> Result<Vec<u8>, SaveError> {
     Ok(writer.into_vec())
 }
 
-/// 编码 v2 追加段：mod 清单 + 世界参数（均按 key 严格升序）。
+/// 编码 v2 追加段：mod 清单 + 世界参数 + 动作表（均严格升序）。
 fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveError> {
-    let mod_count = u32::try_from(meta.mods.len()).unwrap_or(u32::MAX);
+    encode_mods(writer, &meta.mods)?;
+    encode_params(writer, &meta.params)?;
+    encode_actions(writer, &meta.actions)?;
+    Ok(())
+}
+
+/// 编码 mod 清单段：count + 每条 (id_len + id + version)。
+fn encode_mods(writer: &mut Writer, mods: &[ModRecord]) -> Result<(), SaveError> {
+    let mod_count = u32::try_from(mods.len()).unwrap_or(u32::MAX);
     if mod_count > MAX_MOD_COUNT {
         return Err(SaveError::new(
             "world.meta.mod_count",
@@ -201,7 +211,7 @@ fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveErr
     }
     writer.u32(mod_count);
     let mut previous: Option<&str> = None;
-    for (index, record) in meta.mods.iter().enumerate() {
+    for (index, record) in mods.iter().enumerate() {
         let path = indexed_path("world.meta", "mod", index);
         validate_ordered_string(
             &path,
@@ -216,8 +226,12 @@ fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveErr
         writer.bytes(record.id.as_bytes());
         writer.u32(record.version);
     }
+    Ok(())
+}
 
-    let param_count = u32::try_from(meta.params.len()).unwrap_or(u32::MAX);
+/// 编码世界参数段：count + 每条 (key_len + key + ty + scale + value)。
+fn encode_params(writer: &mut Writer, params: &[ParamRecord]) -> Result<(), SaveError> {
+    let param_count = u32::try_from(params.len()).unwrap_or(u32::MAX);
     if param_count > MAX_PARAM_COUNT {
         return Err(SaveError::new(
             "world.meta.param_count",
@@ -231,7 +245,7 @@ fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveErr
     }
     writer.u32(param_count);
     let mut previous: Option<&str> = None;
-    for (index, record) in meta.params.iter().enumerate() {
+    for (index, record) in params.iter().enumerate() {
         let path = indexed_path("world.meta", "param", index);
         validate_ordered_string(
             &path,
@@ -244,6 +258,86 @@ fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveErr
         previous = Some(&record.key);
         encode_param_record(writer, &path, record)?;
     }
+    Ok(())
+}
+
+/// 编码动作表段：count + 每条 (name_len + name + action + channel_bit)。
+fn encode_actions(writer: &mut Writer, actions: &[ActionRecord]) -> Result<(), SaveError> {
+    let action_count = u32::try_from(actions.len()).unwrap_or(u32::MAX);
+    if action_count > MAX_ACTION_COUNT {
+        return Err(SaveError::new(
+            "world.meta.action_count",
+            writer.len(),
+            SaveErrorKind::TooLarge {
+                what: "action_count",
+                value: u64::from(action_count),
+                max: u64::from(MAX_ACTION_COUNT),
+            },
+        ));
+    }
+    writer.u32(action_count);
+    let mut previous: Option<&str> = None;
+    for (index, record) in actions.iter().enumerate() {
+        let path = indexed_path("world.meta", "action", index);
+        validate_ordered_string(
+            &path,
+            "name",
+            &record.name,
+            previous,
+            MAX_ACTION_NAME_LEN,
+            writer.len(),
+        )?;
+        previous = Some(&record.name);
+        encode_action_record(writer, &path, record)?;
+    }
+    Ok(())
+}
+
+/// 写一条动作记录：name 长度已校验，action 非 0、channel_bit 在可用通道内。
+fn encode_action_record(
+    writer: &mut Writer,
+    path: &str,
+    record: &ActionRecord,
+) -> Result<(), SaveError> {
+    if record.action == 0 {
+        return Err(SaveError::new(
+            field_path(path, "action"),
+            writer.len(),
+            SaveErrorKind::InvalidValue {
+                what: "action id (must be non-zero)",
+                value: 0,
+            },
+        ));
+    }
+    if record.channel_bit >= MAX_INPUT_CHANNELS {
+        return Err(SaveError::new(
+            field_path(path, "channel_bit"),
+            writer.len(),
+            SaveErrorKind::TooLarge {
+                what: "channel_bit",
+                value: u64::from(record.channel_bit),
+                max: u64::from(MAX_INPUT_CHANNELS),
+            },
+        ));
+    }
+    let name_len = match u16::try_from(record.name.len()) {
+        Ok(len) => len,
+        Err(_) => {
+            return Err(SaveError::new(
+                field_path(path, "name"),
+                writer.len(),
+                SaveErrorKind::TooLarge {
+                    what: "action name length",
+                    value: record.name.len() as u64,
+                    max: u64::from(MAX_ACTION_NAME_LEN),
+                },
+            ))
+        }
+    };
+    writer.u16(name_len);
+    writer.bytes(record.name.as_bytes());
+    writer.u32(record.action);
+    writer.u32(record.channel_bit);
     Ok(())
 }
 
@@ -604,12 +698,13 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         }
     }
 
-    let (mods, params, digest_offset) = if format_version >= 2 {
+    let (mods, params, actions, digest_offset) = if format_version >= 2 {
         let payload_end = bytes.len() - DIGEST_LEN;
         let mut extension = Reader::new(&bytes[body_end..payload_end], body_end);
         let mut mods = Vec::new();
         let mut params = Vec::new();
-        decode_extension(&mut extension, &mut mods, &mut params)?;
+        let mut actions = Vec::new();
+        decode_extension(&mut extension, &mut mods, &mut params, &mut actions)?;
         if extension.remaining() != 0 {
             return Err(SaveError::new(
                 "world.meta.file_len",
@@ -619,7 +714,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
                 },
             ));
         }
-        (mods, params, payload_end)
+        (mods, params, actions, payload_end)
     } else {
         let expected_len = body_end + DIGEST_LEN;
         if bytes.len() != expected_len {
@@ -633,7 +728,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
                 },
             ));
         }
-        (Vec::new(), Vec::new(), body_end)
+        (Vec::new(), Vec::new(), Vec::new(), body_end)
     };
 
     let stored = read_u64_at(bytes, digest_offset);
@@ -653,6 +748,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         bodies,
         mods,
         params,
+        actions,
     })
 }
 
@@ -661,6 +757,7 @@ fn decode_extension(
     reader: &mut Reader,
     mods: &mut Vec<ModRecord>,
     params: &mut Vec<ParamRecord>,
+    actions: &mut Vec<ActionRecord>,
 ) -> Result<(), SaveError> {
     let count_offset = reader.offset();
     let mod_count = reader.u32("world.meta.mod_count")?;
@@ -828,6 +925,108 @@ fn decode_extension(
             ty,
             scale,
             value,
+        });
+    }
+
+    // v2 起动作表段是必填的：params 之后没字节就是坏档（旧 v2 不再兼容）。
+    decode_actions(reader, actions)
+}
+
+/// 解码动作表段：count + 每条 (name_len + name + action + channel_bit)。
+fn decode_actions(reader: &mut Reader, actions: &mut Vec<ActionRecord>) -> Result<(), SaveError> {
+    let count_offset = reader.offset();
+    let action_count = reader.u32("world.meta.action_count")?;
+    if action_count > MAX_ACTION_COUNT {
+        return Err(SaveError::new(
+            "world.meta.action_count",
+            count_offset,
+            SaveErrorKind::TooLarge {
+                what: "action_count",
+                value: u64::from(action_count),
+                max: u64::from(MAX_ACTION_COUNT),
+            },
+        ));
+    }
+    let mut previous: Option<String> = None;
+    for index in 0..u32_len(action_count) {
+        let path = indexed_path("world.meta", "action", index);
+        let len_offset = reader.offset();
+        let name_len = reader.u16(&field_path(&path, "name_len"))?;
+        if name_len > MAX_ACTION_NAME_LEN {
+            return Err(SaveError::new(
+                field_path(&path, "name_len"),
+                len_offset,
+                SaveErrorKind::TooLarge {
+                    what: "action name length",
+                    value: u64::from(name_len),
+                    max: u64::from(MAX_ACTION_NAME_LEN),
+                },
+            ));
+        }
+        let name_offset = reader.offset();
+        let raw = reader.take(usize::from(name_len), &field_path(&path, "name"))?;
+        let name = std::str::from_utf8(raw).map_err(|_| {
+            SaveError::new(
+                field_path(&path, "name"),
+                name_offset,
+                SaveErrorKind::InvalidString {
+                    what: "action name",
+                },
+            )
+        })?;
+        if name.is_empty() {
+            return Err(SaveError::new(
+                field_path(&path, "name"),
+                name_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "action name (must be non-empty)",
+                    value: 0,
+                },
+            ));
+        }
+        if previous.as_deref().is_some_and(|previous| name <= previous) {
+            return Err(SaveError::new(
+                field_path(&path, "name"),
+                name_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "action name order (must be strictly increasing)",
+                    value: 0,
+                },
+            ));
+        }
+
+        let action_offset = reader.offset();
+        let action = reader.u32(&field_path(&path, "action"))?;
+        if action == 0 {
+            return Err(SaveError::new(
+                field_path(&path, "action"),
+                action_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "action id (must be non-zero)",
+                    value: 0,
+                },
+            ));
+        }
+        let bit_offset = reader.offset();
+        let channel_bit = reader.u32(&field_path(&path, "channel_bit"))?;
+        if channel_bit >= MAX_INPUT_CHANNELS {
+            return Err(SaveError::new(
+                field_path(&path, "channel_bit"),
+                bit_offset,
+                SaveErrorKind::TooLarge {
+                    what: "channel_bit",
+                    value: u64::from(channel_bit),
+                    max: u64::from(MAX_INPUT_CHANNELS),
+                },
+            ));
+        }
+
+        let name = name.to_string();
+        previous = Some(name.clone());
+        actions.push(ActionRecord {
+            name,
+            action,
+            channel_bit,
         });
     }
     Ok(())

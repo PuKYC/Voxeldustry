@@ -210,7 +210,7 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 
 ## Mod 清单
 
-`ModManifest` 声明 `id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`params`。
+`ModManifest` 声明 `id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`params`、`actions`。
 
 - `load_after`：硬依赖，缺失报 `MissingDependency`，同时作为拓扑排序边。
 - `load_after_optional`：可选依赖，存在时排在自己之前，缺失不报错。
@@ -218,12 +218,48 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 - `exclusive_groups`：同一组最多加载一个 mod，冲突报 `ExclusiveGroup`。
 - `engine_api` 是整数版本，只增不改。
 - `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。
+- `actions`：本 mod 声明的输入动作名（`&'static [&'static str]`，不声明则 `&[]`）。解析规则见下节。
 
 参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` 负责这个装配点。
 
-保存时，`capture_world` 从 `ParamTable` 取 mod 清单（id + version）与全部 World 参数，写进 `world.meta` v2 扩展段（`ParamTable::mods()` / `world_values()`）；Debug 参数不落盘。读档在阶段一用 `ParamTable::validate_saved` 按当前 schema 校验：缺失 key 保持默认值，未知 key、非 World 作用域、类型 / scale 不符、值越界都拒绝整档；阶段二在 `WorldParamsFrozen` 冻结前用 `apply_saved` 写回。格式版本升到 2，读取同时接受 1..=2；v1 存档视为空清单 / 空参数。mod 清单目前只记录，不做版本协商，也不因缺 mod 拒档。
+### 动作表解析
 
-实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1。
+动作表在建档（mod 装配）时解析一次，随存档冻结，会话内不可更改。`Mods::apply` 在全部 mod `install` 完成后调用 `ResolvedActions::resolve(S::Actions::table(), &mods)`：
+
+- core 动作保持声明里的 `ActionId` 与 `channel_bit` 原样（本游戏 `ACTION_TABLE` 15 条：bit 0–14、id 1–15）。
+- mod 动作按 `(mod_id, name)` 全局排序后依次分配：`ActionId = 1000 + 序号`（1000–9999 保留给 mod，超过 9000 个报错）、`channel_bit = 从 0 起第一个未占用的位`（core 占 0..=14，因此 mod 从 15 起；`MAX_INPUT_CHANNELS` = 64，耗尽报错）。
+- 名字必须非空、≤ 64 字节、无控制字符；与 core 重名、mod 之间重名、core 占用保留 id 区间、id 或通道位耗尽都让装配失败（`ModError::Actions`）。
+- 结果顺序固定：core 在前按 bit 升序，mod 动作按分配顺序。
+
+成功后 `ResolvedActions` 与 `AppliedModSet`（`mod_set_hash` + 按 id 升序的 `ModRef { id, version }`）作为 Resource 注入 App。输入侧 `derive_input_events` 优先用 `ResolvedActions::action_of_bit`，`RawInputFrame::from_names_with_table` 把 Godot 传来的动作名翻成通道位；无该资源时回退静态 `ActionMap`（无 mod 时结果与旧行为逐位相同）。`mod_set_hash` 的算法不变（逐 mod `"id:version"` 的 fnv1a32 串联）。
+
+### 随存档冻结与读档校验
+
+保存时，`capture_world` 从 `ParamTable` 取 mod 清单（id + version）与全部 World 参数，从 `ResolvedActions` 取动作表（按 name 严格升序），写进 `world.meta` v2 扩展段（`ParamTable::mods()` / `world_values()`）；Debug 参数不落盘。
+
+读档在阶段一（只读校验，失败时 world 一个字节都不改）逐段比对：
+
+- `AppliedModSet` 存在：`meta.mods` 与它按 id 逐项比对（数量、id、version），不等报 `MissingMod` / `UnexpectedMod` / `ModVersionMismatch`。
+- `ResolvedActions` 存在：`meta.actions` 与当前表逐项比对（name / action / channel_bit，顺序敏感），不等报 `ActionCountMismatch` / `ActionTableMismatch`。
+- 资源缺失：段为空则放行；段非空报 `MissingResource`。
+
+参数段仍用 `ParamTable::validate_saved` 按当前 schema 校验：缺失 key 保持默认值，未知 key、非 World 作用域、类型 / scale 不符、值越界都拒绝整档；阶段二在 `WorldParamsFrozen` 冻结前用 `apply_saved` 写回。
+
+格式版本保持 2（`MIN_SUPPORTED_FORMAT_VERSION` 仍为 1），读取同时接受 1..=2。`world.meta` v2 扩展段的线格式（小端）：
+
+```text
+u32 mod_count
+  每条：u16 id_len + id 字节 + u32 version
+u32 param_count
+  每条：u16 key_len + key 字节 + u8 ty + u32 scale + i64 value
+u32 action_count
+  每条：u16 name_len + name 字节 + u32 action + u32 channel_bit
+u64 digest                    # 覆盖头、body 表与上面全部扩展字节
+```
+
+兼容：v1 存档没有扩展段，解码为「空清单 / 空参数 / 空动作表」。**未发布前不做旧档兼容**：v2 的扩展段（含动作表）是必填的，缺段按坏档拒绝——读档阶段一还会把冻结的动作表与当前装配逐项比对，数量或内容不符直接整档失败。上限 `MAX_MOD_COUNT` = `MAX_PARAM_COUNT` = `MAX_ACTION_COUNT` = 4096，名字长度上限 255 / 255 / 64。
+
+实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1（该文档在 `docs/待办` 下，未纳入版本库）。
 
 后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
 

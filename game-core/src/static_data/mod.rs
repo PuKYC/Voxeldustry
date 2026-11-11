@@ -1172,6 +1172,7 @@ mod tests {
             conflicts: &[],
             exclusive_groups: &[],
             params: &[],
+            actions: &[],
         };
 
     struct LayerTestMod;

@@ -7,8 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bevy::prelude::Component;
 use serde::{Deserialize, Serialize};
 
-use game_engine::identity::StableEntityIndex;
-use game_engine::modding::{ModManifest, ParamScope, ParamSpec, ParamTable, ParamType};
+use game_engine::identity::{StableEntityId, StableEntityIndex};
+use game_engine::input::{ActionMap, ResolvedActions};
+use game_engine::modding::{
+    AppliedModSet, ModManifest, ModRef, ParamScope, ParamSpec, ParamTable, ParamType,
+};
 use game_engine::residency::ChunkAnchor;
 use game_engine::save::{write_world_meta, ModRecord, Persist, PersistComponent, StableTypeId};
 use game_engine::voxel::{chunk_content_hash, MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH};
@@ -684,6 +687,7 @@ static TEST_MANIFEST: ModManifest = ModManifest {
     conflicts: &[],
     exclusive_groups: &[],
     params: TEST_PARAM_SPECS,
+    actions: &[],
 };
 
 #[test]
@@ -713,6 +717,7 @@ fn load_applies_saved_world_params_and_mod_records() {
     loaded.insert_resource(
         ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
     );
+    loaded.insert_resource(applied_mod_set(&[("test", 7)]));
     load_world(&mut loaded, &paths, 1)
         .expect("读档成功")
         .expect("world.meta 存在");
@@ -749,10 +754,33 @@ fn load_rejects_unknown_saved_param_key() {
     loaded.insert_resource(
         ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
     );
+    loaded.insert_resource(applied_mod_set(&[("test", 7)]));
     let error = load_world(&mut loaded, &paths, 1).expect_err("未知参数 key 必须拒绝整档");
     assert!(
         error.to_string().contains("未知参数"),
         "错误应指出未知 key，实际：{error}"
+    );
+}
+
+/// 未发布前不做旧档兼容：meta 缺动作表段（动作表写进 meta 之前的 v2）必须拒绝，
+/// 否则 mod 动作位无法还原、读档结果会静默漂移。
+#[test]
+fn meta_without_action_table_is_rejected() {
+    let mut source = test_world(1);
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    assert!(capture.meta.actions.is_empty(), "没有 ResolvedActions 时采集到空表");
+    let dir = TempDir::new("broken_actions");
+    let paths = SavePaths::new(dir.path());
+    write_world_meta(&paths, &capture.meta).expect("写 meta");
+
+    let mut loaded = test_world(1);
+    loaded.insert_resource(
+        ResolvedActions::resolve(CoreActions::table(), &[]).expect("核心动作表解析"),
+    );
+    let error = load_world(&mut loaded, &paths, 1).expect_err("缺动作表必须拒绝");
+    assert!(
+        error.to_string().contains("动作"),
+        "错误应指向动作表，实际：{error}"
     );
 }
 
@@ -805,4 +833,196 @@ fn build_plan_orders_bodies_and_regions() {
         assert_eq!(regions, sorted, "region 必须按 region 键升序");
         assert_eq!(regions.len(), 2, "每个 body 两个 region");
     }
+}
+
+// ---- mod 集合与动作表的读档硬校验 ----
+
+use crate::input::CoreActions;
+
+/// 读档只读校验的指纹：种子、稳定 ID、body 集合、区块内容哈希。
+#[derive(Debug, PartialEq, Eq)]
+struct WorldFingerprint {
+    seed: u64,
+    stable_ids: BTreeSet<u64>,
+    bodies: BTreeSet<u64>,
+    chunks: BTreeMap<(u64, ChunkKey), u64>,
+}
+
+fn fingerprint(world: &World) -> WorldFingerprint {
+    WorldFingerprint {
+        seed: world.resource::<WorldSeed>().0,
+        stable_ids: stable_ids(world),
+        bodies: body_ids(world),
+        chunks: chunk_hashes(world),
+    }
+}
+
+/// 世界里先放一个实体，用来验证校验失败时它不会被改动。
+fn spawn_marker(world: &mut World, id: u64) {
+    world
+        .spawn(TestMarker {
+            value: 1,
+            label: "keep".to_string(),
+        })
+        .insert(StableEntityId(id));
+}
+
+fn applied_mod_set(mods: &[(&str, u32)]) -> AppliedModSet {
+    AppliedModSet {
+        mod_set_hash: 0x5EED,
+        mods: mods
+            .iter()
+            .map(|(id, version)| ModRef {
+                id: (*id).to_string(),
+                version: *version,
+            })
+            .collect(),
+    }
+}
+
+fn resolved_actions(mods: &'static [(&'static str, &'static [&'static str])]) -> ResolvedActions {
+    ResolvedActions::resolve(CoreActions::table(), mods).expect("测试动作表应能解析")
+}
+
+#[test]
+fn load_rejects_changed_mod_set() {
+    let mut source = test_world(0x51);
+    source.insert_resource(
+        ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
+    );
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    assert_eq!(
+        capture.meta.mods,
+        vec![ModRecord {
+            id: "test".to_string(),
+            version: 7,
+        }]
+    );
+
+    let dir = TempDir::new("mod_drift");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    // 1) 存档加载过 mod，当前装配里没有。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(applied_mod_set(&[]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("缺少 mod 必须拒绝整档");
+    assert!(
+        error.to_string().contains("当前装配里没有"),
+        "错误应指出缺失的 mod，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 2) 同名 mod 版本不一致。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(applied_mod_set(&[("test", 8)]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("版本不一致必须拒绝整档");
+    assert!(
+        error.to_string().contains("版本不一致"),
+        "错误应指出版本不一致，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 3) 当前装配多出存档没记录过的 mod。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(applied_mod_set(&[("test", 7), ("ghost", 1)]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("多出 mod 必须拒绝整档");
+    assert!(
+        error.to_string().contains("存档没有记录"),
+        "错误应指出多出的 mod，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+}
+
+#[test]
+fn load_accepts_matching_mod_set_and_action_table() {
+    const MODS: &[(&str, &[&str])] = &[("test", &["mod.build"])];
+    let mut source = test_world(0x52);
+    source.insert_resource(
+        ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
+    );
+    source.insert_resource(resolved_actions(MODS));
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    assert_eq!(capture.meta.mods.len(), 1);
+    assert_eq!(
+        capture.meta.actions.len(),
+        CoreActions::table().len() + 1,
+        "core 动作 + 1 个 mod 动作都要进 meta"
+    );
+    assert!(
+        capture
+            .meta
+            .actions
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name),
+        "meta.actions 必须按 name 严格升序"
+    );
+
+    let dir = TempDir::new("mod_match");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    let mut loaded = test_world(1);
+    loaded.insert_resource(
+        ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
+    );
+    loaded.insert_resource(applied_mod_set(&[("test", 7)]));
+    loaded.insert_resource(resolved_actions(MODS));
+    load_world(&mut loaded, &paths, 1)
+        .expect("一致的 mod 集合与动作表必须放行")
+        .expect("world.meta 存在");
+}
+
+#[test]
+fn load_rejects_action_table_drift() {
+    const MODS: &[(&str, &[&str])] = &[("test", &["mod.build"])];
+    let mut source = test_world(0x53);
+    source.insert_resource(resolved_actions(MODS));
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    assert!(!capture.meta.actions.is_empty());
+
+    let dir = TempDir::new("action_drift");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    // 1) 条数不一致（当前表没有 mod 动作）。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(resolved_actions(&[]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("动作表条数不一致必须拒绝");
+    assert!(
+        error.to_string().contains("动作表条数不一致"),
+        "错误应指出条数不一致，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 2) 条数相同但名字不同。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(resolved_actions(&[("test", &["mod.other"])]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("动作表内容不一致必须拒绝");
+    assert!(
+        error.to_string().contains("动作表记录与存档不一致"),
+        "错误应指出具体动作，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 3) 存档带动作表但世界没有运行期动作表。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("缺少动作表资源必须拒绝");
+    assert!(
+        error.to_string().contains("ResolvedActions"),
+        "错误应指出缺失的资源，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
 }

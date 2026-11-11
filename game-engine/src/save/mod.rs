@@ -47,11 +47,12 @@ pub use codec::{
 };
 pub use content::{export_chunk, install_chunk};
 pub use format::{
-    digest, region_of, splitmix64, AttachTag, BodyKind, BodyRecord, ComponentRecord, ModRecord,
-    RegionFile, WorldMeta, BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT,
-    MAX_CHUNK_COUNT, MAX_COMPONENT_PAYLOAD_LEN, MAX_RECORD_LEN, MAX_REGION_FILE_LEN,
-    PROPOSAL_RECORD_LEN, REGION_HEADER_LEN, REGION_INDEX_ENTRY_LEN, REGION_MAGIC, REGION_SIZE,
-    WORLD_HEADER_LEN, WORLD_MAGIC,
+    digest, region_of, splitmix64, ActionRecord, AttachTag, BodyKind, BodyRecord, ComponentRecord,
+    ModRecord, RegionFile, WorldMeta, BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN, FORMAT_VERSION,
+    MAX_ACTION_COUNT, MAX_ACTION_NAME_LEN, MAX_BODY_COUNT, MAX_CHUNK_COUNT,
+    MAX_COMPONENT_PAYLOAD_LEN, MAX_RECORD_LEN, MAX_REGION_FILE_LEN, PROPOSAL_RECORD_LEN,
+    REGION_HEADER_LEN, REGION_INDEX_ENTRY_LEN, REGION_MAGIC, REGION_SIZE, WORLD_HEADER_LEN,
+    WORLD_MAGIC,
 };
 
 /// ChunkRecord 与 EntityRecord 直接复用流式模块的定义，不在这里重新定义（§3.1/§4.1）。
@@ -209,6 +210,22 @@ pub enum SaveErrorKind {
     InvalidString { what: &'static str },
     /// 插件参数与当前 schema 不一致（加载时由 ParamTable 校验）。
     Param { detail: String },
+    /// 存档加载过的 mod 在当前装配里缺失。
+    MissingMod { id: String },
+    /// 当前装配里有存档没记录过的 mod。
+    UnexpectedMod { id: String },
+    /// 同名 mod 的版本号与存档不一致。
+    ModVersionMismatch {
+        id: String,
+        saved: u32,
+        current: u32,
+    },
+    /// 动作表某条记录（name / action / channel_bit）与存档冻结的表不一致。
+    ActionTableMismatch { name: String },
+    /// 动作表条数与存档不一致。
+    ActionCountMismatch { expected: usize, found: usize },
+    /// 存档里带有该段数据，但世界缺少对应的运行期资源。
+    MissingResource { what: &'static str },
 }
 
 impl fmt::Display for SaveErrorKind {
@@ -263,6 +280,24 @@ impl fmt::Display for SaveErrorKind {
             Self::Payload { what, detail } => write!(f, "{what} failed: {detail}"),
             Self::InvalidString { what } => write!(f, "invalid UTF-8 in {what}"),
             Self::Param { detail } => write!(f, "plugin parameter mismatch: {detail}"),
+            Self::MissingMod { id } => {
+                write!(f, "存档加载过 mod \"{id}\"，当前装配里没有")
+            }
+            Self::UnexpectedMod { id } => {
+                write!(f, "当前装配里有 mod \"{id}\"，存档没有记录")
+            }
+            Self::ModVersionMismatch { id, saved, current } => {
+                write!(f, "mod \"{id}\" 版本不一致：存档 {saved}，当前 {current}")
+            }
+            Self::ActionTableMismatch { name } => {
+                write!(f, "动作 \"{name}\" 的动作表记录与存档不一致")
+            }
+            Self::ActionCountMismatch { expected, found } => {
+                write!(f, "动作表条数不一致：存档 {expected}，当前 {found}")
+            }
+            Self::MissingResource { what } => {
+                write!(f, "世界缺少运行期资源 {what}（存档带有对应数据）")
+            }
             Self::BodyKeyMismatch { map, record } => {
                 write!(f, "body map key {map} != record id {record}")
             }

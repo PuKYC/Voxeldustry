@@ -318,9 +318,11 @@ impl BevyAppManager {
 
     // ───────────────────── 输入通道（Godot → game-core） ─────────────────────
 
-    /// 启动时拉取动作表：`Array[{ name, bit, channel? }]`（按键由 Godot 侧配置）。
+    /// 拉取动作表：`Array[{ name, bit, channel? }]`（按键由 Godot 侧配置）。
     ///
-    /// 名字与通道位的唯一真相源是 `game_core::input::actions::ACTION_TABLE`。
+    /// 名字与通道位的唯一真相源是本次装配解析出的全局动作表
+    /// （`game_core::input::active_actions()`：核心动作 + mod 动作）；
+    /// 世界加载完成后要重新拉一次，mod 动作才会进 Godot 的 `InputMap`。
     #[func]
     fn get_action_table(&self) -> Array<VarDictionary> {
         presentation_bridge::action_table_to_variant()

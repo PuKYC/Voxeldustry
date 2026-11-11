@@ -21,6 +21,7 @@ static CORE_DATA: ModManifest = ModManifest {
     conflicts: &[],
     exclusive_groups: &[],
     params: &[],
+    actions: &[],
 };
 
 /// 数据 mod 示例：注册一条运行期定义（M1）。
@@ -46,6 +47,7 @@ static CORE_GAMEPLAY: ModManifest = ModManifest {
     conflicts: &[],
     exclusive_groups: &[],
     params: &[],
+    actions: &[],
 };
 
 /// 记录 mod 系统运行次数（测试用）。

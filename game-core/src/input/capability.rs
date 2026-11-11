@@ -85,6 +85,17 @@ simple_channel!(
     Rooted
 );
 
+/// 声明实体可以使用哪些 **mod 动作位**。
+///
+/// 核心动作位由各种 `*Channel` 组件决定；这个组件里的核心位会被忽略，
+/// 所以 mod 不能借它绕过能力系统给自己开核心动作。没有这个组件的实体
+/// 一个 mod 动作位也拿不到。
+///
+/// 位号由 `ResolvedActions::resolve` 在建档时分配（核心动作占 0..=63 里的
+/// 低位，mod 动作补空位），所以这个组件的值必须与同一份解析结果同源。
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModActionChannel(pub u64);
+
 // ───────────────────────── 通道 → 动作名集合 ─────────────────────────
 //
 // 唯一真相源仍然是 `actions::ACTION_TABLE`：这里只写名字，
@@ -252,6 +263,12 @@ pub struct ChannelSet {
     pub can_sprint: bool,
     /// 视角轴（`LookChannel`）；不参与动作位掩码，单独走 `InputAvailability.look`。
     pub can_look: bool,
+    /// 内置通道之外的额外动作位（mod 动作，见 [`ModActionChannel`]）。
+    ///
+    /// 核心动作位一律由上面的布尔量决定：系统填这个字段前会滤掉核心位，
+    /// 所以这里只会出现 `ACTION_TABLE` 之外的位。它不受 `Stunned` / `Rooted`
+    /// 削减（mod 动作的语义由 mod 自己决定），但仍受 [`InputDisabled`] 约束。
+    pub extra: u64,
 }
 
 /// 纯函数：只按「能力组件是否存在」生成位掩码（`present`）。
@@ -262,7 +279,8 @@ pub struct ChannelSet {
 /// **视角不在本掩码里**：`LookChannel` 是独立轴，用 [`look_allowed`] /
 /// `InputAvailability.look` 表达；动作位掩码只描述可按 / 可松开的动作。
 pub fn channel_mask(set: ChannelSet) -> u64 {
-    let mut mask = 0u64;
+    // mod 动作位没有对应的能力组件，只能由 `ModActionChannel` 显式声明。
+    let mut mask = set.extra;
     if set.can_move {
         mask |= move_mask();
     }
@@ -319,11 +337,13 @@ pub fn availability_mask(set: ChannelSet, disabled: u64, stunned: bool, rooted: 
 /// 每 tick 重算可用通道（插进引擎的 `InputSet::Availability`）。
 ///
 /// 注意：Bevy 的 Query 元组上限是 15 个元素。三个交互通道各自独立查询后
-/// 正好 15 项，因此 `&ControlledBy` 拆成独立的只读查询（本系统只从中取
-/// `source`），主查询仍以 `With<ControlledBy>` 过滤，语义不变。
+/// 正好 15 项，因此 `&ControlledBy` 与 `&ModActionChannel` 拆成独立的
+/// 只读查询（本系统只从中取 `source` / mod 动作位），主查询仍以
+/// `With<ControlledBy>` 过滤，语义不变。
 #[allow(clippy::type_complexity)]
 pub fn compute_input_availability(
     controlled_query: Query<(Entity, &ControlledBy)>,
+    mod_channels: Query<&ModActionChannel>,
     mut query: Query<
         (
             &mut InputAvailability,
@@ -345,6 +365,9 @@ pub fn compute_input_availability(
         With<ControlledBy>,
     >,
 ) {
+    // 核心位只在这里算一次：`ModActionChannel` 里混进来的核心位必须被滤掉，
+    // 否则 mod 就能给自己开核心动作。
+    let core_bits = all_actions_mask();
     for (entity, controlled) in &controlled_query {
         let Ok((
             mut availability,
@@ -377,6 +400,10 @@ pub fn compute_input_availability(
             can_place_block: can_place_block.is_some(),
             can_sprint: can_sprint.is_some(),
             can_look: can_look.is_some(),
+            extra: mod_channels
+                .get(entity)
+                .map(|channel| channel.0 & !core_bits)
+                .unwrap_or(0),
         };
         let present = channel_mask(set);
         let available = availability_mask(
@@ -600,6 +627,69 @@ mod tests {
             channel_mask(ChannelSet::default()),
             0,
             "没有任何能力组件时 present 必须为 0"
+        );
+    }
+
+    /// mod 动作位只能由 `ModActionChannel` 显式声明，且不能借此打开核心位。
+    #[test]
+    fn mod_action_bits_require_explicit_component() {
+        let bit = 1u64 << 15;
+        assert_eq!(
+            channel_mask(ChannelSet {
+                extra: bit,
+                ..ChannelSet::default()
+            }),
+            bit,
+            "extra 应直接进 present"
+        );
+
+        let mut app = App::new();
+        app.add_systems(Update, compute_input_availability);
+        let mixed = 1u64 | bit; // bit 0 是核心 move 位，必须被滤掉
+        let entity = app
+            .world_mut()
+            .spawn((
+                ControlledBy {
+                    source: Default::default(),
+                },
+                InputAvailability::default(),
+                ModActionChannel(mixed),
+            ))
+            .id();
+        app.update();
+
+        let availability = *app
+            .world()
+            .get::<InputAvailability>(entity)
+            .expect("spawn 时插入了 InputAvailability");
+        assert_ne!(availability.present & bit, 0, "present 应包含 mod 动作位");
+        assert_ne!(availability.mask & bit, 0, "mod 动作位应可用");
+        assert_eq!(availability.mask & 1, 0, "ModActionChannel 不得打开核心位");
+        assert_eq!(availability.present & 1, 0, "present 也不得出现核心位");
+    }
+
+    #[test]
+    fn mod_action_bits_ignore_stun_and_root_but_not_disable() {
+        let bit = 1u64 << 15;
+        let set = ChannelSet {
+            can_move: true,
+            extra: bit,
+            ..ChannelSet::default()
+        };
+        assert_ne!(
+            availability_mask(set, 0, true, false) & bit,
+            0,
+            "眩晕不削减 mod 动作位"
+        );
+        assert_ne!(
+            availability_mask(set, 0, false, true) & bit,
+            0,
+            "定身不削减 mod 动作位"
+        );
+        assert_eq!(
+            availability_mask(set, bit, false, false) & bit,
+            0,
+            "InputDisabled 必须削减 mod 动作位"
         );
     }
 
