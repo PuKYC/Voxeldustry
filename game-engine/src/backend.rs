@@ -71,6 +71,19 @@ pub enum BevyControlMsg {
     Custom(String),
 }
 
+/// 游戏模块装配失败的载荷。
+///
+/// [`GameModule::build`] 没有返回值，失败时由模块把本资源插进 App 并提前
+/// 返回；[`run_headless`] 在发送 `Started` 之前检查它，把 `code` / `message`
+/// 原样回传 Godot 并直接以失败退出，后台线程不会 panic。
+#[derive(Resource, Debug, Clone, PartialEq, Eq)]
+pub struct ModuleBuildFailure {
+    /// 稳定错误码（例如 `profile.unknown_plugin`、`mod.missing_dependency`）。
+    pub code: String,
+    /// 面向玩家的中文错误说明。
+    pub message: String,
+}
+
 /// 退出存档标记：runner 收到 [`BevyControlMsg::Shutdown`] 后插入本资源，
 /// 再跑**最后一帧** `App::update()`，让世界层把「已装块」落盘。
 ///
@@ -88,8 +101,15 @@ pub enum BevyLifecycleMsg {
     Paused,
     /// 模拟已恢复。
     Resumed,
-    /// runner 捕获到 panic，附带错误文本。
-    Error(String),
+    /// 装配失败或 runner 捕获到 panic。
+    ///
+    /// `code` 是稳定错误码，供 Godot 侧分支处理；`message` 是中文说明。
+    Error {
+        /// 稳定错误码（`backend.panic` / `profile.*` / `mod.*`）。
+        code: String,
+        /// 面向玩家的中文错误说明。
+        message: String,
+    },
     /// 透传自定义指令。
     Custom(String),
     /// runner 已停止；`0` 表示正常退出，非零表示异常退出。
@@ -194,6 +214,23 @@ pub fn run_headless<S: GameSpec, M: GameModule<S>>(
     session: u64,
 ) -> ExitCode {
     let mut app = build_app(&config, module, &bridge, ctrl_rx, life_tx.clone(), session);
+
+    // 装配失败：模块把原因放进 ModuleBuildFailure。这里在发 Started 前拦截，
+    // 回传结构化错误并直接失败退出，不进入主循环、不 panic。
+    if let Some(failure) = app.world().get_resource::<ModuleBuildFailure>().cloned() {
+        let _ = life_tx.send(FromBevy {
+            session,
+            payload: BevyLifecycleMsg::Error {
+                code: failure.code,
+                message: failure.message,
+            },
+        });
+        let _ = life_tx.send(FromBevy {
+            session,
+            payload: BevyLifecycleMsg::Stopped(1),
+        });
+        return ExitCode::FAILURE;
+    }
 
     let _ = life_tx.send(FromBevy {
         session,
@@ -388,7 +425,10 @@ fn finish_run(
 
             let _ = life_tx.send(FromBevy {
                 session,
-                payload: BevyLifecycleMsg::Error(err_msg),
+                payload: BevyLifecycleMsg::Error {
+                    code: "backend.panic".to_string(),
+                    message: err_msg,
+                },
             });
             let _ = life_tx.send(FromBevy {
                 session,

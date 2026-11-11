@@ -9,23 +9,72 @@ use bevy::prelude::*;
 use game_engine::backend::GameModule;
 use game_engine::modding::{DataRegistry, ModError, ModParamsPlugin, ParamTable};
 
-use crate::gameplay::{BlockEditPlugin, CameraPlugin, DeathPlugin, GameplayPlugin, MovementPlugin};
-use crate::input::GameInputPlugin;
 use crate::mods::{default_core_mods, CoreMods};
-use crate::prediction::PredictionPlugin;
-use crate::presentation::voxel_mesh::VoxelMeshRefreshPlugin;
-use crate::presentation::{register_synced_components, PresentationPlugin};
 use crate::spec::CoreSpec;
 use crate::static_data::StaticDataPlugin;
-use crate::voxel::terrain::{TerrainMode, TerrainPlugin};
-use crate::voxel::GameVoxelPlugin;
-use crate::world::WorldPlugin;
-use game_engine::aoi::AoIPlugin;
-use game_engine::identity::StableIdPlugin;
-use game_engine::spatial::{Size, SpatialPlugin};
+use crate::world::{default_plugin_selection, resolve_plugins, PluginEntry, ProfileError};
 
 /// 本游戏的默认插件组合。
 pub struct CoreGame;
+
+/// 世界装配失败：mod 应用失败，或 profile 插件解析失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldBuildError {
+    Mod(ModError),
+    Profile(ProfileError),
+}
+
+impl WorldBuildError {
+    /// 稳定错误码，供 Godot 侧按 code 分支处理。
+    pub fn code(&self) -> &'static str {
+        match self {
+            WorldBuildError::Mod(error) => mod_error_code(error),
+            WorldBuildError::Profile(error) => error.code(),
+        }
+    }
+}
+
+fn mod_error_code(error: &ModError) -> &'static str {
+    match error {
+        ModError::MissingDependency { .. } => "mod.missing_dependency",
+        ModError::CircularDependency { .. } => "mod.circular_dependency",
+        ModError::Conflict { .. } => "mod.conflict",
+        ModError::ExclusiveGroup { .. } => "mod.exclusive_group",
+        ModError::DuplicateId { .. } => "mod.duplicate_id",
+        ModError::Param(_) => "mod.param",
+        ModError::Actions(_) => "mod.actions",
+    }
+}
+
+impl std::fmt::Display for WorldBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorldBuildError::Mod(error) => write!(f, "mod 装配失败：{error}"),
+            WorldBuildError::Profile(error) => write!(f, "世界档插件解析失败：{error}"),
+        }
+    }
+}
+
+impl std::error::Error for WorldBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorldBuildError::Mod(error) => Some(error),
+            WorldBuildError::Profile(error) => Some(error),
+        }
+    }
+}
+
+impl From<ModError> for WorldBuildError {
+    fn from(error: ModError) -> Self {
+        WorldBuildError::Mod(error)
+    }
+}
+
+impl From<ProfileError> for WorldBuildError {
+    fn from(error: ProfileError) -> Self {
+        WorldBuildError::Profile(error)
+    }
+}
 
 impl CoreGame {
     /// 装配默认插件，并应用 mod 集合与参数覆盖。
@@ -33,6 +82,37 @@ impl CoreGame {
     /// 参数表在 mod `install` 之前插入，因此 mod 可以读取自己的参数；
     /// 世界参数在 `PostStartup` 冻结。返回 mod_set_hash。
     pub fn build_with_mods(
+        &self,
+        app: &mut App,
+        mods: CoreMods,
+        overrides: &BTreeMap<String, i64>,
+    ) -> Result<u64, ModError> {
+        let mod_set_hash = self.apply_mods(app, mods, overrides)?;
+        add_default_plugins(app);
+        Ok(mod_set_hash)
+    }
+
+    /// 按显式 profile 装配：先解析插件 id（依赖自动补齐），再应用 mod，
+    /// 最后按拓扑序逐个装配插件。
+    ///
+    /// profile 解析在任何资源写入之前完成，因此未知 id / 缺依赖 / 环不会
+    /// 留下半装配的 App。
+    pub fn build_with_profile(
+        &self,
+        app: &mut App,
+        mods: CoreMods,
+        overrides: &BTreeMap<String, i64>,
+        selection: &[&str],
+    ) -> Result<u64, WorldBuildError> {
+        let entries = resolve_plugins(selection)?;
+        let mod_set_hash = self.apply_mods(app, mods, overrides)?;
+        add_resolved_plugins(app, &entries);
+        Ok(mod_set_hash)
+    }
+
+    /// 原有装配顺序：静态数据 → 参数表 → mod apply → 插件。
+    /// 插件装配由调用方负责，保证「插件必须最后」不被破坏。
+    fn apply_mods(
         &self,
         app: &mut App,
         mods: CoreMods,
@@ -50,44 +130,21 @@ impl CoreGame {
         let mod_set_hash = mods.apply(app, &mut data)?;
         app.insert_resource(data);
 
-        add_default_plugins(app);
         Ok(mod_set_hash)
     }
 }
 
 /// 默认插件列表（不含 [StaticDataPlugin] 与 mod 应用）。
 fn add_default_plugins(app: &mut App) {
-    app.add_plugins(GameInputPlugin);
-    app.add_plugins(PresentationPlugin);
-    // 逻辑层基础：稳定 ID / 空间索引 / AOI。生产同样需要。
-    app.add_plugins((
-        StableIdPlugin,
-        // 空间/AOI 一律用世界位置（GlobalTransform），逻辑位置写在 Transform 上。
-        SpatialPlugin::<GlobalTransform, Size>::new(32.0),
-        AoIPlugin::<GlobalTransform>::default(),
-    ));
-    // 玩法层装配。
-    app.add_plugins((
-        GameplayPlugin,
-        MovementPlugin,
-        DeathPlugin,
-        CameraPlugin,
-        BlockEditPlugin,
-    ));
-    // 体素世界层：游戏语义 / 数值 / 生成。v1 无执行。
-    app.add_plugins(WorldPlugin);
-    app.add_plugins(GameVoxelPlugin);
-    app.add_plugins(TerrainPlugin);
-    // 流式地形：只有装配方显式选了 TerrainMode::Streaming 才接整条管线。
-    // Eager（默认）什么都不加，旧路径行为零变化（测试也直接调 CoreGame::build）。
-    if app.world().get_resource::<TerrainMode>().copied() == Some(TerrainMode::Streaming) {
-        app.add_plugins(crate::world::StreamingWorldPlugin);
+    let entries = resolve_plugins(&default_plugin_selection())
+        .expect("内置插件注册表必须满足依赖与默认 profile");
+    add_resolved_plugins(app, &entries);
+}
+
+fn add_resolved_plugins(app: &mut App, entries: &[&PluginEntry]) {
+    for entry in entries {
+        (entry.build)(app);
     }
-    // 脏块 -> RawVoxelGroups：编辑后同一渲染帧更新可见几何。
-    app.add_plugins(VoxelMeshRefreshPlugin);
-    // 预测 / 回滚绑定（单人：全部 Predicted、delay 0、无重演）。
-    app.add_plugins(PredictionPlugin);
-    register_synced_components(app);
 }
 
 impl GameModule<CoreSpec> for CoreGame {
@@ -159,6 +216,38 @@ mod tests {
         fn manifest(&self) -> &'static ModManifest {
             &PARAM_MANIFEST
         }
+    }
+
+    #[test]
+    fn build_with_profile_rejects_unknown_plugin_before_writing_anything() {
+        let mut app = App::new();
+        let error = CoreGame
+            .build_with_profile(&mut app, CoreMods::new(), &BTreeMap::new(), &["nope"])
+            .expect_err("未知插件 id 必须被拒绝");
+        assert_eq!(error.code(), "profile.unknown_plugin");
+        assert_eq!(
+            error,
+            WorldBuildError::Profile(ProfileError::UnknownPlugin {
+                id: "nope".to_string()
+            })
+        );
+        assert!(app.world().get_resource::<ParamTable>().is_none());
+    }
+
+    #[test]
+    fn build_with_profile_only_installs_selected_plugins() {
+        let mut app = App::new();
+        CoreGame
+            .build_with_profile(&mut app, CoreMods::new(), &BTreeMap::new(), &["world"])
+            .expect("最小 profile 应能装配");
+        assert!(app
+            .world()
+            .get_resource::<crate::world::IslandRegistry>()
+            .is_some());
+        assert!(app
+            .world()
+            .get_resource::<game_engine::voxel::VoxelInterner>()
+            .is_none());
     }
 
     #[test]

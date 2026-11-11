@@ -9,6 +9,7 @@
 pub mod chunk;
 pub mod island;
 pub mod load;
+pub mod profile;
 pub mod rng;
 pub mod save;
 pub mod save_plugin;
@@ -21,6 +22,9 @@ pub use chunk::{
 };
 pub use island::{Biome, Island, IslandId, IslandRegistry};
 pub use load::{load_world, LoadStats, LoadedWorld};
+pub use profile::{
+    default_plugin_selection, resolve_plugins, PluginEntry, ProfileError, PLUGIN_REGISTRY,
+};
 pub use rng::WorldRng;
 pub use save::{capture_world, write_capture, WorldCapture};
 pub use save_plugin::{

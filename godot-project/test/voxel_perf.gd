@@ -154,8 +154,8 @@ func _node_count() -> int:
 	return 0
 
 
-func _on_bevy_error(message: String) -> void:
-	push_error("[voxel_perf] Bevy 后端错误：%s" % message)
+func _on_bevy_error(code: String, message: String) -> void:
+	push_error("[voxel_perf] Bevy 后端错误 [%s]：%s" % [code, message])
 
 
 func _on_bevy_stopped(exit_code: int) -> void:

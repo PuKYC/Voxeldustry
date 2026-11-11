@@ -200,6 +200,58 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 
 关键判断：Bevy 调度不支持运行期删除或替换系统，所以替换行为一律抽成 `Strategy` trait 换资源。
 
+## 插件注册表与 profile 解析
+
+世界档的插件清单不再写死在 `add_default_plugins`：每个插件在 `game-core/src/world/profile.rs` 的 `PLUGIN_REGISTRY` 登记一条 `PluginEntry { id, requires, default_on, build }`。profile 本身只是一组 id，解析器负责补齐依赖、检测环并做确定性排序。
+
+id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
+
+`input`、`presentation`、`stable_id`、`spatial`、`aoi`、`gameplay`、`movement`、`death`、`camera`、`block_edit`、`world`、`game_voxel`、`terrain`、`streaming`、`voxel_mesh_refresh`、`prediction`、`sync_register`。
+
+`requires` 只登记代码里能证实的硬依赖：
+
+- `aoi -> spatial`
+- `movement` / `death` / `camera -> gameplay`（系统挂在 `GameplaySet` 的阶段链上）
+- `block_edit -> world, game_voxel, camera, gameplay`（系统参数要体素资源，且 `.after(camera_system)`）
+- `terrain -> game_voxel, stable_id`（build 里的 `assert!(app.is_plugin_added::<GameVoxelPlugin>())`，Startup 生成还要稳定 ID）
+- `streaming -> game_voxel, terrain, stable_id, world`（build 断言 + 启动引导要 `IslandRegistry`）
+- `voxel_mesh_refresh -> game_voxel`
+- `prediction -> presentation, input`（回滚采样接表现管线，系统读 `SimulationTick`）
+- `sync_register -> presentation`
+- 其余（`input` / `presentation` / `stable_id` / `spatial` / `gameplay` / `world` / `game_voxel`）无硬依赖。
+
+这些边来自 `assert!(app.is_plugin_added::<...>())`、系统参数需要的资源与 `.after(...)` 的排序前提，不是凭插件名字猜的。新增插件时必须同时补 `requires`；只改默认清单会让「默认能跑、裁掉依赖才晚崩」的问题重新出现。
+
+解析规则（`resolve_plugins`）：
+
+- `selection` 里的 id 必须存在，否则 `ProfileError::UnknownPlugin`；
+- `requires` 递归自动补齐（cargo feature 语义），同一 id 只装一次；
+- `requires` 指向注册表外报 `MissingDependency`；
+- DFS 检测环，报 `Cycle { chain }`（形如 `a -> b -> a`）；
+- 通过后 Kahn 拓扑排序；同一层（当前入度为 0）按 `PLUGIN_REGISTRY` 下标取最小，保证同一 profile 每次得到完全相同的装配序列；
+- `default_plugin_selection()` 返回全部 `default_on` 的 id（当前 17 个全开）；`streaming` 的 `build` 仍自己判断 `TerrainMode::Streaming`，Eager 下它在序列里但不装任何插件，旧行为零变化。
+
+装配顺序仍是硬约束。`build_with_profile` 依次执行：
+
+1. `resolve_plugins(selection)?`——失败时 App 还没有写入任何东西；
+2. `StaticDataPlugin` → `ParamTable::resolve` → 插入参数表 → `ModParamsPlugin`；
+3. `DataRegistry::new()` → `mods.apply` → 插入数据注册表；
+4. 按解析结果逐个调用 `(entry.build)(app)`。
+
+`build_with_mods` 保持原签名，行为等价于以 `default_plugin_selection()` 调 `build_with_profile`：两者共用 `apply_mods` 与「解析后逐个 build」的路径，`add_default_plugins` 只做「默认 id 解析 + 逐个 build」。
+
+|`code`|`WorldBuildError` 来源|
+| --- | --- |
+|`profile.unknown_plugin`|profile 选了注册表里不存在的 id|
+|`profile.missing_dependency`|`requires` 指向不存在的 id|
+|`profile.cycle`|插件依赖成环|
+|`mod.circular_dependency` / `mod.conflict` / `mod.exclusive_group` / `mod.duplicate_id` / `mod.param` / `mod.actions`|`WorldBuildError::Mod` 对 `ModError` 的映射|
+|`backend.panic`|runner 捕获到未预期 panic|
+
+后台入口 `CoreGameModule::build` 不再 `expect`：`build_with_profile` 失败时把 `ModuleBuildFailure { code, message }` 插进 App 并提前返回。`run_headless` 在 `build_app` 之后、发 `Started` 之前检查该资源，回送 `BevyLifecycleMsg::Error { code, message }` 与 `Stopped(1)`，直接返回 `ExitCode::FAILURE`——后台线程不 panic，也不进入主循环。Godot 侧 `bev_error(code, message)` 改为两参信号，`bevy_client.gd` 原样透传为 `bevy_error(code, message)`，测试脚本按 code + message 输出。
+
+边界：**建档时解析一次、结果随存档冻结**是本轮的设计边界，不是已实现的存档能力。解析只在 `build_with_profile` 里发生一次，运行期不提供重解析接口；本轮不把 profile / 解析结果写进 `world.meta`，`FORMAT_VERSION` 保持 2，读档仍只校验 mod 清单、World 参数与动作表。将来若要把 profile 也冻结，应在 `world.meta` 扩展段加 profile 字段并升格式版本，同时把比对加进读档阶段一。
+
 ## 注册表
 
 `Registry<T>` 的确定性约定：
@@ -220,7 +272,7 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 - `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。
 - `actions`：本 mod 声明的输入动作名（`&'static [&'static str]`，不声明则 `&[]`）。解析规则见下节。
 
-参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` 负责这个装配点。
+参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` / `build_with_profile` 负责这个装配点。
 
 ### 动作表解析
 
@@ -261,7 +313,7 @@ u64 digest                    # 覆盖头、body 表与上面全部扩展字节
 
 实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1（该文档在 `docs/待办` 下，未纳入版本库）。
 
-后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
+后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交；插件 profile 目前固定用 `default_plugin_selection()`，尚未从配置暴露。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
 
 ## 改内容时的落点
 

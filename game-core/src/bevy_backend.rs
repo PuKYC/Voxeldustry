@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
-use game_engine::backend::{self, EngineConfig, GameModule};
+use game_engine::backend::{self, EngineConfig, GameModule, ModuleBuildFailure};
 use game_engine::input::ResolvedActions;
 use game_engine::residency::MemorySoftLimitHandle;
 
@@ -21,7 +21,7 @@ use crate::spec::{ClientBridge, CoreSpec};
 use crate::static_data::ObjectTablesHandle;
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
 use crate::world::streaming::ObserverDrivenStreamingPlayer;
-use crate::world::SaveRoot;
+use crate::world::{default_plugin_selection, SaveRoot};
 
 // 消息类型由引擎定义，重导出保持 godot 侧路径不变。
 pub use game_engine::backend::{BevyControlMsg, BevyLifecycleMsg, FromBevy};
@@ -176,9 +176,20 @@ impl GameModule<CoreSpec> for CoreGameModule {
         {
             app.insert_resource(ObserverDrivenStreamingPlayer);
         }
-        CoreGame
-            .build_with_mods(app, self.mods.clone(), &self.param_overrides)
-            .expect("mod 集合与参数覆盖必须有效");
+        // 装配失败不 panic：把稳定 code + 中文说明放进资源，由 runner 在
+        // 发 Started 之前拦截并回传 Godot，然后以失败退出。
+        if let Err(error) = CoreGame.build_with_profile(
+            app,
+            self.mods.clone(),
+            &self.param_overrides,
+            &default_plugin_selection(),
+        ) {
+            app.insert_resource(ModuleBuildFailure {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            });
+            return;
+        }
         // 发布全局动作表：Godot 线程拿不到 `World`，动作名翻译与动作表查询
         // 都从这里取，否则 mod 动作在客户端永远「查无此名」。
         if let Some(resolved) = app.world().get_resource::<ResolvedActions>() {

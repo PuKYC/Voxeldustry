@@ -74,7 +74,7 @@ const DEFAULT_MATERIAL_LIBRARY_PATH := "res://bevy_client/voxel_material/voxel_m
 signal entity_added(entity: EntityData)
 signal entity_state_changed(entity: EntityData)
 signal entity_removed(entity: EntityData, reason: int)
-signal bevy_error(message: String)
+signal bevy_error(code: String, message: String)
 signal bevy_stopped(exit_code: int)
 ## 本地控制对象切换（来源：INPUTCAPS 载荷的 local / 实体变化）。
 signal controlled_entity_changed(entity: EntityData)
@@ -390,8 +390,8 @@ func _on_bevy_started() -> void:
 		input.refresh_actions()
 
 
-func _on_bevy_error(message: String) -> void:
-	bevy_error.emit(message)
+func _on_bevy_error(code: String, message: String) -> void:
+	bevy_error.emit(code, message)
 
 
 func _on_input_controlled_changed(e: EntityData) -> void:

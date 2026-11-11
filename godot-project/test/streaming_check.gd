@@ -449,8 +449,8 @@ func _fail(message: String) -> void:
 	print("[streaming_check] CHECK FAIL  %s" % message)
 
 
-func _on_client_error(message: String) -> void:
-	_fail("Bevy 错误：%s" % message)
+func _on_client_error(code: String, message: String) -> void:
+	_fail("Bevy 错误 [%s]：%s" % [code, message])
 
 
 func _on_client_stopped(exit_code: int) -> void:

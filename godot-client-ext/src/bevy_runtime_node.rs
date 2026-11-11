@@ -117,7 +117,7 @@ impl INode for BevyAppManager {
                 BevyLifecycleMsg::Started => self.emit_started(),
                 BevyLifecycleMsg::Paused => self.emit_paused(),
                 BevyLifecycleMsg::Resumed => self.emit_resumed(),
-                BevyLifecycleMsg::Error(message) => self.emit_error(message),
+                BevyLifecycleMsg::Error { code, message } => self.emit_error(code, message),
                 BevyLifecycleMsg::Custom(message) => self.emit_custom(message),
                 BevyLifecycleMsg::Stopped(exit_code) => {
                     self.cleanup_after_stop();
@@ -146,8 +146,9 @@ impl BevyAppManager {
     #[signal]
     fn bev_stopped(exit_code: i64);
 
+    /// 装配失败 / 后台 panic：`code` 是稳定错误码，`message` 是中文说明。
     #[signal]
-    fn bev_error(message: GString);
+    fn bev_error(code: GString, message: GString);
 
     #[signal]
     fn bev_custom(message: GString);
@@ -936,11 +937,12 @@ impl BevyAppManager {
             .emit_signal("bev_stopped", &[Variant::from(exit_code)]);
     }
 
-    fn emit_error(&mut self, message: String) {
+    fn emit_error(&mut self, code: String, message: String) {
+        let code = GString::from(code.as_str());
         let msg = GString::from(message.as_str());
         let _ = self
             .base_mut()
-            .emit_signal("bev_error", &[Variant::from(msg)]);
+            .emit_signal("bev_error", &[Variant::from(code), Variant::from(msg)]);
     }
 
     fn emit_custom(&mut self, message: String) {
