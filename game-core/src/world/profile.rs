@@ -320,6 +320,23 @@ pub fn default_plugin_selection() -> Vec<&'static str> {
         .collect()
 }
 
+/// 把外部（存档/配置/UI）传来的插件 id 解析成注册表内的静态 id。
+///
+/// 未知 id 返回 [ProfileError::UnknownPlugin]；只做 id 归一，依赖补齐与排序
+/// 交给 [`resolve_plugins`]。重复 id 原样保留（解析器本来就幂等去重）。
+pub fn intern_plugin_selection(ids: &[String]) -> Result<Vec<&'static str>, ProfileError> {
+    // 注册表只有 17 项，线性查够用：不为它引入 HashMap / 懒加载。
+    let mut selection = Vec::with_capacity(ids.len());
+    for id in ids {
+        let entry = PLUGIN_REGISTRY
+            .iter()
+            .find(|entry| entry.id == id.as_str())
+            .ok_or_else(|| ProfileError::UnknownPlugin { id: id.clone() })?;
+        selection.push(entry.id);
+    }
+    Ok(selection)
+}
+
 /// 按 profile 的 id 列表解析出要装配的插件，依赖自动补齐并拓扑排序。
 ///
 /// 约束：

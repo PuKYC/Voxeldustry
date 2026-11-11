@@ -21,7 +21,7 @@ use crate::spec::{ClientBridge, CoreSpec};
 use crate::static_data::ObjectTablesHandle;
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
 use crate::world::streaming::ObserverDrivenStreamingPlayer;
-use crate::world::{default_plugin_selection, SaveRoot};
+use crate::world::{default_plugin_selection, intern_plugin_selection, SaveRoot};
 
 // 消息类型由引擎定义，重导出保持 godot 侧路径不变。
 pub use game_engine::backend::{BevyControlMsg, BevyLifecycleMsg, FromBevy};
@@ -83,6 +83,10 @@ pub struct BevyBackendConfig {
     /// 参数覆盖（全 key `<mod_id>.<key>`）。在 mod `install` 之前解析校验；
     /// 世界参数随后在 `PostStartup` 冻结。默认空表。
     pub param_overrides: BTreeMap<String, i64>,
+    /// 世界插件选择（注册表 id）。None = 默认 profile（default_plugin_selection）。
+    /// Some 时空列表表示「一个可选插件都不装」，不是「用默认」；未知 id 在启动阶段
+    /// 结构化失败（ModuleBuildFailure + bev_error），不会 panic。
+    pub plugins: Option<Vec<String>>,
 }
 
 impl Default for BevyBackendConfig {
@@ -104,6 +108,7 @@ impl Default for BevyBackendConfig {
             object_tables: None,
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
+            plugins: None,
         }
     }
 }
@@ -128,6 +133,7 @@ struct CoreGameModule {
     object_tables: Option<ObjectTablesHandle>,
     mods: CoreMods,
     param_overrides: BTreeMap<String, i64>,
+    plugins: Option<Vec<String>>,
 }
 
 impl GameModule<CoreSpec> for CoreGameModule {
@@ -176,14 +182,25 @@ impl GameModule<CoreSpec> for CoreGameModule {
         {
             app.insert_resource(ObserverDrivenStreamingPlayer);
         }
+        // None 走默认 profile；Some 先归一 id（未知 id 结构化失败），再交给 build_with_profile。
+        let selection = match self.plugins.as_deref() {
+            None => default_plugin_selection(),
+            Some(ids) => match intern_plugin_selection(ids) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    app.insert_resource(ModuleBuildFailure {
+                        code: error.code().to_string(),
+                        message: error.to_string(),
+                    });
+                    return;
+                }
+            },
+        };
         // 装配失败不 panic：把稳定 code + 中文说明放进资源，由 runner 在
         // 发 Started 之前拦截并回传 Godot，然后以失败退出。
-        if let Err(error) = CoreGame.build_with_profile(
-            app,
-            self.mods.clone(),
-            &self.param_overrides,
-            &default_plugin_selection(),
-        ) {
+        if let Err(error) =
+            CoreGame.build_with_profile(app, self.mods.clone(), &self.param_overrides, &selection)
+        {
             app.insert_resource(ModuleBuildFailure {
                 code: error.code().to_string(),
                 message: error.to_string(),
@@ -245,6 +262,7 @@ pub fn run_bevy_backend(
             object_tables: config.object_tables,
             mods: config.mods,
             param_overrides: config.param_overrides,
+            plugins: config.plugins,
         },
         bridge,
         ctrl_rx,
@@ -256,6 +274,7 @@ pub fn run_bevy_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::{resolve_plugins, ActivePlugins};
     use game_engine::modding::{Mod, ModManifest, ParamScope, ParamSpec, ParamTable, ParamType};
     use std::time::Duration;
 
@@ -275,6 +294,7 @@ mod tests {
             object_tables: None,
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
+            plugins: None,
         }
     }
 
@@ -396,5 +416,91 @@ mod tests {
             .get_resource::<SaveRoot>()
             .expect("save_dir 为 Some 时必须插入 SaveRoot，否则存档层不会被启用");
         assert_eq!(root.0, save_dir);
+    }
+
+    /// 只做装配、不跑调度：插件选择测试只需要看 App 里留下了什么资源。
+    fn assembly_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app
+    }
+
+    /// plugins = None 必须与旧行为逐项一致：默认 profile 的解析结果（装配顺序）。
+    ///
+    /// `ActivePlugins` 记的是 resolve 之后的序列，不是注册表顺序——例如
+    /// `block_edit` 会被排到它依赖的 world / game_voxel / camera / gameplay 之后。
+    #[test]
+    fn plugins_none_uses_default_profile() {
+        let mut app = assembly_app();
+        let mut module = module(TerrainMode::Eager, None);
+        module.plugins = None;
+        module.build(&mut app);
+
+        let expected: Vec<&str> = resolve_plugins(&default_plugin_selection())
+            .expect("默认 profile 必须可解析")
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(
+            app.world().resource::<ActivePlugins>().ids(),
+            &expected[..],
+            "None 必须装配默认 profile（default_plugin_selection 的解析结果）"
+        );
+    }
+
+    /// 显式选择只装选中的插件（及其依赖）；顺序以 resolve 结果为准，不写死。
+    #[test]
+    fn plugins_some_overrides_selection() {
+        let mut app = assembly_app();
+        let mut module = module(TerrainMode::Eager, None);
+        module.plugins = Some(vec!["input".to_string(), "presentation".to_string()]);
+        module.build(&mut app);
+
+        let active = app.world().resource::<ActivePlugins>();
+        assert_eq!(active.ids().len(), 2, "只应装配选中的两个插件");
+        assert!(active.ids().contains(&"input"));
+        assert!(active.ids().contains(&"presentation"));
+        assert!(
+            app.world().get_resource::<ModuleBuildFailure>().is_none(),
+            "合法选择不应留下 ModuleBuildFailure"
+        );
+    }
+
+    /// 选择叶子插件时，requires 必须自动补齐（block_edit -> world/game_voxel/camera/gameplay）。
+    #[test]
+    fn plugins_some_auto_adds_requires() {
+        let mut app = assembly_app();
+        let mut module = module(TerrainMode::Eager, None);
+        module.plugins = Some(vec!["block_edit".to_string()]);
+        module.build(&mut app);
+
+        let active = app.world().resource::<ActivePlugins>();
+        for required in ["block_edit", "world", "game_voxel", "camera", "gameplay"] {
+            assert!(
+                active.ids().contains(&required),
+                "REQUIRES_BLOCK_EDIT 要求装配 {required}，实际：{:?}",
+                active.ids()
+            );
+        }
+    }
+
+    /// 未知 id 结构化失败：只留 ModuleBuildFailure，不 panic，也不写入 ActivePlugins。
+    #[test]
+    fn unknown_plugin_fails_structurally() {
+        let mut app = assembly_app();
+        let mut module = module(TerrainMode::Eager, None);
+        module.plugins = Some(vec!["no_such_plugin".to_string()]);
+        module.build(&mut app);
+
+        let failure = app
+            .world()
+            .get_resource::<ModuleBuildFailure>()
+            .expect("未知插件必须留下 ModuleBuildFailure");
+        assert_eq!(failure.code, "profile.unknown_plugin");
+        assert!(
+            app.world().get_resource::<ActivePlugins>().is_none(),
+            "解析失败必须零写入（不能有 ActivePlugins）"
+        );
     }
 }

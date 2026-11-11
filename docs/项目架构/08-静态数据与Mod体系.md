@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 @ 2026-11-11"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11"
 ---
 
 # 静态数据与 Mod 体系
@@ -259,6 +259,12 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 - 代价是注册表任何变动都会让旧档打不开（`MissingPlugin` / `UnexpectedPlugin` / `PluginOrderMismatch`），这是刻意选的硬门槛，与动作表同一路线；迁移工具将来再做。
 
 装配点早于读档：后台线程启动时 `CoreGameModule::build` 就按 profile 建好 App，`StreamingWorldPlugin` 在 `Startup` 才真正 `load_world`。因此「用哪些插件装配」必须来自档本身或建档选择，不能等读完档再决定。
+
+插件选择从哪来：后台启动配置 `BevyBackendConfig.plugins: Option<Vec<String>>`（经 `CoreGameModule` 搬运到 `build_with_profile`）。`None` = 默认 profile（`default_plugin_selection()`），既有入口行为零变化；`Some` 先经 `intern_plugin_selection` 把运行期 String 收敛成注册表里的 `&'static str`。
+
+`Some(vec![])` **不是**「用默认」，而是「一个可选插件都不装」——空集合是合法的显式选择，不会回退。
+
+未知 id 不 panic：`intern_plugin_selection` 返回 `ProfileError::UnknownPlugin`，`CoreGameModule::build` 把它写成 `ModuleBuildFailure { code: "profile.unknown_plugin", .. }`，由 runner 转成 `bev_error(code, message)` + `Stopped(1)`。Godot 入口是 `start_bevy_streaming_with_plugins(fixed_hz, runner_hz, save_dir, plugins)`，其余参数与 `start_bevy_streaming` 一致。
 
 ## 注册表
 

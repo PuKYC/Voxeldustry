@@ -243,6 +243,33 @@ impl BevyAppManager {
         });
     }
 
+    /// 流式体素场景 + 显式插件选择（其余参数与 start_bevy_streaming 完全一致）。
+    ///
+    /// `plugins` 原样交给后台装配：空数组表示一个可选插件都不装（不是默认
+    /// profile）；未知 id 不会 panic，会以 bev_error(code="profile.unknown_plugin",
+    /// message) 结构化回传并以失败退出。
+    #[func]
+    fn start_bevy_streaming_with_plugins(
+        &mut self,
+        fixed_hz: f64,
+        runner_hz: f64,
+        save_dir: GString,
+        plugins: PackedStringArray,
+    ) {
+        let save_dir = save_dir.to_string();
+        self.start_backend(BevyBackendConfig {
+            fixed_hz,
+            runner_hz,
+            enable_demo: false,
+            terrain: Some(TerrainConfig::default()),
+            voxel_viewer: true,
+            terrain_mode: TerrainMode::Streaming,
+            save_dir: godot_save_dir(&save_dir),
+            plugins: Some(presentation_bridge::packed_strings_to_vec(&plugins)),
+            ..BevyBackendConfig::default()
+        });
+    }
+
     /// 启动体素性能场景：给定半径 / max_lod 的地形 + 每 tick 移动的观察者。
     ///
     /// `radius_blocks` 是 x/z 上围绕世界原点的基础子块半径（1 块 = 32 体素 ≈ 14.4 m），
