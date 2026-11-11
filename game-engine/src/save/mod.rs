@@ -47,8 +47,8 @@ pub use codec::{
 };
 pub use content::{export_chunk, install_chunk};
 pub use format::{
-    digest, region_of, splitmix64, AttachTag, BodyKind, BodyRecord, ComponentRecord, RegionFile,
-    WorldMeta, BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT,
+    digest, region_of, splitmix64, AttachTag, BodyKind, BodyRecord, ComponentRecord, ModRecord,
+    RegionFile, WorldMeta, BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT,
     MAX_CHUNK_COUNT, MAX_COMPONENT_PAYLOAD_LEN, MAX_RECORD_LEN, MAX_REGION_FILE_LEN,
     PROPOSAL_RECORD_LEN, REGION_HEADER_LEN, REGION_INDEX_ENTRY_LEN, REGION_MAGIC, REGION_SIZE,
     WORLD_HEADER_LEN, WORLD_MAGIC,
@@ -138,7 +138,7 @@ impl fmt::Display for SaveError {
 
 impl std::error::Error for SaveError {}
 
-/// SaveError 的失败类别。所有变体都只含整数/静态串，方便断言与日志。
+/// SaveError 的失败类别。除诊断文本（Payload / Param）外只含整数/静态串，方便断言与日志。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SaveErrorKind {
     /// 字节不够：需要 need，实际只剩 have。
@@ -205,6 +205,10 @@ pub enum SaveErrorKind {
     ///
     /// `what` 是阶段（postcard encode / decode），`detail` 是原始错误文本。
     Payload { what: &'static str, detail: String },
+    /// 字符串字段不是合法 UTF-8。
+    InvalidString { what: &'static str },
+    /// 插件参数与当前 schema 不一致（加载时由 ParamTable 校验）。
+    Param { detail: String },
 }
 
 impl fmt::Display for SaveErrorKind {
@@ -257,6 +261,8 @@ impl fmt::Display for SaveErrorKind {
                 )
             }
             Self::Payload { what, detail } => write!(f, "{what} failed: {detail}"),
+            Self::InvalidString { what } => write!(f, "invalid UTF-8 in {what}"),
+            Self::Param { detail } => write!(f, "plugin parameter mismatch: {detail}"),
             Self::BodyKeyMismatch { map, record } => {
                 write!(f, "body map key {map} != record id {record}")
             }

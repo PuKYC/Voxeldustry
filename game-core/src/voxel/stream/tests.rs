@@ -1185,6 +1185,8 @@ fn entity_only_record_survives_unedited_unload() {
         world_tick: 0,
         next_stable_entity_id: body.as_u64().max(entity_id.0) + 1,
         bodies: BTreeMap::new(),
+        mods: Vec::new(),
+        params: Vec::new(),
     };
     meta.bodies.insert(
         body,

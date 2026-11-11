@@ -35,9 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use bevy::prelude::{Entity, World};
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableIdAllocator};
+use game_engine::modding::ParamTable;
 use game_engine::save::{
     capture as capture_snapshot, export_chunk, read_region, region_of, write_region,
-    write_world_meta, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord,
+    write_world_meta, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord, ModRecord,
     OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths, WorldMeta,
 };
 use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelDirtySet, VoxelInterner};
@@ -206,12 +207,30 @@ pub fn capture_world(
         body_table.insert(key, record);
     }
 
+    // 参数表是可选资源：直接搭 World 的单测没有它，此时按「没有 mod / 没有覆盖」落盘。
+    // 生产装配里 `CoreGame` 一定先插 `ParamTable`，所以真存档不会丢 mod 清单。
+    let (mods, params) = match world.get_resource::<ParamTable>() {
+        Some(table) => (
+            table
+                .mods()
+                .map(|(id, version)| ModRecord {
+                    id: id.to_string(),
+                    version,
+                })
+                .collect(),
+            table.world_values(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+
     Ok(WorldCapture {
         meta: WorldMeta {
             seed,
             world_tick,
             next_stable_entity_id,
             bodies: body_table,
+            mods,
+            params,
         },
         regions,
     })
@@ -497,6 +516,8 @@ mod tests {
                 world_tick: 99,
                 next_stable_entity_id: 41,
                 bodies: BTreeMap::new(),
+                mods: Vec::new(),
+                params: Vec::new(),
             }
         );
         assert!(capture.regions.is_empty(), "空世界不产生 region");

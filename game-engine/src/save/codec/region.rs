@@ -2,10 +2,11 @@
 
 use super::reader::{field_path, indexed_path, read_u64_at, u32_len, Reader, Writer};
 use super::record::{decode_record, encode_record};
-use super::{expect_eq, expect_max, expect_nonzero, expect_reserved_zero, expect_supported};
+use super::{expect_eq, expect_max, expect_nonzero, expect_reserved_zero};
 use crate::save::format::{
     digest, ChunkRecord, RegionFile, DIGEST_LEN, FORMAT_VERSION, MAX_CHUNK_COUNT, MAX_RECORD_LEN,
-    MAX_REGION_FILE_LEN, REGION_HEADER_LEN, REGION_INDEX_ENTRY_LEN, REGION_MAGIC,
+    MAX_REGION_FILE_LEN, MIN_SUPPORTED_FORMAT_VERSION, REGION_HEADER_LEN, REGION_INDEX_ENTRY_LEN,
+    REGION_MAGIC,
 };
 use crate::save::{SaveError, SaveErrorKind};
 use ::voxel::ChunkKey;
@@ -234,14 +235,16 @@ pub(crate) fn check_header(bytes: &[u8]) -> Result<RegionHeader, SaveError> {
     }
 
     let format_version = reader.u16("region.format_version")?;
-    expect_supported(
-        "region",
-        "format_version",
-        R_FORMAT_VERSION,
-        "format_version",
-        u64::from(FORMAT_VERSION),
-        u64::from(format_version),
-    )?;
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&format_version) {
+        return Err(SaveError::new(
+            "region.format_version",
+            R_FORMAT_VERSION,
+            SaveErrorKind::Unsupported {
+                what: "format_version",
+                value: u64::from(format_version),
+            },
+        ));
+    }
 
     let header_len = reader.u16("region.header_len")?;
     expect_eq(

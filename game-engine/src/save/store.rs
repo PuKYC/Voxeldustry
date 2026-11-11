@@ -752,6 +752,8 @@ mod tests {
             world_tick: 0,
             next_stable_entity_id: 0,
             bodies: table,
+            mods: Vec::new(),
+            params: Vec::new(),
         }
     }
 
@@ -1116,6 +1118,8 @@ mod tests {
             world_tick: 99,
             next_stable_entity_id: 7,
             bodies: BTreeMap::new(),
+            mods: Vec::new(),
+            params: Vec::new(),
         };
         let target = write_world_meta(&paths, &meta).expect("写 world.meta");
 

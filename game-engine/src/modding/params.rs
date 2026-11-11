@@ -179,6 +179,18 @@ pub struct ParamEntry {
     pub value: i64,
 }
 
+/// 一条随存档落盘的参数值（world.meta v2 参数段）。
+///
+/// `ty` / `scale` 只用于加载时和当前 schema 逐项比对；真正决定值是否合法
+/// 的仍是 `ParamSpec::ty`。key 是全 key（`<mod_id>.<key>`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParamRecord {
+    pub key: String,
+    pub ty: u8,
+    pub scale: u32,
+    pub value: i64,
+}
+
 /// 参数错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamError {
@@ -198,6 +210,20 @@ pub enum ParamError {
     InvalidEnum { key: String, value: i64 },
     /// 世界参数在冻结后被修改。
     Frozen { key: String },
+    /// 存档里的类型标签与当前 schema 不一致。
+    TypeMismatch {
+        key: String,
+        expected: u8,
+        found: u8,
+    },
+    /// 存档里的定点 scale 与当前 schema 不一致。
+    ScaleMismatch {
+        key: String,
+        expected: u32,
+        found: u32,
+    },
+    /// 存档里出现了非世界作用域的参数（只有 World 允许落盘）。
+    NotWorldScope { key: String },
 }
 
 impl std::fmt::Display for ParamError {
@@ -223,6 +249,25 @@ impl std::fmt::Display for ParamError {
             ParamError::Frozen { key } => {
                 write!(f, "世界参数 {key} 已冻结，不能再改")
             }
+            ParamError::TypeMismatch {
+                key,
+                expected,
+                found,
+            } => write!(
+                f,
+                "参数 {key} 的类型 {found} 与当前 schema 的 {expected} 不一致"
+            ),
+            ParamError::ScaleMismatch {
+                key,
+                expected,
+                found,
+            } => write!(
+                f,
+                "参数 {key} 的 scale {found} 与当前 schema 的 {expected} 不一致"
+            ),
+            ParamError::NotWorldScope { key } => {
+                write!(f, "参数 {key} 不是世界参数，不能写入存档")
+            }
         }
     }
 }
@@ -233,6 +278,8 @@ impl std::error::Error for ParamError {}
 #[derive(Resource, Default, Clone, Debug)]
 pub struct ParamTable {
     entries: BTreeMap<String, ParamEntry>,
+    /// 本表来自哪些 mod（id -> version），按 id 升序；随存档落盘用于诊断。
+    mods: BTreeMap<String, u32>,
 }
 
 impl ParamTable {
@@ -246,8 +293,10 @@ impl ParamTable {
         overrides: &BTreeMap<String, i64>,
     ) -> Result<Self, ParamError> {
         let mut entries: BTreeMap<String, ParamEntry> = BTreeMap::new();
+        let mut mods: BTreeMap<String, u32> = BTreeMap::new();
 
         for manifest in manifests {
+            mods.insert(manifest.id.to_string(), manifest.version);
             for spec in manifest.params {
                 if spec.key.is_empty() {
                     return Err(ParamError::InvalidSpec {
@@ -274,7 +323,88 @@ impl ParamTable {
             }
         }
 
-        Ok(Self { entries })
+        Ok(Self { entries, mods })
+    }
+
+    /// 本参数表覆盖的 mod（id -> version），按 id 升序。
+    pub fn mods(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.mods
+            .iter()
+            .map(|(id, version)| (id.as_str(), *version))
+    }
+
+    /// 需要随存档落盘的世界参数，按全 key 升序。
+    pub fn world_values(&self) -> Vec<ParamRecord> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.spec.scope == ParamScope::World)
+            .map(|(key, entry)| ParamRecord {
+                key: key.clone(),
+                ty: entry.spec.ty.tag(),
+                scale: match entry.spec.ty {
+                    ParamType::Fixed { scale, .. } => scale,
+                    _ => 0,
+                },
+                value: entry.value,
+            })
+            .collect()
+    }
+
+    /// 校验一份存档参数值能否套用到当前 schema，不修改任何值。
+    ///
+    /// 缺失的 key 保持当前值（默认值）；未知 key、作用域不符、类型/scale 不符、
+    /// 值越界都直接拒绝，不静默忽略。
+    pub fn validate_saved(&self, records: &[ParamRecord]) -> Result<(), ParamError> {
+        for record in records {
+            let entry = self
+                .entries
+                .get(&record.key)
+                .ok_or_else(|| ParamError::UnknownKey {
+                    key: record.key.clone(),
+                })?;
+            let spec = entry.spec;
+            if spec.scope != ParamScope::World {
+                return Err(ParamError::NotWorldScope {
+                    key: record.key.clone(),
+                });
+            }
+            let expected = spec.ty.tag();
+            if record.ty != expected {
+                return Err(ParamError::TypeMismatch {
+                    key: record.key.clone(),
+                    expected,
+                    found: record.ty,
+                });
+            }
+            let expected_scale = match spec.ty {
+                ParamType::Fixed { scale, .. } => scale,
+                _ => 0,
+            };
+            if record.scale != expected_scale {
+                return Err(ParamError::ScaleMismatch {
+                    key: record.key.clone(),
+                    expected: expected_scale,
+                    found: record.scale,
+                });
+            }
+            spec.ty
+                .validate_value(record.value)
+                .map_err(|error| error.into_param(record.key.clone(), record.value))?;
+        }
+        Ok(())
+    }
+
+    /// 把已通过 [`Self::validate_saved`] 的存档值写回表。
+    pub fn apply_saved(&mut self, records: &[ParamRecord]) -> Result<(), ParamError> {
+        self.validate_saved(records)?;
+        for record in records {
+            let entry = self
+                .entries
+                .get_mut(&record.key)
+                .expect("validate_saved 已确认 key 存在");
+            entry.value = record.value;
+        }
+        Ok(())
     }
 
     /// 按全 key 取一项。

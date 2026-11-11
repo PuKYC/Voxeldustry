@@ -32,6 +32,7 @@ use bevy::prelude::{warn, Entity, Resource, World};
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
 use game_engine::math::{FixedPoint, Vec3F};
+use game_engine::modding::ParamTable;
 use game_engine::residency::ChunkAnchor;
 use game_engine::save::{
     install_chunk, read_region, read_world_meta, reclaim_orphans, region_of, regions_on_disk,
@@ -104,6 +105,7 @@ pub fn load_world(
 
     // 阶段二：先确认所有必需资源都在，再开始写世界。
     require_resources(world)?;
+    apply_meta_params(world, &plan.meta)?;
     let body_entities = spawn_plan_bodies(world, &plan)?;
     let stale_chunks = install_plan_chunks(world, &plan, &body_entities, generator_version)?;
     let entities = apply_plan_entities(world, &plan)?;
@@ -165,6 +167,7 @@ fn build_plan(
     generator_version: u32,
 ) -> Result<Plan, SaveError> {
     validate_meta(&meta)?;
+    validate_meta_params(world, &meta)?;
 
     let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
     let mut bodies: Vec<BodyPlan> = Vec::with_capacity(meta.bodies.len());
@@ -322,6 +325,40 @@ fn validate_next_stable_id(
         ));
     }
     Ok(())
+}
+
+/// 阶段一：按当前插件 schema 校验存档里的世界参数。
+///
+/// 空参数段不要求 `ParamTable`（旧存档 / 无参数装配）；非空时缺表即报错，
+/// 未知 key、类型 / scale 不符、越界都由 [ParamTable::validate_saved] 拒绝。
+fn validate_meta_params(world: &World, meta: &WorldMeta) -> Result<(), SaveError> {
+    if meta.params.is_empty() {
+        return Ok(());
+    }
+    let table = world
+        .get_resource::<ParamTable>()
+        .ok_or_else(|| missing_resource("ParamTable"))?;
+    table.validate_saved(&meta.params).map_err(param_error)
+}
+
+/// 阶段二：把已校验的世界参数写回 `ParamTable`（必须在 `WorldParamsFrozen` 之前）。
+fn apply_meta_params(world: &mut World, meta: &WorldMeta) -> Result<(), SaveError> {
+    if meta.params.is_empty() {
+        return Ok(());
+    }
+    let Some(mut table) = world.get_resource_mut::<ParamTable>() else {
+        return Err(missing_resource("ParamTable"));
+    };
+    table.apply_saved(&meta.params).map_err(param_error)
+}
+
+fn param_error(error: game_engine::modding::ParamError) -> SaveError {
+    SaveError::semantic(
+        "load.meta.params",
+        SaveErrorKind::Param {
+            detail: error.to_string(),
+        },
+    )
 }
 
 /// 阶段一：校验 meta 自身（解码器已做的检查之外，世界级语义再查一遍）。

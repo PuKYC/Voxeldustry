@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use ::voxel::ChunkKey;
 
 use crate::body_key::BodyKey;
+use crate::modding::ParamRecord;
 
 pub use crate::streaming::{ChunkRecord, EntityRecord};
 
@@ -15,8 +16,12 @@ pub use crate::streaming::{ChunkRecord, EntityRecord};
 pub const WORLD_MAGIC: [u8; 8] = *b"VXWORLD\0";
 /// region 文件魔数：b"VXREGION"（§3 偏移 0）。
 pub const REGION_MAGIC: [u8; 8] = *b"VXREGION";
-/// 世界格式版本；未来只升不降（§2 偏移 8 / §6.1）。
-pub const FORMAT_VERSION: u16 = 1;
+/// 当前世界格式版本；未来只升不降（§2 偏移 8 / §6.1）。
+///
+/// v2 在 body 表之后追加「mod 清单 + 世界参数」段；v1 存档仍可读。
+pub const FORMAT_VERSION: u16 = 2;
+/// 仍可读取的最低格式版本（§6.1 支持区间 `MIN_SUPPORTED..=CURRENT`）。
+pub const MIN_SUPPORTED_FORMAT_VERSION: u16 = 1;
 /// 组件负载编码；v1 = 1 = postcard 1.1.3（§2 偏移 12 / §4.3）。
 pub const CODEC_ID: u16 = 1;
 /// world.meta 头长（§2 偏移 10）。
@@ -33,6 +38,14 @@ pub const PROPOSAL_RECORD_LEN: usize = 56;
 pub const DIGEST_LEN: usize = 8;
 /// body 表上限（§2 偏移 40）。
 pub const MAX_BODY_COUNT: u32 = 65_536;
+/// v2 mod 清单条数上限。
+pub const MAX_MOD_COUNT: u32 = 4_096;
+/// v2 世界参数条数上限。
+pub const MAX_PARAM_COUNT: u32 = 4_096;
+/// mod id 的 UTF-8 字节长度上限。
+pub const MAX_MOD_ID_LEN: u16 = 255;
+/// 参数全 key 的 UTF-8 字节长度上限。
+pub const MAX_PARAM_KEY_LEN: u16 = 255;
 /// 单 region 区块数上限（§3 偏移 12）。
 pub const MAX_CHUNK_COUNT: u32 = 64;
 /// 单条记录体长度上限（§0）。
@@ -166,9 +179,19 @@ pub struct BodyRecord {
     pub attach_to: BodyKey,
 }
 
+/// v2 mod 清单里的一条记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModRecord {
+    /// mod 的稳定 id。
+    pub id: String,
+    /// mod 版本号；用于诊断，是否兼容由加载方决定。
+    pub version: u32,
+}
+
 /// world.meta 的内存形态（§2）。
 ///
 /// bodies 用 BTreeMap 保证按 BodyKey 严格升序写盘/读盘，不看任何 HashMap 顺序（§8）。
+/// v2 的 mods / params 在加载时已按 id / key 排序，编码时仍会复查。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct WorldMeta {
     /// 世界种子（§2 偏移 16）。
@@ -179,6 +202,10 @@ pub struct WorldMeta {
     pub next_stable_entity_id: u64,
     /// body 表：键必须等于 BodyRecord::id；最多 MAX_BODY_COUNT 条。
     pub bodies: BTreeMap<BodyKey, BodyRecord>,
+    /// v2：本存档加载的 mod 清单，按 id 严格升序；v1 解码结果为空。
+    pub mods: Vec<ModRecord>,
+    /// v2：随存档保存的世界参数，按全 key 严格升序；v1 解码结果为空。
+    pub params: Vec<ParamRecord>,
 }
 
 impl WorldMeta {

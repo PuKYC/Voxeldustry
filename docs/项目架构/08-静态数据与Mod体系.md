@@ -221,6 +221,10 @@ Godot 侧（`godot-client-ext/src/bevy_runtime_node.rs`）：
 
 参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` 负责这个装配点。
 
+保存时，`capture_world` 从 `ParamTable` 取 mod 清单（id + version）与全部 World 参数，写进 `world.meta` v2 扩展段（`ParamTable::mods()` / `world_values()`）；Debug 参数不落盘。读档在阶段一用 `ParamTable::validate_saved` 按当前 schema 校验：缺失 key 保持默认值，未知 key、非 World 作用域、类型 / scale 不符、值越界都拒绝整档；阶段二在 `WorldParamsFrozen` 冻结前用 `apply_saved` 写回。格式版本升到 2，读取同时接受 1..=2；v1 存档视为空清单 / 空参数。mod 清单目前只记录，不做版本协商，也不因缺 mod 拒档。
+
+实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1。
+
 后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
 
 ## 改内容时的落点

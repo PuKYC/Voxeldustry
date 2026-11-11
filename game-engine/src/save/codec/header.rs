@@ -3,9 +3,11 @@
 use super::reader::{field_path, indexed_path, read_u64_at, u32_len, Reader, Writer};
 use crate::body_key::BodyKey;
 use crate::identity::StableEntityId;
+use crate::modding::ParamRecord;
 use crate::save::format::{
-    digest, AttachTag, BodyKind, BodyRecord, WorldMeta, BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN,
-    FORMAT_VERSION, MAX_BODY_COUNT, WORLD_HEADER_LEN, WORLD_MAGIC,
+    digest, AttachTag, BodyKind, BodyRecord, ModRecord, WorldMeta, BODY_RECORD_LEN, CODEC_ID,
+    DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT, MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT,
+    MAX_PARAM_KEY_LEN, MIN_SUPPORTED_FORMAT_VERSION, WORLD_HEADER_LEN, WORLD_MAGIC,
 };
 use crate::save::{SaveError, SaveErrorKind};
 use std::collections::BTreeMap;
@@ -177,9 +179,159 @@ pub fn encode_world_meta(meta: &WorldMeta) -> Result<Vec<u8>, SaveError> {
         writer.u64(body.attach_to.as_u64());
     }
 
+    encode_extension(&mut writer, meta)?;
     let digest_value = digest(&writer.buf);
     writer.u64(digest_value);
     Ok(writer.into_vec())
+}
+
+/// 编码 v2 追加段：mod 清单 + 世界参数（均按 key 严格升序）。
+fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveError> {
+    let mod_count = u32::try_from(meta.mods.len()).unwrap_or(u32::MAX);
+    if mod_count > MAX_MOD_COUNT {
+        return Err(SaveError::new(
+            "world.meta.mod_count",
+            writer.len(),
+            SaveErrorKind::TooLarge {
+                what: "mod_count",
+                value: u64::from(mod_count),
+                max: u64::from(MAX_MOD_COUNT),
+            },
+        ));
+    }
+    writer.u32(mod_count);
+    let mut previous: Option<&str> = None;
+    for (index, record) in meta.mods.iter().enumerate() {
+        let path = indexed_path("world.meta", "mod", index);
+        validate_ordered_string(
+            &path,
+            "id",
+            &record.id,
+            previous,
+            MAX_MOD_ID_LEN,
+            writer.len(),
+        )?;
+        previous = Some(&record.id);
+        writer.u16(u16::try_from(record.id.len()).expect("长度已校验"));
+        writer.bytes(record.id.as_bytes());
+        writer.u32(record.version);
+    }
+
+    let param_count = u32::try_from(meta.params.len()).unwrap_or(u32::MAX);
+    if param_count > MAX_PARAM_COUNT {
+        return Err(SaveError::new(
+            "world.meta.param_count",
+            writer.len(),
+            SaveErrorKind::TooLarge {
+                what: "param_count",
+                value: u64::from(param_count),
+                max: u64::from(MAX_PARAM_COUNT),
+            },
+        ));
+    }
+    writer.u32(param_count);
+    let mut previous: Option<&str> = None;
+    for (index, record) in meta.params.iter().enumerate() {
+        let path = indexed_path("world.meta", "param", index);
+        validate_ordered_string(
+            &path,
+            "key",
+            &record.key,
+            previous,
+            MAX_PARAM_KEY_LEN,
+            writer.len(),
+        )?;
+        previous = Some(&record.key);
+        encode_param_record(writer, &path, record)?;
+    }
+    Ok(())
+}
+
+/// 校验字符串非空、长度受限且严格升序，并返回可写盘的长度。
+fn validate_ordered_string(
+    path: &str,
+    field: &str,
+    value: &str,
+    previous: Option<&str>,
+    max_len: u16,
+    offset: usize,
+) -> Result<(), SaveError> {
+    if value.is_empty() {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::InvalidValue {
+                what: "string (must be non-empty)",
+                value: 0,
+            },
+        ));
+    }
+    if value.len() > usize::from(max_len) {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::TooLarge {
+                what: "string length",
+                value: value.len() as u64,
+                max: u64::from(max_len),
+            },
+        ));
+    }
+    if previous.is_some_and(|previous| value <= previous) {
+        return Err(SaveError::new(
+            field_path(path, field),
+            offset,
+            SaveErrorKind::InvalidValue {
+                what: "string order (must be strictly increasing)",
+                value: 0,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// 编码一条参数记录：key_len + key + ty + scale + value。
+fn encode_param_record(
+    writer: &mut Writer,
+    path: &str,
+    record: &ParamRecord,
+) -> Result<(), SaveError> {
+    if record.ty > 3 {
+        return Err(SaveError::new(
+            field_path(path, "ty"),
+            writer.len(),
+            SaveErrorKind::Unsupported {
+                what: "param type tag",
+                value: u64::from(record.ty),
+            },
+        ));
+    }
+    if record.ty == 0 && record.value != 0 && record.value != 1 {
+        return Err(SaveError::new(
+            field_path(path, "value"),
+            writer.len(),
+            SaveErrorKind::InvalidValue {
+                what: "bool param value",
+                value: record.value,
+            },
+        ));
+    }
+    if record.ty != 2 && record.scale != 0 {
+        return Err(SaveError::new(
+            field_path(path, "scale"),
+            writer.len(),
+            SaveErrorKind::InvalidValue {
+                what: "scale on non-Fixed param",
+                value: i64::from(record.scale),
+            },
+        ));
+    }
+    writer.u16(u16::try_from(record.key.len()).expect("长度已校验"));
+    writer.bytes(record.key.as_bytes());
+    writer.u8(record.ty);
+    writer.u32(record.scale);
+    writer.i64(record.value);
+    Ok(())
 }
 
 /// 解码 world.meta（§2）。
@@ -217,7 +369,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
     }
 
     let format_version = reader.u16("world.meta.format_version")?;
-    if format_version != FORMAT_VERSION {
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&format_version) {
         return Err(SaveError::new(
             "world.meta.format_version",
             W_FORMAT_VERSION,
@@ -293,15 +445,15 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         ));
     }
 
-    let expected_len = header + u32_len(body_count) * BODY_RECORD_LEN + DIGEST_LEN;
-    if bytes.len() != expected_len {
+    let body_end = header + u32_len(body_count) * BODY_RECORD_LEN;
+    let min_len = body_end + DIGEST_LEN;
+    if bytes.len() < min_len {
         return Err(SaveError::new(
             "world.meta.file_len",
-            bytes.len().min(expected_len),
-            SaveErrorKind::Inconsistent {
-                what: "file length for body_count",
-                expected: expected_len as u64,
-                found: bytes.len() as u64,
+            bytes.len(),
+            SaveErrorKind::Truncated {
+                need: min_len,
+                have: bytes.len(),
             },
         ));
     }
@@ -452,7 +604,38 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         }
     }
 
-    let digest_offset = header + u32_len(body_count) * BODY_RECORD_LEN;
+    let (mods, params, digest_offset) = if format_version >= 2 {
+        let payload_end = bytes.len() - DIGEST_LEN;
+        let mut extension = Reader::new(&bytes[body_end..payload_end], body_end);
+        let mut mods = Vec::new();
+        let mut params = Vec::new();
+        decode_extension(&mut extension, &mut mods, &mut params)?;
+        if extension.remaining() != 0 {
+            return Err(SaveError::new(
+                "world.meta.file_len",
+                extension.offset(),
+                SaveErrorKind::TrailingBytes {
+                    extra: extension.remaining(),
+                },
+            ));
+        }
+        (mods, params, payload_end)
+    } else {
+        let expected_len = body_end + DIGEST_LEN;
+        if bytes.len() != expected_len {
+            return Err(SaveError::new(
+                "world.meta.file_len",
+                bytes.len().min(expected_len),
+                SaveErrorKind::Inconsistent {
+                    what: "file length for body_count",
+                    expected: expected_len as u64,
+                    found: bytes.len() as u64,
+                },
+            ));
+        }
+        (Vec::new(), Vec::new(), body_end)
+    };
+
     let stored = read_u64_at(bytes, digest_offset);
     let computed = digest(&bytes[..digest_offset]);
     if stored != computed {
@@ -468,5 +651,184 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         world_tick,
         next_stable_entity_id,
         bodies,
+        mods,
+        params,
     })
+}
+
+/// 解码 v2 追加段；调用方保证 Reader 的切片在 digest 之前正好覆盖扩展区。
+fn decode_extension(
+    reader: &mut Reader,
+    mods: &mut Vec<ModRecord>,
+    params: &mut Vec<ParamRecord>,
+) -> Result<(), SaveError> {
+    let count_offset = reader.offset();
+    let mod_count = reader.u32("world.meta.mod_count")?;
+    if mod_count > MAX_MOD_COUNT {
+        return Err(SaveError::new(
+            "world.meta.mod_count",
+            count_offset,
+            SaveErrorKind::TooLarge {
+                what: "mod_count",
+                value: u64::from(mod_count),
+                max: u64::from(MAX_MOD_COUNT),
+            },
+        ));
+    }
+    let mut previous: Option<String> = None;
+    for index in 0..u32_len(mod_count) {
+        let path = indexed_path("world.meta", "mod", index);
+        let len_offset = reader.offset();
+        let id_len = reader.u16(&field_path(&path, "id_len"))?;
+        if id_len > MAX_MOD_ID_LEN {
+            return Err(SaveError::new(
+                field_path(&path, "id_len"),
+                len_offset,
+                SaveErrorKind::TooLarge {
+                    what: "mod id length",
+                    value: u64::from(id_len),
+                    max: u64::from(MAX_MOD_ID_LEN),
+                },
+            ));
+        }
+        let id_offset = reader.offset();
+        let raw = reader.take(usize::from(id_len), &field_path(&path, "id"))?;
+        let id = std::str::from_utf8(raw).map_err(|_| {
+            SaveError::new(
+                field_path(&path, "id"),
+                id_offset,
+                SaveErrorKind::InvalidString { what: "mod id" },
+            )
+        })?;
+        if id.is_empty() {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                id_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "mod id (must be non-empty)",
+                    value: 0,
+                },
+            ));
+        }
+        if previous.as_deref().is_some_and(|previous| id <= previous) {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                id_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "mod id order (must be strictly increasing)",
+                    value: 0,
+                },
+            ));
+        }
+        let version = reader.u32(&field_path(&path, "version"))?;
+        let id = id.to_string();
+        previous = Some(id.clone());
+        mods.push(ModRecord { id, version });
+    }
+
+    let count_offset = reader.offset();
+    let param_count = reader.u32("world.meta.param_count")?;
+    if param_count > MAX_PARAM_COUNT {
+        return Err(SaveError::new(
+            "world.meta.param_count",
+            count_offset,
+            SaveErrorKind::TooLarge {
+                what: "param_count",
+                value: u64::from(param_count),
+                max: u64::from(MAX_PARAM_COUNT),
+            },
+        ));
+    }
+    let mut previous: Option<String> = None;
+    for index in 0..u32_len(param_count) {
+        let path = indexed_path("world.meta", "param", index);
+        let len_offset = reader.offset();
+        let key_len = reader.u16(&field_path(&path, "key_len"))?;
+        if key_len > MAX_PARAM_KEY_LEN {
+            return Err(SaveError::new(
+                field_path(&path, "key_len"),
+                len_offset,
+                SaveErrorKind::TooLarge {
+                    what: "param key length",
+                    value: u64::from(key_len),
+                    max: u64::from(MAX_PARAM_KEY_LEN),
+                },
+            ));
+        }
+        let key_offset = reader.offset();
+        let raw = reader.take(usize::from(key_len), &field_path(&path, "key"))?;
+        let key = std::str::from_utf8(raw).map_err(|_| {
+            SaveError::new(
+                field_path(&path, "key"),
+                key_offset,
+                SaveErrorKind::InvalidString { what: "param key" },
+            )
+        })?;
+        if key.is_empty() {
+            return Err(SaveError::new(
+                field_path(&path, "key"),
+                key_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "param key (must be non-empty)",
+                    value: 0,
+                },
+            ));
+        }
+        if previous.as_deref().is_some_and(|previous| key <= previous) {
+            return Err(SaveError::new(
+                field_path(&path, "key"),
+                key_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "param key order (must be strictly increasing)",
+                    value: 0,
+                },
+            ));
+        }
+
+        let ty_offset = reader.offset();
+        let ty = reader.u8(&field_path(&path, "ty"))?;
+        if ty > 3 {
+            return Err(SaveError::new(
+                field_path(&path, "ty"),
+                ty_offset,
+                SaveErrorKind::Unsupported {
+                    what: "param type tag",
+                    value: u64::from(ty),
+                },
+            ));
+        }
+        let scale = reader.u32(&field_path(&path, "scale"))?;
+        let value_offset = reader.offset();
+        let value = reader.i64(&field_path(&path, "value"))?;
+        if ty == 0 && value != 0 && value != 1 {
+            return Err(SaveError::new(
+                field_path(&path, "value"),
+                value_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "bool param value",
+                    value,
+                },
+            ));
+        }
+        if ty != 2 && scale != 0 {
+            return Err(SaveError::new(
+                field_path(&path, "scale"),
+                value_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "scale on non-Fixed param",
+                    value: i64::from(scale),
+                },
+            ));
+        }
+
+        let key = key.to_string();
+        previous = Some(key.clone());
+        params.push(ParamRecord {
+            key,
+            ty,
+            scale,
+            value,
+        });
+    }
+    Ok(())
 }

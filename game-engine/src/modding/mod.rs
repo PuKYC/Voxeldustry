@@ -19,8 +19,8 @@ pub mod params;
 pub mod registry;
 
 pub use params::{
-    ModParamsPlugin, ParamEntry, ParamError, ParamScope, ParamSpec, ParamTable, ParamType,
-    VisibleIf, WorldParamsFrozen,
+    ModParamsPlugin, ParamEntry, ParamError, ParamRecord, ParamScope, ParamSpec, ParamTable,
+    ParamType, VisibleIf, WorldParamsFrozen,
 };
 pub use registry::{NamedEntry, OverridePriority, Registry, RegistryEntry, RegistryError};
 

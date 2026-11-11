@@ -8,8 +8,9 @@ use bevy::prelude::Component;
 use serde::{Deserialize, Serialize};
 
 use game_engine::identity::StableEntityIndex;
+use game_engine::modding::{ModManifest, ParamScope, ParamSpec, ParamTable, ParamType};
 use game_engine::residency::ChunkAnchor;
-use game_engine::save::{Persist, PersistComponent, StableTypeId};
+use game_engine::save::{write_world_meta, ModRecord, Persist, PersistComponent, StableTypeId};
 use game_engine::voxel::{chunk_content_hash, MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH};
 
 use crate::voxel::body::spawn_island_entity;
@@ -648,6 +649,111 @@ fn orphan_regions_are_counted_not_deleted_or_rejected() {
     assert_eq!(result.stats.chunks, 1);
     assert!(orphan_region.exists(), "孤儿 region 不能被删");
     assert!(recovered.exists(), "孤儿 recovered 不能被删");
+}
+
+const TEST_PARAM_SPECS: &[ParamSpec] = &[
+    ParamSpec {
+        key: "flag",
+        ty: ParamType::Bool,
+        default: 0,
+        scope: ParamScope::World,
+        group: "test",
+        visible_if: None,
+    },
+    ParamSpec {
+        key: "ratio",
+        ty: ParamType::Fixed {
+            scale: 1000,
+            min: 0,
+            max: 10_000,
+            step: 10,
+        },
+        default: 1000,
+        scope: ParamScope::World,
+        group: "test",
+        visible_if: None,
+    },
+];
+
+static TEST_MANIFEST: ModManifest = ModManifest {
+    id: "test",
+    version: 7,
+    engine_api: 1,
+    load_after: &[],
+    load_after_optional: &[],
+    conflicts: &[],
+    exclusive_groups: &[],
+    params: TEST_PARAM_SPECS,
+};
+
+#[test]
+fn load_applies_saved_world_params_and_mod_records() {
+    let overrides = BTreeMap::from([
+        ("test.flag".to_string(), 1),
+        ("test.ratio".to_string(), 2500),
+    ]);
+    let mut source = test_world(0xABCD);
+    source.insert_resource(ParamTable::resolve(&[&TEST_MANIFEST], &overrides).expect("解析参数表"));
+
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    assert_eq!(
+        capture.meta.mods,
+        vec![ModRecord {
+            id: "test".to_string(),
+            version: 7,
+        }]
+    );
+    assert_eq!(capture.meta.params.len(), 2);
+
+    let dir = TempDir::new("params");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    let mut loaded = test_world(1);
+    loaded.insert_resource(
+        ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
+    );
+    load_world(&mut loaded, &paths, 1)
+        .expect("读档成功")
+        .expect("world.meta 存在");
+
+    let table = loaded.resource::<ParamTable>();
+    assert_eq!(table.get("test.flag").map(|entry| entry.value), Some(1));
+    assert_eq!(
+        table.get("test.ratio").map(|entry| entry.value),
+        Some(2500),
+        "存档里的世界参数必须覆盖默认值"
+    );
+    assert_eq!(
+        table.mods().collect::<Vec<_>>(),
+        vec![("test", 7)],
+        "mod 清单必须随存档往返"
+    );
+}
+
+#[test]
+fn load_rejects_unknown_saved_param_key() {
+    let overrides = BTreeMap::from([("test.flag".to_string(), 1)]);
+    let mut source = test_world(1);
+    source.insert_resource(ParamTable::resolve(&[&TEST_MANIFEST], &overrides).expect("解析参数表"));
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    let dir = TempDir::new("params_unknown");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    let mut meta = capture.meta.clone();
+    meta.params[1].key = "test.zzz".to_string();
+    write_world_meta(&paths, &meta).expect("写 meta");
+
+    let mut loaded = test_world(1);
+    loaded.insert_resource(
+        ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析默认参数表"),
+    );
+    let error = load_world(&mut loaded, &paths, 1).expect_err("未知参数 key 必须拒绝整档");
+    assert!(
+        error.to_string().contains("未知参数"),
+        "错误应指出未知 key，实际：{error}"
+    );
 }
 
 /// 计划的输出顺序是确定性契约：body 按 BodyKey 升序、每个 body 的 region
