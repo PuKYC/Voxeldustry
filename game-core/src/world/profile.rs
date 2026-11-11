@@ -41,6 +41,29 @@ pub struct PluginEntry {
     pub build: fn(&mut App),
 }
 
+/// 本次装配实际装上的插件 id，按装配顺序保存。
+///
+/// 这是注册表与存档之间唯一的桥：存档写入时把它冻结进 `world.meta`，读档时
+/// 逐项比对——顺序也是数据，重算会把「注册表变了」降级成静默漂移。
+///
+/// 直接搭 `App` 的单测没有这个资源：存档侧按空清单落盘，读档侧按空清单放行。
+#[derive(Resource, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ActivePlugins(Vec<&'static str>);
+
+impl ActivePlugins {
+    /// 按装配顺序记录插件 id。
+    #[must_use]
+    pub fn new(ids: Vec<&'static str>) -> Self {
+        Self(ids)
+    }
+
+    /// 装配顺序（不是字典序）。
+    #[must_use]
+    pub fn ids(&self) -> &[&'static str] {
+        &self.0
+    }
+}
+
 const NO_REQUIRES: &[&str] = &[];
 const REQUIRES_SPATIAL: &[&str] = &["spatial"];
 const REQUIRES_GAMEPLAY: &[&str] = &["gameplay"];

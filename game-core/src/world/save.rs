@@ -243,6 +243,13 @@ pub fn capture_world(
         None => Vec::new(),
     };
 
+    // 插件清单同理：装配过 profile 的会话有 `ActivePlugins`，直接搭 World 的单测没有。
+    // 顺序原样写盘（不是字典序），读档要逐项比对。
+    let plugins: Vec<String> = match world.get_resource::<super::ActivePlugins>() {
+        Some(active) => active.ids().iter().map(|id| (*id).to_string()).collect(),
+        None => Vec::new(),
+    };
+
     Ok(WorldCapture {
         meta: WorldMeta {
             seed,
@@ -252,6 +259,7 @@ pub fn capture_world(
             mods,
             params,
             actions,
+            plugins,
         },
         regions,
     })
@@ -540,6 +548,7 @@ mod tests {
                 mods: Vec::new(),
                 params: Vec::new(),
                 actions: Vec::new(),
+                plugins: Vec::new(),
             }
         );
         assert!(capture.regions.is_empty(), "空世界不产生 region");

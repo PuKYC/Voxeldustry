@@ -18,8 +18,8 @@ pub const WORLD_MAGIC: [u8; 8] = *b"VXWORLD\0";
 pub const REGION_MAGIC: [u8; 8] = *b"VXREGION";
 /// 当前世界格式版本；未来只升不降（§2 偏移 8 / §6.1）。
 ///
-/// v2 在 body 表之后追加「mod 清单 + 世界参数 + 动作表」段；v1 存档仍可读，
-/// 早期 v2（无动作表段）按空表解码。
+/// v2 在 body 表之后追加「mod 清单 + 世界参数 + 动作表 + 插件清单」段；
+/// v1 存档仍可读（扩展段解为空）；v2 缺任一扩展段按坏档拒绝。
 pub const FORMAT_VERSION: u16 = 2;
 /// 仍可读取的最低格式版本（§6.1 支持区间 `MIN_SUPPORTED..=CURRENT`）。
 pub const MIN_SUPPORTED_FORMAT_VERSION: u16 = 1;
@@ -51,6 +51,10 @@ pub const MAX_PARAM_KEY_LEN: u16 = 255;
 pub const MAX_ACTION_COUNT: u32 = 4_096;
 /// 动作名的 UTF-8 字节长度上限。
 pub const MAX_ACTION_NAME_LEN: u16 = 64;
+/// v2 插件清单条数上限（等于注册表规模上限，留足 mod 插件余量）。
+pub const MAX_PLUGIN_COUNT: u32 = 64;
+/// 插件 id 的 UTF-8 字节长度上限。
+pub const MAX_PLUGIN_ID_LEN: u16 = 64;
 /// 单 region 区块数上限（§3 偏移 12）。
 pub const MAX_CHUNK_COUNT: u32 = 64;
 /// 单条记录体长度上限（§0）。
@@ -225,6 +229,12 @@ pub struct WorldMeta {
     /// v2：随存档冻结的动作表（含 mod 动作），按 name 严格升序；
     /// v1 解码结果为空，v2 缺该段即坏档。
     pub actions: Vec<ActionRecord>,
+    /// v2：本世界装配过的插件 id，按**装配顺序**排列（不是字典序）。
+    ///
+    /// 顺序本身是数据：它是注册表确定性拓扑排序的结果，读档要逐项比对，
+    /// 不能事后重算（重算会把「注册表变了」变成静默漂移）。v1 为空，
+    /// v2 缺该段即坏档。
+    pub plugins: Vec<String>,
 }
 
 impl WorldMeta {

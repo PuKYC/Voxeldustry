@@ -137,9 +137,8 @@ mod tests {
     fn published_table_includes_mod_actions() {
         let mods: &[(&'static str, &'static [&'static str])] =
             &[("demo", &["demo_action", "demo_other"])];
-        let resolved =
-            game_engine::input::ResolvedActions::resolve(CoreActions::table(), mods)
-                .expect("演示动作表必须可解析");
+        let resolved = game_engine::input::ResolvedActions::resolve(CoreActions::table(), mods)
+            .expect("演示动作表必须可解析");
         publish_active_actions(&resolved);
 
         let active = active_actions();

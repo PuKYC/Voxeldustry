@@ -3,12 +3,12 @@ title: 静态数据与 Mod 体系
 type: 架构文档
 status: active
 created: 2026-10-19
-updated: 2026-11-08
+updated: 2026-11-11
 tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 @ 2026-11-11"
 ---
 
 # 静态数据与 Mod 体系
@@ -250,7 +250,15 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 
 后台入口 `CoreGameModule::build` 不再 `expect`：`build_with_profile` 失败时把 `ModuleBuildFailure { code, message }` 插进 App 并提前返回。`run_headless` 在 `build_app` 之后、发 `Started` 之前检查该资源，回送 `BevyLifecycleMsg::Error { code, message }` 与 `Stopped(1)`，直接返回 `ExitCode::FAILURE`——后台线程不 panic，也不进入主循环。Godot 侧 `bev_error(code, message)` 改为两参信号，`bevy_client.gd` 原样透传为 `bevy_error(code, message)`，测试脚本按 code + message 输出。
 
-边界：**建档时解析一次、结果随存档冻结**是本轮的设计边界，不是已实现的存档能力。解析只在 `build_with_profile` 里发生一次，运行期不提供重解析接口；本轮不把 profile / 解析结果写进 `world.meta`，`FORMAT_VERSION` 保持 2，读档仍只校验 mod 清单、World 参数与动作表。将来若要把 profile 也冻结，应在 `world.meta` 扩展段加 profile 字段并升格式版本，同时把比对加进读档阶段一。
+边界：**建档时解析一次、解析结果随存档冻结**。解析只在 `build_with_profile` 里发生一次，运行期不提供重解析接口；`world.meta` 存的是**解析后的插件装配序列**（`ActivePlugins`，按构建顺序），不是建档时的 selection，也不在运行期重算。`FORMAT_VERSION` 仍为 2，在 v2 扩展段末尾追加插件段，读档阶段一逐项比对。
+
+为什么存序列而不是存 selection：
+
+- 版本号只能兜住「字节布局变了」。布局没变、但 `PLUGIN_REGISTRY` 里的 `requires` / 默认集合 / 排序 tie-break 变了这类改动不升 `FORMAT_VERSION`，迁移钩子根本不会被触发；只存 selection 再重算就会静默漂移（旧世界凭空多装一个插件、系统调度顺序变了）。
+- 迁移只能使用档里已有的信息。存序列时迁移有 ground truth（旧序列 → 新序列的映射规则），存 selection 则连「当年解析出了什么」都不知道。
+- 代价是注册表任何变动都会让旧档打不开（`MissingPlugin` / `UnexpectedPlugin` / `PluginOrderMismatch`），这是刻意选的硬门槛，与动作表同一路线；迁移工具将来再做。
+
+装配点早于读档：后台线程启动时 `CoreGameModule::build` 就按 profile 建好 App，`StreamingWorldPlugin` 在 `Startup` 才真正 `load_world`。因此「用哪些插件装配」必须来自档本身或建档选择，不能等读完档再决定。
 
 ## 注册表
 
@@ -287,12 +295,13 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 
 ### 随存档冻结与读档校验
 
-保存时，`capture_world` 从 `ParamTable` 取 mod 清单（id + version）与全部 World 参数，从 `ResolvedActions` 取动作表（按 name 严格升序），写进 `world.meta` v2 扩展段（`ParamTable::mods()` / `world_values()`）；Debug 参数不落盘。
+保存时，`capture_world` 从 `ParamTable` 取 mod 清单（id + version）与全部 World 参数，从 `ResolvedActions` 取动作表（按 name 严格升序），从 `ActivePlugins` 取插件装配序列（按构建顺序，**不排序**），写进 `world.meta` v2 扩展段（`ParamTable::mods()` / `world_values()`）；Debug 参数不落盘。
 
 读档在阶段一（只读校验，失败时 world 一个字节都不改）逐段比对：
 
 - `AppliedModSet` 存在：`meta.mods` 与它按 id 逐项比对（数量、id、version），不等报 `MissingMod` / `UnexpectedMod` / `ModVersionMismatch`。
 - `ResolvedActions` 存在：`meta.actions` 与当前表逐项比对（name / action / channel_bit，顺序敏感），不等报 `ActionCountMismatch` / `ActionTableMismatch`。
+- `ActivePlugins` 存在：先比集合（存档有、当前没有报 `MissingPlugin`；当前有、存档没记录报 `UnexpectedPlugin`），再逐项比顺序（报 `PluginOrderMismatch`）。
 - 资源缺失：段为空则放行；段非空报 `MissingResource`。
 
 参数段仍用 `ParamTable::validate_saved` 按当前 schema 校验：缺失 key 保持默认值，未知 key、非 World 作用域、类型 / scale 不符、值越界都拒绝整档；阶段二在 `WorldParamsFrozen` 冻结前用 `apply_saved` 写回。
@@ -306,10 +315,12 @@ u32 param_count
   每条：u16 key_len + key 字节 + u8 ty + u32 scale + i64 value
 u32 action_count
   每条：u16 name_len + name 字节 + u32 action + u32 channel_bit
+u32 plugin_count              # 插件装配顺序：不排序，按构建顺序原样写
+  每条：u16 id_len + id 字节
 u64 digest                    # 覆盖头、body 表与上面全部扩展字节
 ```
 
-兼容：v1 存档没有扩展段，解码为「空清单 / 空参数 / 空动作表」。**未发布前不做旧档兼容**：v2 的扩展段（含动作表）是必填的，缺段按坏档拒绝——读档阶段一还会把冻结的动作表与当前装配逐项比对，数量或内容不符直接整档失败。上限 `MAX_MOD_COUNT` = `MAX_PARAM_COUNT` = `MAX_ACTION_COUNT` = 4096，名字长度上限 255 / 255 / 64。
+兼容：v1 存档没有扩展段，解码为「空清单 / 空参数 / 空动作表 / 空插件表」。**未发布前不做旧档兼容**：v2 的扩展段（mod 清单、参数、动作表、插件表）全部必填，缺段按坏档拒绝——读档阶段一还会把冻结的动作表与当前装配逐项比对，数量或内容不符直接整档失败。上限 `MAX_MOD_COUNT` = `MAX_PARAM_COUNT` = `MAX_ACTION_COUNT` = 4096、`MAX_PLUGIN_COUNT` = 64，名字长度上限 255 / 255 / 64 / 64。
 
 实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1（该文档在 `docs/待办` 下，未纳入版本库）。
 

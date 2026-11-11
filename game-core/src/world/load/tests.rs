@@ -768,7 +768,10 @@ fn load_rejects_unknown_saved_param_key() {
 fn meta_without_action_table_is_rejected() {
     let mut source = test_world(1);
     let capture = capture_world(&mut source, 1, 1).expect("采集成功");
-    assert!(capture.meta.actions.is_empty(), "没有 ResolvedActions 时采集到空表");
+    assert!(
+        capture.meta.actions.is_empty(),
+        "没有 ResolvedActions 时采集到空表"
+    );
     let dir = TempDir::new("broken_actions");
     let paths = SavePaths::new(dir.path());
     write_world_meta(&paths, &capture.meta).expect("写 meta");
@@ -835,9 +838,10 @@ fn build_plan_orders_bodies_and_regions() {
     }
 }
 
-// ---- mod 集合与动作表的读档硬校验 ----
+// ---- mod 集合、动作表与插件序列的读档硬校验 ----
 
 use crate::input::CoreActions;
+use crate::world::ActivePlugins;
 
 /// 读档只读校验的指纹：种子、稳定 ID、body 集合、区块内容哈希。
 #[derive(Debug, PartialEq, Eq)]
@@ -1025,4 +1029,97 @@ fn load_rejects_action_table_drift() {
         "错误应指出缺失的资源，实际：{error}"
     );
     assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+}
+
+// ---- 插件装配序列的读档硬校验 ----
+
+#[test]
+fn load_rejects_plugin_drift() {
+    let mut source = test_world(0x54);
+    source.insert_resource(resolved_actions(&[]));
+    source.insert_resource(ActivePlugins::new(vec!["core.world", "core.terrain"]));
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    assert_eq!(
+        capture.meta.plugins,
+        vec!["core.world".to_string(), "core.terrain".to_string()],
+        "装配顺序必须原样进 meta"
+    );
+
+    let dir = TempDir::new("plugin_drift");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    // 1) 集合相同但顺序不同。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(resolved_actions(&[]));
+    loaded.insert_resource(ActivePlugins::new(vec!["core.terrain", "core.world"]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("顺序不一致必须拒绝整档");
+    assert!(
+        error.to_string().contains("装配顺序"),
+        "错误应指出装配顺序，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 2) 当前装配少了存档记录的插件。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(resolved_actions(&[]));
+    loaded.insert_resource(ActivePlugins::new(vec!["core.world"]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("缺少插件必须拒绝整档");
+    assert!(
+        error.to_string().contains("当前注册表里没有"),
+        "错误应指出缺失的插件，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 3) 当前装配多出存档没记录过的插件。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(resolved_actions(&[]));
+    loaded.insert_resource(ActivePlugins::new(vec![
+        "core.world",
+        "core.terrain",
+        "core.extra",
+    ]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("多出插件必须拒绝整档");
+    assert!(
+        error.to_string().contains("存档没有记录"),
+        "错误应指出多出的插件，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+
+    // 4) 世界根本没跑注册表，无法核对装配序列。
+    let mut loaded = test_world(1);
+    spawn_marker(&mut loaded, 42);
+    loaded.insert_resource(resolved_actions(&[]));
+    let before = fingerprint(&loaded);
+    let error = load_world(&mut loaded, &paths, 1).expect_err("缺少 ActivePlugins 必须拒绝");
+    assert!(
+        error.to_string().contains("ActivePlugins"),
+        "错误应指出缺失的资源，实际：{error}"
+    );
+    assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+}
+
+#[test]
+fn load_accepts_matching_plugins() {
+    let mut source = test_world(0x55);
+    source.insert_resource(resolved_actions(&[]));
+    source.insert_resource(ActivePlugins::new(vec!["core.world", "core.terrain"]));
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+
+    let dir = TempDir::new("plugin_match");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    let mut loaded = test_world(1);
+    loaded.insert_resource(resolved_actions(&[]));
+    loaded.insert_resource(ActivePlugins::new(vec!["core.world", "core.terrain"]));
+    load_world(&mut loaded, &paths, 1)
+        .expect("一致的插件序列必须放行")
+        .expect("world.meta 存在");
 }

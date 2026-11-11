@@ -29,8 +29,7 @@ pub use capability::{
     look_allowed, move_mask, place_block_mask, rooted_mask, sprint_mask, stunned_mask,
     AttackChannel, BreakBlockChannel, ChannelSet, FlightChannel, GlideChannel, InputChannelDef,
     InteractChannel, JumpChannel, LookChannel, ModActionChannel, MoveChannel, PlaceBlockChannel,
-    Rooted,
-    SprintChannel, Stunned, INPUT_CHANNEL_TABLE,
+    Rooted, SprintChannel, Stunned, INPUT_CHANNEL_TABLE,
 };
 pub(crate) use game_engine::input::{InputSet, InteractRequest, SimulationTick};
 

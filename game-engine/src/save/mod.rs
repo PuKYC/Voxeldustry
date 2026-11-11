@@ -224,6 +224,12 @@ pub enum SaveErrorKind {
     ActionTableMismatch { name: String },
     /// 动作表条数与存档不一致。
     ActionCountMismatch { expected: usize, found: usize },
+    /// 存档记录过该插件，当前注册表里没有（删名/改名）。
+    MissingPlugin { id: String },
+    /// 当前装配里有存档没记录过的插件（新增 default_on 插件）。
+    UnexpectedPlugin { id: String },
+    /// 插件集合一致，但装配顺序与存档不同（tie-break 变了）。
+    PluginOrderMismatch { saved: String, current: String },
     /// 存档里带有该段数据，但世界缺少对应的运行期资源。
     MissingResource { what: &'static str },
 }
@@ -294,6 +300,18 @@ impl fmt::Display for SaveErrorKind {
             }
             Self::ActionCountMismatch { expected, found } => {
                 write!(f, "动作表条数不一致：存档 {expected}，当前 {found}")
+            }
+            Self::MissingPlugin { id } => {
+                write!(f, "存档装配过插件 \"{id}\"，当前注册表里没有")
+            }
+            Self::UnexpectedPlugin { id } => {
+                write!(f, "当前装配里有插件 \"{id}\"，存档没有记录")
+            }
+            Self::PluginOrderMismatch { saved, current } => {
+                write!(
+                    f,
+                    "插件装配顺序与存档不一致：存档 \"{saved}\"，当前 \"{current}\""
+                )
             }
             Self::MissingResource { what } => {
                 write!(f, "世界缺少运行期资源 {what}（存档带有对应数据）")

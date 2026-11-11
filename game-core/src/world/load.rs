@@ -170,6 +170,7 @@ fn build_plan(
     validate_meta(&meta)?;
     validate_meta_mods(world, &meta)?;
     validate_meta_actions(world, &meta)?;
+    validate_meta_plugins(world, &meta)?;
     validate_meta_params(world, &meta)?;
 
     let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
@@ -425,6 +426,46 @@ fn validate_meta_actions(world: &World, meta: &WorldMeta) -> Result<(), SaveErro
         }
     }
     Ok(())
+}
+
+/// 阶段一：存档冻结的插件清单必须与本次装配完全一致（集合 + 顺序）。
+///
+/// 为什么连顺序都比：插件装配顺序是确定性拓扑排序的结果，也是 world 的一部分。
+/// 只比集合的话，tie-break 变化会悄悄改变系统调度顺序，而存档看起来「能读」。
+/// 空清单 + 当前装配没有 `ActivePlugins` 时放行（直接搭 World 的单测）。
+fn validate_meta_plugins(world: &World, meta: &WorldMeta) -> Result<(), SaveError> {
+    let Some(active) = world.get_resource::<super::ActivePlugins>() else {
+        return if meta.plugins.is_empty() {
+            Ok(())
+        } else {
+            Err(missing_resource("ActivePlugins"))
+        };
+    };
+    let saved: BTreeSet<&str> = meta.plugins.iter().map(String::as_str).collect();
+    let current: BTreeSet<&str> = active.ids().iter().copied().collect();
+    if let Some(id) = saved.difference(&current).next() {
+        return Err(plugin_error(SaveErrorKind::MissingPlugin {
+            id: (*id).to_string(),
+        }));
+    }
+    if let Some(id) = current.difference(&saved).next() {
+        return Err(plugin_error(SaveErrorKind::UnexpectedPlugin {
+            id: (*id).to_string(),
+        }));
+    }
+    for (saved_id, current_id) in meta.plugins.iter().zip(active.ids()) {
+        if saved_id.as_str() != *current_id {
+            return Err(plugin_error(SaveErrorKind::PluginOrderMismatch {
+                saved: saved_id.clone(),
+                current: (*current_id).to_string(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn plugin_error(kind: SaveErrorKind) -> SaveError {
+    SaveError::semantic("load.meta.plugins", kind)
 }
 
 fn mod_error(kind: SaveErrorKind) -> SaveError {

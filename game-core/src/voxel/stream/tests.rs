@@ -1188,6 +1188,7 @@ fn entity_only_record_survives_unedited_unload() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     meta.bodies.insert(
         body,

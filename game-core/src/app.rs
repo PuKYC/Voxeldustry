@@ -12,7 +12,9 @@ use game_engine::modding::{DataRegistry, ModError, ModParamsPlugin, ParamTable};
 use crate::mods::{default_core_mods, CoreMods};
 use crate::spec::CoreSpec;
 use crate::static_data::StaticDataPlugin;
-use crate::world::{default_plugin_selection, resolve_plugins, PluginEntry, ProfileError};
+use crate::world::{
+    default_plugin_selection, resolve_plugins, ActivePlugins, PluginEntry, ProfileError,
+};
 
 /// 本游戏的默认插件组合。
 pub struct CoreGame;
@@ -145,6 +147,10 @@ fn add_resolved_plugins(app: &mut App, entries: &[&PluginEntry]) {
     for entry in entries {
         (entry.build)(app);
     }
+    // 装配顺序必须原样留下来：存档要冻结它，读档要逐项比对。
+    app.insert_resource(ActivePlugins::new(
+        entries.iter().map(|entry| entry.id).collect(),
+    ));
 }
 
 impl GameModule<CoreSpec> for CoreGame {

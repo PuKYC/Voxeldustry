@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 
 use crate::save::format::{
     region_of, CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_BODY_COUNT, MAX_CHUNK_COUNT,
-    MAX_COMPONENT_PAYLOAD_LEN, MAX_RECORD_LEN, PROPOSAL_RECORD_LEN, REGION_HEADER_LEN,
-    REGION_MAGIC, WORLD_HEADER_LEN,
+    MAX_COMPONENT_PAYLOAD_LEN, MAX_PLUGIN_COUNT, MAX_PLUGIN_ID_LEN, MAX_RECORD_LEN,
+    PROPOSAL_RECORD_LEN, REGION_HEADER_LEN, REGION_MAGIC, WORLD_HEADER_LEN,
 };
 
 /// region 索引项内 record_len 的偏移（§3 索引项 32 B 布局）。
@@ -69,6 +69,7 @@ fn golden_world_meta() -> WorldMeta {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     }
 }
 
@@ -209,14 +210,14 @@ const GOLDEN_WORLD_META_HEX: &str = concat!(
 );
 
 /// v2 黄金字节：v1 的 body 表后追加空的「mod 清单 + 世界参数 + 动作表」段（12 B 全 0）。
-/// 总长 176 B = 48 + 2 × 54 + 12 + 8。
+/// 总长 180 B = 48 + 2 × 54 + 12 + 4 + 8。
 const GOLDEN_WORLD_META_V2_HEX: &str = concat!(
     "5658574f524c44000200300001000000efcdab89674523013930000000000000",
     "4000000000000000020000000000000001000000000000000201000000000000",
     "8001000000000000000000000000000000000000000000000000000000000300",
     "0000000000000300000000000000000207010000000000010000000000000000",
     "0000000000000000000000000000000000000000000000000000000000000000",
-    "000000000000000024009508ec51f722",
+    "000000000000000000000000e7899c388df79e09",
 );
 
 /// v1 黄金字节：同一份规格 §3 的布局（format_version = 1）。
@@ -255,7 +256,7 @@ const GOLDEN_REGION_V2_HEX: &str = concat!(
 fn world_meta_roundtrip() {
     let meta = golden_world_meta();
     let bytes = encode_world_meta(&meta).expect("world.meta 必须可编码");
-    assert_eq!(bytes.len(), 48 + 2 * 54 + 12 + 8);
+    assert_eq!(bytes.len(), 48 + 2 * 54 + 12 + 4 + 8);
     assert_eq!(u16_at(&bytes, W_HEADER_LEN), WORLD_HEADER_LEN);
     assert_eq!(u16_at(&bytes, W_CODEC_ID), CODEC_ID);
     assert_eq!(u16_at(&bytes, W_FORMAT_VERSION), FORMAT_VERSION);
@@ -291,13 +292,18 @@ fn world_meta_empty_body_table_roundtrip() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let bytes = encode_world_meta(&meta).expect("空 body 表合法");
-    assert_eq!(bytes.len(), 48 + 12 + 8);
+    assert_eq!(bytes.len(), 48 + 12 + 4 + 8);
     assert_eq!(u32_at(&bytes, W_BODY_COUNT), 0);
     assert_eq!(decode_world_meta(&bytes).expect("空 body 表合法"), meta);
-    assert_eq!(&bytes[48..60], &[0u8; 12], "空的 mods/params/actions 段");
-    assert_eq!(&bytes[60..68], &digest(&bytes[..60]).to_le_bytes());
+    assert_eq!(
+        &bytes[48..64],
+        &[0u8; 16],
+        "空的 mods/params/actions/plugins 段"
+    );
+    assert_eq!(&bytes[64..72], &digest(&bytes[..64]).to_le_bytes());
 }
 
 #[test]
@@ -378,7 +384,7 @@ fn region_empty_roundtrip() {
 #[test]
 fn golden_world_meta_bytes_match_spec_v2() {
     let bytes = encode_world_meta(&golden_world_meta()).expect("world.meta 必须可编码");
-    assert_eq!(bytes.len(), 176);
+    assert_eq!(bytes.len(), 180);
     assert_eq!(bytes.len() * 2, GOLDEN_WORLD_META_V2_HEX.len());
     assert_eq!(hex(&bytes), GOLDEN_WORLD_META_V2_HEX);
     assert_eq!(
@@ -447,6 +453,72 @@ fn world_meta_v2_extension_roundtrip() {
 }
 
 #[test]
+fn world_meta_v2_plugins_roundtrip_preserves_build_order() {
+    let mut meta = golden_world_meta();
+    // 故意不是字典序：装配顺序是数据，编码不得排序。
+    meta.plugins = vec![
+        "core.terrain".to_string(),
+        "core.streaming".to_string(),
+        "core.world".to_string(),
+    ];
+
+    let bytes = encode_world_meta(&meta).expect("插件清单必须可编码");
+    let decoded = decode_world_meta(&bytes).expect("插件清单必须可解码");
+    assert_eq!(decoded.plugins, meta.plugins, "必须按原顺序读回");
+    assert_eq!(encode_world_meta(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn world_meta_v2_without_plugins_segment_is_rejected() {
+    let mut meta = golden_world_meta();
+    meta.plugins = vec!["core.world".to_string()];
+
+    let bytes = encode_world_meta(&meta).expect("插件清单必须可编码");
+    // 插件段紧贴摘要之前；裁掉整个 4 B 头 + 一条记录再重算摘要。
+    let plugin_bytes = 4 + 2 + "core.world".len();
+    let cut = bytes.len() - DIGEST_LEN - plugin_bytes;
+    let mut legacy = bytes[..cut].to_vec();
+    let checksum = digest(&legacy);
+    legacy.extend_from_slice(&checksum.to_le_bytes());
+
+    let error = decode_world_meta(&legacy).expect_err("缺插件段的 v2 必须拒绝");
+    assert!(
+        error.to_string().contains("plugin_count"),
+        "错误应指向插件段，实际：{error}"
+    );
+    assert!(
+        matches!(error.kind(), crate::save::SaveErrorKind::Truncated { .. }),
+        "缺段应报截断，实际：{:?}",
+        error.kind()
+    );
+}
+
+#[test]
+fn world_meta_v2_rejects_bad_plugin_records() {
+    let mut duplicate = golden_world_meta();
+    duplicate.plugins = vec!["core.world".to_string(), "core.world".to_string()];
+    let err = encode_world_meta(&duplicate).expect_err("重复插件 id 必须拒绝");
+    assert!(err.to_string().contains("unique"), "{err}");
+
+    let mut empty = golden_world_meta();
+    empty.plugins = vec![String::new()];
+    let err = encode_world_meta(&empty).expect_err("空插件 id 必须拒绝");
+    assert!(err.to_string().contains("non-empty"), "{err}");
+
+    let mut too_long = golden_world_meta();
+    too_long.plugins = vec!["x".repeat(usize::from(MAX_PLUGIN_ID_LEN) + 1)];
+    let err = encode_world_meta(&too_long).expect_err("超长插件 id 必须拒绝");
+    assert!(err.to_string().contains("plugin id length"), "{err}");
+
+    let mut too_many = golden_world_meta();
+    too_many.plugins = (0..=MAX_PLUGIN_COUNT + 1)
+        .map(|index| format!("core.p{index}"))
+        .collect();
+    let err = encode_world_meta(&too_many).expect_err("插件条数超限必须拒绝");
+    assert!(err.to_string().contains("plugin_count"), "{err}");
+}
+
+#[test]
 fn world_meta_v2_without_actions_segment_is_rejected() {
     let mut meta = golden_world_meta();
     meta.mods = vec![ModRecord {
@@ -461,11 +533,12 @@ fn world_meta_v2_without_actions_segment_is_rejected() {
     }];
 
     let bytes = encode_world_meta(&meta).expect("v2 扩展必须可编码");
-    // 空动作表段只有 4 B 的 action_count，位于摘要之前；裁掉它再重算摘要，
-    // 就得到一份「有 mods/params、没有 actions 段」的字节。v2 起该段必填，
-    // 未发布前不做旧档兼容，必须拒绝。
-    let cut = bytes.len() - DIGEST_LEN - 4;
+    // 段序是 mods → params → actions → plugins；把动作表段及其后的插件段、摘要
+    // 全部裁掉再重算摘要，就得到一份「停在 params 之后」的旧 v2 字节。
+    // v2 起动作表段必填，未发布前不做旧档兼容，必须拒绝。
+    let cut = bytes.len() - DIGEST_LEN - 4 - 4;
     assert_eq!(&bytes[cut..cut + 4], &[0u8; 4]);
+    assert_eq!(&bytes[cut + 4..cut + 8], &[0u8; 4]);
     let mut legacy = bytes[..cut].to_vec();
     let checksum = digest(&legacy);
     legacy.extend_from_slice(&checksum.to_le_bytes());
@@ -596,7 +669,7 @@ fn assert_region_rejects(bytes: &[u8], marker: &str) {
 #[test]
 fn world_meta_header_corruption_is_rejected() {
     let bytes = world_meta_fixture_bytes();
-    assert_eq!(bytes.len(), 176);
+    assert_eq!(bytes.len(), 180);
 
     let cases: [(usize, u8, &str); 10] = [
         (0, 0x01, "magic"),
@@ -692,9 +765,10 @@ fn world_meta_body_count_limit_and_extremes() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let bytes = encode_world_meta(&meta).expect("65536 条 body 合法");
-    assert_eq!(bytes.len(), 48 + 65_536 * 54 + 12 + 8);
+    assert_eq!(bytes.len(), 48 + 65_536 * 54 + 12 + 4 + 8);
     let decoded = decode_world_meta(&bytes).expect("65536 条 body 合法");
     assert_eq!(decoded.body_count(), MAX_BODY_COUNT);
     assert_eq!(decoded.bodies.len(), 65_536);
@@ -729,6 +803,7 @@ fn world_meta_body_count_limit_and_extremes() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let encoded = encode_world_meta(&extreme).expect("极值合法");
     assert_eq!(decode_world_meta(&encoded).expect("极值合法"), extreme);
@@ -746,6 +821,7 @@ fn world_meta_body_count_limit_and_extremes() {
             mods: Vec::new(),
             params: Vec::new(),
             actions: Vec::new(),
+            plugins: Vec::new(),
         };
         let err = encode_world_meta(&bad).expect_err("voxel_size <= 0 必须拒绝");
         assert!(err.to_string().contains("voxel_size"), "{err}");
@@ -776,6 +852,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("键不一致必须拒绝");
     assert!(err.to_string().contains("body map key"), "{err}");
@@ -792,6 +869,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("悬空 attach_to 必须拒绝");
     assert!(err.to_string().contains("attach_to body"), "{err}");
@@ -809,6 +887,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("非 body attach 的 attach_to 必须拒绝");
     assert!(err.to_string().contains("attach_to"), "{err}");
@@ -826,6 +905,7 @@ fn world_meta_encode_rejects_inconsistent_keys_and_attach() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
     let err = encode_world_meta(&meta).expect_err("attach_to = 0 必须拒绝");
     assert!(err.to_string().contains("attach_to"), "{err}");
@@ -1521,6 +1601,7 @@ fn non_island_fields_are_normalized_on_write() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
 
     if cfg!(debug_assertions) {
@@ -1581,6 +1662,7 @@ fn ship_with_body_attach_is_rejected_on_write() {
         mods: Vec::new(),
         params: Vec::new(),
         actions: Vec::new(),
+        plugins: Vec::new(),
     };
 
     let err = encode_world_meta(&meta).expect_err("Ship 不得 attach_tag = Body");

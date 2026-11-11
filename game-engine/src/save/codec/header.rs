@@ -8,11 +8,11 @@ use crate::modding::ParamRecord;
 use crate::save::format::{
     digest, ActionRecord, AttachTag, BodyKind, BodyRecord, ModRecord, WorldMeta, BODY_RECORD_LEN,
     CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_ACTION_COUNT, MAX_ACTION_NAME_LEN, MAX_BODY_COUNT,
-    MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT, MAX_PARAM_KEY_LEN,
-    MIN_SUPPORTED_FORMAT_VERSION, WORLD_HEADER_LEN, WORLD_MAGIC,
+    MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT, MAX_PARAM_KEY_LEN, MAX_PLUGIN_COUNT,
+    MAX_PLUGIN_ID_LEN, MIN_SUPPORTED_FORMAT_VERSION, WORLD_HEADER_LEN, WORLD_MAGIC,
 };
 use crate::save::{SaveError, SaveErrorKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // 线格式偏移常量（§2 / §3）：既用于报错定位，也让编码顺序与规格表一一对应。
@@ -187,11 +187,12 @@ pub fn encode_world_meta(meta: &WorldMeta) -> Result<Vec<u8>, SaveError> {
     Ok(writer.into_vec())
 }
 
-/// 编码 v2 追加段：mod 清单 + 世界参数 + 动作表（均严格升序）。
+/// 编码 v2 追加段：mod 清单 + 世界参数 + 动作表（均严格升序）+ 插件清单（装配顺序）。
 fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveError> {
     encode_mods(writer, &meta.mods)?;
     encode_params(writer, &meta.params)?;
     encode_actions(writer, &meta.actions)?;
+    encode_plugins(writer, &meta.plugins)?;
     Ok(())
 }
 
@@ -338,6 +339,65 @@ fn encode_action_record(
     writer.bytes(record.name.as_bytes());
     writer.u32(record.action);
     writer.u32(record.channel_bit);
+    Ok(())
+}
+
+/// 编码插件清单段：count + 每条 (id_len + id)，**按装配顺序**写，不排序。
+///
+/// 顺序是数据：确定性拓扑排序的结果就是世界的一部分，读档要求逐项一致，
+/// 所以这里只校验非空 / 长度 / 唯一，不校验升降序。
+fn encode_plugins(writer: &mut Writer, plugins: &[String]) -> Result<(), SaveError> {
+    let plugin_count = u32::try_from(plugins.len()).unwrap_or(u32::MAX);
+    if plugin_count > MAX_PLUGIN_COUNT {
+        return Err(SaveError::new(
+            "world.meta.plugin_count",
+            writer.len(),
+            SaveErrorKind::TooLarge {
+                what: "plugin_count",
+                value: u64::from(plugin_count),
+                max: u64::from(MAX_PLUGIN_COUNT),
+            },
+        ));
+    }
+    writer.u32(plugin_count);
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (index, id) in plugins.iter().enumerate() {
+        let path = indexed_path("world.meta", "plugin", index);
+        let offset = writer.len();
+        if id.is_empty() {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                offset,
+                SaveErrorKind::InvalidValue {
+                    what: "plugin id (must be non-empty)",
+                    value: 0,
+                },
+            ));
+        }
+        if id.len() > usize::from(MAX_PLUGIN_ID_LEN) {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                offset,
+                SaveErrorKind::TooLarge {
+                    what: "plugin id length",
+                    value: id.len() as u64,
+                    max: u64::from(MAX_PLUGIN_ID_LEN),
+                },
+            ));
+        }
+        if !seen.insert(id.as_str()) {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                offset,
+                SaveErrorKind::InvalidValue {
+                    what: "plugin id (must be unique)",
+                    value: 0,
+                },
+            ));
+        }
+        writer.u16(u16::try_from(id.len()).expect("长度已校验"));
+        writer.bytes(id.as_bytes());
+    }
     Ok(())
 }
 
@@ -698,13 +758,20 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         }
     }
 
-    let (mods, params, actions, digest_offset) = if format_version >= 2 {
+    let (mods, params, actions, plugins, digest_offset) = if format_version >= 2 {
         let payload_end = bytes.len() - DIGEST_LEN;
         let mut extension = Reader::new(&bytes[body_end..payload_end], body_end);
         let mut mods = Vec::new();
         let mut params = Vec::new();
         let mut actions = Vec::new();
-        decode_extension(&mut extension, &mut mods, &mut params, &mut actions)?;
+        let mut plugins = Vec::new();
+        decode_extension(
+            &mut extension,
+            &mut mods,
+            &mut params,
+            &mut actions,
+            &mut plugins,
+        )?;
         if extension.remaining() != 0 {
             return Err(SaveError::new(
                 "world.meta.file_len",
@@ -714,7 +781,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
                 },
             ));
         }
-        (mods, params, actions, payload_end)
+        (mods, params, actions, plugins, payload_end)
     } else {
         let expected_len = body_end + DIGEST_LEN;
         if bytes.len() != expected_len {
@@ -728,7 +795,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
                 },
             ));
         }
-        (Vec::new(), Vec::new(), Vec::new(), body_end)
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), body_end)
     };
 
     let stored = read_u64_at(bytes, digest_offset);
@@ -749,6 +816,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         mods,
         params,
         actions,
+        plugins,
     })
 }
 
@@ -758,6 +826,7 @@ fn decode_extension(
     mods: &mut Vec<ModRecord>,
     params: &mut Vec<ParamRecord>,
     actions: &mut Vec<ActionRecord>,
+    plugins: &mut Vec<String>,
 ) -> Result<(), SaveError> {
     let count_offset = reader.offset();
     let mod_count = reader.u32("world.meta.mod_count")?;
@@ -929,7 +998,9 @@ fn decode_extension(
     }
 
     // v2 起动作表段是必填的：params 之后没字节就是坏档（旧 v2 不再兼容）。
-    decode_actions(reader, actions)
+    decode_actions(reader, actions)?;
+    // 插件清单段同样必填：缺段即坏档，不做「按空清单放行」。
+    decode_plugins(reader, plugins)
 }
 
 /// 解码动作表段：count + 每条 (name_len + name + action + channel_bit)。
@@ -1028,6 +1099,73 @@ fn decode_actions(reader: &mut Reader, actions: &mut Vec<ActionRecord>) -> Resul
             action,
             channel_bit,
         });
+    }
+    Ok(())
+}
+
+/// 解码插件清单段：count + 每条 (id_len + id)。
+///
+/// 顺序即装配顺序，因此不校验升降序，只校验非空 / 长度 / 唯一。
+fn decode_plugins(reader: &mut Reader, plugins: &mut Vec<String>) -> Result<(), SaveError> {
+    let count_offset = reader.offset();
+    let plugin_count = reader.u32("world.meta.plugin_count")?;
+    if plugin_count > MAX_PLUGIN_COUNT {
+        return Err(SaveError::new(
+            "world.meta.plugin_count",
+            count_offset,
+            SaveErrorKind::TooLarge {
+                what: "plugin_count",
+                value: u64::from(plugin_count),
+                max: u64::from(MAX_PLUGIN_COUNT),
+            },
+        ));
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for index in 0..u32_len(plugin_count) {
+        let path = indexed_path("world.meta", "plugin", index);
+        let len_offset = reader.offset();
+        let id_len = reader.u16(&field_path(&path, "id_len"))?;
+        if id_len > MAX_PLUGIN_ID_LEN {
+            return Err(SaveError::new(
+                field_path(&path, "id_len"),
+                len_offset,
+                SaveErrorKind::TooLarge {
+                    what: "plugin id length",
+                    value: u64::from(id_len),
+                    max: u64::from(MAX_PLUGIN_ID_LEN),
+                },
+            ));
+        }
+        let id_offset = reader.offset();
+        let raw = reader.take(usize::from(id_len), &field_path(&path, "id"))?;
+        let id = std::str::from_utf8(raw).map_err(|_| {
+            SaveError::new(
+                field_path(&path, "id"),
+                id_offset,
+                SaveErrorKind::InvalidString { what: "plugin id" },
+            )
+        })?;
+        if id.is_empty() {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                id_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "plugin id (must be non-empty)",
+                    value: 0,
+                },
+            ));
+        }
+        if !seen.insert(id.to_string()) {
+            return Err(SaveError::new(
+                field_path(&path, "id"),
+                id_offset,
+                SaveErrorKind::InvalidValue {
+                    what: "plugin id (must be unique)",
+                    value: 0,
+                },
+            ));
+        }
+        plugins.push(id.to_string());
     }
     Ok(())
 }
