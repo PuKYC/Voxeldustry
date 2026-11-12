@@ -170,9 +170,60 @@ func _decode_wire(e: EntityData, c: CommandCursor, schema: Dictionary) -> Varian
 					return null
 				value[name] = bag
 				i32i = c.i32_cnt
+			BevyEnums.Wire.MOD_GROUPS:
+				var groups: Variant = _decode_mod_groups(e, c.i32_pool, c.i32_off + i32i)
+				if groups == null:
+					return null
+				value[name] = groups
+				i32i = c.i32_cnt
 			_:
 				return null
 	return value
+
+
+# ───────────────────────── mod 表现组 ─────────────────────────
+
+## CUSTOM 载荷：按 sub_kind 分组，字段形如 EXT 的 (key, tag, value)。
+## 返回 Array[{sub_kind, fields: [{key, tag, value}]}]；未知 tag 整组拒绝。
+func _decode_mod_groups(e: EntityData, p: PackedInt64Array, start: int) -> Variant:
+	var cur := start
+	var group_count := int(p[cur])
+	cur += 1
+	if group_count < 0:
+		return null
+	var groups: Array = []
+	for _group in group_count:
+		var sub_kind := int(p[cur])
+		var field_count := int(p[cur + 1])
+		cur += 2
+		if field_count < 0:
+			return null
+		var fields: Array = []
+		for _field in field_count:
+			var key := int(p[cur])
+			var tag := int(p[cur + 1])
+			cur += 2
+			var value: Variant
+			match tag:
+				BevyEnums.EXT_TAG_I32:
+					value = int(p[cur])
+					cur += 1
+				BevyEnums.EXT_TAG_BOOL:
+					value = p[cur] != 0
+					cur += 1
+				BevyEnums.EXT_TAG_TAGS:
+					var n := int(p[cur])
+					cur += 1
+					if n < 0:
+						return null
+					value = _read_tags(p, cur, n)
+					cur += n
+				_:
+					push_warning("[PayloadCodec] 未知 mod 字段 tag=%d（实体 %d）" % [tag, e.stable_id])
+					return null
+			fields.append({"key": key, "tag": tag, "value": value})
+		groups.append({"sub_kind": sub_kind, "fields": fields})
+	return groups
 
 
 # ───────────────────────── EXT 袋 ─────────────────────────

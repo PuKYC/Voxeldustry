@@ -51,7 +51,7 @@ enum Payload {
 	INPUTCAPS = 11,
 	## mod 自定义表现载荷：一个实体、多个 sub_kind 分组的整包快照。
 	## sub_kind 由 mod 清单在装配期分配（0 保留核心），用 get_mod_payload_table()
-	## 查表翻译字段 key；表不进存档。解码端暂未支持 MOD_GROUPS（本里程碑只到桥）。
+	## 查表翻译字段 key；表不进存档。解码端按 MOD_GROUPS 解成 [{sub_kind, fields}]。
 	CUSTOM = 12,
 }
 
@@ -177,7 +177,7 @@ const PAYLOAD_SCHEMA := {
 	## mod 自定义表现载荷：i32 池 = [group_count, (sub_kind, field_count, 字段...)*]，
 	## 组按 sub_kind 升序、组内字段按 key 升序；字段编码与 EXT 袋逐项一致
 	## （key, tag, value；tag 0=i32 / 1=bool / 2=tags）。本里程碑只到桥：
-	## PayloadCodec 尚未实现 MOD_GROUPS，会按未知 token 丢弃该载荷（不报错）。
+	## 值形如 [{sub_kind, fields: [{key, tag, value}]}]；表由 get_mod_payload_table() 提供。
 	Payload.CUSTOM: {
 		"fields": ["groups"],
 		"wire": [Wire.MOD_GROUPS],
