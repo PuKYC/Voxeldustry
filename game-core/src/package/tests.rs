@@ -110,6 +110,52 @@ fn parses_package_and_joins_mod_pipeline() {
 }
 
 #[test]
+fn loads_lua_scripts_from_package() {
+    let dir = TempDir::new("scripts");
+    package_with(
+        dir.path(),
+        &manifest(r#","scripts":["scripts/bobber.lua"]"#),
+        &[("scripts/bobber.lua", "function on_update() end")],
+    );
+    let package = load_package(dir.path()).expect("包应解析成功");
+    assert_eq!(package.manifest.scripts, vec!["scripts/bobber.lua"]);
+    assert_eq!(package.scripts.len(), 1);
+    assert_eq!(package.scripts[0].path, "scripts/bobber.lua");
+    assert!(package.scripts[0].source.contains("on_update"));
+}
+
+#[test]
+fn rejects_bad_script_paths() {
+    let dir = TempDir::new("bad_scripts");
+    package_with(
+        dir.path(),
+        &manifest(r#","scripts":["../escape.lua"]"#),
+        &[],
+    );
+    let error = load_package(dir.path()).expect_err("包外路径应拒绝");
+    assert_eq!(error.kind(), PackageErrorKind::Schema);
+
+    let dir = TempDir::new("bad_script_ext");
+    package_with(
+        dir.path(),
+        &manifest(r#","scripts":["scripts/a.txt"]"#),
+        &[],
+    );
+    let error = load_package(dir.path()).expect_err("非 .lua 应拒绝");
+    assert_eq!(error.kind(), PackageErrorKind::Schema);
+    assert!(error.message().contains(".lua"));
+
+    let dir = TempDir::new("missing_script");
+    package_with(
+        dir.path(),
+        &manifest(r#","scripts":["scripts/none.lua"]"#),
+        &[],
+    );
+    let error = load_package(dir.path()).expect_err("缺失脚本应拒绝");
+    assert_eq!(error.kind(), PackageErrorKind::Data);
+}
+
+#[test]
 fn rejects_unknown_manifest_field() {
     let dir = TempDir::new("unknown");
     package_with(dir.path(), &manifest(r#","extra":1"#), &[]);

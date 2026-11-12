@@ -186,6 +186,15 @@ pub static PLUGIN_REGISTRY: &[PluginEntry] = &[
         default_on: true,
         build: build_prediction,
     },
+    #[cfg(feature = "scripting")]
+    PluginEntry {
+        id: "scripting",
+        // BMS 的 PreUpdate / PostUpdate 链不依赖其他插件；脚本操作世界靠 ECS 绑定。
+        // 默认关：脚本层目前不参与存档 / 同步，开了也只影响本机表现。
+        requires: NO_REQUIRES,
+        default_on: false,
+        build: build_scripting,
+    },
     PluginEntry {
         id: "sync_register",
         // register_synced_components 往表现管线的 CollectPresentationSet 挂系统，
@@ -204,6 +213,11 @@ fn build_input(app: &mut App) {
 
 fn build_presentation(app: &mut App) {
     app.add_plugins(PresentationPlugin);
+}
+
+#[cfg(feature = "scripting")]
+fn build_scripting(app: &mut App) {
+    app.add_plugins(crate::scripting::ScriptingPlugin);
 }
 
 fn build_stable_id(app: &mut App) {
@@ -610,6 +624,18 @@ mod tests {
         }
         // 依赖由解析器补齐；只读 profile 本身也必须可解析。
         resolve_plugins(&readonly).expect("只读 profile 必须可解析");
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn scripting_entry_is_opt_in() {
+        assert!(
+            !default_plugin_selection().contains(&"scripting"),
+            "脚本层不能默认装配"
+        );
+        let resolved = resolve_plugins(&["scripting"]).expect("显式选择应可解析");
+        let ids: Vec<_> = resolved.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids, vec!["scripting"]);
     }
 
     #[test]

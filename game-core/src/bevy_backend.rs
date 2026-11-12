@@ -239,6 +239,21 @@ impl GameModule<CoreSpec> for CoreGameModule {
         };
         // 装配失败不 panic：把稳定 code + 中文说明放进资源，由 runner 在
         // 发 Started 之前拦截并回传 Godot，然后以失败退出。
+        // mod 包里的 Lua 脚本：先转成内存源，ScriptingPlugin 在 Startup 载入。
+        // 插件没被选中时这个资源只是闲置，不会拉起 BMS。
+        #[cfg(feature = "scripting")]
+        {
+            let mut sources = crate::scripting::ScriptSources::default();
+            for package in &self.packages {
+                for script in &package.scripts {
+                    sources.push(
+                        format!("{}/{}", package.id(), script.path),
+                        script.source.clone(),
+                    );
+                }
+            }
+            app.insert_resource(sources);
+        }
         // 目录式包追加在编译期 mod 之后：两者共享同一套拓扑排序与冲突校验。
         // `to_mod` 会 leak 清单与补丁文本（启动一次，进程生命周期）。
         let mut mods = self.mods.clone();

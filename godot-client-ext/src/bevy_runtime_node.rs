@@ -390,6 +390,13 @@ impl BevyAppManager {
                         .map(|path| path.as_str())
                         .collect();
                     item.set("data_files", &strings_to_packed(&data));
+                    let scripts: Vec<&str> = package
+                        .manifest
+                        .scripts
+                        .iter()
+                        .map(|path| path.as_str())
+                        .collect();
+                    item.set("scripts", &strings_to_packed(&scripts));
                     list.push(&item);
                 }
                 out.set("ok", true);

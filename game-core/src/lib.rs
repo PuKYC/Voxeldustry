@@ -40,6 +40,9 @@ pub mod package;
 mod prediction;
 pub mod presentation;
 pub mod privacy;
+/// BMS 脚本层（feature = "scripting"）：Lua 脚本作为 ECS 附件。
+#[cfg(feature = "scripting")]
+pub mod scripting;
 pub mod spec;
 pub mod static_data;
 /// 体素世界层（游戏内容）：Body / 停靠 / LOD / 地形；装配 GameVoxelPlugin + TerrainPlugin。

@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -317,12 +317,14 @@ Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`�
     mod.json
     data/blocks.jsonc
     data/items.jsonc
+    scripts/bobber.lua
 ```
 
 - 扫描入口 `scan_package_root(root)`：根目录自身有 `mod.json` 时按单包处理；否则只扫**含 `mod.json` 的子目录**，没有清单的子目录直接跳过。目录名与包顺序都排序后确定。
-- 清单字段与 `ModManifest` 同名：`id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`actions`、`params`、`presentation`、`data`。`serde` 用 `deny_unknown_fields`，写错字段名直接报 schema 错误，不静默忽略。
+- 清单字段与 `ModManifest` 同名：`id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`actions`、`params`、`presentation`、`data`、`scripts`。`serde` 用 `deny_unknown_fields`，写错字段名直接报 schema 错误，不静默忽略。
 - `params` 的元素是 `{ key, type: { kind: "bool" | "int" | "fixed" | "enum", min, max, step, scale, values }, default, scope: "world" | "debug", group?, visible_if? }`；`presentation` 的元素是 `{ name, fields: [{ key, name, visibility: "all" | "required" | "server_only", required_bits? }] }`。
 - `data` 是相对包目录的路径数组，只接受 `Component::Normal` 段（拒绝 `..` 逃逸），不重复，≤ 64 个；文件用 JSONC 解析，顶层必须是对象，表名走 `ObjectTableKind::parse`（voxel / biome / entity / item 及其别名），补丁必须是数组。
+- `scripts` 是相对包目录的 `.lua` 路径数组，同样只接受 `Component::Normal`、不重复、≤ 64 个；单文件 ≤ 256 KiB，读取为 UTF-8 文本后交给脚本层（见下节）。
 
 校验（任一失败整包拒绝，错误码 `mod.package.*`）：
 
@@ -334,16 +336,36 @@ Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`�
 | 参数 | key 包内唯一；Bool 默认 0/1；Int/Fixed `min <= max`、`step > 0`、默认在范围内；Fixed `scale > 0`；Enum 非空且默认下标合法；`visible_if.key` 必须已声明 | `mod.package.schema` |
 | 表现 | 子种类名 / 字段名非空且 ≤ 64 字节；包内子种类不重名；字段 key 与名字在 spec 内不重名；`required` 必须有非 0 `required_bits`，其它可见性必须为 0 | `mod.package.schema` |
 | 数据 | 文件存在、≤ 1 MiB（单文件）/ 8 MiB（整包）、JSONC 可解析、表名可识别、补丁是数组 | `mod.package.data` |
+| 脚本 | 路径为包内相对路径且以 `.lua` 结尾、不重复、文件存在、≤ 256 KiB、UTF-8 可读 | `mod.package.schema` / `mod.package.data` |
 | IO | 目录 / 文件读失败 | `mod.package.io` |
 
 上限：单包清单 ≤ 256 KiB、data ≤ 64 个、扫描结果 ≤ 64 个包（`MAX_PACKAGES`）。
 
-装配链与编译期 mod 完全共用：`Mods::push(package.to_mod())` → 拓扑排序 / 冲突 / `ResolvedActions` / `ResolvedModPayloads` 全部照旧，因此包声明的动作与表现子种类自动获得通道位与 `sub_kind`。包**不加载可执行代码**，只提供清单与数据补丁；脚本层是独立里程碑（BMS），不在这条路径上。
+装配链与编译期 mod 完全共用：`Mods::push(package.to_mod())` → 拓扑排序 / 冲突 / `ResolvedActions` / `ResolvedModPayloads` 全部照旧，因此包声明的动作与表现子种类自动获得通道位与 `sub_kind`。包**不加载 native 可执行代码**；`scripts` 里的 Lua 由 BMS 解释执行，同一份源码跨平台，不参与 ABI。
 
-Godot 侧流程：`BevyAppManager.scan_mod_packages(root)` 读目录并解析，返回 `{ ok, count, packages, errors }`（`ok=false` 时 `errors` 为 `{ path, code, message }`）；成功结果留在节点上，之后**任一** `start_bevy_*` 都把它带进 `BevyBackendConfig.packages`。`bevy_client.gd` 的 `mod_dir` 非空时在 `_start_backend` 前自动扫描，失败则取消本次启动（不装半套）。
+Godot 侧流程：`BevyAppManager.scan_mod_packages(root)` 读目录并解析，返回 `{ ok, count, packages, errors }`（每个包带 `id`、`version`、`source`、`actions`、`params`、`presentation`、`data_files`、`scripts`）（`ok=false` 时 `errors` 为 `{ path, code, message }`）；成功结果留在节点上，之后**任一** `start_bevy_*` 都把它带进 `BevyBackendConfig.packages`。`bevy_client.gd` 的 `mod_dir` 非空时在 `_start_backend` 前自动扫描，失败则取消本次启动（不装半套）。
 
 包不参与存档身份：`world.meta` 冻结的是 mod `id/version` 与解析后的插件序列，**不含**包文件哈希。改了包内容却没升 `version`，旧档仍会放行；发布者必须靠 `version` 表达内容变更，校验 / 回滚等价是后续里程碑。
 
+
+### Lua 脚本层（feature = `scripting`）
+
+mod 包可以在 `scripts` 里带 Lua 脚本，由 BMS（bevy_mod_scripting v0.21.1 / Bevy 0.19）解释执行。这一层默认关闭：`game-core` 的 `scripting` feature 才把 BMS 拉进依赖树，插件注册表里的 `scripting` 条目 `default_on = false`，要显式选进 profile（只读 profile 不含它）。
+
+装配路径：
+
+1. `load_package` 把每个 `scripts/*.lua` 读成 `PackageScript { path, source }`（UTF-8；路径 / 大小校验见上表）。
+2. `CoreGameModule::build` 在 `build_with_profile` 之前把所有包的脚本塞进 `ScriptSources`（名字是 `<mod_id>/<相对路径>`，顺序按包拓扑序）。插件没被选中时这个资源只是闲置，不会拉起 BMS。
+3. `ScriptingPlugin`（`game-core/src/scripting/mod.rs`）缺 `AssetPlugin` 时补一个，加 `BMSPlugin`，然后 Startup 系统把每条源码 `ScriptAsset::new(text).with_language(Language::Lua)` 加进 `Assets<ScriptAsset>`，最后 spawn 一个实体挂 `ScriptComponent`。**所有脚本挂同一实体**，脚本之间用全局环境共享状态。
+
+边界（与《插件化架构方案》一致）：
+
+- 脚本只能「声明组件 / 写系统体」；热路径仍在 Rust。
+- `ScriptValue` 目前没有网络 / 存档编码路径，`SyncPayload` 与存档 codec 都只认具体 Rust 类型（见 05-表现管线）。脚本组件**不参与同步、不进存档**，联机时各端各自跑脚本，跨端一致性由 Rust 组件负责。
+- Lua 表遍历顺序、浮点行为与 BMS 内部调度未纳入确定性验证；`fixed_tick_simulation_is_bitwise_deterministic` 只覆盖 Rust 玩法。要求确定性的玩法不要把状态写进脚本。
+- 脚本编译 / 运行错误由 BMS 的 `ScriptErrorEvent` 记录（`bevy_log::error`），不会 panic 整个 App；坏脚本不会阻止世界加载。
+
+测试：`scripting::tests` 两个用例覆盖「两条源码 → 两个资产 + 一个 ScriptComponent」与「空源不 spawn」；`package::tests` 覆盖脚本路径校验与读取。
 
 ### 动作表解析
 

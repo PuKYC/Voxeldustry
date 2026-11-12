@@ -40,6 +40,10 @@ pub const CURRENT_ENGINE_API: u32 = 1;
 pub const MAX_PACKAGES: usize = 64;
 /// 每个包的数据补丁文件数量上限。
 pub const MAX_DATA_FILES: usize = 64;
+/// 每个包的 Lua 脚本数量上限。
+pub const MAX_SCRIPT_FILES: usize = 64;
+/// 单个 Lua 脚本大小上限。
+pub const MAX_SCRIPT_FILE_BYTES: u64 = 256 * 1024;
 /// 清单文件大小上限。
 pub const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 /// 单个数据补丁文件大小上限。
@@ -173,6 +177,15 @@ pub struct PackagePayload {
     pub fields: Vec<PackageField>,
 }
 
+/// 一个 Lua 脚本文件（已读取为文本，尚未编译）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageScript {
+    /// 相对包根目录的路径（清单里写的原样）。
+    pub path: String,
+    /// UTF-8 源码。
+    pub source: String,
+}
+
 /// 一个数据补丁文件（已校验存在与顶层 schema）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageData {
@@ -197,6 +210,8 @@ pub struct PackageManifest {
     pub presentation: Vec<PackagePayload>,
     /// 数据补丁路径（相对包根目录，清单里写的原样）。
     pub data: Vec<String>,
+    /// Lua 脚本路径（相对包根目录，清单里写的原样）。
+    pub scripts: Vec<String>,
 }
 
 /// 一个已解析的包。
@@ -206,6 +221,8 @@ pub struct LoadedPackage {
     pub source: PathBuf,
     pub manifest: PackageManifest,
     pub data: Vec<PackageData>,
+    /// 已读取的 Lua 脚本，按清单顺序；装配时交给 `ScriptSources`。
+    pub scripts: Vec<PackageScript>,
 }
 
 impl LoadedPackage {
@@ -320,10 +337,42 @@ pub fn load_package(dir: &Path) -> Result<LoadedPackage, PackageError> {
         });
     }
 
+    let mut scripts = Vec::with_capacity(manifest.scripts.len());
+    for relative in &manifest.scripts {
+        let relative_path = Path::new(relative);
+        let path = resolve_data_path(dir, relative_path)?;
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            PackageError::new(
+                &path,
+                PackageErrorKind::Data,
+                format!("脚本 {} 不存在：{error}", relative_path.display()),
+            )
+        })?;
+        if metadata.len() > MAX_SCRIPT_FILE_BYTES {
+            return Err(PackageError::new(
+                &path,
+                PackageErrorKind::Data,
+                format!("脚本超过 {MAX_SCRIPT_FILE_BYTES} 字节"),
+            ));
+        }
+        let source = std::fs::read_to_string(&path).map_err(|error| {
+            PackageError::new(
+                &path,
+                PackageErrorKind::Data,
+                format!("读取脚本失败：{error}"),
+            )
+        })?;
+        scripts.push(PackageScript {
+            path: relative.clone(),
+            source,
+        });
+    }
+
     Ok(LoadedPackage {
         source: dir.to_path_buf(),
         manifest,
         data,
+        scripts,
     })
 }
 
@@ -419,6 +468,8 @@ struct RawManifest {
     presentation: Vec<RawPayload>,
     #[serde(default)]
     data: Vec<PathBuf>,
+    #[serde(default)]
+    scripts: Vec<PathBuf>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -703,6 +754,38 @@ fn validate_manifest(path: &Path, raw: RawManifest) -> Result<PackageManifest, P
         data.push(text);
     }
 
+    if raw.scripts.len() > MAX_SCRIPT_FILES {
+        return Err(schema(format!(
+            "脚本数量 {} 超过上限 {MAX_SCRIPT_FILES}",
+            raw.scripts.len()
+        )));
+    }
+    let mut scripts = Vec::with_capacity(raw.scripts.len());
+    let mut seen_scripts = BTreeSet::new();
+    for path in raw.scripts {
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(schema(format!(
+                "脚本路径 \"{}\" 必须是包内相对路径",
+                path.display()
+            )));
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("lua") {
+            return Err(schema(format!(
+                "脚本路径 \"{}\" 必须以 .lua 结尾",
+                path.display()
+            )));
+        }
+        let text = path.to_string_lossy().to_string();
+        if !seen_scripts.insert(text.clone()) {
+            return Err(schema(format!("脚本路径 \"{text}\" 重复")));
+        }
+        scripts.push(text);
+    }
+
     Ok(PackageManifest {
         id: raw.id,
         version: raw.version,
@@ -715,6 +798,7 @@ fn validate_manifest(path: &Path, raw: RawManifest) -> Result<PackageManifest, P
         params,
         presentation,
         data,
+        scripts,
     })
 }
 
