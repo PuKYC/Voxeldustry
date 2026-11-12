@@ -90,6 +90,13 @@ pub struct BevyBackendConfig {
     /// Some 时空列表表示「一个可选插件都不装」，不是「用默认」；未知 id 在启动阶段
     /// 结构化失败（ModuleBuildFailure + bev_error），不会 panic。
     pub plugins: Option<Vec<String>>,
+    /// 只读打开：不推进玩法、不写盘（见 [crate::input::ReadOnlySession]）。
+    ///
+    /// true 时装配前插入 [ReadOnlySession]，默认插件选择换成
+    /// [crate::world::readonly_plugin_selection]（剔除 gameplay / movement /
+    /// death / camera / block_edit / prediction），存档层建只读路径，读档只做
+    /// 结构校验。显式 [Self::plugins] 优先，不会自动加只读 profile。
+    pub read_only: bool,
     /// 读档拒绝信息的跨线程句柄（Bevy 写、Godot 读）。
     ///
     /// Some 时插进 World：[WorldLoadRejectionHandle] 会被
@@ -120,6 +127,7 @@ impl Default for BevyBackendConfig {
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
             plugins: None,
+            read_only: false,
             world_load_rejection: None,
         }
     }
@@ -146,6 +154,7 @@ struct CoreGameModule {
     mods: CoreMods,
     param_overrides: BTreeMap<String, i64>,
     plugins: Option<Vec<String>>,
+    read_only: bool,
     world_load_rejection: Option<WorldLoadRejectionHandle>,
 }
 
@@ -188,6 +197,11 @@ impl GameModule<CoreSpec> for CoreGameModule {
         if let Some(handle) = &self.world_load_rejection {
             app.insert_resource(handle.clone());
         }
+        // 只读资源必须早于 CoreGame.build：InputPlugin 在 build 时看它决定是否
+        // 注册输入链，StreamingWorldPlugin 在 build 时看它决定读档模式与只读路径。
+        if self.read_only {
+            app.insert_resource(crate::input::ReadOnlySession);
+        }
         // dev 观察者入口（流式 + voxel_viewer，即 start_bevy_streaming）没有输入
         // 位移系统：玩家出生后只会受重力，驻留锚点固定在出生点，世界流式永远
         // 不卸载块。这条件装配一条「相机 / 观察者驱动玩家」的 dev 通道，让 Godot
@@ -202,6 +216,7 @@ impl GameModule<CoreSpec> for CoreGameModule {
         }
         // None 走默认 profile；Some 先归一 id（未知 id 结构化失败），再交给 build_with_profile。
         let selection = match self.plugins.as_deref() {
+            None if self.read_only => crate::world::readonly_plugin_selection(),
             None => default_plugin_selection(),
             Some(ids) => match intern_plugin_selection(ids) {
                 Ok(selection) => selection,
@@ -286,6 +301,7 @@ pub fn run_bevy_backend(
             mods: config.mods,
             param_overrides: config.param_overrides,
             plugins: config.plugins,
+            read_only: config.read_only,
             world_load_rejection: config.world_load_rejection,
         },
         bridge,
@@ -319,6 +335,7 @@ mod tests {
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
             plugins: None,
+            read_only: false,
             world_load_rejection: None,
         }
     }

@@ -21,10 +21,13 @@ pub use chunk::{
     WorldChunkPlugin, WorldChunkSet, WorldChunkUnloading,
 };
 pub use island::{Biome, Island, IslandId, IslandRegistry};
-pub use load::{load_world, LoadStats, LoadedWorld, WorldLoadRejection, WorldLoadRejectionHandle};
+pub use load::{
+    load_world, load_world_with_mode, LoadMode, LoadStats, LoadedWorld, WorldLoadRejection,
+    WorldLoadRejectionHandle,
+};
 pub use profile::{
-    default_plugin_selection, intern_plugin_selection, resolve_plugins, ActivePlugins, PluginEntry,
-    ProfileError, PLUGIN_REGISTRY,
+    default_plugin_selection, intern_plugin_selection, readonly_plugin_selection, resolve_plugins,
+    ActivePlugins, PluginEntry, ProfileError, PLUGIN_REGISTRY,
 };
 pub use rng::WorldRng;
 pub use save::{capture_world, write_capture, SaveBlocked, WorldCapture};
@@ -36,6 +39,9 @@ pub use seed::WorldSeed;
 pub use streaming::StreamingWorldPlugin;
 // BiomeId 定义在 static_data（游戏数值），这里重导出以满足 world 语义入口。
 pub use crate::static_data::voxel::BiomeId;
+// 只读会话资源定义在 game-engine（InputPlugin 所在层），world 侧入口重导出，
+// Godot / 上层不需要知道它在 input 模块。
+pub use crate::input::ReadOnlySession;
 
 use bevy::prelude::*;
 

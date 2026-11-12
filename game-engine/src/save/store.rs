@@ -72,6 +72,8 @@ const MAX_WORLD_META_FILE_LEN: u64 =
 #[derive(Debug)]
 pub struct SavePaths {
     root: PathBuf,
+    /// 只读会话：写盘、删除、回收、`.corrupt` 备份全部关掉。
+    read_only: bool,
     state: Mutex<SessionState>,
 }
 
@@ -90,8 +92,30 @@ impl SavePaths {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            read_only: false,
             state: Mutex::new(SessionState::default()),
         }
+    }
+
+    /// 只读会话的路径集合（打开旧世界查看用）。
+    ///
+    /// 读路径照常（包括回退 `.recovered`），但**任何**写盘入口都变成 no-op 或报错：
+    /// - `.corrupt` 备份不复制、不 quarantine（不留任何新文件）；
+    /// - region / world.meta 写入直接报错（tripwire：只读会话不该走到这里）；
+    /// - 回收（删孤儿目录、删空 region、删空 body 目录）一律跳过。
+    #[must_use]
+    pub fn read_only(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            read_only: true,
+            state: Mutex::new(SessionState::default()),
+        }
+    }
+
+    /// 是否只读会话。
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// 存档根目录。
@@ -286,6 +310,11 @@ fn read_file(path: &Path, max_len: u64) -> Result<Option<Vec<u8>>, SaveError> {
 /// `.corrupt` 只留第一份：已存在就不再覆盖、不删除。
 /// 复制失败（磁盘满 / 权限）→ 本会话 quarantine 该文件并返回错误，**不**覆盖主文件。
 fn backup_corrupt(paths: &SavePaths, main: &Path) -> Result<(), SaveError> {
+    // 只读会话：不复制、不 quarantine。代价是损坏文件每次启动都会再失败一次，
+    // 调用方应把“存档可能已损坏”提示给玩家。
+    if paths.is_read_only() {
+        return Ok(());
+    }
     let corrupt = paths.corrupt(main);
     if corrupt.is_file() {
         return Ok(());
@@ -491,6 +520,9 @@ pub fn orphan_bodies(paths: &SavePaths, meta: &WorldMeta) -> Result<Vec<BodyKey>
 /// 删完后目录为空才 `remove_dir` 并 fsync 根目录；若还有残余（并发写入）不报错，
 /// 目录留在原地下一次再清。目录不存在 = 已经没有可回收的东西，返回全 0。
 pub fn reclaim_body(paths: &SavePaths, body: BodyKey) -> Result<ReclaimStats, SaveError> {
+    if paths.is_read_only() {
+        return Ok(ReclaimStats::default());
+    }
     let dir = paths.body_dir(body);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -561,6 +593,9 @@ pub fn reclaim_body(paths: &SavePaths, body: BodyKey) -> Result<ReclaimStats, Sa
 /// 统计按 body 累加。任何一个目录回收失败都整体返回 `Err`：宁可让调用方看到
 /// “这次没清完”，也不要把半清理状态当成成功。
 pub fn reclaim_orphans(paths: &SavePaths, meta: &WorldMeta) -> Result<ReclaimStats, SaveError> {
+    if paths.is_read_only() {
+        return Ok(ReclaimStats::default());
+    }
     let mut total = ReclaimStats::default();
     for body in orphan_bodies(paths, meta)? {
         let stats = reclaim_body(paths, body)?;
@@ -610,6 +645,9 @@ pub(crate) fn remove_region(
     key: ChunkKey,
 ) -> Result<PathBuf, SaveError> {
     let main = paths.region(body, key);
+    if paths.is_read_only() {
+        return Ok(main);
+    }
     let recovered = paths.recovered(&main);
     for file in [&main, &recovered] {
         match std::fs::remove_file(file) {
@@ -635,6 +673,9 @@ pub(crate) fn remove_region(
 /// `.tmp` / `.corrupt` 残留）原样保留、返回 `false`。目录不存在同样返回
 /// `false`——没有东西可删，也不算失败。
 pub(crate) fn prune_empty_body_dir(paths: &SavePaths, body: BodyKey) -> Result<bool, SaveError> {
+    if paths.is_read_only() {
+        return Ok(false);
+    }
     let dir = paths.body_dir(body);
     let mut entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -664,6 +705,14 @@ pub fn write_world_meta(paths: &SavePaths, meta: &WorldMeta) -> Result<PathBuf, 
 
 /// 选目标并原子写：quarantine 的文件直接拒绝（§5.3），其余走 [`SavePaths::write_target`]。
 fn write_encoded(paths: &SavePaths, main: &Path, bytes: &[u8]) -> Result<PathBuf, SaveError> {
+    if paths.is_read_only() {
+        // tripwire：只读会话不该有写路径。宁可报错，也不要静默污染旧档。
+        return Err(io_error(
+            fs_atomic::STAGE_WRITE,
+            main,
+            io::Error::new(io::ErrorKind::PermissionDenied, "只读会话不允许写存档"),
+        ));
+    }
     if paths.is_quarantined(main) {
         return Err(quarantined_error(main));
     }
@@ -908,6 +957,34 @@ mod tests {
         // 再读一次：仍然失败，.corrupt 不变。
         assert!(read_region(&paths, b, k).is_err());
         assert_eq!(fs::read(&corrupt).expect("读 .corrupt"), broken);
+    }
+
+    #[test]
+    fn read_only_paths_refuse_writes_and_skip_corrupt_backup() {
+        let dir = TempDir::new("read-only-paths");
+        let ro = SavePaths::read_only(dir.path());
+        assert!(ro.is_read_only());
+        let b = body(1);
+        let k = key(0, 0, 0);
+
+        let err = write_region(&ro, b, k, &region(0xAA)).expect_err("只读必须拒绝写");
+        assert!(
+            matches!(err.kind(), SaveErrorKind::Io { stage, .. } if *stage == "write"),
+            "只读写必须报 write 阶段的 Io 错误: {err}"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).expect("读目录").count(),
+            0,
+            "只读的写 tripwire 不能留下任何文件"
+        );
+
+        // 先正常写一份，再损坏，然后用只读路径读：不得生成 .corrupt。
+        let rw = dir.paths();
+        let main = write_region(&rw, b, k, &region(0x11)).expect("正常写");
+        flip_last_byte(&main);
+        assert!(read_region(&ro, b, k).is_err(), "损坏文件仍然读失败");
+        assert!(!ro.corrupt(&main).exists(), "只读不得写 .corrupt");
+        assert!(!ro.recovered(&main).exists(), "只读不得写 .recovered");
     }
 
     #[test]

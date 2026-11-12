@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -260,11 +260,25 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 
 装配点早于读档：后台线程启动时 `CoreGameModule::build` 就按 profile 建好 App，`StreamingWorldPlugin` 在 `Startup` 才真正 `load_world`。因此「用哪些插件装配」必须来自档本身或建档选择，不能等读完档再决定。
 
+### 只读打开（`read_only`）
+
+只读会话不是另一种 App，而是同一套装配上的三个开关同时打开：
+
+1. `BevyBackendConfig.read_only = true` 插入 `ReadOnlySession` 资源；输入链整体不注册（不 tick、不消费暂存区，见 `04-输入链路.md`）。
+2. 未显式给 `plugins` 时，选择 `readonly_plugin_selection()`：从 `default_plugin_selection()` 里剔除 `gameplay` / `movement` / `death` / `camera` / `block_edit` / `prediction`，保留 `input` / `presentation` / `stable_id` / `spatial` / `aoi` / `world` / `game_voxel` / `terrain` / `streaming` / `voxel_mesh_refresh` / `sync_register`，`requires` 仍由解析器补齐。显式 `plugins` 优先，只读不额外过滤——调用方自己负责。
+3. 存档路径用 `SavePaths::read_only(root)`：读档可用，所有写入口（`write_encoded` / `remove_region` / `backup_corrupt` / `reclaim_*` / 卸载落盘）直接拒绝或跳过；`load_world_with_mode(..., LoadMode::ReadOnly)` 跳过 mod 清单、动作表、插件序列与参数的身份校验（只 `warn!`），但保留摘要 / region / 负载结构校验。
+
+只读**绝不降级新建世界**：`world.meta` 缺失或结构损坏时直接走读档拒绝路径（`world_load_failed` 或 `bev_error`），不会静默给一个空世界。身份不符的档（例如装了本机没有的 mod）在只读下可以打开查看，这正是只读存在的意义。
+
+Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`（`save_dir` 必填），`bevy_client.gd` 对应 `read_only = true` 的 STREAMING 模式与 `open_world_readonly(directory)`。
+
 插件选择从哪来：后台启动配置 `BevyBackendConfig.plugins: Option<Vec<String>>`（经 `CoreGameModule` 搬运到 `build_with_profile`）。`None` = 默认 profile（`default_plugin_selection()`），既有入口行为零变化；`Some` 先经 `intern_plugin_selection` 把运行期 String 收敛成注册表里的 `&'static str`。
 
 `Some(vec![])` **不是**「用默认」，而是「一个可选插件都不装」——空集合是合法的显式选择，不会回退。
 
 未知 id 不 panic：`intern_plugin_selection` 返回 `ProfileError::UnknownPlugin`，`CoreGameModule::build` 把它写成 `ModuleBuildFailure { code: "profile.unknown_plugin", .. }`，由 runner 转成 `bev_error(code, message)` + `Stopped(1)`。Godot 入口是 `start_bevy_streaming_with_plugins(fixed_hz, runner_hz, save_dir, plugins)`，其余参数与 `start_bevy_streaming` 一致。
+
+同一结构里还有 `read_only: bool`（默认 `false`）：`true` 时插入 `ReadOnlySession`、`plugins: None` 改选只读 profile、存档路径转只读，对应 Godot 入口 `start_bevy_streaming_readonly`。`plugins` 显式给出时按原样解析，只读不再过滤。
 
 ## 注册表
 

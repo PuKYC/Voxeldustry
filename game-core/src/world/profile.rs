@@ -320,6 +320,29 @@ pub fn default_plugin_selection() -> Vec<&'static str> {
         .collect()
 }
 
+/// 只读查看 profile：默认 profile 去掉会推进玩法状态、产生副作用的插件。
+///
+/// 只读会话冻结输入与模拟时钟（[crate::input::ReadOnlySession]），但
+/// `FixedUpdate` 仍会跑；剔除 gameplay / movement / death / camera / block_edit /
+/// prediction 后，世界里不会再有 AI、移动、死亡结算或方块编辑，剩下地形、
+/// 流式、表现链负责把存档画出来。
+///
+/// 依赖不在这里补：调用方把结果交给 [resolve_plugins]，requires 自动补齐。
+pub fn readonly_plugin_selection() -> Vec<&'static str> {
+    const EXCLUDED: [&str; 6] = [
+        "gameplay",
+        "movement",
+        "death",
+        "camera",
+        "block_edit",
+        "prediction",
+    ];
+    default_plugin_selection()
+        .into_iter()
+        .filter(|id| !EXCLUDED.contains(id))
+        .collect()
+}
+
 /// 把外部（存档/配置/UI）传来的插件 id 解析成注册表内的静态 id。
 ///
 /// 未知 id 返回 [ProfileError::UnknownPlugin]；只做 id 归一，依赖补齐与排序
@@ -564,6 +587,29 @@ mod tests {
             .map(|entry| entry.id)
             .collect();
         assert_eq!(default_plugin_selection(), expected);
+    }
+
+    #[test]
+    fn readonly_selection_drops_play_simulation_plugins() {
+        let readonly = readonly_plugin_selection();
+        for excluded in [
+            "gameplay",
+            "movement",
+            "death",
+            "camera",
+            "block_edit",
+            "prediction",
+        ] {
+            assert!(
+                !readonly.contains(&excluded),
+                "只读 profile 不应装 {excluded}"
+            );
+        }
+        for kept in ["input", "presentation", "terrain", "streaming", "world"] {
+            assert!(readonly.contains(&kept), "只读 profile 必须保留 {kept}");
+        }
+        // 依赖由解析器补齐；只读 profile 本身也必须可解析。
+        resolve_plugins(&readonly).expect("只读 profile 必须可解析");
     }
 
     #[test]

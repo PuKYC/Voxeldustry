@@ -34,6 +34,9 @@ enum Mode {
 ## streaming：世界存档目录（绝对路径）。空串 = 不落盘（每次全生成）。
 ## 传了目录时，后端启动会先尝试载入存档，命中则复用，不再重新生成地形。
 @export var save_dir: String = ""
+## streaming：true 时以只读方式打开 save_dir——可看、不可玩、不写盘。
+## 读档身份校验放宽，但结构损坏的存档仍然拒绝；插件只装表现与地形，不装玩法。
+@export var read_only: bool = false
 ## 路径 B：AO 总强度（1.0 = 当前观感、默认开启；0.0 = 完全关闭）。启动时写入 VoxelMeshNode。
 @export_range(0.0, 1.0, 0.01) var voxel_ao_strength: float = 1.0
 ## 路径 B：AO 曲线指数（1.0 = 当前观感；>1 加深，<1 减淡）。
@@ -201,13 +204,33 @@ func _start_backend() -> void:
 				push_warning("[BevyClient] 扩展缺少 start_bevy_gameplay_test()，回退到实体演示")
 				_start_entity_backend()
 		Mode.STREAMING:
-			if _mgr.has_method("start_bevy_streaming"):
+			if read_only:
+				# 只读意图下绝不回退到可写入口：宁可不起，也不能让「查看」变成可改。
+				if _mgr.has_method("start_bevy_streaming_readonly"):
+					_mgr.start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)
+				else:
+					push_error("[BevyClient] 扩展缺少 start_bevy_streaming_readonly()，拒绝以可写方式打开")
+			elif _mgr.has_method("start_bevy_streaming"):
 				_mgr.start_bevy_streaming(fixed_hz, runner_hz, save_dir)
 			else:
 				push_warning("[BevyClient] 扩展缺少 start_bevy_streaming()，回退到实体演示")
 				_start_entity_backend()
 		_:
 			_start_entity_backend()
+
+
+## 只读打开一个世界（不 tick、不写盘）。供主菜单 / 校验界面在「查看」时调用。
+##
+## 要求本节点尚未启动后端（场景里把 autostart 设为 false），启动后再调用不会重启；
+## 目录为空时后端只警告不启动。
+func open_world_readonly(directory: String) -> void:
+	if _mgr == null:
+		push_error("[BevyClient] 找不到 BevyAppManager，无法只读打开世界")
+		return
+	save_dir = directory
+	mode = Mode.STREAMING
+	read_only = true
+	_start_backend()
 
 
 ## 既有入口：实体演示 / 生产装配（start_bevy_with_config）。

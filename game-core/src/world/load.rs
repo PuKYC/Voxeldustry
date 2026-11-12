@@ -120,7 +120,26 @@ impl WorldLoadRejectionHandle {
     }
 }
 
+/// 读档模式。
+///
+/// - [Normal]：完整校验，身份不符（mod / 插件 / 动作表 / 参数 / 版本）拒绝读档；
+/// - [ReadOnly]：只做**结构**校验（键、ID、region 归属、负载可解码……），跳过身份
+///   校验，并允许世界参数应用失败。用于「打开旧世界看一眼」：装配本来就和存档不同，
+///   按身份拒绝会让只读入口永远打不开。
+///
+/// 只读模式**不**改变磁盘：写侧由 `SavePaths::read_only` 与只读闸门保证。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadMode {
+    /// 正常读档（默认）。
+    #[default]
+    Normal,
+    /// 只读查看：放宽身份校验，不写盘。
+    ReadOnly,
+}
+
 /// 从 paths 读一个世界；generator_version 是当前生成器的版本号。
+///
+/// 等价于 [load_world_with_mode] 的 [LoadMode::Normal]。
 ///
 /// 返回 Ok(None) 表示磁盘上没有 world.meta（新世界，调用方走生成器），
 /// 此时 world 一点都不会被改动。其余错误都表示存档损坏或世界缺资源，
@@ -139,16 +158,34 @@ pub fn load_world(
     paths: &SavePaths,
     generator_version: u32,
 ) -> Result<Option<LoadedWorld>, SaveError> {
+    load_world_with_mode(world, paths, generator_version, LoadMode::Normal)
+}
+
+/// 按 [LoadMode] 读一个世界（见 [LoadMode] 的语义）。
+///
+/// 阶段一 / 阶段二的划分与 [load_world] 相同；只读模式只在阶段一放宽身份校验、
+/// 在阶段二把世界参数应用失败降级为 warn。
+pub fn load_world_with_mode(
+    world: &mut World,
+    paths: &SavePaths,
+    generator_version: u32,
+    mode: LoadMode,
+) -> Result<Option<LoadedWorld>, SaveError> {
     let Some(meta) = read_world_meta(paths)? else {
         return Ok(None);
     };
 
     // 阶段一：只读文件 + 全部校验；这一步不碰 world。
-    let plan = build_plan(world, paths, meta, generator_version)?;
+    let plan = build_plan(world, paths, meta, generator_version, mode)?;
 
     // 阶段二：先确认所有必需资源都在，再开始写世界。
     require_resources(world)?;
-    apply_meta_params(world, &plan.meta)?;
+    if mode == LoadMode::Normal {
+        apply_meta_params(world, &plan.meta)?;
+    } else if let Err(error) = apply_meta_params(world, &plan.meta) {
+        // 只读查看的目标是地形和实体，不是玩法数值；参数表对不上不该挡住打开。
+        warn!("world: 只读会话未能应用世界参数（继续查看）：{error}");
+    }
     let body_entities = spawn_plan_bodies(world, &plan)?;
     let stale_chunks = install_plan_chunks(world, &plan, &body_entities, generator_version)?;
     let entities = apply_plan_entities(world, &plan)?;
@@ -208,12 +245,17 @@ fn build_plan(
     paths: &SavePaths,
     meta: WorldMeta,
     generator_version: u32,
+    mode: LoadMode,
 ) -> Result<Plan, SaveError> {
     validate_meta(&meta)?;
-    validate_meta_mods(world, &meta)?;
-    validate_meta_actions(world, &meta)?;
-    validate_meta_plugins(world, &meta)?;
-    validate_meta_params(world, &meta)?;
+    if mode == LoadMode::Normal {
+        // 身份校验：装配必须与存档逐项一致。只读查看刻意跳过——装配不同正是
+        // 它要展示的东西。
+        validate_meta_mods(world, &meta)?;
+        validate_meta_actions(world, &meta)?;
+        validate_meta_plugins(world, &meta)?;
+        validate_meta_params(world, &meta)?;
+    }
 
     let mut seen_entities: BTreeSet<u64> = BTreeSet::new();
     let mut bodies: Vec<BodyPlan> = Vec::with_capacity(meta.bodies.len());

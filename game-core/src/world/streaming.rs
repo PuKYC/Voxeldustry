@@ -98,6 +98,7 @@ use game_engine::save::{PersistPlugin, SaveConfig, SaveError, SavePaths, SavePlu
 
 use crate::gameplay::Velocity;
 use crate::input::control::LocalPlayer;
+use crate::input::ReadOnlySession;
 use crate::spec::CoreSpec;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
@@ -108,7 +109,9 @@ use crate::voxel::{
 };
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
-use crate::world::load::{load_world, WorldLoadRejection, WorldLoadRejectionHandle};
+use crate::world::load::{
+    load_world_with_mode, LoadMode, WorldLoadRejection, WorldLoadRejectionHandle,
+};
 use crate::world::save::SaveBlocked;
 use crate::world::save_plugin::{OrphanPolicy, SaveRoot, WorldSaveConfig, WorldSavePlugin};
 use crate::world::seed::WorldSeed;
@@ -280,10 +283,14 @@ impl Plugin for StreamingWorldPlugin {
             .unwrap_or(WorldSaveConfig {
                 autosave_interval_ticks: Some(STREAMING_AUTOSAVE_TICKS),
             });
+        // 只读会话：存档层建只读路径（写操作在 store 层直接拒绝），自动存档仍然
+        // 会跑，但每次都被闸门挡下，不会产生任何磁盘写入。
+        let read_only = app.world().contains_resource::<ReadOnlySession>();
         if !has_save_layer {
             app.add_plugins(SavePlugin {
                 config: SaveConfig {
                     root,
+                    read_only,
                     ..SaveConfig::default()
                 },
             });
@@ -300,6 +307,10 @@ impl Plugin for StreamingWorldPlugin {
 ///
 /// 失败只 warn：清理失败不该把一个已经读好的世界判成启动失败。
 fn reclaim_after_load(world: &World, paths: &SavePaths) {
+    if paths.is_read_only() {
+        debug!("world: 只读会话跳过孤儿 region 回收");
+        return;
+    }
     if world
         .get_resource::<OrphanPolicy>()
         .copied()
@@ -331,13 +342,23 @@ fn reclaim_after_load(world: &World, paths: &SavePaths) {
 /// 这里必须能在没有任何 SaveStore 时运行（无 SaveRoot 的 headless / 单测），
 /// 所以只按 SaveRoot 决定是否碰磁盘，不无条件取 SaveStore。
 fn bootstrap_streaming_world(world: &mut World) {
+    let read_only = world.contains_resource::<ReadOnlySession>();
     let save_root = world.get_resource::<SaveRoot>().map(|root| root.0.clone());
     if let Some(root) = save_root {
-        let paths = SavePaths::new(root);
+        let paths = if read_only {
+            SavePaths::read_only(root)
+        } else {
+            SavePaths::new(root)
+        };
         // 生成器版本的唯一来源是流式层配置。这里是 exclusive &mut World，
         // 先把值拷出来再传，免得 load_world 的 &mut 借用与资源借用重叠。
         let generator_version = world.resource::<VoxelStreamConfig>().generator_version;
-        match load_world(world, &paths, generator_version) {
+        let mode = if read_only {
+            LoadMode::ReadOnly
+        } else {
+            LoadMode::Normal
+        };
+        match load_world_with_mode(world, &paths, generator_version, mode) {
             Ok(Some(loaded)) => {
                 info!(
                     "world: 读档完成（tick={} bodies={} chunks={} stale_chunks={} entities={} orphan_regions={}），跳过空地形",
@@ -367,10 +388,17 @@ fn bootstrap_streaming_world(world: &mut World) {
             }
             Ok(None) => {
                 info!("world: 没有存档，按新世界启动");
+                if read_only {
+                    // 只读入口明确指向一个不存在 / 没有 world.meta 的目录：
+                    // 建一个空世界会让人误以为「档是空的」，直接不生成。
+                    warn!("world: 只读会话没有找到 world.meta，保持空世界");
+                    return;
+                }
             }
-            Err(error) if error.kind().is_world_rejection() => {
+            Err(error) if read_only || error.kind().is_world_rejection() => {
                 // 身份不符（mod / 插件 / 动作表 / 参数 / 版本）：档本身是好的，
                 // 只是与当前装配不同。这里既不建新世界也不落盘，原档原样留给玩家。
+                // 只读会话对任何读档错误都走这条路：只读绝不降级新建世界。
                 reject_world_load(world, &error);
                 return;
             }
@@ -1451,6 +1479,33 @@ mod tests {
         assert!(
             world.get::<BodyRef>(player).is_none(),
             "没有地形体时不能瞎写 BodyRef"
+        );
+    }
+
+    #[test]
+    fn readonly_boot_rejects_unreadable_save_instead_of_building_new_world() {
+        let dir = TempDir::new("readonly_boot");
+        std::fs::write(dir.path().join("world.meta"), b"not a world").expect("写坏档");
+
+        let mut app = terrain_app_with_root(Some(TerrainMode::Streaming), true, Some(dir.path()));
+        // 装配完成后才插：只读路径必须看资源，而不是看 SavePlugin 有没有先建好。
+        app.insert_resource(ReadOnlySession);
+        app.update();
+
+        assert!(
+            app.world().contains_resource::<SaveBlocked>(),
+            "只读读档失败也必须装存档闸门"
+        );
+        assert!(
+            !app.world().resource::<WorldLoadReport>().loaded_from_save,
+            "只读读档失败不能写成「已从档恢复」"
+        );
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<VoxVolume>>();
+        assert_eq!(
+            query.iter(world).count(),
+            0,
+            "只读会话读档失败绝不能降级新建世界"
         );
     }
 

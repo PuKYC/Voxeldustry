@@ -688,6 +688,7 @@ static TEST_MANIFEST: ModManifest = ModManifest {
     exclusive_groups: &[],
     params: TEST_PARAM_SPECS,
     actions: &[],
+    presentation: &[],
 };
 
 #[test]
@@ -818,7 +819,7 @@ fn build_plan_orders_bodies_and_regions() {
         .expect("读 meta")
         .expect("world.meta 存在");
     let reader = test_world(1);
-    let plan = build_plan(&reader, &paths, meta, 1).expect("建计划成功");
+    let plan = build_plan(&reader, &paths, meta, 1, LoadMode::Normal).expect("建计划成功");
 
     expected.sort_unstable();
     let keys: Vec<BodyKey> = plan.bodies.iter().map(|body| body.key).collect();
@@ -1103,6 +1104,39 @@ fn load_rejects_plugin_drift() {
         "错误应指出缺失的资源，实际：{error}"
     );
     assert_eq!(fingerprint(&loaded), before, "校验失败时 world 不得改动");
+}
+
+#[test]
+fn readonly_load_accepts_identity_drift() {
+    let mut source = test_world(0x56);
+    source.insert_resource(resolved_actions(&[]));
+    source.insert_resource(ActivePlugins::new(vec!["core.world", "core.terrain"]));
+    let capture = capture_world(&mut source, 1, 1).expect("采集成功");
+    let dir = TempDir::new("readonly_drift");
+    let paths = SavePaths::new(dir.path());
+    write_capture(&paths, &capture).expect("落盘成功");
+
+    // 正常读档：装配顺序不同，必须拒绝。
+    let mut normal = test_world(1);
+    normal.insert_resource(resolved_actions(&[]));
+    normal.insert_resource(ActivePlugins::new(vec!["core.terrain", "core.world"]));
+    let error = load_world(&mut normal, &paths, 1).expect_err("正常读档必须校验装配");
+    assert!(
+        error.to_string().contains("装配顺序"),
+        "错误应指出装配顺序，实际：{error}"
+    );
+
+    // 只读读档：跳过身份校验，但仍能恢复出存档内容。
+    let mut readonly = test_world(1);
+    readonly.insert_resource(crate::input::ReadOnlySession);
+    let loaded = load_world_with_mode(&mut readonly, &paths, 1, LoadMode::ReadOnly)
+        .expect("只读读档不做身份校验")
+        .expect("world.meta 存在");
+    assert_eq!(
+        loaded.stats.bodies,
+        capture.meta.bodies.len(),
+        "只读读档也要把 body 全部恢复出来"
+    );
 }
 
 #[test]

@@ -141,6 +141,7 @@ use game_engine::voxel::{
     VoxelDirtySet, VoxelInterner,
 };
 
+use crate::input::ReadOnlySession;
 use crate::presentation::{PresentedTransform, RenderGroupBody, VoxChunkGroupRaw};
 use crate::static_data::voxel::{DEFAULT_BIOME, DEFAULT_VOXEL_SIZE};
 use crate::voxel::terrain::blocks::block_origin_meters;
@@ -1117,6 +1118,14 @@ pub fn persist_pending_unloads(world: &mut World) {
         warn!("stream: 卸载落盘已禁用（读档被拒绝，原档保留），本 tick 不写盘");
         return;
     }
+    // 只读会话：磁盘一个字都不能动。条目保持 version == None，释放阶段照常
+    // 回收内存（只读查看不需要把块留在容器里）。
+    if world.contains_resource::<ReadOnlySession>() {
+        // 不写盘；[release_pending_unloads] 在只读会话里把条目当「无需确认」立即
+        // 释放，内存不会积压。刷屏风险高（走动时每 tick 都有卸载），用 debug。
+        debug!("stream: 只读会话不写卸载块，本 tick 跳过落盘");
+        return;
+    }
     // 没有存档（headless / 单测）：跳过写盘，释放阶段会立即释放。
     if world.get_resource::<SaveStore>().is_none() {
         return;
@@ -1245,8 +1254,12 @@ pub fn release_pending_unloads(world: &mut World) {
     {
         let store = world.get_resource::<SaveStore>();
         let has_worker = store.is_some_and(|store| store.has_worker());
+        // 只读会话永远不会有写入确认（persist_pending_unloads 直接跳过），
+        // 不特殊处理的话条目永远留在表里、块永不释放，内存只增不减。
+        let read_only = world.contains_resource::<ReadOnlySession>();
         for (pair, entry) in pending {
             let release = match store {
+                _ if read_only => true,
                 // 没有存档 / 没有后台线程：永远不会确认，不能无限等。
                 None => true,
                 Some(_) if !has_worker => true,

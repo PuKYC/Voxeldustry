@@ -12,7 +12,7 @@ pub mod capability;
 // 这些子模块现在住在 game-engine；重导出以保持 `crate::input::raw::*` 等旧路径可用。
 // 这是**面向 FFI 的有意重导出**：godot-client-ext 只依赖 game-core，需要经
 // `game_core::input::*` 取到这些引擎机制类型，请勿当作冗余 import 清理。
-pub use game_engine::input::{control, events, raw, snapshot, staging};
+pub use game_engine::input::{control, events, raw, snapshot, staging, ReadOnlySession};
 
 // 仅供 crate 内部（dev::demo / dev::perf / presentation 等兄弟模块）使用的顶层别名。
 // 不对外公开：外部/未来 Mod 请从 `input::control`、`input::capability` 等

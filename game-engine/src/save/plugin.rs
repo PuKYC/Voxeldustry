@@ -94,6 +94,12 @@ pub struct SaveConfig {
     /// 默认 1（每 tick）：没有 `ChunkWillUnload` 落盘钩子时，周期 >1 意味着最近一段
     /// 时间的编辑只在内存里，崩溃即丢。
     pub flush_interval_ticks: u64,
+    /// 只读会话：写/删只换版本号并立即标为已确认，**不缓冲、不标脏、不发后台任务**。
+    ///
+    /// 只读模式仍然需要后台线程：未驻留的块要从磁盘读出来才能看。
+    /// 写入侧靠这个开关关掉，而不是靠不装 `SavePlugin`——不装就没有 `SaveStore`
+    /// 可读，流式层会退化成重新生成地形。
+    pub read_only: bool,
 }
 
 impl Default for SaveConfig {
@@ -103,6 +109,7 @@ impl Default for SaveConfig {
             read_timeout_ticks: DEFAULT_READ_TIMEOUT_TICKS,
             write_budget_per_tick: DEFAULT_WRITE_BUDGET_PER_TICK,
             flush_interval_ticks: DEFAULT_FLUSH_INTERVAL_TICKS,
+            read_only: false,
         }
     }
 }
@@ -278,8 +285,13 @@ impl SaveStore {
     #[must_use]
     pub fn new(config: SaveConfig) -> Self {
         let (worker, results) = WorkerThread::spawn(config.root.clone());
+        let paths = if config.read_only {
+            SavePaths::read_only(config.root.clone())
+        } else {
+            SavePaths::new(config.root.clone())
+        };
         Self {
-            paths: SavePaths::new(config.root.clone()),
+            paths,
             config,
             state: Mutex::new(StoreState::default()),
             worker: Some(worker),
@@ -412,6 +424,15 @@ impl SaveStore {
         let mut state = self.state();
         let version = state.next_version();
         state.versions.insert(id, version);
+        if self.config.read_only {
+            // 只读会话：立刻算“已确认”，让卸载释放链路（is_committed）正常走，
+            // 但不进缓冲、不标脏、不产生后台任务，内存与磁盘都不变。
+            state.committed.insert(id, version);
+            state.buffer.remove(&id);
+            state.tombstones.remove(&id);
+            state.dirty.remove(&id);
+            return Ok(version);
+        }
         state.buffer.insert(id, record);
         state.tombstones.remove(&id);
         state.dirty.insert(id);
@@ -437,6 +458,17 @@ impl SaveStore {
         let version = state.next_version();
         // 换一个新版本号：在途的旧写/旧读因此作废，迟到的成功不会清掉墓碑。
         state.versions.insert(id, version);
+        if self.config.read_only {
+            // 只读会话：内存里照常“忘掉”这块（lookup → Miss），但不落盘、不标脏。
+            state.committed.insert(id, version);
+            state.buffer.remove(&id);
+            state.tombstones.insert(id);
+            state.dirty.remove(&id);
+            state.in_flight_reads.remove(&id);
+            state.ready.remove(&id);
+            state.misses.insert(id);
+            return Ok(version);
+        }
         state.buffer.remove(&id);
         state.tombstones.insert(id);
         state.dirty.insert(id);
@@ -1177,12 +1209,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_only_store_confirms_without_touching_disk() {
+        let dir = TempDir::new("read-only");
+        let mut config = config(&dir);
+        config.read_only = true;
+        let store = SaveStore::new(config);
+        let b = body(1);
+        let k = key(0, 0, 0);
+
+        let version = store
+            .write(b, k, record(1))
+            .expect("只读写的版本号必须照常返回");
+        assert!(store.is_committed(b, k, version), "只读写必须立即算已确认");
+        assert_eq!(store.stats().buffered, 0, "只读不缓冲");
+        assert_eq!(store.stats().dirty, 0, "只读不标脏");
+
+        let version = store.delete(b, k).expect("只读删也要 Ok");
+        assert!(store.is_committed(b, k, version), "只读删必须立即算已确认");
+        assert_eq!(store.stats().dirty, 0, "只读删不标脏");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("读目录").count(),
+            0,
+            "只读会话不能落任何文件"
+        );
+    }
+
     fn config(dir: &TempDir) -> SaveConfig {
         SaveConfig {
             root: dir.path().to_path_buf(),
             read_timeout_ticks: DEFAULT_READ_TIMEOUT_TICKS,
             write_budget_per_tick: 4,
             flush_interval_ticks: 1,
+            read_only: false,
         }
     }
 

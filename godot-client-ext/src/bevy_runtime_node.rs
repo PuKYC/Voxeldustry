@@ -263,6 +263,36 @@ impl BevyAppManager {
         });
     }
 
+    /// 只读打开一个已有存档：读档、跑表现，但不推进玩法、不写盘。
+    ///
+    /// 与 start_bevy_streaming 的差别全在装配参数：
+    /// - `read_only: true` → 后台插入 `ReadOnlySession`，输入链与 tick 冻结，
+    ///   插件 profile 走 `readonly_plugin_selection()`（不装玩法 / 移动 / 相机），
+    ///   存档路径用 `SavePaths::read_only`，任何写盘请求都直接拒绝；
+    /// - `save_dir` 必须非空：只读打开没有存档就无从看起，空路径只警告不启动。
+    ///
+    /// 读档身份校验（mod / 动作表 / 插件序列）在只读下放宽，坏档仍然拒绝：
+    /// 只读不等于可以打开一个结构损坏的世界。
+    #[func]
+    fn start_bevy_streaming_readonly(&mut self, fixed_hz: f64, runner_hz: f64, save_dir: GString) {
+        let save_dir = save_dir.to_string();
+        if save_dir.is_empty() {
+            godot_warn!("[BevyAppManager] 只读打开需要 save_dir；忽略本次启动");
+            return;
+        }
+        self.start_backend(BevyBackendConfig {
+            fixed_hz,
+            runner_hz,
+            enable_demo: false,
+            terrain: Some(TerrainConfig::default()),
+            voxel_viewer: true,
+            terrain_mode: TerrainMode::Streaming,
+            save_dir: godot_save_dir(&save_dir),
+            read_only: true,
+            ..BevyBackendConfig::default()
+        });
+    }
+
     /// 流式体素场景 + 显式插件选择（其余参数与 start_bevy_streaming 完全一致）。
     ///
     /// `plugins` 原样交给后台装配：空数组表示一个可选插件都不装（不是默认

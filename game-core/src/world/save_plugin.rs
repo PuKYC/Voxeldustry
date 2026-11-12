@@ -74,6 +74,7 @@ use game_engine::backend::BackendShutdown;
 use game_engine::residency::GameTickSet;
 use game_engine::save::{SaveConfig, SavePaths, SaveSet, SaveStore};
 
+use crate::input::ReadOnlySession;
 use crate::voxel::stream::VoxelStreamConfig;
 use crate::world::save::{capture_world, write_capture, SaveBlocked};
 
@@ -178,13 +179,24 @@ impl Plugin for WorldSavePlugin {
             );
         }
         let root = configured_root.unwrap_or_else(|| SaveConfig::default().root);
+        // 只读会话以资源为准（存档层的 SaveConfig 可能还没插进来）；两者任意一个
+        // 说只读，路径对象就必须是只读的，否则刷新路径时会把闸门悄悄拆掉。
+        let read_only = app.world().contains_resource::<ReadOnlySession>()
+            || app
+                .world()
+                .get_resource::<SaveConfig>()
+                .is_some_and(|config| config.read_only);
 
         app.insert_resource(self.config.clone())
             .init_resource::<WorldSaveStatus>()
             // 装配方可以用 insert_resource(OrphanPolicy::Delete) 覆盖；这里 init
             // 一次保证读档引导读得到默认值（Keep）。
             .init_resource::<OrphanPolicy>()
-            .insert_resource(WorldSavePaths(SavePaths::new(root)))
+            .insert_resource(WorldSavePaths(if read_only {
+                SavePaths::read_only(root)
+            } else {
+                SavePaths::new(root)
+            }))
             .add_message::<SaveNow>()
             // 排在 SaveSet::Poll 之后：先让 Flush 推进 tick、Poll 回收后台结果，
             // 再拿世界做全量采集，避免和存档层的世界访问抢在同一段。
@@ -227,11 +239,19 @@ fn refresh_paths(world: &mut World) {
             |paths| paths.0.root().to_path_buf(),
         ),
     };
-    let stale = world
-        .get_resource::<WorldSavePaths>()
-        .is_none_or(|paths| paths.0.root() != root.as_path());
+    let read_only = world.contains_resource::<ReadOnlySession>()
+        || world
+            .get_resource::<WorldSavePaths>()
+            .is_some_and(|paths| paths.0.is_read_only());
+    let stale = world.get_resource::<WorldSavePaths>().is_none_or(|paths| {
+        paths.0.root() != root.as_path() || paths.0.is_read_only() != read_only
+    });
     if stale {
-        world.insert_resource(WorldSavePaths(SavePaths::new(root)));
+        world.insert_resource(WorldSavePaths(if read_only {
+            SavePaths::read_only(root)
+        } else {
+            SavePaths::new(root)
+        }));
     }
 }
 
@@ -274,6 +294,12 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
 /// [capture_world] 采集 -> [write_capture] 落盘 -> 记账。失败只记
 /// [WorldSaveStatus::last_error]，不 panic、不前进 saves / last_world_tick。
 fn perform_save(world: &mut World, tick: u64) {
+    // 只读会话：连采集都不做。SavePaths 已经在 store 层拒绝写入，这里提前
+    // 返回只是省掉一次全量采集与后台任务，并给出一条明确日志。
+    if world.contains_resource::<ReadOnlySession>() {
+        warn!("只读会话不写存档：本次存档请求不写盘");
+        return;
+    }
     // 读档被拒绝（SaveBlocked）时世界只是空壳：此刻任何落盘都会把原档覆盖成
     // 一个空世界，而原档本身是好的，玩家装回 mod / 插件后还想再进。所有触发
     // 路径（手动 SaveNow、自动存档、退出补跑帧）都汇到 perform_save，一个闸门
