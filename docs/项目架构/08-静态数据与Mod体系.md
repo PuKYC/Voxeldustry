@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12；运行期校验和（verify::simulation_checksum / diagnostics.checksum）@ 2026-11-12；参数 schema 面板（param_schema.rs / get_param_schema / set_param_overrides / ParamPanel）@ 2026-11-12"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12；运行期校验和（verify::simulation_checksum / diagnostics.checksum）@ 2026-11-12；参数 schema 面板（param_schema.rs / get_param_schema / set_param_overrides / ParamPanel）@ 2026-11-12；导入验证（verify_mod.rs / package_hash / verify_mod / verify_mods）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -386,8 +386,24 @@ GDScript 面板 `godot-project/ui/screens/param_panel.gd`（`class_name ParamPan
 
 Godot 侧流程：`BevyAppManager.scan_mod_packages(root)` 读目录并解析，返回 `{ ok, count, packages, errors }`（每个包带 `id`、`version`、`source`、`actions`、`params`、`presentation`、`data_files`、`scripts`）（`ok=false` 时 `errors` 为 `{ path, code, message }`）；成功结果留在节点上，之后**任一** `start_bevy_*` 都把它带进 `BevyBackendConfig.packages`。`bevy_client.gd` 的 `mod_dir` 非空时在 `_start_backend` 前自动扫描，失败则取消本次启动（不装半套）。
 
-包不参与存档身份：`world.meta` 冻结的是 mod `id/version` 与解析后的插件序列，**不含**包文件哈希。改了包内容却没升 `version`，旧档仍会放行；发布者必须靠 `version` 表达内容变更。运行期漂移由下面的校验和发现，安装期验证与包哈希仍是后续里程碑。
+包不参与存档身份：`world.meta` 冻结的是 mod `id/version` 与解析后的插件序列，**不含**包文件哈希。改了包内容却没升 `version`，旧档仍会放行；发布者必须靠 `version` 表达内容变更。运行期漂移由下面的校验和发现；安装期验证与包哈希见下节「导入验证（verify_mod）」。
 
+
+### 导入验证（verify_mod）
+
+`game-core/src/verify_mod.rs` 是 P0-2 的后端：给定一个 `LoadedPackage`，产出结构化 `VerificationReport`。验证过程不写存档、不碰 `SaveRoot`，也不调用 `publish_active_actions` / `publish_mod_payloads` 等全局发布入口；两个验证 App 与游戏本体完全隔离。
+
+- `package_hash(&LoadedPackage) -> u64`：FNV-1a 64，域前缀 `voxeldustry.package.v1`。按声明顺序混入 manifest 的全部语义字段（`id` / `version` / `engine_api` / `load_after` / `load_after_optional` / `conflicts` / `exclusive_groups` / `actions` / `params` / `presentation` / `data` / `scripts`；字符串一律 `u32` 长度前缀，避免拼接歧义），再混入每个**已声明** data / scripts 的相对路径与字节。未声明文件不参与（`load_package` 本来也不读）。`package_hash_hex` 输出 16 位小写十六进制。
+- `verify_package(package, context, options)`：`context` 是带依赖的其它已扫描包；它与被测包按 `id` 去重后一起 `to_mod::<CoreSpec>()`。用 `default_plugin_selection()` 构建两个独立 App（`App::new()` + `MinimalPlugins` + `Time::<Fixed>::from_hz(60.0)` + `TimeUpdateStrategy::ManualDuration(1/60 s)`），各插入同一 `WorldRng::from_seed(seed)` 与 8 个固定探针（`StableEntityId(0xFFFF_0000 + i)`、`Transform::from_xyz(i, 0, 0)`、`Velocity { linear: Vec3::new(1.0, 0.0, 0.5) }`），`finish` / `cleanup` 后先 `update()` 一次跑完 Startup / PostStartup，再逐 tick `update()`。
+- 报告字段（FFI 同名）：`mod_id`、`version`、`package_hash`、`engine_api`、`engine_version`（game-core 的 `CARGO_PKG_VERSION`）、`ok`、`deterministic`、`rollback_equivalent`、`ticks`、`hashes`、`first_divergence_tick`、`errors`、`cached`；`errors` 每项是 `{ code, message, tick }`，`tick = -1` / `None` 表示无。
+- `VerifyOptions` 默认 `ticks = 120`、`rollback_at = 60`、`rollback_ticks = 30`、固定 `seed`。`first_divergence_tick` **从 1 开始**，`None` 表示未分叉。
+- 确定性双跑：两个 App 的 `simulation_checksum` 序列逐 tick 比较，第一处不同记 `first_divergence_tick`，`deterministic = false`，并追加 `verify.nondeterministic`。
+- 回滚等价：第一个 App 在 `rollback_at` 快照所有带 `StableEntityId` 的实体 `(Entity, StableEntityId, Transform, Option<Velocity>)` 与 `WorldRng`，记录当 tick 校验和；继续跑 `rollback_ticks` 得到 future 校验和；随后写回 Transform / Velocity / RNG，despawn 回滚窗内新生成的 `StableEntityId` 实体，再跑 `rollback_ticks` 比较。不等记 `verify.rollback_mismatch`（同时保留两个 hash）；快照实体已消失记 `verify.rollback_entity_missing`。
+- `ok = deterministic && rollback_equivalent && errors.is_empty()`。构建失败转成 `WorldBuildError::code()`（`mod.*` / `profile.*`）报告，不 panic。
+- 缓存 `VerificationCache`：键 `(mod_id, version, package_hash, engine_api, engine_version)`。命中直接 clone 报告并置 `cached = true`，不重跑；未命中跑完插入。**键不含 `VerifyOptions`**，因此只对默认 options 安全；自定义 tick / seed 应直接调 `verify_package`，或先 `clear()` 缓存。
+- FFI：`BevyAppManager.verify_mod(path)` / `verify_mods(paths)` 是**同步**调用，会阻塞调用线程约数秒（两轮 120 tick + 回滚 30 tick），Godot UI 必须放到后台线程或后续异步任务；本轮不提供异步。坏包返回报告形状（`mod_id` 为空、`errors[0].code = mod.package.*`、message 含路径），不抛 panic。字典里 `package_hash` / `final_hash` 是 hex 字符串，`hashes` 按 `i64` 位模式给（u64 最高位会丢，比较请用 hex），`first_divergence_tick = -1` 表示无分叉。
+- 覆盖边界（刻意保守）：只证明**本机、当前引擎版本、这组固定探针 / seed** 下双跑与回滚一致；**不执行 Lua / BMS 脚本层**，不覆盖跨平台浮点差异；回滚快照只覆盖 `StableEntityId` 实体的 Transform / Velocity 与 `WorldRng`，mod 自定义资源不在快照里，因此带自定义状态的回滚会被判不等价；窗口内新生成的实体会被清理，快照实体消失则无法恢复。
+- 策略约定：单机验证失败只警告并允许继续；联机（尚未实现）只放行 `ok == true` 且 `package_hash` 一致的加入者。文案只写「已通过检测」，不承诺反作弊或绝对安全。
 
 ### Lua 脚本层（feature = `scripting`）
 
@@ -482,6 +498,8 @@ u64 digest                    # 覆盖头、body 表与上面全部扩展字节
 诊断快照 `StreamingDiagnostics.checksum` 每帧采集（`capture` 里调用，O(实体数)），Godot 侧 `streaming_diagnostics_to_dictionary` 以 `i64` 输出（`u64` 按位塞入，`-1` = 未采集），键名 `checksum`。校验和不参与玩法判定，也不写进存档。
 
 测试 `verify::tests` 五个用例：spawn 顺序无关、Transform / 种子变化会改变结果、无稳定 ID 的实体不影响结果、同一批 fixed tick 双跑一致、Transform 快照恢复后校验和回到原值。
+
+导入验证（上节 `verify_mod`）不另造校验和，而是在隔离 App 里复用 `simulation_checksum`，所以覆盖范围与上面完全一致。
 
 ## 改内容时的落点
 

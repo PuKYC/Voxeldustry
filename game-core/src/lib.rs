@@ -50,6 +50,8 @@ pub mod spec;
 pub mod static_data;
 /// 世界校验和：确定性验证与回滚等价。
 pub mod verify;
+/// 目录式 mod 包的导入验证（包哈希 / 无头双跑 / 回滚等价 / 缓存）。
+pub mod verify_mod;
 /// 体素世界层（游戏内容）：Body / 停靠 / LOD / 地形；装配 GameVoxelPlugin + TerrainPlugin。
 pub mod voxel;
 /// 游戏世界语义：Island / WorldSeed / WorldRng（极简确定性状态）。

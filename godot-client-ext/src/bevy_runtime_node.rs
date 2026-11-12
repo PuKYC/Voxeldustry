@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 
 use game_core::bevy_backend::*;
 use game_core::mods::default_core_mods;
-use game_core::package::{scan_package_root, LoadedPackage};
+use game_core::package::{load_package, scan_package_root, LoadedPackage};
 use game_core::param_schema::{
     collect_param_schema, param_error_code, validate_param_overrides, ParamKind,
 };
@@ -35,6 +35,10 @@ use game_core::spec::ClientBridge;
 use game_core::static_data::ObjectTablesHandle;
 #[cfg(debug_assertions)]
 use game_core::static_data::ReloadObjectTables;
+use game_core::verify_mod::{
+    package_error_report, package_hash_hex, verify_cached, VerificationCache, VerificationReport,
+    VerifyOptions,
+};
 use game_core::voxel::terrain::{
     nearest_block_distance_m, TerrainConfig, TerrainMode, VoxelLodRuntime,
 };
@@ -99,6 +103,11 @@ pub struct BevyAppManager {
     /// 就随之后每一次启动带进后台配置，直到下一次扫描覆盖。
     packages: Vec<LoadedPackage>,
 
+    /// 导入验证缓存：按 (mod_id, version, package_hash, engine_api, engine_version) 命中。
+    ///
+    /// 只服务默认 VerifyOptions；UI 若允许改 ticks / seed，应另行清空缓存。
+    verification_cache: VerificationCache,
+
     /// 待装配的参数覆盖值（全 key -> 落盘整数），由参数面板在启动前写入。
     ///
     /// 每次 start_backend 原样搬进 BevyBackendConfig 的 param_overrides；
@@ -132,6 +141,7 @@ impl INode for BevyAppManager {
             object_tables: ObjectTablesHandle::default(),
             world_load_rejection: WorldLoadRejectionHandle::default(),
             packages: Vec::new(),
+            verification_cache: VerificationCache::new(),
             param_overrides: BTreeMap::new(),
             last_error: None,
         }
@@ -435,6 +445,44 @@ impl BevyAppManager {
         }
         out
     }
+
+    /// 验证单个目录式 mod 包（同步阻塞，见 [Self::verify_mods]）。
+    ///
+    /// **会阻塞调用线程约数秒**（120 tick 双跑 + 30 tick 回滚，默认 profile）。
+    /// GDScript 应在后台线程 / 后续异步任务里调用，本轮不做异步。
+    #[func]
+    fn verify_mod(&mut self, path: GString) -> VarDictionary {
+        verify_one_package(
+            &path.to_string(),
+            &self.packages,
+            &mut self.verification_cache,
+        )
+    }
+
+    /// 批量验证目录式 mod 包（同步阻塞）。
+    ///
+    /// 每个路径独立加载、独立验证；坏包也会返回报告形状的字典，不 panic。
+    /// context 取本节点已扫描通过的包（排除与被测包同 id 的项），因此有依赖的包
+    /// 在 scan_mod_packages 之后能解析。返回 Array[Dictionary]，字段见
+    /// [verification_report_to_dict]。
+    ///
+    /// **线程边界**：内部会装配两个无头 Bevy App 并跑 tick（默认 120 + 30），
+    /// 在本机大约需要数秒；这是在 Godot 主线程上执行的同步调用，会卡住 UI。
+    /// 本轮不提供异步版本，调用方应放到后台线程 / 后续异步任务。
+    #[func]
+    fn verify_mods(&mut self, paths: PackedStringArray) -> Array<VarDictionary> {
+        let mut out: Array<VarDictionary> = Array::new();
+        for path in paths.to_vec() {
+            let report = verify_one_package(
+                &path.to_string(),
+                &self.packages,
+                &mut self.verification_cache,
+            );
+            out.push(&report);
+        }
+        out
+    }
+
     /// 采集装配前参数 schema（编译期 mod + 已扫描的目录式包）。
     ///
     /// 返回 { ok, schema, errors }。
@@ -1197,6 +1245,71 @@ impl BevyAppManager {
         out.set("message", &message);
         out
     }
+}
+
+/// 单个路径的验证：load_package -> verify_cached -> 字典。
+///
+/// FFI 与单测共用；坏包走报告形状，不 panic。context 由调用方给已扫描包，
+/// 本函数只排除同 id 的项，避免同一包装两次。
+fn verify_one_package(
+    path: &str,
+    packages: &[LoadedPackage],
+    cache: &mut VerificationCache,
+) -> VarDictionary {
+    let source = PathBuf::from(path);
+    let package = match load_package(&source) {
+        Ok(package) => package,
+        Err(error) => return verification_report_to_dict(&package_error_report(&source, &error)),
+    };
+    let context: Vec<LoadedPackage> = packages
+        .iter()
+        .filter(|candidate| candidate.id() != package.id())
+        .cloned()
+        .collect();
+    let report = verify_cached(&package, &context, VerifyOptions::default(), cache);
+    verification_report_to_dict(&report)
+}
+
+/// VerificationReport -> Godot 字典（字段名固定）。
+///
+/// u64 哈希在 GDScript 侧没有无符号 64 位整数：
+/// - package_hash / final_hash 给 16 位十六进制字符串（推荐用于比较 / 显示）；
+/// - package_hash_u64 与 hashes 按 i64 位模式给（可能为负，仅用于透传）；
+/// - first_divergence_tick 用 -1 表示 None。
+fn verification_report_to_dict(report: &VerificationReport) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    out.set("mod_id", report.mod_id.as_str());
+    out.set("version", i64::from(report.version));
+    out.set(
+        "package_hash",
+        package_hash_hex(report.package_hash).as_str(),
+    );
+    out.set("package_hash_u64", report.package_hash as i64);
+    out.set("engine_api", i64::from(report.engine_api));
+    out.set("engine_version", report.engine_version.as_str());
+    out.set("ok", report.ok);
+    out.set("deterministic", report.deterministic);
+    out.set("rollback_equivalent", report.rollback_equivalent);
+    out.set("ticks", i64::from(report.ticks));
+    let hashes: Vec<i64> = report.hashes.iter().map(|hash| *hash as i64).collect();
+    out.set("hashes", &PackedInt64Array::from(&hashes[..]));
+    let final_hash = report.hashes.last().copied().unwrap_or(0);
+    out.set("final_hash", package_hash_hex(final_hash).as_str());
+    out.set(
+        "first_divergence_tick",
+        report.first_divergence_tick.map(i64::from).unwrap_or(-1),
+    );
+    let mut errors: Array<VarDictionary> = Array::new();
+    for error in &report.errors {
+        let mut item = VarDictionary::new();
+        item.set("code", error.code.as_str());
+        item.set("message", error.message.as_str());
+        item.set("tick", error.tick.map(i64::from).unwrap_or(-1));
+        errors.push(&item);
+    }
+    out.set("errors", &errors);
+    out.set("cached", report.cached);
+    out
 }
 
 /// 往 errors 数组追加一条 { code, message }（参数 FFI 共用）。
