@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12；运行期校验和（verify::simulation_checksum / diagnostics.checksum）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -345,7 +345,7 @@ Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`�
 
 Godot 侧流程：`BevyAppManager.scan_mod_packages(root)` 读目录并解析，返回 `{ ok, count, packages, errors }`（每个包带 `id`、`version`、`source`、`actions`、`params`、`presentation`、`data_files`、`scripts`）（`ok=false` 时 `errors` 为 `{ path, code, message }`）；成功结果留在节点上，之后**任一** `start_bevy_*` 都把它带进 `BevyBackendConfig.packages`。`bevy_client.gd` 的 `mod_dir` 非空时在 `_start_backend` 前自动扫描，失败则取消本次启动（不装半套）。
 
-包不参与存档身份：`world.meta` 冻结的是 mod `id/version` 与解析后的插件序列，**不含**包文件哈希。改了包内容却没升 `version`，旧档仍会放行；发布者必须靠 `version` 表达内容变更，校验 / 回滚等价是后续里程碑。
+包不参与存档身份：`world.meta` 冻结的是 mod `id/version` 与解析后的插件序列，**不含**包文件哈希。改了包内容却没升 `version`，旧档仍会放行；发布者必须靠 `version` 表达内容变更。运行期漂移由下面的校验和发现，安装期验证与包哈希仍是后续里程碑。
 
 
 ### Lua 脚本层（feature = `scripting`）
@@ -428,6 +428,19 @@ u64 digest                    # 覆盖头、body 表与上面全部扩展字节
 实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1（该文档在 `docs/待办` 下，未纳入版本库）。
 
 后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交。插件 profile 由 `plugins: Option<Vec<String>>` 暴露（`None` = 默认 profile，`Some(vec![])` = 显式空选择，未知 id 走 `ProfileError::UnknownPlugin` 结构化失败）；`start_bevy_streaming_with_plugins` 是对应的 GDScript 入口。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
+
+### 运行期校验和（确定性验证 / 回滚等价）
+
+`game_core::verify::simulation_checksum(&mut World) -> u64` 是确定性与回滚等价的公共原语：
+
+- FNV-1a 64，混入 `CHECKSUM_VERSION`、`WorldSeed`、实体数，以及按 `(StableEntityId, Transform 位模式)` 排序后的每一项（平移 / 旋转 / 缩放共 10 个 `u32`）。
+- 实体按稳定 ID 排序后再混入，所以 spawn 顺序不影响结果；没有 `Transform` 的实体（纯逻辑实体、体素体）不参与，避免把 Bevy 内部实体顺序带进校验和。
+- 覆盖范围刻意保守：**不覆盖**体素内容、物品栏与脚本状态。脚本（Lua）不参与确定性，见上节；要覆盖新状态必须同时递增 `CHECKSUM_VERSION`，否则旧值会静默兼容。
+- 三类用途：验证双跑（同一存档 / 输入跑两遍）、回滚等价（快照恢复后校验和回到快照值）、联机漂移诊断（客户端上报，主机比对）。
+
+诊断快照 `StreamingDiagnostics.checksum` 每帧采集（`capture` 里调用，O(实体数)），Godot 侧 `streaming_diagnostics_to_dictionary` 以 `i64` 输出（`u64` 按位塞入，`-1` = 未采集），键名 `checksum`。校验和不参与玩法判定，也不写进存档。
+
+测试 `verify::tests` 五个用例：spawn 顺序无关、Transform / 种子变化会改变结果、无稳定 ID 的实体不影响结果、同一批 fixed tick 双跑一致、Transform 快照恢复后校验和回到原值。
 
 ## 改内容时的落点
 

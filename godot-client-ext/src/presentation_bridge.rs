@@ -736,6 +736,11 @@ pub fn streaming_diagnostics_to_dictionary(snapshot: &StreamingDiagnostics) -> V
         "edited_chunks",
         snapshot.edited_chunks.map_or(-1, |count| count as i64),
     );
+    // u64 按位塞进 i64：Godot 只有 64 位有符号整数，比较时也按位比。
+    out.set(
+        "checksum",
+        snapshot.checksum.map_or(-1, |checksum| checksum as i64),
+    );
     out
 }
 

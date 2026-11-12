@@ -36,6 +36,11 @@ pub struct StreamingDiagnostics {
     /// 已编辑块数（`VoxelDirtySet::edited_len`）：卸载时「要不要把内容写进存档」
     /// 的唯一判据。测试用它确认编辑真的落进了体素容器，再断言存档行为。
     pub edited_chunks: Option<usize>,
+    /// 世界状态校验和（`crate::verify::simulation_checksum`）。
+    ///
+    /// 只覆盖世界种子、稳定 ID 与 Transform 位模式；每帧采集是 O(实体数)，
+    /// 用于验证双跑 / 回滚等价 / 联机漂移诊断，不参与玩法判定。
+    pub checksum: Option<u64>,
 }
 
 impl GameDiagnostics for StreamingDiagnostics {
@@ -48,6 +53,7 @@ impl GameDiagnostics for StreamingDiagnostics {
             edited_chunks: world
                 .get_resource::<VoxelDirtySet>()
                 .map(VoxelDirtySet::edited_len),
+            checksum: Some(crate::verify::simulation_checksum(world)),
         }
     }
 }
@@ -98,5 +104,10 @@ mod tests {
         assert_eq!(residency.render_chunks, 9);
         // 没插 MemoryPressure 时必须是 None，而不是伪造的全 0。
         assert!(snapshot.memory.is_none());
+        // 校验和每帧都采集：没有实体时也要有确定值，而不是 None。
+        assert_eq!(
+            snapshot.checksum,
+            Some(crate::verify::simulation_checksum(app.world_mut()))
+        );
     }
 }
