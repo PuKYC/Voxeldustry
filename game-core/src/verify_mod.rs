@@ -22,7 +22,8 @@
 //! # 缓存
 //!
 //! [VerificationCache] 的键是 (mod_id, version, package_hash, engine_api,
-//! engine_version)；**不包含 [VerifyOptions]**。所以缓存只应服务于默认 / 固定
+//! engine_version, context)，其中 context 是依赖包的 (id, version, package_hash)
+//! 有序去重列表；**不包含 [VerifyOptions]**。所以缓存只应服务于默认 / 固定
 //! options 的重复验证；调用方若改变 ticks / seed，应使用独立缓存或绕过缓存。
 //!
 //! # first_divergence_tick
@@ -223,17 +224,41 @@ pub struct VerificationCacheKey {
     pub package_hash: u64,
     pub engine_api: u32,
     pub engine_version: String,
+    /// 参与本次验证的依赖上下文（按 id / version / 包哈希排序去重）。
+    ///
+    /// 同一个包单独验证（缺依赖）与带上下文验证（依赖齐全）结论不同，
+    /// 因此上下文必须进键；否则先失败后扫描到依赖时会一直命中旧报告。
+    pub context: Vec<(String, u32, u64)>,
 }
 
 impl VerificationCacheKey {
-    /// 从包与已算好的哈希构造。
+    /// 从包与已算好的哈希构造（空上下文）。
     pub fn new(package: &LoadedPackage, package_hash: u64) -> Self {
+        Self::with_context(package, package_hash, &[])
+    }
+
+    /// 从包、哈希与依赖上下文构造。
+    pub fn with_context(package: &LoadedPackage, hash: u64, context: &[LoadedPackage]) -> Self {
+        let mut context: Vec<(String, u32, u64)> = context
+            .iter()
+            .filter(|candidate| candidate.id() != package.id())
+            .map(|candidate| {
+                (
+                    candidate.id().to_string(),
+                    candidate.version(),
+                    package_hash(candidate),
+                )
+            })
+            .collect();
+        context.sort();
+        context.dedup();
         Self {
             mod_id: package.id().to_string(),
             version: package.version(),
-            package_hash,
+            package_hash: hash,
             engine_api: CURRENT_ENGINE_API,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            context,
         }
     }
 }
@@ -286,17 +311,20 @@ pub fn verify_cached(
     options: VerifyOptions,
     cache: &mut VerificationCache,
 ) -> VerificationReport {
-    verify_cached_impl(package, options, cache, || package_mods(package, context))
+    let hash = package_hash(package);
+    let key = VerificationCacheKey::with_context(package, hash, context);
+    verify_cached_impl(package, options, key, cache, || {
+        package_mods(package, context)
+    })
 }
 
 fn verify_cached_impl<F: FnOnce() -> CoreMods>(
     package: &LoadedPackage,
     options: VerifyOptions,
+    key: VerificationCacheKey,
     cache: &mut VerificationCache,
     make_mods: F,
 ) -> VerificationReport {
-    let hash = package_hash(package);
-    let key = VerificationCacheKey::new(package, hash);
     if let Some(hit) = cache.get(&key) {
         let mut report = hit.clone();
         report.cached = true;
@@ -369,15 +397,18 @@ fn verify_package_with_mods(
         .max(options.rollback_at.saturating_add(options.rollback_ticks));
     let mut hashes_a = Vec::with_capacity(run_ticks as usize);
     let mut hashes_b = Vec::with_capacity(options.ticks as usize);
+
+    // 先各 update 一次，让 Startup / PostStartup 跑完；这次不计入 tick。
+    app_a.update();
+    app_b.update();
+
+    // rollback_at = 0 表示“Startup 之后、第一个 tick 之前”的快照；必须放在
+    // 上面的 Startup update 之后，否则恢复后不会重跑 Startup，必然不等价。
     let mut snapshot = if options.rollback_at == 0 {
         Some(capture_rollback_snapshot(&mut app_a))
     } else {
         None
     };
-
-    // 先各 update 一次，让 Startup / PostStartup 跑完；这次不计入 tick。
-    app_a.update();
-    app_b.update();
 
     for tick in 0..run_ticks {
         app_a.update();
@@ -536,7 +567,7 @@ fn build_verification_app(mods: CoreMods, seed: u64) -> Result<App, WorldBuildEr
 struct EntitySnapshot {
     entity: Entity,
     id: StableEntityId,
-    transform: Transform,
+    transform: Option<Transform>,
     velocity: Option<Velocity>,
 }
 
@@ -555,13 +586,20 @@ struct RestoreOutcome {
 
 fn capture_rollback_snapshot(app: &mut App) -> RollbackSnapshot {
     let world = app.world_mut();
-    let mut query = world.query::<(Entity, &StableEntityId, &Transform, Option<&Velocity>)>();
+    // 不能要求实体带 Transform：纯逻辑实体也可能有 StableEntityId。若快照漏掉它们，
+    // 恢复阶段的“清理回滚窗新增实体”会把它们误删。
+    let mut query = world.query::<(
+        Entity,
+        &StableEntityId,
+        Option<&Transform>,
+        Option<&Velocity>,
+    )>();
     let mut entities: Vec<EntitySnapshot> = query
         .iter(world)
         .map(|(entity, id, transform, velocity)| EntitySnapshot {
             entity,
             id: *id,
-            transform: *transform,
+            transform: transform.copied(),
             velocity: velocity.cloned(),
         })
         .collect();
@@ -586,11 +624,17 @@ fn restore_rollback_snapshot(app: &mut App, snapshot: &RollbackSnapshot) -> Rest
             outcome.missing.push(entry.id.0);
             continue;
         };
-        if let Some(mut transform) = entity.get_mut::<Transform>() {
-            *transform = entry.transform;
-        } else {
-            outcome.missing.push(entry.id.0);
-            continue;
+        match &entry.transform {
+            Some(transform) => {
+                if let Some(mut current) = entity.get_mut::<Transform>() {
+                    *current = *transform;
+                } else {
+                    entity.insert(*transform);
+                }
+            }
+            None => {
+                entity.remove::<Transform>();
+            }
         }
         match &entry.velocity {
             Some(velocity) => {
@@ -951,7 +995,8 @@ mod tests {
         let mut cache = VerificationCache::new();
 
         let before = CACHE_TICKS.load(Ordering::Relaxed);
-        let first = verify_cached_impl(&package, options, &mut cache, || {
+        let key = VerificationCacheKey::new(&package, package_hash(&package));
+        let first = verify_cached_impl(&package, options, key, &mut cache, || {
             package_mods(&package, &[]).push(CacheCountingMod)
         });
         let after_first = CACHE_TICKS.load(Ordering::Relaxed);
@@ -960,7 +1005,13 @@ mod tests {
         assert!(after_first > before, "首次验证应实际运行");
 
         // 命中时闭包不应被调用：这里故意传空 mods。
-        let second = verify_cached_impl(&package, options, &mut cache, CoreMods::new);
+        let second = verify_cached_impl(
+            &package,
+            options,
+            VerificationCacheKey::new(&package, package_hash(&package)),
+            &mut cache,
+            CoreMods::new,
+        );
         assert!(second.cached);
         assert_eq!(CACHE_TICKS.load(Ordering::Relaxed), after_first);
         assert_eq!(second.package_hash, first.package_hash);
@@ -1070,6 +1121,97 @@ mod tests {
 
         let with_context = verify_package(&user, &[dep], options);
         assert!(with_context.ok, "带 context 应通过：{with_context:#?}");
+    }
+
+    #[test]
+    fn cache_is_not_poisoned_by_a_missing_dependency_run() {
+        let dir_dep = TempDir::new("cache_poison_dep");
+        let dep = write_package(&dir_dep, "verify_poison_dep", 1, &[]);
+        let dir_user = TempDir::new("cache_poison_user");
+        write_file(
+            &dir_user.path().join("mod.json"),
+            r#"{"id":"verify_poison_user","version":1,"engine_api":1,"load_after":["verify_poison_dep"]}"#,
+        );
+        let user = crate::package::load_package(dir_user.path()).expect("加载依赖包");
+        let mut cache = VerificationCache::new();
+        let options = VerifyOptions {
+            ticks: 8,
+            rollback_at: 4,
+            rollback_ticks: 2,
+            ..VerifyOptions::default()
+        };
+
+        let alone = verify_cached(&user, &[], options, &mut cache);
+        assert!(!alone.ok, "缺依赖应失败：{alone:#?}");
+        assert!(!alone.cached);
+
+        let with_dep = verify_cached(&user, &[dep], options, &mut cache);
+        assert!(with_dep.ok, "补上依赖后不应命中失败缓存：{with_dep:#?}");
+        assert!(!with_dep.cached);
+
+        let again = verify_cached(&user, &[], options, &mut cache);
+        assert!(again.cached, "上下文变回空时应命中之前的失败报告");
+        assert!(!again.ok, "不能把带依赖的通过结果复用到缺依赖场景");
+    }
+
+    #[test]
+    fn cache_key_changes_with_context() {
+        let dir_dep = TempDir::new("cache_context_dep");
+        let dep = write_package(&dir_dep, "verify_context_dep", 1, &[]);
+        let dir_pkg = TempDir::new("cache_context_pkg");
+        let package = write_package(&dir_pkg, "verify_context_pkg", 1, &[]);
+        let hash = package_hash(&package);
+        let alone = VerificationCacheKey::with_context(&package, hash, &[]);
+        let with_dep =
+            VerificationCacheKey::with_context(&package, hash, std::slice::from_ref(&dep));
+        assert_ne!(alone, with_dep);
+
+        // 同一上下文、不同顺序应得到同一个键。
+        let (_dir_other, other) = simple_package("cache_context_other", "verify_context_other");
+        let a = VerificationCacheKey::with_context(&package, hash, &[dep.clone(), other.clone()]);
+        let b = VerificationCacheKey::with_context(&package, hash, &[other, dep]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rollback_snapshot_keeps_stable_entities_without_transform() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        let logic = app.world_mut().spawn(StableEntityId(1)).id();
+        let probe = app
+            .world_mut()
+            .spawn((StableEntityId(2), Transform::from_xyz(1.0, 0.0, 0.0)))
+            .id();
+        let snapshot = capture_rollback_snapshot(&mut app);
+        let late = app
+            .world_mut()
+            .spawn((StableEntityId(3), Transform::from_xyz(2.0, 0.0, 0.0)))
+            .id();
+
+        let outcome = restore_rollback_snapshot(&mut app, &snapshot);
+        assert!(outcome.missing.is_empty(), "{outcome:#?}");
+        assert!(
+            app.world().get_entity(logic).is_ok(),
+            "快照中无 Transform 的逻辑实体不能被当成窗内新增而误删"
+        );
+        assert!(app.world().get_entity(probe).is_ok());
+        assert!(
+            app.world().get_entity(late).is_err(),
+            "窗内新增实体应被清理"
+        );
+    }
+
+    #[test]
+    fn rollback_at_zero_snapshots_after_startup() {
+        let (_dir, package) = simple_package("rollback_zero", "verify_rollback_zero");
+        let options = VerifyOptions {
+            ticks: 8,
+            rollback_at: 0,
+            rollback_ticks: 4,
+            ..VerifyOptions::default()
+        };
+        let report = verify_package(&package, &[], options);
+        assert!(report.ok, "Startup 后快照应可回滚：{report:#?}");
     }
 
     #[test]
