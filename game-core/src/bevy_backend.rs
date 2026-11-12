@@ -12,6 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use game_engine::backend::{self, EngineConfig, GameModule, ModuleBuildFailure};
 use game_engine::input::ResolvedActions;
+use game_engine::modding::ResolvedModPayloads;
 use game_engine::residency::MemorySoftLimitHandle;
 
 use crate::app::CoreGame;
@@ -229,6 +230,11 @@ impl GameModule<CoreSpec> for CoreGameModule {
         if let Some(resolved) = app.world().get_resource::<ResolvedActions>() {
             crate::input::publish_active_actions(resolved);
         }
+        // 发布 mod 表现子种类表：Godot 侧按 sub_kind 查表才能把自定义载荷翻译成可读结构。
+        // 这张表是装配期派生的，不进存档（表现不跨模拟 / 回放边界，mod 清单已由存档冻结）。
+        if let Some(resolved) = app.world().get_resource::<ResolvedModPayloads>() {
+            crate::presentation::publish_mod_payloads(resolved);
+        }
         if self.terrain_perf {
             let config = *app.world().resource::<TerrainConfig>();
             app.add_plugins(crate::dev::perf::VoxelPerfPlugin::new(config));
@@ -338,6 +344,7 @@ mod tests {
             visible_if: None,
         }],
         actions: &[],
+        presentation: &[],
     };
 
     struct BackendParamMod;

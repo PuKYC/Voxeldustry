@@ -9,9 +9,9 @@ use game_engine::presentation::packed::{
 };
 
 use super::payload::{
-    ExtField, ExtValue, ExtensionPayload, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedInputCaps, PresentedPrototype, PresentedVisibility,
-    RawVoxelGroupPayload, RawVoxelPayload, SyncPayload,
+    CustomPayload, ExtField, ExtValue, ExtensionPayload, InteractionHint, ModPayloadGroup,
+    PayloadKind, PresentationState, PresentedHealth, PresentedInputCaps, PresentedPrototype,
+    PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload, SyncPayload,
 };
 use super::RenderTransformSample;
 use super::{PresentationCommand, PresentationFrame, PresentationSlot};
@@ -520,8 +520,9 @@ fn wire_shape(tokens: &[String]) -> (usize, usize, bool, bool) {
             "F32" | "ANGLE" => f32_count += 1,
             "VEC3" => f32_count += 3,
             "I32" | "BOOL" => i32_count += 1,
-            // TAGS / BYTES / CHUNK_BLOCKS 都是「count + n 个 i32 池槽」的变长列表。
-            "TAGS" | "BYTES" | "CHUNK_BLOCKS" => has_varlen = true,
+            // TAGS / BYTES / CHUNK_BLOCKS / MOD_GROUPS 都是「count + n 个 i32 池槽」
+            // 的变长列表（MOD_GROUPS = u32 组数 + 每组 u16 sub_kind + 字段编码）。
+            "TAGS" | "BYTES" | "CHUNK_BLOCKS" | "MOD_GROUPS" => has_varlen = true,
             "EXT_BAG" => has_ext = true,
             _ => {}
         }
@@ -588,6 +589,32 @@ fn sample_payload(kind: PayloadKind) -> SyncPayload {
             local: true,
             look: true,
         }),
+        // mod 表现载荷：两组、字段混三种 tag，覆盖分组头 + 共用字段编码。
+        PayloadKind::Custom => SyncPayload::Custom(
+            CustomPayload::from_groups(vec![
+                ModPayloadGroup {
+                    sub_kind: 1,
+                    fields: vec![
+                        ExtField {
+                            key: 1,
+                            value: ExtValue::I32(5),
+                        },
+                        ExtField {
+                            key: 2,
+                            value: ExtValue::Bool(true),
+                        },
+                    ],
+                },
+                ModPayloadGroup {
+                    sub_kind: 7,
+                    fields: vec![ExtField {
+                        key: 9,
+                        value: ExtValue::Tags(vec![3, 4]),
+                    }],
+                },
+            ])
+            .expect("测试样本身份合法"),
+        ),
     }
 }
 

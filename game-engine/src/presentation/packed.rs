@@ -115,6 +115,8 @@ pub enum PackedError {
     TooManyExtensionFields,
     /// 未知扩展字段 tag（无长度信息，无法安全跳过）。
     BadExtensionTag(u8),
+    /// mod 表现载荷的子种类数越界。
+    TooManyModGroups,
 }
 
 impl std::fmt::Display for PackedError {
@@ -128,6 +130,7 @@ impl std::fmt::Display for PackedError {
             PackedError::TooManyTags => write!(f, "overlay tag 数量越界"),
             PackedError::TooManyExtensionFields => write!(f, "扩展字段数越界"),
             PackedError::BadExtensionTag(tag) => write!(f, "未知扩展字段 tag {tag}"),
+            PackedError::TooManyModGroups => write!(f, "mod 表现子种类数越界"),
         }
     }
 }

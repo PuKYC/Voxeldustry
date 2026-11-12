@@ -59,6 +59,16 @@ macro_rules! synced_components {
                 crate::presentation::sync::collect_extension_bag
                     .in_set(game_engine::presentation::CollectPresentationSet),
             );
+            // mod 自定义表现载荷：同样走自定义 collector（按 sub_kind 查表做可见性投影）。
+            app.claim_payload_kind(
+                crate::presentation::payload::PayloadKind::Custom,
+                "collect_mod_presentation",
+            );
+            app.add_systems(
+                Update,
+                crate::presentation::sync::collect_mod_presentation
+                    .in_set(game_engine::presentation::CollectPresentationSet),
+            );
             // Debug 自检：schema 里 Required 字段必须声明非零 required_bits。
             #[cfg(debug_assertions)]
             app.add_systems(

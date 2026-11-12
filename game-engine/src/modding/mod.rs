@@ -16,11 +16,16 @@
 //! 一律抽成 Strategy trait 换资源，而不是从调度里抠系统。
 
 pub mod params;
+pub mod presentation;
 pub mod registry;
 
 pub use params::{
     ModParamsPlugin, ParamEntry, ParamError, ParamRecord, ParamScope, ParamSpec, ParamTable,
     ParamType, VisibleIf, WorldParamsFrozen,
+};
+pub use presentation::{
+    ModFieldSpec, ModFieldVis, ModPayloadSpec, PresentationResolveError, ResolvedModPayloadField,
+    ResolvedModPayloadKind, ResolvedModPayloads, MAX_MOD_SUB_KIND,
 };
 pub use registry::{NamedEntry, OverridePriority, Registry, RegistryEntry, RegistryError};
 
@@ -57,6 +62,11 @@ pub struct ModManifest {
     ///
     /// 名字在装配期解析成全局动作表（id / 通道位），随存档冻结。
     pub actions: &'static [&'static str],
+    /// 本 mod 声明的自定义表现子种类（[ModPayloadSpec]）；空则 `&[]`。
+    ///
+    /// 装配期按拓扑序分配 `sub_kind`（见 [presentation]）。表**不进存档**：
+    /// 表现不跨模拟 / 回放边界，mod 清单已由存档冻结，`sub_kind` 可重建。
+    pub presentation: &'static [ModPayloadSpec],
 }
 
 /// 一个生效 mod 的标识（id + version）。
@@ -125,6 +135,7 @@ pub enum ModError {
     DuplicateId { id: String },
     Param(ParamError),
     Actions(ActionResolveError),
+    Presentation(PresentationResolveError),
 }
 
 impl std::fmt::Display for ModError {
@@ -143,6 +154,7 @@ impl std::fmt::Display for ModError {
             ModError::DuplicateId { id } => write!(f, "mod id 重复：{id}"),
             ModError::Param(error) => write!(f, "mod 参数表错误：{error}"),
             ModError::Actions(error) => write!(f, "mod 动作表解析失败：{error}"),
+            ModError::Presentation(error) => write!(f, "mod 表现载荷表解析失败：{error}"),
         }
     }
 }
@@ -486,11 +498,14 @@ impl<S: GameSpec> Mods<S> {
 
         let mut mod_actions: Vec<(&'static str, &'static [&'static str])> =
             Vec::with_capacity(count);
+        let mut mod_payloads: Vec<(&'static str, &'static [ModPayloadSpec])> =
+            Vec::with_capacity(count);
         let mut applied: Vec<ModRef> = Vec::with_capacity(count);
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for &position in &order {
             let manifest = self.mods[position].manifest();
             mod_actions.push((manifest.id, manifest.actions));
+            mod_payloads.push((manifest.id, manifest.presentation));
             applied.push(ModRef {
                 id: manifest.id.to_string(),
                 version: manifest.version,
@@ -504,8 +519,14 @@ impl<S: GameSpec> Mods<S> {
         // mod 动作由各 manifest 声明。失败是装配错误，不是运行期降级。
         let resolved = ResolvedActions::resolve(S::Actions::table(), &mod_actions)
             .map_err(ModError::Actions)?;
+        // mod 表现载荷的 sub_kind 同样在装配期一次分配：按当前 order（确定性拓扑序）
+        // 与 manifest 声明顺序递增，因此同样的 mod 集合必得同一张表。
+        // 表不进存档：表现不跨模拟 / 回放边界，mod 清单已由存档冻结。
+        let resolved_payloads =
+            ResolvedModPayloads::resolve(&mod_payloads).map_err(ModError::Presentation)?;
         applied.sort_by(|a, b| a.id.cmp(&b.id));
         app.insert_resource(resolved);
+        app.insert_resource(resolved_payloads);
         app.insert_resource(AppliedModSet {
             mod_set_hash: hash,
             mods: applied,
@@ -560,6 +581,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     struct BumpMod;
@@ -583,6 +605,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
     static MB: ModManifest = ModManifest {
         id: "b",
@@ -594,6 +617,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     struct LogMod(&'static ModManifest, &'static str);
@@ -640,6 +664,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
     static LAYER_EARLY: ModManifest = ModManifest {
         id: "a_layer",
@@ -651,6 +676,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     struct LayerMod(&'static ModManifest, &'static str);
@@ -707,6 +733,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
     static CONFLICT_B: ModManifest = ModManifest {
         id: "cb",
@@ -718,6 +745,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -741,6 +769,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -763,6 +792,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
     static OPTIONAL_HOST: ModManifest = ModManifest {
         id: "opt_host",
@@ -774,6 +804,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -799,6 +830,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -824,6 +856,7 @@ mod tests {
         exclusive_groups: &["renderer"],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
     static GROUP_B: ModManifest = ModManifest {
         id: "group_b",
@@ -835,6 +868,7 @@ mod tests {
         exclusive_groups: &["renderer"],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -874,6 +908,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
     static CYCLE_B: ModManifest = ModManifest {
         id: "cycle_b",
@@ -885,6 +920,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -952,6 +988,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &[],
+        presentation: &[],
     };
 
     struct PatchMod;
@@ -994,6 +1031,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &["mod.build"],
+        presentation: &[],
     };
     static ACTION_ZETA: ModManifest = ModManifest {
         id: "mod.zeta",
@@ -1005,6 +1043,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &["mod.zeta.act"],
+        presentation: &[],
     };
     static ACTION_CONFLICT: ModManifest = ModManifest {
         id: "mod.conflict",
@@ -1016,6 +1055,7 @@ mod tests {
         exclusive_groups: &[],
         params: &[],
         actions: &["mod.build"],
+        presentation: &[],
     };
 
     /// 装配成功后，动作表与 mod 集合都作为 Resource 留在 App 里，供存档 / 读档比对。
@@ -1079,5 +1119,85 @@ mod tests {
         );
         assert!(app.world().get_resource::<ResolvedActions>().is_none());
         assert!(app.world().get_resource::<AppliedModSet>().is_none());
+    }
+
+    static PAYLOAD_FIELDS: [ModFieldSpec; 2] = [
+        ModFieldSpec::all(1, "intensity"),
+        ModFieldSpec::required(2, "secret", 0b100),
+    ];
+    static PAYLOAD_SPECS_ALPHA: [ModPayloadSpec; 2] = [
+        ModPayloadSpec {
+            name: "aura",
+            fields: &PAYLOAD_FIELDS,
+        },
+        ModPayloadSpec {
+            name: "beam",
+            fields: &[],
+        },
+    ];
+    static PAYLOAD_SPECS_ZETA: [ModPayloadSpec; 1] = [ModPayloadSpec {
+        name: "aura",
+        fields: &[],
+    }];
+
+    static PRESENTATION_ALPHA: ModManifest = ModManifest {
+        id: "mod.alpha",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+        params: &[],
+        actions: &[],
+        presentation: &PAYLOAD_SPECS_ALPHA,
+    };
+    static PRESENTATION_ZETA: ModManifest = ModManifest {
+        id: "mod.zeta",
+        version: 1,
+        engine_api: 1,
+        load_after: &[],
+        load_after_optional: &[],
+        conflicts: &[],
+        exclusive_groups: &[],
+        params: &[],
+        actions: &[],
+        presentation: &PAYLOAD_SPECS_ZETA,
+    };
+
+    fn presentation_table(
+        mods: [&'static ModManifest; 2],
+    ) -> Vec<(u16, &'static str, &'static str)> {
+        let mut app = app_with_sets();
+        let mut data = DataRegistry::new();
+        Mods::<DefaultSpec>::new()
+            .push(SimpleMod(mods[0]))
+            .push(SimpleMod(mods[1]))
+            .apply(&mut app, &mut data)
+            .expect("装配必须成功");
+        app.world()
+            .resource::<ResolvedModPayloads>()
+            .kinds()
+            .iter()
+            .map(|kind| (kind.sub_kind, kind.mod_id, kind.name))
+            .collect()
+    }
+
+    /// sub_kind 只由「确定性拓扑序 + manifest 声明顺序」决定：两个 mod 以不同
+    /// 顺序 push，装配结果必须逐项相同，否则跨端 / 跨机器的表现会对不上。
+    #[test]
+    fn apply_assigns_presentation_sub_kinds_deterministically() {
+        let forward = presentation_table([&PRESENTATION_ALPHA, &PRESENTATION_ZETA]);
+        let reversed = presentation_table([&PRESENTATION_ZETA, &PRESENTATION_ALPHA]);
+        let expected = vec![
+            (1, "mod.alpha", "aura"),
+            (2, "mod.alpha", "beam"),
+            (3, "mod.zeta", "aura"),
+        ];
+        assert_eq!(
+            forward, expected,
+            "sub_kind 从 1 起、按拓扑序 + 声明顺序分配"
+        );
+        assert_eq!(reversed, expected, "push 顺序不得影响 sub_kind");
     }
 }

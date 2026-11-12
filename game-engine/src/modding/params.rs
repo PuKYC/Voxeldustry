@@ -583,6 +583,7 @@ mod tests {
             },
         ],
         actions: &[],
+        presentation: &[],
     };
 
     #[test]
@@ -641,6 +642,7 @@ mod tests {
                 visible_if: None,
             }],
             actions: &[],
+            presentation: &[],
         };
         let error = ParamTable::resolve(&[&BAD], &BTreeMap::new()).unwrap_err();
         assert_eq!(

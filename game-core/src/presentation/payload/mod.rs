@@ -4,9 +4,15 @@
 //! PayloadKind + SyncPayload，并定义各载荷类型与 ToPresentation。
 
 // packed.rs 持有各载荷的 GPF1 字节布局（实现引擎的 PackedPayload）。
+mod custom;
 mod extension;
 mod packed;
 
+pub use custom::{
+    mod_payload_table, project_mod_presentation, publish_mod_payloads, CustomPayload, ModFieldVis,
+    ModPayloadError, ModPayloadGroup, ModPresentation, ResolvedModPayloadField,
+    ResolvedModPayloadKind, MAX_MOD_PAYLOAD_GROUPS,
+};
 pub use extension::{
     project, ExtError, ExtField, ExtValue, ExtensionBag, ExtensionFieldSchema, ExtensionPayload,
     ExtensionSchema, FieldVisibility, SetOutcome, MAX_EXT_FIELDS, MAX_EXT_TAGS,
@@ -50,6 +56,10 @@ game_engine::define_payloads! {
     // source（ControlledBy.source）/ local（是否挂 LocalPlayer）。code 11 是
     // code 7 留空后的下一个可用位，只追加。
     InputCaps    = 11, "inputcaps",   payload: PresentedInputCaps;
+    // mod 自定义表现载荷：一个实体、多个 sub_kind 分组的整包快照（见 payload/custom.rs）。
+    // sub_kind 由 mod 清单在装配期分配（game-engine modding::presentation），
+    // 0 保留给核心；表不进存档。code 12 是 11 之后的下一个可用位，只追加。
+    Custom       = 12, "custom",      payload: CustomPayload;
 }
 
 /// L5：精简表现状态。
@@ -333,7 +343,19 @@ mod tests {
         assert!(RawVoxelGroupPayload::default().is_empty());
     }
 
-    /// 0..6、8..=11 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
+    /// mod 表现载荷 code / 名字只追加：12 是 11 之后的下一个可用位，且不受门控。
+    #[test]
+    fn custom_kind_is_registered_append_only() {
+        assert_eq!(PayloadKind::Custom.code(), 12);
+        assert_eq!(PayloadKind::Custom.as_str(), "custom");
+        assert_eq!(PayloadKind::from_code(12), Some(PayloadKind::Custom));
+        assert!(!PayloadKind::Custom.is_perception_gated());
+        let payload = CustomPayload::from_groups(Vec::new()).expect("空载荷合法");
+        assert!(payload.is_empty());
+        assert!(CustomPayload::default().is_empty());
+    }
+
+    /// 0..6、8..=12 保持固定；code 7 是已删除 RectList 的遗位，必须留空不得复用。
     #[test]
     fn payload_codes_are_append_only_and_code_seven_stays_vacant() {
         assert_eq!(
@@ -353,6 +375,7 @@ mod tests {
             (9, "rawvoxelgroups"),
             (10, "camera"),
             (11, "inputcaps"),
+            (12, "custom"),
         ] {
             assert_eq!(
                 PayloadKind::from_code(code).map(|kind| kind.as_str()),

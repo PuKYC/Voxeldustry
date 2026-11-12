@@ -4,6 +4,7 @@ use super::*;
 
 mod command;
 mod extension_bag;
+mod mod_payload;
 mod packed;
 
 /// 契约自检：is_perception_gated() 的载荷类型必须与 CorePrivacyScope 对齐。
@@ -92,6 +93,9 @@ fn all_payload_kinds_have_round_trippable_labels() {
                 SyncPayload::Camera(crate::presentation::payload::PresentedCamera::default())
             }
             PayloadKind::InputCaps => SyncPayload::InputCaps(PresentedInputCaps::default()),
+            PayloadKind::Custom => {
+                SyncPayload::Custom(crate::presentation::payload::CustomPayload::default())
+            }
         };
         assert_eq!(payload.kind(), kind);
         assert_eq!(payload.type_name(), kind.as_str());

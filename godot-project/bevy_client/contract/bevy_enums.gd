@@ -49,12 +49,16 @@ enum Payload {
 	## source = ControlledBy.source（0 = 无控制源），local = 是否挂 LocalPlayer。
 	## view = NONE，由 BevyInputContext 消费并翻译成通道级信号。
 	INPUTCAPS = 11,
+	## mod 自定义表现载荷：一个实体、多个 sub_kind 分组的整包快照。
+	## sub_kind 由 mod 清单在装配期分配（0 保留核心），用 get_mod_payload_table()
+	## 查表翻译字段 key；表不进存档。解码端暂未支持 MOD_GROUPS（本里程碑只到桥）。
+	CUSTOM = 12,
 }
 
 ## attach / detach / despawn 命令的 payload_kinds 哨兵（packed::PAYLOAD_NONE）。
 const PAYLOAD_NONE := 0xFF
 ## 枚举条目数（Rust PayloadKind::ALL.len()），不进 enum 以免破坏契约测试。
-const PAYLOAD_COUNT := 11
+const PAYLOAD_COUNT := 12
 
 ## extension 载荷字段 tag（与 game-core payload/packed.rs 对齐）。
 const EXT_TAG_I32 := 0
@@ -77,6 +81,7 @@ enum Wire {
 	EXT_BAG, ## i32 池：变长扩展袋（吃掉本条命令剩余槽位）
 	BYTES,   ## i32 池：[byte_len, chunk_count, chunk...] -> PackedByteArray（RAWVOXELS 用）
 	CHUNK_BLOCKS, ## i32 池：[count, (x, y, z, byte_len, skirt_mask, chunk_count, chunk...)*] -> Array[Dictionary]（RAWVOXELGROUPS 用；每块带 skirt_mask）
+	MOD_GROUPS, ## i32 池：[group_count, (sub_kind, field_count, (key, tag, value...)...)*]（CUSTOM 用；字段 tag 同 EXT_TAG_*）
 }
 
 ## 视图呈现方式：PayloadCodec 只产数据，ViewLayer 按它决定怎么演。
@@ -167,6 +172,15 @@ const PAYLOAD_SCHEMA := {
 	Payload.INPUTCAPS: {
 		"fields": ["present", "available", "source", "local", "look"],
 		"wire": [Wire.I32, Wire.I32, Wire.I32, Wire.BOOL, Wire.BOOL],
+		"view": View.NONE,
+	},
+	## mod 自定义表现载荷：i32 池 = [group_count, (sub_kind, field_count, 字段...)*]，
+	## 组按 sub_kind 升序、组内字段按 key 升序；字段编码与 EXT 袋逐项一致
+	## （key, tag, value；tag 0=i32 / 1=bool / 2=tags）。本里程碑只到桥：
+	## PayloadCodec 尚未实现 MOD_GROUPS，会按未知 token 丢弃该载荷（不报错）。
+	Payload.CUSTOM: {
+		"fields": ["groups"],
+		"wire": [Wire.MOD_GROUPS],
 		"view": View.NONE,
 	},
 }

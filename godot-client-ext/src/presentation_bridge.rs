@@ -27,7 +27,7 @@ use game_core::input::control::InputSourceId;
 use game_core::input::raw::RawInputFrame;
 use game_core::presentation::event::{PresentationEvent, TimedPresentationEvent};
 use game_core::presentation::packed;
-use game_core::presentation::payload::{ExtValue, SyncPayload};
+use game_core::presentation::payload::{ExtField, ExtValue, ModFieldVis, SyncPayload};
 use game_core::presentation::semantics;
 use game_core::presentation::{PresentationCommand, PresentationFrame};
 use game_core::static_data::item;
@@ -51,6 +51,43 @@ pub fn action_table_to_variant() -> Array<VarDictionary> {
         out.push(&row);
     }
     out
+}
+
+/// mod 表现子种类表 → `Array[Dictionary]`，每项
+/// `{ sub_kind, mod_id, name, fields: [{ key, name, vis, required_bits }] }`。
+///
+/// - `vis`：0 = 所有观察者可见、1 = Required（需命中 `required_bits`）、2 = 仅服务器；
+/// - 数据源是装配期发布的全局快照（`publish_mod_payloads`），Godot 线程只读；
+/// - 这张表不进存档：读档时按冻结的 mod 清单重建，结果确定。
+pub fn mod_payload_table_to_variant() -> Array<VarDictionary> {
+    let mut out: Array<VarDictionary> = Array::new();
+    for kind in game_core::presentation::mod_payload_table().iter() {
+        let mut row = VarDictionary::new();
+        row.set("sub_kind", i64::from(kind.sub_kind));
+        row.set("mod_id", kind.mod_id);
+        row.set("name", kind.name);
+        let mut fields: Array<VarDictionary> = Array::new();
+        for field in &kind.fields {
+            let mut spec = VarDictionary::new();
+            spec.set("key", i64::from(field.key));
+            spec.set("name", field.name);
+            spec.set("vis", vis_code(field.visibility));
+            spec.set("required_bits", i64::from(field.required_bits));
+            fields.push(&spec);
+        }
+        row.set("fields", &fields);
+        out.push(&row);
+    }
+    out
+}
+
+/// 可见性枚举 → Godot 侧整数编号（0/1/2，与 [mod_payload_table_to_variant] 的文档一致）。
+fn vis_code(vis: ModFieldVis) -> i64 {
+    match vis {
+        ModFieldVis::All => 0,
+        ModFieldVis::Required => 1,
+        ModFieldVis::ServerOnly => 2,
+    }
 }
 
 /// 输入通道表 → `Array[Dictionary]`，每项 `{ key, mask, mode, actions }`。
@@ -478,31 +515,51 @@ fn payload_to_dictionary(payload: &SyncPayload) -> VarDictionary {
         SyncPayload::Extension(value) => {
             // 兼容通道：整袋字段 → Array[{ key, tag, value }]；tag 与 GPF1 线格式一致
             // （0=i32、1=bool、2=tags），value 分别装 int / bool / PackedInt32Array。
-            let mut fields: Array<VarDictionary> = Array::new();
-            for field in value.fields() {
+            out.set("fields", &ext_fields_to_array(value.fields()));
+        }
+        SyncPayload::Custom(value) => {
+            // 兼容通道：整包 → { groups: [ { sub_kind, fields: [ { key, tag, value } ] } ] }。
+            // 组序 / 字段序已由 CustomPayload 规范化为升序，tag 语义与扩展袋一致。
+            let mut groups: Array<VarDictionary> = Array::new();
+            for group in value.groups() {
                 let mut row = VarDictionary::new();
-                row.set("key", i64::from(field.key));
-                match &field.value {
-                    ExtValue::I32(v) => {
-                        row.set("tag", 0i64);
-                        row.set("value", i64::from(*v));
-                    }
-                    ExtValue::Bool(b) => {
-                        row.set("tag", 1i64);
-                        row.set("value", *b);
-                    }
-                    ExtValue::Tags(tags) => {
-                        row.set("tag", 2i64);
-                        let packed: Vec<i32> = tags.iter().map(|tag| *tag as i32).collect();
-                        row.set("value", &PackedInt32Array::from(&packed[..]));
-                    }
-                }
-                fields.push(&row);
+                row.set("sub_kind", i64::from(group.sub_kind));
+                row.set("fields", &ext_fields_to_array(&group.fields));
+                groups.push(&row);
             }
-            out.set("fields", &fields);
+            out.set("groups", &groups);
         }
     }
 
+    out
+}
+
+/// 扩展字段 → `Array[Dictionary]`，每项 `{ key, tag, value }`。
+///
+/// tag 与 GPF1 线格式一致（0=i32、1=bool、2=tags）：扩展袋与 mod 表现载荷共用，
+/// 避免两处各维护一份 tag 语义。
+fn ext_fields_to_array(fields: &[ExtField]) -> Array<VarDictionary> {
+    let mut out: Array<VarDictionary> = Array::new();
+    for field in fields {
+        let mut row = VarDictionary::new();
+        row.set("key", i64::from(field.key));
+        match &field.value {
+            ExtValue::I32(v) => {
+                row.set("tag", 0i64);
+                row.set("value", i64::from(*v));
+            }
+            ExtValue::Bool(value) => {
+                row.set("tag", 1i64);
+                row.set("value", *value);
+            }
+            ExtValue::Tags(tags) => {
+                row.set("tag", 2i64);
+                let packed: Vec<i32> = tags.iter().map(|tag| *tag as i32).collect();
+                row.set("value", &PackedInt32Array::from(&packed[..]));
+            }
+        }
+        out.push(&row);
+    }
     out
 }
 

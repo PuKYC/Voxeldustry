@@ -45,6 +45,7 @@ fn mod_error_code(error: &ModError) -> &'static str {
         ModError::DuplicateId { .. } => "mod.duplicate_id",
         ModError::Param(_) => "mod.param",
         ModError::Actions(_) => "mod.actions",
+        ModError::Presentation(_) => "mod.presentation",
     }
 }
 
@@ -214,6 +215,7 @@ mod tests {
             visible_if: None,
         }],
         actions: &[],
+        presentation: &[],
     };
 
     struct ParamMod;

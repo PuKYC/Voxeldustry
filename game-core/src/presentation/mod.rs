@@ -59,10 +59,12 @@ pub use game_engine::presentation::interp::{
 pub(crate) use game_engine::presentation::interp::{PresentedTransform, RenderTransformSample};
 pub use game_engine::presentation::pipeline::{PresentationRuntime, PresentationVisibility};
 pub use payload::{
-    project, ExtError, ExtField, ExtValue, ExtensionBag, ExtensionFieldSchema, ExtensionPayload,
-    ExtensionSchema, FieldVisibility, InteractionHint, PayloadKind, PresentationState,
-    PresentedHealth, PresentedInputCaps, PresentedPrototype, PresentedVisibility,
-    RawVoxelGroupPayload, RawVoxelPayload, SetOutcome, SyncPayload, ToPresentation,
+    mod_payload_table, project, project_mod_presentation, publish_mod_payloads, CustomPayload,
+    ExtError, ExtField, ExtValue, ExtensionBag, ExtensionFieldSchema, ExtensionPayload,
+    ExtensionSchema, FieldVisibility, InteractionHint, ModPayloadError, ModPayloadGroup,
+    ModPresentation, PayloadKind, PresentationState, PresentedHealth, PresentedInputCaps,
+    PresentedPrototype, PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload, SetOutcome,
+    SyncPayload, ToPresentation, MAX_MOD_PAYLOAD_GROUPS,
 };
 pub use semantics::{
     action_state_name, anim_name, domain_table, is_core_domain, locomotion_name, mod_hash_id,

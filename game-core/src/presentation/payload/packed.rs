@@ -3,7 +3,8 @@
 //! 字节布局知识在引擎的 packed 模块提供原语；这里只把「字段 -> 字节」接上。
 
 use game_engine::presentation::packed::{
-    put_bool, put_f32, put_u32, put_u64, put_u8, PackedError, PackedPayload, Reader, MAX_TAGS,
+    put_bool, put_f32, put_u16, put_u32, put_u64, put_u8, PackedError, PackedPayload, Reader,
+    MAX_TAGS,
 };
 
 use crate::input::actions::ActionId;
@@ -11,9 +12,10 @@ use crate::input::actions::ActionId;
 use std::collections::BTreeMap;
 
 use super::{
-    ExtValue, ExtensionPayload, InteractionHint, PresentationState, PresentedCamera,
-    PresentedHealth, PresentedInputCaps, PresentedPrototype, PresentedVisibility,
-    RawVoxelGroupPayload, RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
+    CustomPayload, ExtField, ExtValue, ExtensionPayload, InteractionHint, ModPayloadGroup,
+    PresentationState, PresentedCamera, PresentedHealth, PresentedInputCaps, PresentedPrototype,
+    PresentedVisibility, RawVoxelGroupPayload, RawVoxelPayload, MAX_EXT_FIELDS, MAX_EXT_TAGS,
+    MAX_MOD_PAYLOAD_GROUPS,
 };
 
 impl PackedPayload for PresentationState {
@@ -556,10 +558,163 @@ impl PackedPayload for RawVoxelGroupPayload {
     }
 }
 
+// ── 通用字段编解码：扩展袋与 mod 表现载荷共用 ──
+//
+// 一组字段的字节体：count(u32)，然后每字段 [key(u32), tag(u8), value]；
+// 池布局：count，每字段 key, tag, 然后按 tag 推值。两个载荷只是外层容器不同
+// （扩展袋一份字段集，mod 载荷每组一份），抽成共用 helper 避免两份实现漂移。
+
+/// 写一组字段的字节体（count + 每字段 key/tag/值；超限按上限截断）。
+fn put_ext_fields(out: &mut Vec<u8>, fields: &[ExtField]) {
+    let count = fields.len().min(MAX_EXT_FIELDS);
+    put_u32(out, count as u32);
+    for field in &fields[..count] {
+        put_u32(out, u32::from(field.key));
+        match &field.value {
+            ExtValue::I32(v) => {
+                put_u8(out, 0);
+                put_u32(out, *v as u32);
+            }
+            ExtValue::Bool(b) => {
+                put_u8(out, 1);
+                put_u8(out, u8::from(*b));
+            }
+            ExtValue::Tags(tags) => {
+                debug_assert!(
+                    tags.len() <= MAX_EXT_TAGS,
+                    "扩展 Tags 数 {} 超过上限 {}（normalize 应已截断）",
+                    tags.len(),
+                    MAX_EXT_TAGS
+                );
+                let n = tags.len().min(MAX_EXT_TAGS);
+                put_u8(out, 2);
+                put_u32(out, n as u32);
+                for tag in &tags[..n] {
+                    put_u32(out, *tag);
+                }
+            }
+        }
+    }
+}
+
+/// 推一组字段的池槽（与 [put_ext_fields] 逐项对应）。
+fn push_ext_fields_pools(i: &mut Vec<i64>, fields: &[ExtField]) {
+    let count = fields.len().min(MAX_EXT_FIELDS);
+    i.push(count as i64);
+    for field in &fields[..count] {
+        i.push(i64::from(u32::from(field.key)));
+        match &field.value {
+            ExtValue::I32(v) => {
+                i.push(0);
+                i.push(i64::from(*v));
+            }
+            ExtValue::Bool(b) => {
+                i.push(1);
+                i.push(i64::from(*b as u8));
+            }
+            ExtValue::Tags(tags) => {
+                let n = tags.len().min(MAX_EXT_TAGS);
+                i.push(2);
+                i.push(n as i64);
+                for tag in &tags[..n] {
+                    i.push(i64::from(*tag));
+                }
+            }
+        }
+    }
+}
+
+/// 读一组字段并推池槽（只校验 + 建池；载荷重建走 from_pools）。
+fn read_ext_fields(r: &mut Reader<'_>, i: &mut Vec<i64>) -> Result<(), PackedError> {
+    let count = r.u32()?;
+    if count as usize > MAX_EXT_FIELDS {
+        return Err(PackedError::TooManyExtensionFields);
+    }
+    i.push(i64::from(count));
+    for _ in 0..count {
+        let key = r.u32()?;
+        let tag = r.u8()?;
+        i.push(i64::from(key));
+        i.push(i64::from(tag));
+        match tag {
+            0 => i.push(i64::from(r.u32()? as i32)),
+            1 => i.push(i64::from(r.u8()?)),
+            2 => {
+                let n = r.u32()?;
+                if n as usize > MAX_EXT_TAGS {
+                    return Err(PackedError::TooManyTags);
+                }
+                i.push(i64::from(n));
+                for _ in 0..n {
+                    i.push(i64::from(r.u32()?));
+                }
+            }
+            // 未知 tag 无长度信息，无法安全跳过：整帧拒绝（前向兼容靠尾部追加）。
+            other => return Err(PackedError::BadExtensionTag(other)),
+        }
+    }
+    Ok(())
+}
+
+/// 从池里解一组字段；脏池 / 越界返回 None（调用方退化为默认载荷）。
+fn ext_fields_from_pools(i: &[i64], cursor: &mut usize) -> Option<Vec<ExtField>> {
+    if *cursor >= i.len() {
+        return None;
+    }
+    let count = i[*cursor] as usize;
+    *cursor += 1;
+    if count > MAX_EXT_FIELDS {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        if *cursor + 2 > i.len() {
+            return None;
+        }
+        let key = i[*cursor] as u32 as u16;
+        *cursor += 1;
+        let tag = i[*cursor];
+        *cursor += 1;
+        let value = match tag {
+            0 => {
+                if *cursor >= i.len() {
+                    return None;
+                }
+                let value = i[*cursor] as u32 as i32;
+                *cursor += 1;
+                ExtValue::I32(value)
+            }
+            1 => {
+                if *cursor >= i.len() {
+                    return None;
+                }
+                let value = i[*cursor] != 0;
+                *cursor += 1;
+                ExtValue::Bool(value)
+            }
+            2 => {
+                if *cursor >= i.len() {
+                    return None;
+                }
+                let n = i[*cursor] as usize;
+                *cursor += 1;
+                if n > MAX_EXT_TAGS || *cursor + n > i.len() {
+                    return None;
+                }
+                let tags = i[*cursor..*cursor + n].iter().map(|x| *x as u32).collect();
+                *cursor += n;
+                ExtValue::Tags(tags)
+            }
+            _ => ExtValue::I32(0),
+        };
+        fields.push(ExtField { key, value });
+    }
+    Some(fields)
+}
+
 // ── 扩展载荷：字段袋的 GPF1 布局（原型期全部写 i32 池）──
 //
-// 线格式：count, 然后每字段 [key(u32), tag(u8), value]；
-// 池布局：i.push(count), 每字段 i.push(key), i.push(tag), 然后按 tag 推值。
+// 线格式：count, 然后每字段 [key(u32), tag(u8), value]；池布局与之一一对应。
 impl PackedPayload for ExtensionPayload {
     fn put_body(&self, out: &mut Vec<u8>) {
         // 上限的最终防线：即使载荷经 serde / 手工路径构造（绕过 from_fields），
@@ -571,62 +726,61 @@ impl PackedPayload for ExtensionPayload {
             fields.len(),
             MAX_EXT_FIELDS
         );
-        let count = fields.len().min(MAX_EXT_FIELDS);
-        put_u32(out, count as u32);
-        for field in &fields[..count] {
-            put_u32(out, u32::from(field.key));
-            match &field.value {
-                ExtValue::I32(v) => {
-                    put_u8(out, 0);
-                    put_u32(out, *v as u32);
-                }
-                ExtValue::Bool(b) => {
-                    put_u8(out, 1);
-                    put_u8(out, u8::from(*b));
-                }
-                ExtValue::Tags(tags) => {
-                    debug_assert!(
-                        tags.len() <= MAX_EXT_TAGS,
-                        "扩展 Tags 数 {} 超过上限 {}（normalize 应已截断）",
-                        tags.len(),
-                        MAX_EXT_TAGS
-                    );
-                    let n = tags.len().min(MAX_EXT_TAGS);
-                    put_u8(out, 2);
-                    put_u32(out, n as u32);
-                    for tag in &tags[..n] {
-                        put_u32(out, *tag);
-                    }
-                }
-            }
-        }
+        put_ext_fields(out, fields);
     }
 
     fn write_pools(&self, _f: &mut Vec<f32>, i: &mut Vec<i64>) {
         // 与 read_body 的池布局逐项一致；上限截断同 put_body。
-        let fields = self.fields();
-        let count = fields.len().min(MAX_EXT_FIELDS);
+        push_ext_fields_pools(i, self.fields());
+    }
+
+    fn read_body(
+        r: &mut Reader<'_>,
+        _f: &mut Vec<f32>,
+        i: &mut Vec<i64>,
+    ) -> Result<(), PackedError> {
+        read_ext_fields(r, i)
+    }
+
+    fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
+        // 公开 API 且无 Result：脏池 / 越界 offset 一律退化为空载荷，绝不 panic。
+        let mut cursor = io;
+        let Some(fields) = ext_fields_from_pools(i, &mut cursor) else {
+            return ExtensionPayload::default();
+        };
+        // 脏池可能给出重复 key / 超限字段数：交给 from_fields 兜底为空载荷。
+        ExtensionPayload::from_fields(fields).unwrap_or_default()
+    }
+}
+
+// ── mod 表现载荷：分组字段的 GPF1 布局（沿用扩展字段的编解码）──
+//
+// 线格式：group_count(u32)，然后每组 [sub_kind(u16), field_count(u32), 字段…]；
+// 池布局：group_count, 每组 sub_kind，然后字段池布局逐项对应。
+impl PackedPayload for CustomPayload {
+    fn put_body(&self, out: &mut Vec<u8>) {
+        let groups = self.groups();
+        debug_assert!(
+            groups.len() <= MAX_MOD_PAYLOAD_GROUPS,
+            "mod 表现组数 {} 超过上限 {}（from_groups 应已拦截）",
+            groups.len(),
+            MAX_MOD_PAYLOAD_GROUPS
+        );
+        let count = groups.len().min(MAX_MOD_PAYLOAD_GROUPS);
+        put_u32(out, count as u32);
+        for group in &groups[..count] {
+            put_u16(out, group.sub_kind);
+            put_ext_fields(out, &group.fields);
+        }
+    }
+
+    fn write_pools(&self, _f: &mut Vec<f32>, i: &mut Vec<i64>) {
+        let groups = self.groups();
+        let count = groups.len().min(MAX_MOD_PAYLOAD_GROUPS);
         i.push(count as i64);
-        for field in &fields[..count] {
-            i.push(i64::from(u32::from(field.key)));
-            match &field.value {
-                ExtValue::I32(v) => {
-                    i.push(0);
-                    i.push(i64::from(*v));
-                }
-                ExtValue::Bool(b) => {
-                    i.push(1);
-                    i.push(i64::from(*b as u8));
-                }
-                ExtValue::Tags(tags) => {
-                    let n = tags.len().min(MAX_EXT_TAGS);
-                    i.push(2);
-                    i.push(n as i64);
-                    for tag in &tags[..n] {
-                        i.push(i64::from(*tag));
-                    }
-                }
-            }
+        for group in &groups[..count] {
+            i.push(i64::from(group.sub_kind));
+            push_ext_fields_pools(i, &group.fields);
         }
     }
 
@@ -636,91 +790,42 @@ impl PackedPayload for ExtensionPayload {
         i: &mut Vec<i64>,
     ) -> Result<(), PackedError> {
         let count = r.u32()?;
-        if count as usize > MAX_EXT_FIELDS {
-            return Err(PackedError::TooManyExtensionFields);
+        if count as usize > MAX_MOD_PAYLOAD_GROUPS {
+            return Err(PackedError::TooManyModGroups);
         }
         i.push(i64::from(count));
         for _ in 0..count {
-            let key = r.u32()?;
-            let tag = r.u8()?;
-            i.push(i64::from(key));
-            i.push(i64::from(tag));
-            match tag {
-                0 => i.push(i64::from(r.u32()? as i32)),
-                1 => i.push(i64::from(r.u8()?)),
-                2 => {
-                    let n = r.u32()?;
-                    if n as usize > MAX_EXT_TAGS {
-                        return Err(PackedError::TooManyTags);
-                    }
-                    i.push(i64::from(n));
-                    for _ in 0..n {
-                        i.push(i64::from(r.u32()?));
-                    }
-                }
-                // 未知 tag 无长度信息，无法安全跳过：整帧拒绝（前向兼容靠尾部追加）。
-                other => return Err(PackedError::BadExtensionTag(other)),
-            }
+            i.push(i64::from(r.u16()?));
+            read_ext_fields(r, i)?;
         }
         Ok(())
     }
 
     fn from_pools(_f: &[f32], i: &[i64], _fo: usize, io: usize) -> Self {
-        // 公开 API 且无 Result：脏池 / 越界 offset 一律退化为空载荷，绝不 panic。
         if io >= i.len() {
-            return ExtensionPayload::default();
+            return CustomPayload::default();
         }
         let mut cursor = io;
         let count = i[cursor] as usize;
         cursor += 1;
-        if count > MAX_EXT_FIELDS {
-            return ExtensionPayload::default();
+        if count > MAX_MOD_PAYLOAD_GROUPS {
+            return CustomPayload::default();
         }
-        let mut fields = Vec::with_capacity(count);
+        let mut groups = Vec::with_capacity(count);
         for _ in 0..count {
-            if cursor + 2 > i.len() {
-                return ExtensionPayload::default();
+            if cursor >= i.len() {
+                return CustomPayload::default();
             }
-            let key = i[cursor] as u32 as u16;
+            // 与字段 key 一致：只取低 16 位，脏池不 panic。
+            let sub_kind = i[cursor] as u16;
             cursor += 1;
-            let tag = i[cursor];
-            cursor += 1;
-            let value = match tag {
-                0 => {
-                    if cursor >= i.len() {
-                        return ExtensionPayload::default();
-                    }
-                    let v = i[cursor] as u32 as i32;
-                    cursor += 1;
-                    ExtValue::I32(v)
-                }
-                1 => {
-                    if cursor >= i.len() {
-                        return ExtensionPayload::default();
-                    }
-                    let b = i[cursor] != 0;
-                    cursor += 1;
-                    ExtValue::Bool(b)
-                }
-                2 => {
-                    if cursor >= i.len() {
-                        return ExtensionPayload::default();
-                    }
-                    let n = i[cursor] as usize;
-                    cursor += 1;
-                    if n > MAX_EXT_TAGS || cursor + n > i.len() {
-                        return ExtensionPayload::default();
-                    }
-                    let tags = i[cursor..cursor + n].iter().map(|x| *x as u32).collect();
-                    cursor += n;
-                    ExtValue::Tags(tags)
-                }
-                _ => ExtValue::I32(0),
+            let Some(fields) = ext_fields_from_pools(i, &mut cursor) else {
+                return CustomPayload::default();
             };
-            fields.push(super::ExtField { key, value });
+            groups.push(ModPayloadGroup { sub_kind, fields });
         }
-        // 这里若因脏池越界则 from_fields 失败 -> 退化为空载荷，绝不 panic。
-        ExtensionPayload::from_fields(fields).unwrap_or_default()
+        // 脏池可能给出重复 sub_kind / 越界字段数：from_groups 兜底为空载荷。
+        CustomPayload::from_groups(groups).unwrap_or_default()
     }
 }
 

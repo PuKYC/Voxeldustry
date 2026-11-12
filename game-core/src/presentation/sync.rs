@@ -16,9 +16,11 @@ use game_engine::presentation::pipeline::{
 use crate::privacy::{memory_path_component_visible, CoreRequiredPerception};
 use game_engine::identity::StableEntityId;
 
+use game_engine::modding::ResolvedModPayloads;
+
 use super::payload::{
-    project, ExtensionBag, ExtensionPayload, ExtensionSchema, PayloadKind, SyncPayload,
-    ToPresentation,
+    project, project_mod_presentation, CustomPayload, ExtensionBag, ExtensionPayload,
+    ExtensionSchema, ModPresentation, PayloadKind, SyncPayload, ToPresentation,
 };
 use super::{compact_commands, PresentationCommand, PresentationFrame, PresentationSlot};
 
@@ -120,7 +122,12 @@ pub fn collect_extension_bag(
             continue; // 实体已销毁，交给 finalize 的 Despawn 路径
         };
         last_sent.remove(&id.0);
-        remove_extension_baseline(&mut out.baseline, &mut out.pending, id.0);
+        remove_payload_baseline(
+            &mut out.baseline,
+            &mut out.pending,
+            id.0,
+            PayloadKind::Extension,
+        );
     }
 
     // 2) 可见实体：投影 -> 哈希去抖；空投影 -> Remove。
@@ -136,7 +143,12 @@ pub fn collect_extension_bag(
         if payload.fields().is_empty() {
             if in_baseline {
                 last_sent.remove(&id.0);
-                remove_extension_baseline(&mut out.baseline, &mut out.pending, id.0);
+                remove_payload_baseline(
+                    &mut out.baseline,
+                    &mut out.pending,
+                    id.0,
+                    PayloadKind::Extension,
+                );
             }
             continue;
         }
@@ -177,7 +189,12 @@ pub fn collect_extension_bag(
             .collect();
         for sid in stale {
             last_sent.remove(&sid);
-            remove_extension_baseline(&mut out.baseline, &mut out.pending, sid);
+            remove_payload_baseline(
+                &mut out.baseline,
+                &mut out.pending,
+                sid,
+                PayloadKind::Extension,
+            );
         }
     }
 
@@ -188,19 +205,145 @@ pub fn collect_extension_bag(
     });
 }
 
-/// 清除扩展袋基线并下发 Remove（幂等：基线没有就不发）。
-fn remove_extension_baseline(
+/// mod 表现收集的读取侧：可见性、sub_kind 表、组件 / 稳定 ID 查询与移除事件。
+#[derive(SystemParam)]
+pub struct ModPresentationSources<'w, 's> {
+    /// 本帧可见实体与观察者感知掩码。
+    visibility: Res<'w, PresentationVisibility>,
+    /// 装配期分配的 sub_kind 表；未挂 mod（或未装配）时缺失。
+    schema: Option<Res<'w, ResolvedModPayloads>>,
+    /// 带 mod 表现组件的实体。
+    all: Query<'w, 's, (&'static StableEntityId, &'static ModPresentation)>,
+    /// 稳定 ID 反查。
+    ids: Query<'w, 's, &'static StableEntityId>,
+    /// 本帧被移除的 mod 表现组件。
+    removed: RemovedComponents<'w, 's, ModPresentation>,
+}
+
+/// mod 表现载荷收集系统。
+///
+/// 与 [collect_extension_bag] 同一套四步流程（移除事件 / 可见实体投影 / 基线反查 /
+/// 缓存清理），差别只在投影：按 sub_kind 查 schema 求值字段可见性，找不到 schema
+/// 的组整组丢弃；投影为空（空包 / 无任何可见字段）时主动发 `Remove` 并清基线。
+///
+/// **不依赖 `Changed`**：与扩展袋同理，同值写入也会被 Bevy 标记为 Changed，
+/// 因此对每个可见实体重算投影，用「上次下发」比较来去抖。
+pub fn collect_mod_presentation(
+    mut last_sent: Local<HashMap<u64, CustomPayload>>,
+    mut src: ModPresentationSources,
+    mut out: SyncSinks,
+) {
+    // 1) 组件被移除：实体仍在且未在同帧重新挂回 -> Remove + 清基线。
+    for entity in src.removed.read() {
+        if src.all.get(entity).is_ok() {
+            continue; // 同帧先删后加，视为仍在
+        }
+        let Ok(id) = src.ids.get(entity) else {
+            continue; // 实体已销毁，交给 finalize 的 Despawn 路径
+        };
+        last_sent.remove(&id.0);
+        remove_payload_baseline(
+            &mut out.baseline,
+            &mut out.pending,
+            id.0,
+            PayloadKind::Custom,
+        );
+    }
+
+    // 2) 可见实体：投影 -> 去抖；空投影 -> Remove。
+    for &entity in src.visibility.entities.iter() {
+        let Ok((id, presentation)) = src.all.get(entity) else {
+            continue;
+        };
+        let in_baseline = out.baseline.has_component(*id, PayloadKind::Custom);
+        // schema 缺失（未挂 mod / 未装配）等价于「所有组都没有 schema」：投影为空。
+        let payload = match src.schema.as_deref() {
+            Some(schema) => {
+                project_mod_presentation(presentation, src.visibility.local_perception, schema)
+            }
+            None => CustomPayload::default(),
+        };
+
+        if payload.is_empty() {
+            if in_baseline {
+                last_sent.remove(&id.0);
+                remove_payload_baseline(
+                    &mut out.baseline,
+                    &mut out.pending,
+                    id.0,
+                    PayloadKind::Custom,
+                );
+            }
+            continue;
+        }
+
+        // 基线缺失 = 首次进入（或 detach 后重进）-> 必须 Add，不能因哈希相同而跳过。
+        if !in_baseline {
+            last_sent.insert(id.0, payload.clone());
+            out.baseline.components.insert((id.0, PayloadKind::Custom));
+            out.pending.commands.push(PresentationCommand::Add {
+                id: *id,
+                payload: SyncPayload::Custom(payload),
+            });
+            continue;
+        }
+
+        if last_sent.get(&id.0) == Some(&payload) {
+            continue; // 投影未变（含同值写入 / 无变化）
+        }
+        last_sent.insert(id.0, payload.clone());
+        out.pending.commands.push(PresentationCommand::Update {
+            id: *id,
+            payload: SyncPayload::Custom(payload),
+        });
+    }
+
+    // 3) 反查基线：有 Custom 基线但当前查不到组件 -> 清理（防跳帧丢事件留下残影）。
+    let live: std::collections::HashSet<u64> = src.all.iter().map(|(id, _)| id.0).collect();
+    for sid in stale_baselines(&out.baseline, &live, PayloadKind::Custom) {
+        last_sent.remove(&sid);
+        remove_payload_baseline(
+            &mut out.baseline,
+            &mut out.pending,
+            sid,
+            PayloadKind::Custom,
+        );
+    }
+
+    // 清理已不在基线的缓存（despawn / detach 后），防无限增长。
+    last_sent.retain(|id, _| {
+        out.baseline
+            .has_component(StableEntityId(*id), PayloadKind::Custom)
+    });
+}
+
+/// 基线里记着 `kind`、但当前已查不到对应组件的稳定 ID（升序，确定性）。
+fn stale_baselines(
+    baseline: &CoreSyncBaseline,
+    live: &std::collections::HashSet<u64>,
+    kind: PayloadKind,
+) -> Vec<u64> {
+    let mut stale: Vec<u64> = baseline
+        .components
+        .iter()
+        .filter(|(sid, baseline_kind)| *baseline_kind == kind && !live.contains(sid))
+        .map(|(sid, _)| *sid)
+        .collect();
+    stale.sort_unstable();
+    stale
+}
+
+/// 清除某载荷 kind 的基线并下发 Remove（幂等：基线没有就不发）。
+fn remove_payload_baseline(
     baseline: &mut CoreSyncBaseline,
     pending: &mut CorePendingPresentation,
     stable: u64,
+    kind: PayloadKind,
 ) {
-    if baseline
-        .components
-        .remove(&(stable, PayloadKind::Extension))
-    {
+    if baseline.components.remove(&(stable, kind)) {
         pending.commands.push(PresentationCommand::Remove {
             id: StableEntityId(stable),
-            kind: PayloadKind::Extension,
+            kind,
         });
     }
 }
@@ -236,7 +379,7 @@ pub fn reconcile_extension_baseline(
     // 确定性：HashSet/HashMap 迭代顺序随机，先排序再发命令。
     stale.sort_unstable();
     for stable in stale {
-        remove_extension_baseline(&mut baseline, &mut pending, stable);
+        remove_payload_baseline(&mut baseline, &mut pending, stable, PayloadKind::Extension);
     }
 }
 

@@ -376,6 +376,16 @@ impl BevyAppManager {
         presentation_bridge::action_table_to_variant()
     }
 
+    /// mod 表现子种类表：`Array[{ sub_kind, mod_id, name, fields: [{ key, name, vis, required_bits }] }]`。
+    ///
+    /// Godot 侧按 `sub_kind` 查表即可把 CUSTOM 载荷的字段 key 翻译成人可读的名字，
+    /// 并按 `vis` 决定是否交给渲染器。表来自装配期发布的全局快照，世界加载完成后
+    /// 要重新拉一次（与 `get_action_table` 同一生命周期）。
+    #[func]
+    fn get_mod_payload_table(&self) -> Array<VarDictionary> {
+        presentation_bridge::mod_payload_table_to_variant()
+    }
+
     /// 输入通道表：`Array[{ key, mask, mode, actions }]`。
     ///
     /// 供 Godot 的 BevyInputContext 把 INPUTCAPS 的位掩码翻译成通道级

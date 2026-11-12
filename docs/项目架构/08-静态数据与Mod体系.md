@@ -3,12 +3,12 @@ title: 静态数据与 Mod 体系
 type: 架构文档
 status: active
 created: 2026-10-19
-updated: 2026-11-11
+updated: 2026-11-12
 tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -276,7 +276,7 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 
 ## Mod 清单
 
-`ModManifest` 声明 `id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`params`、`actions`。
+`ModManifest` 声明 `id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`params`、`actions`、`presentation`。
 
 - `load_after`：硬依赖，缺失报 `MissingDependency`，同时作为拓扑排序边。
 - `load_after_optional`：可选依赖，存在时排在自己之前，缺失不报错。
@@ -285,6 +285,9 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 - `engine_api` 是整数版本，只增不改。
 - `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。
 - `actions`：本 mod 声明的输入动作名（`&'static [&'static str]`，不声明则 `&[]`）。解析规则见下节。
+- `presentation`：本 mod 的表现子种类声明（`&'static [ModPayloadSpec]`，不声明则 `&[]`）。
+  每项 `ModPayloadSpec { name, fields }`，字段 `ModFieldSpec { key, name, visibility, required_bits }`，
+  `ModFieldVis` 取 `All` / `Required` / `ServerOnly`（与扩展袋可见性同义）。解析规则见「表现子种类分配」小节。
 
 参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` / `build_with_profile` 负责这个装配点。
 
@@ -298,6 +301,15 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 - 结果顺序固定：core 在前按 bit 升序，mod 动作按分配顺序。
 
 成功后 `ResolvedActions` 与 `AppliedModSet`（`mod_set_hash` + 按 id 升序的 `ModRef { id, version }`）作为 Resource 注入 App。输入侧 `derive_input_events` 优先用 `ResolvedActions::action_of_bit`，`RawInputFrame::from_names_with_table` 把 Godot 传来的动作名翻成通道位；无该资源时回退静态 `ActionMap`（无 mod 时结果与旧行为逐位相同）。`mod_set_hash` 的算法不变（逐 mod `"id:version"` 的 fnv1a32 串联）。
+
+### 表现子种类分配
+
+mod 自定义表现载荷（表现层 code 12 `custom`）用 `u16 sub_kind` 区分「同一个实体上的不同表现种类」。`Mods::apply` 在全部 mod `install` 完成后调用 `ResolvedModPayloads::resolve(&mods)`：
+
+- 编号按**拓扑排序后的 mod 顺序**、每个 mod **manifest 里的声明顺序**从 1 递增（0 保留给核心 / 未分配），与 `load_after` 排出的实际装配顺序一致，因此两个 mod 的 `Mods::push` 顺序不影响结果。
+- 同一 mod 内两个子种类重名、同一 spec 内字段 key 重复、子种类总数超过 `u16::MAX` 都让装配失败（`ModError::Presentation`，错误码 `mod.presentation`）。
+- 组内字段按 key 升序规范化后写入 `ResolvedModPayloadKind { sub_kind, mod_id, name, fields }`，作为 `ResolvedModPayloads` 资源注入 App，并由 `bevy_backend` 发布到全局快照 `publish_mod_payloads` / `mod_payload_table()` 供 Godot 读（`BevyRuntimeNode.get_mod_payload_table()`）。
+- **sub_kind 是装配期派生值，不进存档**：表现不跨模拟 / 回放边界，mod 清单本身已由 `world.meta` 冻结（见下节），读档时按同一清单重建即得到同一编号，不需要额外保存或比对。
 
 ### 随存档冻结与读档校验
 
