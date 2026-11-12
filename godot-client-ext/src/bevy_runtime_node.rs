@@ -14,16 +14,22 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use godot::builtin::{
     Array, PackedByteArray, PackedFloat32Array, PackedInt64Array, PackedStringArray, VarDictionary,
+    VariantType,
 };
 #[cfg(debug_assertions)]
 use godot::classes::FileAccess;
 use godot::prelude::*;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use game_core::bevy_backend::*;
+use game_core::mods::default_core_mods;
 use game_core::package::{scan_package_root, LoadedPackage};
+use game_core::param_schema::{
+    collect_param_schema, param_error_code, validate_param_overrides, ParamKind,
+};
 use game_core::presentation::semantics::SemanticRegistry;
 use game_core::spec::ClientBridge;
 use game_core::static_data::ObjectTablesHandle;
@@ -93,6 +99,13 @@ pub struct BevyAppManager {
     /// 就随之后每一次启动带进后台配置，直到下一次扫描覆盖。
     packages: Vec<LoadedPackage>,
 
+    /// 待装配的参数覆盖值（全 key -> 落盘整数），由参数面板在启动前写入。
+    ///
+    /// 每次 start_backend 原样搬进 BevyBackendConfig 的 param_overrides；
+    /// 真正的语义校验在 CoreGame::build_with_profile 里由 ParamTable 完成，
+    /// 本节点只保证「面板提交时 schema 合法」。默认空表。
+    param_overrides: BTreeMap<String, i64>,
+
     /// 后台线程回传的最后一次错误 (code, message)。
     ///
     /// 句柄里没有拒绝信息时，`world_load_rejection()` 用它兜底：`save.*` 的
@@ -119,6 +132,7 @@ impl INode for BevyAppManager {
             object_tables: ObjectTablesHandle::default(),
             world_load_rejection: WorldLoadRejectionHandle::default(),
             packages: Vec::new(),
+            param_overrides: BTreeMap::new(),
             last_error: None,
         }
     }
@@ -421,6 +435,152 @@ impl BevyAppManager {
         }
         out
     }
+    /// 采集装配前参数 schema（编译期 mod + 已扫描的目录式包）。
+    ///
+    /// 返回 { ok, schema, errors }。
+    ///
+    /// 成功时 schema 是 Array[Dictionary]，每项字段：
+    /// - key：全 key "<mod_id>.<local_key>"；
+    /// - mod_id / local_key：拆开的 mod 与局部 key；
+    /// - scope："world" / "debug"；
+    /// - kind："bool" / "int" / "fixed" / "enum"；
+    /// - default：落盘整数（Bool 0/1，Enum 是下标，Fixed 是乘过 scale 的整数）；
+    /// - min / max / step / scale：不适用的字段给 -1；min/max/step 只对 int/fixed
+    ///   有值，scale 只对 fixed 有值（且 > 0）；
+    /// - values：PackedStringArray，enum 顺序即下标；非 enum 为空数组；
+    /// - group：分组名，空字符串表示未分组；
+    /// - visible_if：空字典，或 { key, equals }。这里的 key 是**同一 mod 内的
+    ///   local key**，不是全 key；UI 先用 mod_id 拼全 key 再比较，避免跨 mod 误判。
+    ///
+    /// 失败时 ok=false、schema 为空数组，errors 是 [{ code, message }]，code 形如
+    /// param.duplicate_key / param.invalid_spec / param.invalid_default。
+    /// 本方法只读，不触碰节点上待用的覆盖表。
+    #[func]
+    fn get_param_schema(&self) -> VarDictionary {
+        let mut out = VarDictionary::new();
+        let mut schema: Array<VarDictionary> = Array::new();
+        let mut errors: Array<VarDictionary> = Array::new();
+
+        match collect_param_schema(&default_core_mods(), &self.packages) {
+            Ok(entries) => {
+                for entry in entries {
+                    let mut item = VarDictionary::new();
+                    item.set("key", entry.key.as_str());
+                    item.set("mod_id", entry.mod_id.as_str());
+                    item.set("local_key", entry.local_key.as_str());
+                    item.set("scope", entry.scope_code());
+                    item.set("kind", entry.kind.code());
+                    item.set("default", entry.default);
+                    item.set("min", entry.min.unwrap_or(-1));
+                    item.set("max", entry.max.unwrap_or(-1));
+                    item.set("step", entry.step.unwrap_or(-1));
+                    item.set("scale", entry.scale.map_or(-1, i64::from));
+                    let values: Vec<&str> = match &entry.kind {
+                        ParamKind::Enum { values } => values.iter().map(String::as_str).collect(),
+                        _ => Vec::new(),
+                    };
+                    item.set("values", &strings_to_packed(&values));
+                    item.set("group", entry.group.as_str());
+                    let mut visible_if = VarDictionary::new();
+                    if let Some((key, equals)) = &entry.visible_if {
+                        visible_if.set("key", key.as_str());
+                        visible_if.set("equals", *equals);
+                    }
+                    item.set("visible_if", &visible_if);
+                    schema.push(&item);
+                }
+                out.set("ok", true);
+            }
+            Err(error) => {
+                push_param_error(&mut errors, param_error_code(&error), &error.to_string());
+                out.set("ok", false);
+            }
+        }
+
+        out.set("schema", &schema);
+        out.set("errors", &errors);
+        out
+    }
+
+    /// 提交参数覆盖值（Dictionary：String 全 key -> 整数），按当前 schema 校验。
+    ///
+    /// 接受 World 与 Debug 两种作用域（参数面板会同时显示）。返回
+    /// { ok, count, errors }：成功时替换节点上待用的覆盖表，count 是条目数；
+    /// 失败时 ok=false、count=0，errors 每项 { code, message }，且**旧覆盖表保持不变**。
+    ///
+    /// code 形如 param.unknown_key / param.out_of_range / param.invalid_bool /
+    /// param.invalid_enum / param.invalid_override（key 不是 String，或 value 不是
+    /// 整数）。schema 本身采集失败时回传对应的 param.invalid_spec /
+    /// param.duplicate_key 等。
+    ///
+    /// 这里只做装配前校验；真正写进 ECS 是下一次 start_bevy_* 时
+    /// CoreGame::build_with_profile 的事。
+    #[func]
+    fn set_param_overrides(&mut self, params: VarDictionary) -> VarDictionary {
+        let mut errors: Array<VarDictionary> = Array::new();
+        let mut parsed: BTreeMap<String, i64> = BTreeMap::new();
+
+        for (key, value) in &params {
+            if key.get_type() != VariantType::STRING {
+                push_param_error(
+                    &mut errors,
+                    "param.invalid_override",
+                    "参数覆盖的 key 必须是 String",
+                );
+                continue;
+            }
+            let key = match key.try_to::<GString>() {
+                Ok(key) => key.to_string(),
+                Err(_) => {
+                    push_param_error(
+                        &mut errors,
+                        "param.invalid_override",
+                        "参数覆盖的 key 无法转换为 String",
+                    );
+                    continue;
+                }
+            };
+            if value.get_type() != VariantType::INT {
+                push_param_error(
+                    &mut errors,
+                    "param.invalid_override",
+                    &format!("参数覆盖 {key} 的值必须是整数"),
+                );
+                continue;
+            }
+            match value.try_to::<i64>() {
+                Ok(value) => {
+                    parsed.insert(key, value);
+                }
+                Err(_) => push_param_error(
+                    &mut errors,
+                    "param.invalid_override",
+                    &format!("参数覆盖 {key} 的值超出 i64 范围"),
+                ),
+            }
+        }
+
+        if !errors.is_empty() {
+            return param_override_result(false, 0, errors);
+        }
+
+        let entries = match collect_param_schema(&default_core_mods(), &self.packages) {
+            Ok(entries) => entries,
+            Err(error) => {
+                push_param_error(&mut errors, param_error_code(&error), &error.to_string());
+                return param_override_result(false, 0, errors);
+            }
+        };
+        if let Err(error) = validate_param_overrides(&entries, &parsed) {
+            push_param_error(&mut errors, param_error_code(&error), &error.to_string());
+            return param_override_result(false, 0, errors);
+        }
+
+        let count = parsed.len();
+        self.param_overrides = parsed;
+        param_override_result(true, count, errors)
+    }
+
     /// 启动体素性能场景：给定半径 / max_lod 的地形 + 每 tick 移动的观察者。
     ///
     /// `radius_blocks` 是 x/z 上围绕世界原点的基础子块半径（1 块 = 32 体素 ≈ 14.4 m），
@@ -1039,6 +1199,23 @@ impl BevyAppManager {
     }
 }
 
+/// 往 errors 数组追加一条 { code, message }（参数 FFI 共用）。
+fn push_param_error(errors: &mut Array<VarDictionary>, code: &str, message: &str) {
+    let mut error = VarDictionary::new();
+    error.set("code", code);
+    error.set("message", message);
+    errors.push(&error);
+}
+
+/// set_param_overrides 的统一返回形状。
+fn param_override_result(ok: bool, count: usize, errors: Array<VarDictionary>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    out.set("ok", ok);
+    out.set("count", i64::try_from(count).unwrap_or(i64::MAX));
+    out.set("errors", &errors);
+    out
+}
+
 /// 借用字符串切片 -> Godot 字符串数组（FFI 返回值的说明性字段用）。
 fn strings_to_packed(items: &[&str]) -> PackedStringArray {
     let owned: Vec<GString> = items.iter().map(|item| GString::from(*item)).collect();
@@ -1094,6 +1271,7 @@ impl BevyAppManager {
         config.memory_soft_limit = Some(self.memory_soft_limit.clone());
         config.object_tables = Some(self.object_tables.clone());
         config.packages = self.packages.clone();
+        config.param_overrides = self.param_overrides.clone();
         // 新会话从零开始：上一次的拒绝不能冒充这一次的。
         self.world_load_rejection.clear();
         self.last_error = None;

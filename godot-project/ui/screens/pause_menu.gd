@@ -9,6 +9,7 @@ extends Control
 ## - signal debug_scheme_requested(scheme: int)：强制输入方案（仅 debug 构建显示）；
 ## - signal reload_object_tables_requested：重载后端静态表（仅 debug 构建显示，
 ##   pause_menu 不自持 manager，由 UiRoot 调 BevyAppManager.reload_object_tables()）；
+## - signal param_panel_requested：打开通用 mod 参数面板（UiRoot 负责实例化与灌 schema）；
 ## - 期 3 设置区信号（UiRoot 负责写 UiState + 落盘 + 立即应用）：
 ##   action_layout_changed(value: int) / button_scale_changed(value: float) /
 ##   button_opacity_changed(value: float) / left_handed_changed(value: bool) /
@@ -28,6 +29,8 @@ signal debug_overlay_requested(enabled: bool)
 signal debug_scheme_requested(scheme: int)
 ## 静态表重载：只发信号，Bevy 调用由 UiRoot 负责。
 signal reload_object_tables_requested
+## 通用参数面板：只发信号，面板由 UiRoot 持有。
+signal param_panel_requested
 ## 期 3 设置区信号。
 signal action_layout_changed(value: int)
 signal button_scale_changed(value: float)
@@ -74,6 +77,7 @@ var _button_opacity_slider: HSlider = null
 var _button_opacity_value: Label = null
 var _left_handed_button: Button = null
 var _joystick_mode_button: Button = null
+var _param_panel_button: Button = null
 ## 设置区本地镜像：refresh 时从 UiState 同步，交互时先改镜像再发信号。
 var _settings_action_layout: int = UiState.ActionLayout.CONTEXT
 var _settings_button_scale: float = UiState.DEFAULT_BUTTON_SCALE
@@ -207,6 +211,11 @@ func _build_settings_controls() -> void:
 	_joystick_mode_button.pressed.connect(_on_joystick_mode_pressed)
 	_insert_settings_node(_joystick_mode_button)
 
+	# 通用 mod 参数面板：面板与 schema 都由 UiRoot 管理，这里只发请求。
+	_param_panel_button = _make_settings_button("ParamPanelButton", "MOD PARAMS")
+	_param_panel_button.pressed.connect(_on_param_panel_pressed)
+	_insert_settings_node(_param_panel_button)
+
 	# 交互 -> 信号（不在这里写 UiState：UiRoot 统一写 + 落盘）。
 	_button_scale_slider.value_changed.connect(_on_button_scale_value_changed)
 	_button_opacity_slider.value_changed.connect(_on_button_opacity_value_changed)
@@ -312,6 +321,10 @@ func _on_joystick_mode_pressed() -> void:
 	joystick_mode_changed.emit(next)
 
 
+func _on_param_panel_pressed() -> void:
+	param_panel_requested.emit()
+
+
 # ── 设置控件访问器（测试 / UiRoot 用，避免依赖运行期唯一名） ──
 
 func action_layout_button() -> Button:
@@ -342,6 +355,10 @@ func joystick_mode_button() -> Button:
 	return _joystick_mode_button
 
 
+func param_panel_button() -> Button:
+	return _param_panel_button
+
+
 func reload_tables_button() -> Button:
 	return _reload_tables_button
 
@@ -356,6 +373,7 @@ func settings_controls() -> Dictionary:
 		"ButtonOpacityValue": _button_opacity_value,
 		"LeftHandedButton": _left_handed_button,
 		"JoystickModeButton": _joystick_mode_button,
+		"ParamPanelButton": _param_panel_button,
 	}
 
 

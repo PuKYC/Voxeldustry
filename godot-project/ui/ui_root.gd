@@ -41,6 +41,7 @@ const BUILTIN_WIDGET_PATHS: Array[String] = [
 ]
 const TOUCH_CONTROLS_SCENE := "res://ui/touch/touch_controls.tscn"
 const PAUSE_MENU_SCENE := "res://ui/screens/pause_menu.tscn"
+const PARAM_PANEL_SCRIPT := preload("res://ui/screens/param_panel.gd")
 const DEBUG_OVERLAY_SCRIPT := preload("res://ui/debug/hud_debug_overlay.gd")
 
 @export var manager_path: NodePath = ^"../BevyAppManager"
@@ -63,6 +64,7 @@ var client: Node = null
 var registry := HudRegistry.new()
 var action_host: ActionButtonHost = null
 var pause_menu: Control = null
+var param_panel: Control = null
 var touch_controls: Control = null
 var debug_overlay: Control = null
 
@@ -225,7 +227,19 @@ func _instantiate_optional() -> void:
 				pause_menu.debug_scheme_requested.connect(_on_debug_scheme_requested)
 			if pause_menu.has_signal("reload_object_tables_requested"):
 				pause_menu.reload_object_tables_requested.connect(_on_reload_object_tables_requested)
+			if pause_menu.has_signal("param_panel_requested"):
+				pause_menu.param_panel_requested.connect(open_param_panel)
 			_connect_pause_settings()
+
+	param_panel = PARAM_PANEL_SCRIPT.new() as Control
+	param_panel.name = "ParamPanel"
+	_root.add_child(param_panel)
+	param_panel.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	param_panel.visible = false
+	if param_panel.has_signal("apply_requested"):
+		param_panel.apply_requested.connect(_on_param_panel_apply_requested)
+	if param_panel.has_signal("close_requested"):
+		param_panel.close_requested.connect(close_param_panel)
 
 	debug_overlay = DEBUG_OVERLAY_SCRIPT.new()
 	debug_overlay.name = "HudDebugOverlay"
@@ -503,7 +517,9 @@ func _set_scheme(next: int, from_input: bool = false) -> void:
 func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("ui_cancel"):
 		get_viewport().set_input_as_handled()
-		if UiState.is_menu_open():
+		if param_panel != null and param_panel.visible:
+			close_param_panel()
+		elif UiState.is_menu_open():
 			close_pause_menu()
 		else:
 			open_pause_menu()
@@ -527,6 +543,8 @@ func open_pause_menu() -> void:
 	if UiState.is_menu_open():
 		return
 	UiState.set_menu_open(true)
+	if param_panel != null:
+		param_panel.visible = false
 	if not UiState.has_scheme(UiState.Scheme.TOUCH):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	if touch_controls != null:
@@ -551,6 +569,8 @@ func close_pause_menu() -> void:
 	if not UiState.is_menu_open():
 		return
 	UiState.set_menu_open(false)
+	if param_panel != null:
+		param_panel.visible = false
 	if pause_menu != null:
 		if pause_menu.has_method("close"):
 			pause_menu.close()
@@ -568,6 +588,45 @@ func toggle_pause_menu() -> void:
 		close_pause_menu()
 	else:
 		open_pause_menu()
+
+
+## 打开通用 mod 参数面板：每次打开都重拉 schema（包可能在菜单期间扫描完成）。
+## 菜单保持「打开且后端暂停」状态，只是把暂停面板换成参数面板。
+func open_param_panel() -> void:
+	if param_panel == null:
+		return
+	if not UiState.is_menu_open():
+		open_pause_menu()
+	if pause_menu != null:
+		pause_menu.visible = false
+
+	var schema: Dictionary = {
+		"ok": false,
+		"schema": [],
+		"errors": [{"code": "param.unsupported", "message": "缺少 BevyClient，无法拉取参数 schema"}],
+	}
+	if client != null and client.has_method("get_param_schema"):
+		var result: Variant = client.call("get_param_schema")
+		if result is Dictionary:
+			schema = result as Dictionary
+	param_panel.call("load_schema", schema)
+	param_panel.visible = true
+
+
+## 关闭参数面板：菜单仍打开时回到暂停面板，而不是直接恢复游戏。
+func close_param_panel() -> void:
+	if param_panel != null:
+		param_panel.visible = false
+	if UiState.is_menu_open() and pause_menu != null:
+		pause_menu.visible = true
+		if pause_menu.has_method("open"):
+			pause_menu.open()
+
+
+func _on_param_panel_apply_requested() -> void:
+	if param_panel == null:
+		return
+	param_panel.call("apply_to", _get_manager())
 
 
 func _set_backend_paused(paused: bool) -> void:

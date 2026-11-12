@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12；运行期校验和（verify::simulation_checksum / diagnostics.checksum）@ 2026-11-12"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12；BMS Lua 脚本层（scripting feature / ScriptSources / ScriptingPlugin）@ 2026-11-12；运行期校验和（verify::simulation_checksum / diagnostics.checksum）@ 2026-11-12；参数 schema 面板（param_schema.rs / get_param_schema / set_param_overrides / ParamPanel）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -297,13 +297,54 @@ Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`�
 - `conflicts`：单向声明，对方存在即报 `Conflict`。
 - `exclusive_groups`：同一组最多加载一个 mod，冲突报 `ExclusiveGroup`。
 - `engine_api` 是整数版本，只增不改。
-- `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。
+- `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。目录式包的 `params` 与它**同表**合并（见下节）。
 - `actions`：本 mod 声明的输入动作名（`&'static [&'static str]`，不声明则 `&[]`）。解析规则见下节。
 - `presentation`：本 mod 的表现子种类声明（`&'static [ModPayloadSpec]`，不声明则 `&[]`）。
   每项 `ModPayloadSpec { name, fields }`，字段 `ModFieldSpec { key, name, visibility, required_bits }`，
   `ModFieldVis` 取 `All` / `Required` / `ServerOnly`（与扩展袋可见性同义）。解析规则见「表现子种类分配」小节。
 
 参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` / `build_with_profile` 负责这个装配点。
+
+### 参数 schema 面板（装配前只读）
+
+Godot 通用参数面板不经过运行期 `ParamTable`，而是在装配前用 `game-core/src/param_schema.rs` 采集一份**只读**合并 schema：
+
+```rust
+pub fn collect_param_schema(
+    mods: &CoreMods,
+    packages: &[LoadedPackage],
+) -> Result<Vec<ParamSchemaEntry>, ParamError>;
+pub fn validate_param_overrides(
+    entries: &[ParamSchemaEntry],
+    overrides: &BTreeMap<String, i64>,
+) -> Result<(), ParamError>;
+```
+
+- 编译期 `ModManifest.params` 与包 `PackageManifest.params` **同表**合并，key 一律 `<mod_id>.<local_key>`，结果按全 key 升序（`BTreeMap` 序）稳定。
+- 重复全 key 报 `DuplicateKey`；编译期条目走 `ParamSpec::validate`（内部 `ParamType::validate_spec` + 默认值校验）；包侧另校验 `min <= max`、`step > 0`、`scale > 0`、默认在范围、Enum 默认下标合法、Enum 值非空，`visible_if.key` 必须是**同一 mod 内**已声明的 local key（跨 mod 引用报 `InvalidSpec`）。前向引用合法。
+- `ParamSchemaEntry` 字段：`key`、`mod_id`、`local_key`、`scope`、`kind`（`Bool` / `Int` / `Fixed` / `Enum { values }`）、`default`、`min` / `max` / `step`（`Option<i64>`）、`scale`（`Option<u32>`）、`group`、`visible_if: Option<(String, i64)>`。`visible_if` 的 key 与 `ParamSpec` 一致，**始终是 local key**；面板自己用 `mod_id` 拼全 key，避免跨 mod 误判。
+- `validate_param_overrides` 只校验取值：未知 key、Bool 非 0/1、Int / Fixed 越界、Enum 下标越界都拒绝；**不按作用域拒绝**，World 与 Debug 都允许出现在覆盖表里。它不是运行期路径，`ParamTable::resolve` 的装配逻辑不变。
+
+Godot FFI（`godot-client-ext/src/bevy_runtime_node.rs`，`BevyAppManager`）：
+
+| 方法 | 行为与返回 |
+| --- | --- |
+| `get_param_schema()` | 用 `default_core_mods()` + 节点上 `scan_mod_packages` 的结果采集，返回 `{ ok, schema, errors }`。成功时 schema 每项：`key` / `mod_id` / `local_key` / `scope`（`"world"` / `"debug"`）/ `kind`（`"bool"` / `"int"` / `"fixed"` / `"enum"`）/ `default` / `min` / `max` / `step` / `scale`（不适用为 `-1`）/ `values`（`PackedStringArray`，非 enum 为空数组）/ `group` / `visible_if`（空字典或 `{ key, equals }`，`key` 为 local key）。失败时 `ok=false`、`schema=[]`，`errors` 每项 `{ code, message }` |
+| `set_param_overrides(params)` | 解析 `{ key: String, value: i64 }`，用当前 schema 校验；成功替换节点上的待用覆盖表，返回 `{ ok, count, errors }`；失败 `ok=false` 且**保留旧表**。非 String key / 非整数 value 报 `param.invalid_override` |
+
+节点字段 `param_overrides: BTreeMap<String, i64>` 默认空；`start_backend` 构造 `BevyBackendConfig` 时写入 `config.param_overrides`，因此所有 `start_bevy_*` 入口都生效。校验失败不会在启动时 panic，仍由 `build_with_profile` 走结构化失败（`mod.param`）。
+
+GDScript 面板 `godot-project/ui/screens/param_panel.gd`（`class_name ParamPanel extends Control`，纯代码构建，无 `.tscn`）：
+
+- `load_schema(result: Dictionary)` 接受 `get_param_schema()` 的返回；`ok=false` 时显示错误标签并禁用 Apply。`close_requested` 只发信号，面板不自行隐藏。
+- `collect_values() -> Dictionary`、`reset_defaults() -> void`、`apply_to(manager: Node) -> bool`（内部用 `manager.call("set_param_overrides", collect_values())` 动态派发，先 `has_method` 检查，成功才返回 true）。
+- Bool → `CheckButton`；Int → `SpinBox`；Fixed → `HSlider` + 数值 Label（显示 `落盘整数 / scale`，按 scale 位数格式化，提交 `round(display * scale)`）；Enum → `OptionButton`（values 顺序即下标）。按 `group` 分节，空 group 归「常规」。
+- `visible_if` 按同 mod 的 `local_key` 联动，条件不满足时整行隐藏（不是禁用）。隐藏行仍参与 `collect_values()`，切换父开关不会丢输入。
+- World 参数行带「建档后不可改」徽标与颜色标记，但建档前仍可编辑，不置灰、不禁用。
+- 没有 manager / 方法不存在时 `apply_to` 返回 false 并 `push_error`，不崩溃。`bevy_client.gd` 提供 `get_param_schema()` / `set_param_overrides(values)` 两个薄代理，无 manager 时返回 `ok=false`。
+- 真实入口是暂停菜单 Settings 区的 `MOD PARAMS`：`UiRoot` 持有面板、每次打开重拉 schema、`apply_requested` 接给 `apply_to`，关闭后回到暂停面板；关闭不改 `UiState`，菜单与后端暂停状态保持。
+
+错误码统一 `param.*` 前缀（与 `mod.*` / `profile.*` 分开）：`param.duplicate_key`、`param.unknown_key`、`param.invalid_spec`、`param.invalid_default`、`param.out_of_range`、`param.invalid_bool`、`param.invalid_enum`、`param.invalid_override`；客户端代理缺扩展方法时为 `param.unsupported`。
 
 ### 目录式 mod 包（运行期加载）
 

@@ -315,8 +315,33 @@ fn extract_enum_block(source: &str, name: &str) -> Option<String> {
     let needle = format!("enum {name} {{");
     let start = source.find(&needle)?;
     let body_start = start + needle.len();
-    let body_end = source[body_start..].find('}')? + body_start;
-    Some(source[body_start..body_end].to_string())
+    let bytes = source.as_bytes();
+    let mut depth = 1usize;
+    let mut index = body_start;
+    let mut in_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_comment {
+            if byte == b'\n' {
+                in_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'#' => in_comment = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(source[body_start..index].to_string());
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 /// GDScript 的 `enum Payload` 必须与 Rust 注册表逐项一致。

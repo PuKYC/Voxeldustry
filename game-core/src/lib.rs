@@ -18,6 +18,7 @@
 //! | [`input`] | 动作表与能力通道 |
 //! | [`privacy`] | 隐私组件与 `CorePrivacyScope` |
 //! | `prediction` | 预测 / 回滚绑定（单人路径） |
+//! | [`param_schema`] | 装配前参数 schema（编译期 mod + 目录包合并，供 Godot 面板） |
 //! | [`presentation`] | 表现通道（payload / synced_components / sync / semantics / event） |
 //! | [`static_data`] | 静态数据（prototype / item / voxel 数值 + WorldTables） |
 //! | `voxel` | 体素世界层（Body / 停靠 / LOD / 地形；GameVoxelPlugin + TerrainPlugin） |
@@ -37,6 +38,8 @@ pub mod logic_ext;
 pub mod mods;
 /// 目录式 mod 包解析（Godot 读盘 → Rust 解析 → Mods）。
 pub mod package;
+/// 装配前参数 schema：编译期 mod 与目录包参数合并成只读表，供 UI 读取。
+pub mod param_schema;
 mod prediction;
 pub mod presentation;
 pub mod privacy;

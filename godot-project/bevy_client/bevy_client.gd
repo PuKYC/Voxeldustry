@@ -189,6 +189,20 @@ func scan_mod_packages(directory: String) -> Dictionary:
 	return _mgr.scan_mod_packages(directory)
 
 
+## 采集装配前参数 schema（薄代理，只搬运）；扩展缺少方法时 ok=false。
+func get_param_schema() -> Dictionary:
+	if _mgr == null or not _mgr.has_method("get_param_schema"):
+		return {"ok": false, "schema": [], "errors": [{"code": "param.unsupported", "message": "扩展缺少 get_param_schema()"}]}
+	return _mgr.get_param_schema()
+
+
+## 提交参数覆盖（薄代理，只搬运）；无 manager 时 ok=false，不静默丢参数。
+func set_param_overrides(values: Dictionary) -> Dictionary:
+	if _mgr == null or not _mgr.has_method("set_param_overrides"):
+		return {"ok": false, "count": 0, "errors": [{"code": "param.unsupported", "message": "扩展缺少 set_param_overrides()"}]}
+	return _mgr.set_param_overrides(values)
+
+
 ## 启动前确保 mod 包已扫描；返回 false 表示本次不应启动。
 func _ensure_mod_packages() -> bool:
 	if mod_dir.is_empty():

@@ -3,13 +3,13 @@ title: Godot UI 方案
 type: 架构文档
 status: active
 created: 2026-10-21
-updated: 2026-10-22
+updated: 2026-11-12
 tags:
   - 项目架构
   - UI
   - 输入
   - 移动端
-source: "代码阅读 @ 本次 UI 适配"
+source: "代码阅读 @ 本次 UI 适配；参数面板 ParamPanel 契约 @ 2026-11-12"
 ---
 
 # Godot UI 方案
@@ -56,13 +56,18 @@ source: "代码阅读 @ 本次 UI 适配"
 | `godot-project/ui/widgets/pause_button.gd` / `.tscn` | 触屏暂停按钮（仅 TOUCH 方案显示，落 TOP / END 槽位） | 已实现 |
 | `godot-project/ui/touch/touch_controls.gd` / `.tscn` | 触屏控件层：虚拟摇杆 + 视角区 + 浮动摇杆区；左手镜像、避让登记 | 已实现 |
 | `godot-project/ui/touch/touch_joystick.gd` | 单指虚拟摇杆，写 `move_*` 动作强度；推到边缘自动 `sprint` | 已实现 |
-| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | 暂停菜单：Resume / Settings（UI 缩放 + 期 3 设置区）/ Quit；debug 构建额外显示 Debug 区 | 已实现 |
+| `godot-project/ui/screens/pause_menu.gd` / `.tscn` | 暂停菜单：Resume / Settings（UI 缩放 + 期 3 设置区 + MOD PARAMS）/ Quit；debug 构建额外显示 Debug 区 | 已实现 |
+| `godot-project/ui/screens/param_panel.gd` | 通用 mod 参数面板（纯代码构建）：按 group 分节，Bool / Int / Fixed / Enum 控件，`visible_if` 联动，World 参数「建档后不可改」标记；`load_schema` / `collect_values` / `reset_defaults` / `apply_to` / `close_requested` | 本轮新增 |
 | `godot-project/bevy_client/camera/camera_rig.gd` | 相机：`camera_rig` 组、`set_ui_blocked()`、触屏 / 菜单不捕获鼠标 | 已实现 |
 | `godot-project/test/ui_smoke_test.gd` | UI headless 冒烟（`extends SceneTree`），按 P0-P6 分阶段覆盖 | 已实现 |
 | `godot-project/test/gen_class_cache.gd` | 无编辑器时生成 `class_name` 缓存 | 已实现 |
 | `tools/ui_check.sh` | 一步跑完类名缓存 + UI 冒烟 | 已实现 |
 
 `UiRoot` 的场景文件只挂脚本，整棵布局树在 `_build_layout()` 里用代码构建，避免场景文件与适配逻辑两头维护。
+
+参数面板由 `UiRoot` 在 `_instantiate_optional()` 里实例化并挂到 `UiTree` 最上层（默认隐藏），入口是暂停菜单 Settings 区的 `MOD PARAMS` 按钮（`pause_menu.gd` 的 `param_panel_requested` 信号）。打开时 `UiRoot` 调 `client.get_param_schema()` 重新灌 schema（包可能在菜单期间才扫描完），并保持「菜单打开 + 后端暂停」状态，只把暂停面板换成参数面板；关闭面板回到暂停面板，不直接恢复游戏。
+
+面板本身不持有 manager：`apply_requested` 由 `UiRoot` 接住并调 `ParamPanel.apply_to(_get_manager())`，成功只更新 `BevyAppManager` 上待用的覆盖表，下一次 `start_bevy_*` 才进 `build_with_profile`。`bevy_client.gd` 的 `get_param_schema()` / `set_param_overrides()` 两个薄代理只负责搬运，无 manager 时返回 `ok=false`；Apply 不自己启动后端。
 
 可选子场景按“存在才加载”处理（`ResourceLoader.exists`）：触屏控件、暂停菜单、内置 HUD 场景缺失时 UiRoot 照常启动，只是少对应部件。这让 UI 骨架与具体控件可以分开落地。`ActionButtonHost` 不是场景：`enable_touch_controls` 为真时由 UiRoot 在代码里创建，它再创建 `ActionCluster`（触屏）与 `ActionHints`（键鼠 / 手柄）；无 client 时按钮数为 0。
 
