@@ -17,6 +17,7 @@ use game_engine::voxel::VoxelDirtySet;
 pub use game_engine::residency::{MemoryPressure, ResidencyStats};
 
 use crate::voxel::StreamStats;
+use crate::world::load::WorldLoadDiff;
 use crate::world::streaming::WorldLoadReport;
 
 /// 流式世界的一帧诊断快照。
@@ -41,6 +42,10 @@ pub struct StreamingDiagnostics {
     /// 只覆盖世界种子、稳定 ID 与 Transform 位模式；每帧采集是 O(实体数)，
     /// 用于验证双跑 / 回滚等价 / 联机漂移诊断，不参与玩法判定。
     pub checksum: Option<u64>,
+    /// 只读打开的装配差异；只有 `LoadMode::ReadOnly` 读档成功时才存在。
+    ///
+    /// 正常读档没有这个字段值（None）：身份不符会直接拒绝，不会走到这里。
+    pub diff: Option<WorldLoadDiff>,
 }
 
 impl GameDiagnostics for StreamingDiagnostics {
@@ -54,6 +59,7 @@ impl GameDiagnostics for StreamingDiagnostics {
                 .get_resource::<VoxelDirtySet>()
                 .map(VoxelDirtySet::edited_len),
             checksum: Some(crate::verify::simulation_checksum(world)),
+            diff: world.get_resource::<WorldLoadDiff>().cloned(),
         }
     }
 }

@@ -42,6 +42,7 @@ const BUILTIN_WIDGET_PATHS: Array[String] = [
 const TOUCH_CONTROLS_SCENE := "res://ui/touch/touch_controls.tscn"
 const PAUSE_MENU_SCENE := "res://ui/screens/pause_menu.tscn"
 const PARAM_PANEL_SCRIPT := preload("res://ui/screens/param_panel.gd")
+const READONLY_DIFF_PANEL_SCRIPT := preload("res://ui/screens/readonly_diff_panel.gd")
 const DEBUG_OVERLAY_SCRIPT := preload("res://ui/debug/hud_debug_overlay.gd")
 
 @export var manager_path: NodePath = ^"../BevyAppManager"
@@ -65,6 +66,7 @@ var registry := HudRegistry.new()
 var action_host: ActionButtonHost = null
 var pause_menu: Control = null
 var param_panel: Control = null
+var readonly_diff_panel: Control = null
 var touch_controls: Control = null
 var debug_overlay: Control = null
 
@@ -99,6 +101,7 @@ func _ready() -> void:
 	_apply_scale()
 	_update_safe_area()
 	_instantiate_optional()
+	_connect_readonly_diff()
 	_register_builtin_widgets()
 	_setup_action_buttons()
 	_connect_viewport()
@@ -241,6 +244,16 @@ func _instantiate_optional() -> void:
 	if param_panel.has_signal("close_requested"):
 		param_panel.close_requested.connect(close_param_panel)
 
+	readonly_diff_panel = READONLY_DIFF_PANEL_SCRIPT.new() as Control
+	readonly_diff_panel.name = "ReadOnlyDiffPanel"
+	_root.add_child(readonly_diff_panel)
+	readonly_diff_panel.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	readonly_diff_panel.visible = false
+	if readonly_diff_panel.has_signal("continue_requested"):
+		readonly_diff_panel.continue_requested.connect(_on_readonly_continue)
+	if readonly_diff_panel.has_signal("close_requested"):
+		readonly_diff_panel.close_requested.connect(close_readonly_diff)
+
 	debug_overlay = DEBUG_OVERLAY_SCRIPT.new()
 	debug_overlay.name = "HudDebugOverlay"
 	_root.add_child(debug_overlay)
@@ -270,6 +283,18 @@ func _load_scene_instance(path: String) -> Node:
 		push_warning("[UiRoot] 无法加载场景：%s" % path)
 		return null
 	return (resource as PackedScene).instantiate()
+
+
+## 只读打开的差异结果由 BevyClient 轮询后发出；UiRoot 只负责展示。
+func _connect_readonly_diff() -> void:
+	if client == null or not client.has_signal("world_load_diff_ready"):
+		return
+	if not client.world_load_diff_ready.is_connected(_on_world_load_diff_ready):
+		client.world_load_diff_ready.connect(_on_world_load_diff_ready)
+
+
+func _on_world_load_diff_ready(diff: Dictionary) -> void:
+	open_readonly_diff(diff)
 
 
 ## 动作按钮宿主：绑定层把语义动作解析成触屏动作簇 + 键鼠/手柄键位提示。
@@ -517,7 +542,9 @@ func _set_scheme(next: int, from_input: bool = false) -> void:
 func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("ui_cancel"):
 		get_viewport().set_input_as_handled()
-		if param_panel != null and param_panel.visible:
+		if readonly_diff_panel != null and readonly_diff_panel.visible:
+			close_readonly_diff()
+		elif param_panel != null and param_panel.visible:
 			close_param_panel()
 		elif UiState.is_menu_open():
 			close_pause_menu()
@@ -545,6 +572,8 @@ func open_pause_menu() -> void:
 	UiState.set_menu_open(true)
 	if param_panel != null:
 		param_panel.visible = false
+	if readonly_diff_panel != null:
+		readonly_diff_panel.visible = false
 	if not UiState.has_scheme(UiState.Scheme.TOUCH):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	if touch_controls != null:
@@ -571,6 +600,8 @@ func close_pause_menu() -> void:
 	UiState.set_menu_open(false)
 	if param_panel != null:
 		param_panel.visible = false
+	if readonly_diff_panel != null:
+		readonly_diff_panel.visible = false
 	if pause_menu != null:
 		if pause_menu.has_method("close"):
 			pause_menu.close()
@@ -617,6 +648,37 @@ func open_param_panel() -> void:
 func close_param_panel() -> void:
 	if param_panel != null:
 		param_panel.visible = false
+	if UiState.is_menu_open() and pause_menu != null:
+		pause_menu.visible = true
+		if pause_menu.has_method("open"):
+			pause_menu.open()
+
+
+## 打开只读差异面板。菜单保持打开、后端暂停，只是把暂停面板换成差异面板。
+func open_readonly_diff(diff: Dictionary) -> void:
+	if readonly_diff_panel == null:
+		return
+	if not UiState.is_menu_open():
+		open_pause_menu()
+	if pause_menu != null:
+		pause_menu.visible = false
+	if param_panel != null:
+		param_panel.visible = false
+	readonly_diff_panel.call("load_diff", diff)
+	readonly_diff_panel.visible = true
+
+
+## 以只读方式继续：收起菜单回到游戏，但后端仍冻结输入/模拟，且拒绝写盘。
+func _on_readonly_continue() -> void:
+	if readonly_diff_panel != null:
+		readonly_diff_panel.visible = false
+	close_pause_menu()
+
+
+## 关闭差异面板：菜单仍打开时回到暂停面板，而不是直接恢复游戏。
+func close_readonly_diff() -> void:
+	if readonly_diff_panel != null:
+		readonly_diff_panel.visible = false
 	if UiState.is_menu_open() and pause_menu != null:
 		pause_menu.visible = true
 		if pause_menu.has_method("open"):

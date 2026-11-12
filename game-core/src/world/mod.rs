@@ -22,12 +22,14 @@ pub use chunk::{
 };
 pub use island::{Biome, Island, IslandId, IslandRegistry};
 pub use load::{
-    load_world, load_world_with_mode, LoadMode, LoadStats, LoadedWorld, WorldLoadRejection,
+    compute_load_diff, load_world, load_world_with_mode, ActionDiff, LoadMode, LoadStats,
+    LoadedWorld, ModDiff, ParamDiff, PluginDiff, WorldLoadDiff, WorldLoadRejection,
     WorldLoadRejectionHandle,
 };
 pub use profile::{
-    default_plugin_selection, intern_plugin_selection, readonly_plugin_selection, resolve_plugins,
-    ActivePlugins, PluginEntry, ProfileError, PLUGIN_REGISTRY,
+    default_plugin_selection, intern_plugin_selection, readonly_excluded_plugins,
+    readonly_plugin_selection, resolve_plugins, ActivePlugins, PluginEntry, ProfileError,
+    PLUGIN_REGISTRY,
 };
 pub use rng::WorldRng;
 pub use save::{capture_world, write_capture, SaveBlocked, WorldCapture};

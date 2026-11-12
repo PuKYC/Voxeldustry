@@ -272,6 +272,9 @@ id 列表（按注册表顺序，也是同层拓扑排序的 tie-break）：
 
 Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`（`save_dir` 必填），`bevy_client.gd` 对应 `read_only = true` 的 STREAMING 模式与 `open_world_readonly(directory)`。
 
+只读打开成功后，`compute_load_diff` 会把存档的 mod 清单、插件序列、动作表、世界参数与当前 `AppliedModSet` / `ActivePlugins` / `ResolvedActions` / `ParamTable` 逐项比较，结果写进 `WorldLoadDiff` 资源；只读 profile 主动剔除的 6 个玩法插件（gameplay / movement / death / camera / block_edit / prediction）不计入缺失与顺序差异；`StreamingDiagnostics.diff` 与 FFI `get_world_load_diff()` 把它送到 Godot，`ReadOnlyDiffPanel` 负责展示。正常读档会移除该资源，所以正常档不会弹面板。
+
+
 插件选择从哪来：后台启动配置 `BevyBackendConfig.plugins: Option<Vec<String>>`（经 `CoreGameModule` 搬运到 `build_with_profile`）。`None` = 默认 profile（`default_plugin_selection()`），既有入口行为零变化；`Some` 先经 `intern_plugin_selection` 把运行期 String 收敛成注册表里的 `&'static str`。
 
 `Some(vec![])` **不是**「用默认」，而是「一个可选插件都不装」——空集合是合法的显式选择，不会回退。

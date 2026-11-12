@@ -85,6 +85,8 @@ signal bevy_stopped(exit_code: int)
 ## 读档被拒绝（code 以 "save." 开头）：世界身份与存档不一致，原档保留未覆盖。
 ## 与 bevy_error 同时发出，区别是它只表达「世界打不开」这一类可展示的拒绝。
 signal world_load_failed(code: String, message: String)
+## 只读打开完成：diff 为装配差异字典（空 = 完全一致）。由 _process 轮询后端诊断后发出。
+signal world_load_diff_ready(diff: Dictionary)
 ## 本地控制对象切换（来源：INPUTCAPS 载荷的 local / 实体变化）。
 signal controlled_entity_changed(entity: EntityData)
 ## 输入能力位变化（present = 能力组件并集，available = 当前可用位）。
@@ -116,6 +118,8 @@ var _tick: int = 0
 var render_alpha: float = 1.0
 ## 最近一次后端错误（{code, message}）；后端停掉后仍保留，供差异面板读取。
 var last_error: Dictionary = {}
+## 只读打开后等待「world 已加载」再取一次差异；取到或后端停止即清零。
+var _world_load_diff_pending: bool = false
 
 
 func _ready() -> void:
@@ -220,6 +224,7 @@ func _ensure_mod_packages() -> bool:
 ## 路径 B 的两个入口用 `has_method` 保护：扩展还没编译进这些方法时回退到实体
 ## 演示，而不是让场景直接起不来（前向兼容）。
 func _start_backend() -> void:
+	_world_load_diff_pending = false
 	if not _ensure_mod_packages():
 		return
 	match mode:
@@ -246,6 +251,8 @@ func _start_backend() -> void:
 			if read_only:
 				# 只读意图下绝不回退到可写入口：宁可不起，也不能让「查看」变成可改。
 				if _mgr.has_method("start_bevy_streaming_readonly"):
+					# 读档完成后从诊断里取一次装配差异；后端停止 / 读档拒绝时清零。
+					_world_load_diff_pending = true
 					_mgr.start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)
 				else:
 					push_error("[BevyClient] 扩展缺少 start_bevy_streaming_readonly()，拒绝以可写方式打开")
@@ -417,6 +424,8 @@ func _process(_dt: float) -> void:
 		_tick = int(frame["tick"])
 		dispatcher.apply(frame)
 	
+	_poll_world_load_diff()
+
 	events.route(_bridge.drain_events())
 	# 空闲/全静止时不进 interp，也不做 render_alpha 的 FFI。
 	if _registry.active().size() > 0:
@@ -463,9 +472,31 @@ func _on_bevy_error(code: String, message: String) -> void:
 	# 读档拒绝：世界停在「已 Started 但没建世界」的半死状态，必须在这里收尾。
 	# 同时通知外部（差异面板），再走既有 stop 入口把后端线程干净停掉。
 	if code.begins_with("save."):
+		_world_load_diff_pending = false
 		world_load_failed.emit(code, message)
 		if _mgr != null and _mgr.has_method("stop_bevy"):
 			_mgr.stop_bevy()
+
+
+## 只读读档成功后取一次装配差异。
+##
+## 诊断里的 world 是读档完成才写入的快照；没有它说明还在 bootstrap / 已失败。
+## 取完即停轮询，避免每帧过 FFI。
+func _poll_world_load_diff() -> void:
+	if not _world_load_diff_pending or _mgr == null:
+		return
+	if not _mgr.has_method("get_world_load_diff") or not _mgr.has_method("streaming_diagnostics"):
+		_world_load_diff_pending = false
+		return
+	var diagnostics: Variant = _mgr.streaming_diagnostics()
+	if typeof(diagnostics) != TYPE_DICTIONARY:
+		return
+	var world: Variant = (diagnostics as Dictionary).get("world", {})
+	if typeof(world) != TYPE_DICTIONARY or (world as Dictionary).is_empty():
+		return
+	var raw: Variant = _mgr.get_world_load_diff()
+	_world_load_diff_pending = false
+	world_load_diff_ready.emit(raw if typeof(raw) == TYPE_DICTIONARY else {})
 
 
 func _on_input_controlled_changed(e: EntityData) -> void:
@@ -482,5 +513,6 @@ func _on_input_look_changed(available: bool) -> void:
 
 func _on_bevy_stopped(exit_code: int) -> void:
 	# 后端停止后不会再有 INPUTCAPS：先清空能力上下文，再通知外部。
+	_world_load_diff_pending = false
 	input_context.reset()
 	bevy_stopped.emit(exit_code)

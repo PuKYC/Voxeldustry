@@ -13,7 +13,9 @@ use game_engine::modding::{
     AppliedModSet, ModManifest, ModRef, ParamScope, ParamSpec, ParamTable, ParamType,
 };
 use game_engine::residency::ChunkAnchor;
-use game_engine::save::{write_world_meta, ModRecord, Persist, PersistComponent, StableTypeId};
+use game_engine::save::{
+    write_world_meta, ActionRecord, ModRecord, Persist, PersistComponent, StableTypeId,
+};
 use game_engine::voxel::{chunk_content_hash, MaxDepth, VoxOpsBulkWrite, VoxTree, CHUNK_DEPTH};
 
 use crate::voxel::body::spawn_island_entity;
@@ -1137,6 +1139,302 @@ fn readonly_load_accepts_identity_drift() {
         capture.meta.bodies.len(),
         "只读读档也要把 body 全部恢复出来"
     );
+
+    // 差异必须留下来：当前既没有 ActivePlugins 也没有动作表。
+    let diff = readonly
+        .get_resource::<WorldLoadDiff>()
+        .expect("只读读档成功后必须写入差异资源");
+    assert_eq!(
+        diff.plugins.missing,
+        vec!["core.terrain".to_string(), "core.world".to_string()],
+        "当前装配为空，存档里的插件都应报缺失（缺失集合按字典序）"
+    );
+    assert!(diff.plugins.extra.is_empty());
+    assert!(!diff.plugins.order_changed);
+    assert_eq!(
+        diff.actions.len(),
+        capture.meta.actions.len(),
+        "当前动作表为空，存档里的每条动作都应报缺失"
+    );
+    assert!(
+        diff.actions
+            .iter()
+            .all(|entry| matches!(entry, ActionDiff::Missing { .. })),
+        "只读世界没有动作表，不应出现多余或变化项"
+    );
+}
+
+#[test]
+fn compute_load_diff_reports_mod_plugin_action_and_param_drift() {
+    let mut world = test_world(0x5A);
+    let resolved = resolved_actions(&[("test", &["fish"])]);
+    let mut saved_actions: Vec<ActionRecord> = resolved
+        .table()
+        .iter()
+        .map(|def| ActionRecord {
+            name: def.name.to_string(),
+            action: def.action.0,
+            channel_bit: def.channel_bit,
+        })
+        .collect();
+    saved_actions.retain(|record| record.name != "interact");
+    if let Some(record) = saved_actions
+        .iter_mut()
+        .find(|record| record.name == "jump")
+    {
+        record.action = 105;
+    }
+    saved_actions.push(ActionRecord {
+        name: "legacy".to_string(),
+        action: 900,
+        channel_bit: 40,
+    });
+
+    let table = ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析参数表");
+    let mut saved_params = table.world_values();
+    for record in &mut saved_params {
+        if record.key == "test.flag" {
+            record.value = 1;
+        }
+    }
+
+    let meta = WorldMeta {
+        mods: vec![ModRecord {
+            id: "test".to_string(),
+            version: 7,
+        }],
+        actions: saved_actions,
+        plugins: vec!["core.extra".to_string(), "core.world".to_string()],
+        params: saved_params,
+        ..Default::default()
+    };
+
+    world.insert_resource(resolved);
+    world.insert_resource(table);
+    world.insert_resource(ActivePlugins::new(vec!["core.world", "core.extra"]));
+    // 当前装配里没有 test mod。
+    world.insert_resource(applied_mod_set(&[]));
+
+    let diff = compute_load_diff(&world, &meta);
+    assert_eq!(
+        diff.mods,
+        vec![ModDiff::Missing {
+            id: "test".to_string(),
+            saved_version: 7,
+        }]
+    );
+    assert!(diff.plugins.missing.is_empty());
+    assert!(diff.plugins.extra.is_empty());
+    assert!(
+        diff.plugins.order_changed,
+        "集合相同、顺序不同必须报顺序变化"
+    );
+    assert_eq!(
+        diff.plugins.saved,
+        vec!["core.extra".to_string(), "core.world".to_string()]
+    );
+    assert_eq!(
+        diff.plugins.current,
+        vec!["core.world".to_string(), "core.extra".to_string()]
+    );
+
+    assert!(
+        diff.actions.iter().any(|entry| matches!(
+            entry,
+            ActionDiff::Extra { name, .. } if name == "interact"
+        )),
+        "当前有、存档没有的动作应报多余：{:?}",
+        diff.actions
+    );
+    assert!(
+        diff.actions.iter().any(|entry| matches!(
+            entry,
+            ActionDiff::Missing { name, .. } if name == "legacy"
+        )),
+        "存档有、当前没有的动作应报缺失：{:?}",
+        diff.actions
+    );
+    assert!(
+        diff.actions.iter().any(|entry| matches!(
+            entry,
+            ActionDiff::Changed {
+                name,
+                saved_action,
+                current_action,
+                ..
+            } if name == "jump" && *saved_action == 105 && *current_action == 5
+        )),
+        "同名动作 ID 变化应报 changed：{:?}",
+        diff.actions
+    );
+
+    assert!(
+        diff.params.iter().any(|entry| matches!(
+            entry,
+            ParamDiff::Changed { saved, current }
+                if saved.key == "test.flag" && saved.value == 1 && current.value == 0
+        )),
+        "世界参数值变化应报 changed：{:?}",
+        diff.params
+    );
+    assert!(!diff.is_empty());
+}
+
+#[test]
+fn compute_load_diff_reports_extra_entries_and_version_mismatch() {
+    let mut world = test_world(0x5C);
+    let resolved = resolved_actions(&[]);
+    let table = ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析参数表");
+    let mut saved_params = table.world_values();
+    saved_params.retain(|record| record.key != "test.flag");
+    saved_params.push(ParamRecord {
+        key: "test.gone".to_string(),
+        ty: 0,
+        scale: 0,
+        value: 0,
+    });
+
+    let meta = WorldMeta {
+        mods: vec![ModRecord {
+            id: "test".to_string(),
+            version: 7,
+        }],
+        actions: resolved
+            .table()
+            .iter()
+            .map(|def| ActionRecord {
+                name: def.name.to_string(),
+                action: def.action.0,
+                channel_bit: def.channel_bit,
+            })
+            .collect(),
+        plugins: vec!["core.world".to_string()],
+        params: saved_params,
+        ..Default::default()
+    };
+
+    world.insert_resource(resolved);
+    world.insert_resource(table);
+    world.insert_resource(ActivePlugins::new(vec!["core.world", "core.extra"]));
+    world.insert_resource(applied_mod_set(&[("test", 9)]));
+
+    let diff = compute_load_diff(&world, &meta);
+    assert_eq!(
+        diff.mods,
+        vec![ModDiff::VersionMismatch {
+            id: "test".to_string(),
+            saved: 7,
+            current: 9,
+        }]
+    );
+    assert_eq!(diff.plugins.extra, vec!["core.extra".to_string()]);
+    assert!(diff.plugins.missing.is_empty());
+    assert!(
+        diff.params.iter().any(|entry| matches!(
+            entry,
+            ParamDiff::Extra { record } if record.key == "test.flag"
+        )),
+        "当前有、存档没有的参数应报多余：{:?}",
+        diff.params
+    );
+    assert!(
+        diff.params.iter().any(|entry| matches!(
+            entry,
+            ParamDiff::Missing { record } if record.key == "test.gone"
+        )),
+        "存档有、当前没有的参数应报缺失：{:?}",
+        diff.params
+    );
+    assert!(diff.actions.is_empty(), "动作表一致不应有动作差异");
+    assert!(!diff.is_empty());
+}
+
+#[test]
+fn compute_load_diff_ignores_plugins_omitted_by_readonly_profile() {
+    let mut world = test_world(0x5D);
+    let resolved = resolved_actions(&[]);
+    let table = ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析参数表");
+    let mods = applied_mod_set(&[("test", 7)]);
+
+    let meta = WorldMeta {
+        mods: mods
+            .mods
+            .iter()
+            .map(|entry| ModRecord {
+                id: entry.id.clone(),
+                version: entry.version,
+            })
+            .collect(),
+        actions: resolved
+            .table()
+            .iter()
+            .map(|def| ActionRecord {
+                name: def.name.to_string(),
+                action: def.action.0,
+                channel_bit: def.channel_bit,
+            })
+            .collect(),
+        // 存档来自普通会话，含只读 profile 主动剔除的 gameplay。
+        plugins: vec!["core.world".to_string(), "gameplay".to_string()],
+        params: table.world_values(),
+        ..Default::default()
+    };
+
+    world.insert_resource(resolved);
+    world.insert_resource(table);
+    world.insert_resource(mods);
+    world.insert_resource(ActivePlugins::new(vec!["core.world"]));
+
+    let diff = compute_load_diff(&world, &meta);
+    assert!(
+        diff.plugins.missing.is_empty(),
+        "只读主动剔除的插件不应报缺失：{:?}",
+        diff.plugins.missing
+    );
+    assert!(!diff.plugins.order_changed);
+    assert!(
+        diff.is_empty(),
+        "除只读裁剪外身份一致时不应有差异：{diff:?}"
+    );
+}
+
+#[test]
+fn compute_load_diff_is_empty_when_identity_matches() {
+    let mut world = test_world(0x5B);
+    let resolved = resolved_actions(&[]);
+    let table = ParamTable::resolve(&[&TEST_MANIFEST], &BTreeMap::new()).expect("解析参数表");
+    let mods = applied_mod_set(&[("test", 7)]);
+
+    let meta = WorldMeta {
+        mods: mods
+            .mods
+            .iter()
+            .map(|entry| ModRecord {
+                id: entry.id.clone(),
+                version: entry.version,
+            })
+            .collect(),
+        actions: resolved
+            .table()
+            .iter()
+            .map(|def| ActionRecord {
+                name: def.name.to_string(),
+                action: def.action.0,
+                channel_bit: def.channel_bit,
+            })
+            .collect(),
+        plugins: vec!["core.world".to_string(), "core.terrain".to_string()],
+        params: table.world_values(),
+        ..Default::default()
+    };
+
+    world.insert_resource(resolved);
+    world.insert_resource(table);
+    world.insert_resource(mods);
+    world.insert_resource(ActivePlugins::new(vec!["core.world", "core.terrain"]));
+
+    let diff = compute_load_diff(&world, &meta);
+    assert!(diff.is_empty(), "身份完全一致时不应有差异：{diff:?}");
 }
 
 #[test]

@@ -34,6 +34,7 @@ use game_core::static_data::item;
 use game_core::static_data::ObjectTables;
 use game_core::voxel::StreamStats;
 use game_core::world::streaming::WorldLoadReport;
+use game_core::world::{ActionDiff, ModDiff, ParamDiff, WorldLoadDiff};
 
 /// 动作表 → `Array[Dictionary]`，每项 `{ name, bit, channel? }`。
 ///
@@ -741,6 +742,159 @@ pub fn streaming_diagnostics_to_dictionary(snapshot: &StreamingDiagnostics) -> V
         "checksum",
         snapshot.checksum.map_or(-1, |checksum| checksum as i64),
     );
+    out
+}
+
+/// 只读打开的装配差异 → Dictionary；没有差异或不是只读会话时返回空字典。
+///
+/// 结构：
+///   mods:    [{ kind: "missing"|"extra"|"version", id, saved_version, current_version }]
+///   plugins: { missing: [], extra: [], order_changed: bool, saved: [], current: [] }
+///   actions: [{ kind: "missing"|"extra"|"changed", name, saved_action, current_action,
+///               saved_channel_bit, current_channel_bit }]
+///   params:  [{ kind: "missing"|"extra"|"changed", key, saved_value, current_value,
+///               saved_ty, current_ty, saved_scale, current_scale }]
+///
+/// 不适用的字段用 -1（Godot 只有 i64；动作 ID / 参数值都非负）。
+/// params 只包含世界参数：Debug 参数不落盘，没有可比对的存档值。
+pub fn world_load_diff_to_dictionary(diff: Option<&WorldLoadDiff>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    let Some(diff) = diff else {
+        return out;
+    };
+
+    let mut mods: Array<VarDictionary> = Array::new();
+    for entry in &diff.mods {
+        let mut row = VarDictionary::new();
+        match entry {
+            ModDiff::Missing { id, saved_version } => {
+                row.set("kind", "missing");
+                row.set("id", id.as_str());
+                row.set("saved_version", i64::from(*saved_version));
+                row.set("current_version", -1);
+            }
+            ModDiff::Extra {
+                id,
+                current_version,
+            } => {
+                row.set("kind", "extra");
+                row.set("id", id.as_str());
+                row.set("saved_version", -1);
+                row.set("current_version", i64::from(*current_version));
+            }
+            ModDiff::VersionMismatch { id, saved, current } => {
+                row.set("kind", "version");
+                row.set("id", id.as_str());
+                row.set("saved_version", i64::from(*saved));
+                row.set("current_version", i64::from(*current));
+            }
+        }
+        mods.push(&row);
+    }
+    out.set("mods", &mods);
+
+    let mut plugins = VarDictionary::new();
+    plugins.set("missing", &string_array(&diff.plugins.missing));
+    plugins.set("extra", &string_array(&diff.plugins.extra));
+    plugins.set("order_changed", diff.plugins.order_changed);
+    plugins.set("saved", &string_array(&diff.plugins.saved));
+    plugins.set("current", &string_array(&diff.plugins.current));
+    out.set("plugins", &plugins);
+
+    let mut actions: Array<VarDictionary> = Array::new();
+    for entry in &diff.actions {
+        let mut row = VarDictionary::new();
+        match entry {
+            ActionDiff::Missing {
+                name,
+                action,
+                channel_bit,
+            } => {
+                row.set("kind", "missing");
+                row.set("name", name.as_str());
+                row.set("saved_action", i64::from(*action));
+                row.set("saved_channel_bit", i64::from(*channel_bit));
+                row.set("current_action", -1);
+                row.set("current_channel_bit", -1);
+            }
+            ActionDiff::Extra {
+                name,
+                action,
+                channel_bit,
+            } => {
+                row.set("kind", "extra");
+                row.set("name", name.as_str());
+                row.set("saved_action", -1);
+                row.set("saved_channel_bit", -1);
+                row.set("current_action", i64::from(*action));
+                row.set("current_channel_bit", i64::from(*channel_bit));
+            }
+            ActionDiff::Changed {
+                name,
+                saved_action,
+                saved_channel_bit,
+                current_action,
+                current_channel_bit,
+            } => {
+                row.set("kind", "changed");
+                row.set("name", name.as_str());
+                row.set("saved_action", i64::from(*saved_action));
+                row.set("saved_channel_bit", i64::from(*saved_channel_bit));
+                row.set("current_action", i64::from(*current_action));
+                row.set("current_channel_bit", i64::from(*current_channel_bit));
+            }
+        }
+        actions.push(&row);
+    }
+    out.set("actions", &actions);
+
+    let mut params: Array<VarDictionary> = Array::new();
+    for entry in &diff.params {
+        let mut row = VarDictionary::new();
+        match entry {
+            ParamDiff::Missing { record } => {
+                row.set("kind", "missing");
+                row.set("key", record.key.as_str());
+                row.set("saved_value", record.value);
+                row.set("current_value", 0);
+                row.set("saved_ty", i64::from(record.ty));
+                row.set("current_ty", -1);
+                row.set("saved_scale", i64::from(record.scale));
+                row.set("current_scale", -1);
+            }
+            ParamDiff::Extra { record } => {
+                row.set("kind", "extra");
+                row.set("key", record.key.as_str());
+                row.set("saved_value", 0);
+                row.set("current_value", record.value);
+                row.set("saved_ty", -1);
+                row.set("current_ty", i64::from(record.ty));
+                row.set("saved_scale", -1);
+                row.set("current_scale", i64::from(record.scale));
+            }
+            ParamDiff::Changed { saved, current } => {
+                row.set("kind", "changed");
+                row.set("key", saved.key.as_str());
+                row.set("saved_value", saved.value);
+                row.set("current_value", current.value);
+                row.set("saved_ty", i64::from(saved.ty));
+                row.set("current_ty", i64::from(current.ty));
+                row.set("saved_scale", i64::from(saved.scale));
+                row.set("current_scale", i64::from(current.scale));
+            }
+        }
+        params.push(&row);
+    }
+    out.set("params", &params);
+
+    out
+}
+
+fn string_array(values: &[String]) -> Array<GString> {
+    let mut out: Array<GString> = Array::new();
+    for value in values {
+        out.push(&GString::from(value.as_str()));
+    }
     out
 }
 

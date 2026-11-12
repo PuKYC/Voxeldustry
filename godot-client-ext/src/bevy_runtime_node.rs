@@ -1176,6 +1176,20 @@ impl BevyAppManager {
         presentation_bridge::streaming_diagnostics_to_dictionary(&bridge.diagnostics())
     }
 
+    /// 只读打开时的装配差异快照。
+    ///
+    /// 返回 { mods: [...], plugins: {...}, actions: [...], params: [...] }；
+    /// 不是只读会话、或装配完全一致时返回空字典。
+    /// 只读读档成功后才会有值，轮询方应在 streaming_diagnostics().world 出现后取一次。
+    #[func]
+    fn get_world_load_diff(&self) -> VarDictionary {
+        let Some(bridge) = self.bridge.clone() else {
+            return VarDictionary::new();
+        };
+        let diagnostics = bridge.diagnostics();
+        presentation_bridge::world_load_diff_to_dictionary(diagnostics.diff.as_ref())
+    }
+
     /// 运行期覆盖内存软上限（百分比，0..=100）；传负数撤销覆盖。
     ///
     /// 撤销后立刻回到 ResidencyConfig::memory_soft_limit 的配置值
@@ -1273,8 +1287,9 @@ fn verify_one_package(
 /// VerificationReport -> Godot 字典（字段名固定）。
 ///
 /// u64 哈希在 GDScript 侧没有无符号 64 位整数：
-/// - package_hash / final_hash 给 16 位十六进制字符串（推荐用于比较 / 显示）；
-/// - package_hash_u64 与 hashes 按 i64 位模式给（可能为负，仅用于透传）；
+/// - package_hash / final_hash 给 16 位十六进制字符串（推荐用于比较 / 显示；
+///   final_hash 是最后一个 tick 的世界校验和，不是包哈希）；
+/// - package_hash_u64 与 hashes 按 i64 位模式给（保留全部 64 位，可能为负，仅用于透传）；
 /// - first_divergence_tick 用 -1 表示 None。
 fn verification_report_to_dict(report: &VerificationReport) -> VarDictionary {
     let mut out = VarDictionary::new();

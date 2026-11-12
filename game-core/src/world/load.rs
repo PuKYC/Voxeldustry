@@ -34,7 +34,7 @@ use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
 use game_engine::input::ResolvedActions;
 use game_engine::math::{FixedPoint, Vec3F};
-use game_engine::modding::{AppliedModSet, ParamTable};
+use game_engine::modding::{AppliedModSet, ParamRecord, ParamTable};
 use game_engine::residency::ChunkAnchor;
 use game_engine::save::{
     install_chunk, read_region, read_world_meta, reclaim_orphans, region_of, regions_on_disk,
@@ -137,6 +137,111 @@ pub enum LoadMode {
     ReadOnly,
 }
 
+/// 只读打开时，存档身份与当前装配的差异。
+///
+/// 只读模式跳过身份校验，但「打开了什么、和现在的装配差在哪」必须能看见：
+/// 正常读档只会返回**第一个**错误，这里收集全部差异供差异面板逐项展示。
+/// 只在 [LoadMode::ReadOnly] 且读档成功时写入 World；正常读档没有这个资源。
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorldLoadDiff {
+    /// mod 清单差异（缺失 / 多余 / 版本不一致）。
+    pub mods: Vec<ModDiff>,
+    /// 插件装配差异（集合 + 顺序）。
+    pub plugins: PluginDiff,
+    /// 动作表差异（缺失 / 多余 / 映射变化）。
+    pub actions: Vec<ActionDiff>,
+    /// 世界参数差异（缺失 / 多余 / 值或类型变化）。
+    pub params: Vec<ParamDiff>,
+}
+
+impl WorldLoadDiff {
+    /// 没有任何差异。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.mods.is_empty()
+            && self.plugins.is_empty()
+            && self.actions.is_empty()
+            && self.params.is_empty()
+    }
+}
+
+/// 一条 mod 清单差异。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModDiff {
+    /// 存档里有、当前装配没有。
+    Missing { id: String, saved_version: u32 },
+    /// 当前装配有、存档没有。
+    Extra { id: String, current_version: u32 },
+    /// 同 id，版本不同。
+    VersionMismatch {
+        id: String,
+        saved: u32,
+        current: u32,
+    },
+}
+
+/// 插件装配差异。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginDiff {
+    /// 存档里有、当前装配没有的插件。
+    pub missing: Vec<String>,
+    /// 当前装配有、存档没有的插件。
+    pub extra: Vec<String>,
+    /// 集合相同但顺序不同。
+    pub order_changed: bool,
+    /// 存档记录的装配顺序（面板展示用）。
+    pub saved: Vec<String>,
+    /// 当前装配顺序（面板展示用）。
+    pub current: Vec<String>,
+}
+
+impl PluginDiff {
+    /// 没有缺失、多余或顺序变化。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.extra.is_empty() && !self.order_changed
+    }
+}
+
+/// 一条动作表差异。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionDiff {
+    /// 存档里有、当前动作表没有。
+    Missing {
+        name: String,
+        action: u32,
+        channel_bit: u32,
+    },
+    /// 当前动作表有、存档没有。
+    Extra {
+        name: String,
+        action: u32,
+        channel_bit: u32,
+    },
+    /// 同名动作的 ID 或通道位变了。
+    Changed {
+        name: String,
+        saved_action: u32,
+        saved_channel_bit: u32,
+        current_action: u32,
+        current_channel_bit: u32,
+    },
+}
+
+/// 一条世界参数差异。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamDiff {
+    /// 存档里有、当前 schema 没有。
+    Missing { record: ParamRecord },
+    /// 当前 schema 有、存档没有（用默认值）。
+    Extra { record: ParamRecord },
+    /// 同一个 key，类型 / scale / 值有变化。
+    Changed {
+        saved: ParamRecord,
+        current: ParamRecord,
+    },
+}
+
 /// 从 paths 读一个世界；generator_version 是当前生成器的版本号。
 ///
 /// 等价于 [load_world_with_mode] 的 [LoadMode::Normal]。
@@ -181,10 +286,17 @@ pub fn load_world_with_mode(
     // 阶段二：先确认所有必需资源都在，再开始写世界。
     require_resources(world)?;
     if mode == LoadMode::Normal {
+        world.remove_resource::<WorldLoadDiff>();
         apply_meta_params(world, &plan.meta)?;
-    } else if let Err(error) = apply_meta_params(world, &plan.meta) {
-        // 只读查看的目标是地形和实体，不是玩法数值；参数表对不上不该挡住打开。
-        warn!("world: 只读会话未能应用世界参数（继续查看）：{error}");
+    } else {
+        if let Err(error) = apply_meta_params(world, &plan.meta) {
+            // 只读查看的目标是地形和实体，不是玩法数值；参数表对不上不该挡住打开。
+            warn!("world: 只读会话未能应用世界参数（继续查看）：{error}");
+        }
+        // 差异在参数应用之后收集：能应用的参数已经写回，面板展示的是真正没能
+        // 对上的 mod / 插件 / 动作 / 参数，而不是「存档值不等于默认值」。
+        let diff = compute_load_diff(world, &plan.meta);
+        world.insert_resource(diff);
     }
     let body_entities = spawn_plan_bodies(world, &plan)?;
     let stale_chunks = install_plan_chunks(world, &plan, &body_entities, generator_version)?;
@@ -546,6 +658,185 @@ fn validate_meta_plugins(world: &World, meta: &WorldMeta) -> Result<(), SaveErro
         }
     }
     Ok(())
+}
+
+/// 收集只读打开时存档身份与当前装配的全部差异。
+///
+/// 与 validate_meta_mods / validate_meta_actions / validate_meta_plugins /
+/// validate_meta_params 使用同一组事实来源，但不短路：正常读档只需要第一个
+/// 错误，只读面板需要知道差在哪几项。身份校验只在 LoadMode::Normal 运行，
+/// 本函数只在 LoadMode::ReadOnly 运行，两者不会同时生效。
+///
+/// 参数差异在 load_world_with_mode 尝试应用存档值之后计算：能应用的值
+/// 已经写回 ParamTable，因此这里报出的是「没能应用」的 key（schema 缺失 /
+/// 类型变化 / 值非法），不是「存档值本来就和默认值不同」。
+#[must_use]
+pub fn compute_load_diff(world: &World, meta: &WorldMeta) -> WorldLoadDiff {
+    let mut diff = WorldLoadDiff::default();
+
+    // ── mod 清单 ────────────────────────────────────────────────
+    let current_mods: BTreeMap<&str, u32> = world
+        .get_resource::<AppliedModSet>()
+        .map(|applied| {
+            applied
+                .mods
+                .iter()
+                .map(|mod_ref| (mod_ref.id.as_str(), mod_ref.version))
+                .collect()
+        })
+        .unwrap_or_default();
+    let saved_mods: BTreeMap<&str, u32> = meta
+        .mods
+        .iter()
+        .map(|record| (record.id.as_str(), record.version))
+        .collect();
+    let mod_ids: BTreeSet<&str> = saved_mods
+        .keys()
+        .chain(current_mods.keys())
+        .copied()
+        .collect();
+    for id in mod_ids {
+        match (saved_mods.get(id), current_mods.get(id)) {
+            (Some(saved), Some(current)) if saved != current => {
+                diff.mods.push(ModDiff::VersionMismatch {
+                    id: id.to_string(),
+                    saved: *saved,
+                    current: *current,
+                });
+            }
+            (Some(saved), None) => diff.mods.push(ModDiff::Missing {
+                id: id.to_string(),
+                saved_version: *saved,
+            }),
+            (None, Some(current)) => diff.mods.push(ModDiff::Extra {
+                id: id.to_string(),
+                current_version: *current,
+            }),
+            _ => {}
+        }
+    }
+
+    // ── 插件序列 ────────────────────────────────────────────────
+    let current_plugins: Vec<&str> = world
+        .get_resource::<super::ActivePlugins>()
+        .map(|active| active.ids().to_vec())
+        .unwrap_or_default();
+    let saved_plugins: Vec<&str> = meta.plugins.iter().map(String::as_str).collect();
+    let saved_set: BTreeSet<&str> = saved_plugins.iter().copied().collect();
+    let current_set: BTreeSet<&str> = current_plugins.iter().copied().collect();
+    // 只读 profile 会主动剔除 gameplay / movement 等。那些插件「存档有、当前没有」
+    // 是只读的刻意裁剪，不是身份漂移；从缺失与顺序比较里都排除掉。
+    let omitted: BTreeSet<&str> = super::profile::readonly_excluded_plugins()
+        .iter()
+        .copied()
+        .filter(|id| !current_set.contains(id))
+        .collect();
+    diff.plugins.missing = saved_set
+        .difference(&current_set)
+        .filter(|id| !omitted.contains(*id))
+        .map(|id| (*id).to_string())
+        .collect();
+    diff.plugins.extra = current_set
+        .difference(&saved_set)
+        .map(|id| (*id).to_string())
+        .collect();
+    let saved_visible: Vec<&str> = saved_plugins
+        .iter()
+        .copied()
+        .filter(|id| !omitted.contains(id))
+        .collect();
+    diff.plugins.order_changed = diff.plugins.missing.is_empty()
+        && diff.plugins.extra.is_empty()
+        && saved_visible != current_plugins;
+    if diff.plugins.order_changed {
+        diff.plugins.saved = saved_visible.iter().map(|id| (*id).to_string()).collect();
+        diff.plugins.current = current_plugins.iter().map(|id| (*id).to_string()).collect();
+    }
+
+    // ── 动作表 ─────────────────────────────────────────────────
+    let current_actions: BTreeMap<&str, (u32, u32)> = world
+        .get_resource::<ResolvedActions>()
+        .map(|resolved| {
+            resolved
+                .table()
+                .iter()
+                .map(|def| (def.name, (def.action.0, def.channel_bit)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let saved_actions: BTreeMap<&str, (u32, u32)> = meta
+        .actions
+        .iter()
+        .map(|record| (record.name.as_str(), (record.action, record.channel_bit)))
+        .collect();
+    let action_names: BTreeSet<&str> = saved_actions
+        .keys()
+        .chain(current_actions.keys())
+        .copied()
+        .collect();
+    for name in action_names {
+        match (saved_actions.get(name), current_actions.get(name)) {
+            (Some(saved), Some(current)) if saved != current => {
+                diff.actions.push(ActionDiff::Changed {
+                    name: name.to_string(),
+                    saved_action: saved.0,
+                    saved_channel_bit: saved.1,
+                    current_action: current.0,
+                    current_channel_bit: current.1,
+                });
+            }
+            (Some(saved), None) => diff.actions.push(ActionDiff::Missing {
+                name: name.to_string(),
+                action: saved.0,
+                channel_bit: saved.1,
+            }),
+            (None, Some(current)) => diff.actions.push(ActionDiff::Extra {
+                name: name.to_string(),
+                action: current.0,
+                channel_bit: current.1,
+            }),
+            _ => {}
+        }
+    }
+
+    // ── 世界参数 ────────────────────────────────────────────────
+    let current_params_vec: Vec<ParamRecord> = world
+        .get_resource::<ParamTable>()
+        .map(ParamTable::world_values)
+        .unwrap_or_default();
+    let current_params: BTreeMap<&str, &ParamRecord> = current_params_vec
+        .iter()
+        .map(|record| (record.key.as_str(), record))
+        .collect();
+    let saved_params: BTreeMap<&str, &ParamRecord> = meta
+        .params
+        .iter()
+        .map(|record| (record.key.as_str(), record))
+        .collect();
+    let param_keys: BTreeSet<&str> = saved_params
+        .keys()
+        .chain(current_params.keys())
+        .copied()
+        .collect();
+    for key in param_keys {
+        match (saved_params.get(key), current_params.get(key)) {
+            (Some(saved), Some(current)) if saved != current => {
+                diff.params.push(ParamDiff::Changed {
+                    saved: (*saved).clone(),
+                    current: (*current).clone(),
+                });
+            }
+            (Some(saved), None) => diff.params.push(ParamDiff::Missing {
+                record: (*saved).clone(),
+            }),
+            (None, Some(current)) => diff.params.push(ParamDiff::Extra {
+                record: (*current).clone(),
+            }),
+            _ => {}
+        }
+    }
+
+    diff
 }
 
 fn plugin_error(kind: SaveErrorKind) -> SaveError {

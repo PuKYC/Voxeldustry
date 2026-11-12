@@ -343,6 +343,17 @@ pub fn default_plugin_selection() -> Vec<&'static str> {
 ///
 /// 依赖不在这里补：调用方把结果交给 [resolve_plugins]，requires 自动补齐。
 pub fn readonly_plugin_selection() -> Vec<&'static str> {
+    default_plugin_selection()
+        .into_iter()
+        .filter(|id| !readonly_excluded_plugins().contains(id))
+        .collect()
+}
+
+/// 只读 profile 相对默认 profile 主动剔除的插件。
+///
+/// 差异面板据此忽略「只读本来就不装」的插件：存档里有 `gameplay`、只读会话里没有，
+/// 不是身份漂移，而是只读的刻意裁剪。
+pub fn readonly_excluded_plugins() -> &'static [&'static str] {
     const EXCLUDED: [&str; 6] = [
         "gameplay",
         "movement",
@@ -351,10 +362,7 @@ pub fn readonly_plugin_selection() -> Vec<&'static str> {
         "block_edit",
         "prediction",
     ];
-    default_plugin_selection()
-        .into_iter()
-        .filter(|id| !EXCLUDED.contains(id))
-        .collect()
+    &EXCLUDED
 }
 
 /// 把外部（存档/配置/UI）传来的插件 id 解析成注册表内的静态 id。
