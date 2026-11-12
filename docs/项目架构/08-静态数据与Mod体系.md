@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11"
 ---
 
 # 静态数据与 Mod 体系
@@ -328,9 +328,18 @@ u64 digest                    # 覆盖头、body 表与上面全部扩展字节
 
 兼容：v1 存档没有扩展段，解码为「空清单 / 空参数 / 空动作表 / 空插件表」。**未发布前不做旧档兼容**：v2 的扩展段（mod 清单、参数、动作表、插件表）全部必填，缺段按坏档拒绝——读档阶段一还会把冻结的动作表与当前装配逐项比对，数量或内容不符直接整档失败。上限 `MAX_MOD_COUNT` = `MAX_PARAM_COUNT` = `MAX_ACTION_COUNT` = 4096、`MAX_PLUGIN_COUNT` = 64，名字长度上限 255 / 255 / 64 / 64。
 
+读档失败按**原因分成两类**，处置完全不同（判据是 `SaveErrorKind::is_world_rejection()`）：
+
+| 类别 | 变体 | 处置 |
+| --- | --- | --- |
+| 世界身份不符 | `MissingMod` / `UnexpectedMod` / `ModVersionMismatch` / `ActionTableMismatch` / `ActionCountMismatch` / `MissingPlugin` / `UnexpectedPlugin` / `PluginOrderMismatch` / `MissingResource` / `Param` / `Unsupported` | **硬拒绝**：不建新世界，插 `WorldLoadRejection`（code / path / message）与 `SaveBlocked`，经 `bev_error(save.*)` 报给 Godot 后退出；原档**一个字节都不写** |
+| 存档损坏 | `Truncated` / `TrailingBytes` / `BadMagic` / `Io` / `DigestMismatch` / `Payload` 等 | **降级建新世界**：只写日志，玩家仍可继续玩（多半只能靠删档恢复） |
+
+拒绝态下 `SaveBlocked` 是最后一道保险：手动 SaveNow、自动存档、退出补跑帧、卸载落盘全部提前返回，所以即使 Godot 立刻 `stop_bevy()`，退出前那一次补跑帧也不会把新世界盖到坏档上。
+
 实现细节（扩展段线格式、上限、校验顺序）见 `docs/待办/实现文档/存档格式规格.md` §2.1 与 §6.1（该文档在 `docs/待办` 下，未纳入版本库）。
 
-后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交；插件 profile 目前固定用 `default_plugin_selection()`，尚未从配置暴露。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
+后台入口的 `BevyBackendConfig` 也走同一装配点：`mods` 与 `param_overrides` 默认是 `default_core_mods()` 和空表，Godot 后端在启动时原样转交。插件 profile 由 `plugins: Option<Vec<String>>` 暴露（`None` = 默认 profile，`Some(vec![])` = 显式空选择，未知 id 走 `ProfileError::UnknownPlugin` 结构化失败）；`start_bevy_streaming_with_plugins` 是对应的 GDScript 入口。GDScript 无法构造 `dyn Mod`，需要注入 native mod 时由 Rust 侧在启动前写入这两个字段。
 
 ## 改内容时的落点
 

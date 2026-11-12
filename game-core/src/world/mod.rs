@@ -21,13 +21,13 @@ pub use chunk::{
     WorldChunkPlugin, WorldChunkSet, WorldChunkUnloading,
 };
 pub use island::{Biome, Island, IslandId, IslandRegistry};
-pub use load::{load_world, LoadStats, LoadedWorld};
+pub use load::{load_world, LoadStats, LoadedWorld, WorldLoadRejection, WorldLoadRejectionHandle};
 pub use profile::{
     default_plugin_selection, intern_plugin_selection, resolve_plugins, ActivePlugins, PluginEntry,
     ProfileError, PLUGIN_REGISTRY,
 };
 pub use rng::WorldRng;
-pub use save::{capture_world, write_capture, WorldCapture};
+pub use save::{capture_world, write_capture, SaveBlocked, WorldCapture};
 pub use save_plugin::{
     OrphanPolicy, SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSavePlugin,
     WorldSaveStatus,

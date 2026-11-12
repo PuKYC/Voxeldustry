@@ -84,6 +84,8 @@ var _stop_requested: bool = false
 var _stopped_code: int = -999
 var _last_break_ms: int = 0
 var _restart_requested_at_ms: int = 0
+## 读档被拒绝时弹的最小差异面板（只为演示「世界打不开」，不是 UI 框架）。
+var _reject_dialog: AcceptDialog = null
 
 
 func _enter_tree() -> void:
@@ -113,6 +115,9 @@ func _ready() -> void:
 		return
 	_client.connect(&"bevy_error", _on_client_error)
 	_client.connect(&"bevy_stopped", _on_client_stopped)
+	# 老扩展没有这条信号：保持前向兼容，不连即可。
+	if _client.has_signal("world_load_failed"):
+		_client.connect(&"world_load_failed", _on_world_load_failed)
 	print("[streaming_check] 存档目录：%s" % _save_dir)
 	_enter(Phase.BOOT)
 
@@ -455,6 +460,27 @@ func _on_client_error(code: String, message: String) -> void:
 
 func _on_client_stopped(exit_code: int) -> void:
 	_stopped_code = exit_code
+
+
+## 读档被拒绝（code 形如 save.missing_mod）：弹差异面板，让玩家看见原因。
+## message 已含中文原因与路径（SaveError 的 Display），够展示差异；不做完整 UI。
+func _on_world_load_failed(code: String, message: String) -> void:
+	_fail("读档被拒绝 [%s]：%s" % [code, message])
+	if _reject_dialog == null:
+		_reject_dialog = AcceptDialog.new()
+		_reject_dialog.title = "世界打不开"
+		_reject_dialog.ok_button_text = "返回"
+		_reject_dialog.confirmed.connect(_on_reject_dialog_confirmed)
+		add_child(_reject_dialog)
+	_reject_dialog.dialog_text = "%s\n\n错误码：%s\n存档原样保留，未被覆盖。" % [message, code]
+	_reject_dialog.popup_centered()
+
+
+## 「返回」= 走既有 stop 入口把后端彻底停掉（客户端在 world_load_failed 里已请求过一次，
+## 重复调用是幂等的：shutdown_blocking 对已停状态是空操作）。
+func _on_reject_dialog_confirmed() -> void:
+	if _mgr != null:
+		_mgr.call("stop_bevy")
 
 
 func _finish() -> void:

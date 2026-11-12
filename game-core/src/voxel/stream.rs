@@ -149,6 +149,7 @@ use crate::voxel::terrain::{
     unload_chunk, TerrainConfig, TerrainGeneratedBlocks, TerrainNeighborBlocks,
 };
 use crate::voxel::{arbitrate, realize_chunk, FeatureError, WorldFeatureRegistry};
+use crate::world::save::SaveBlocked;
 use crate::world::WorldSeed;
 
 /// 流式加载配置。
@@ -1106,6 +1107,14 @@ pub fn persist_pending_unloads(world: &mut World) {
         .get_resource::<PendingUnloads>()
         .is_some_and(|pending| pending.0.values().any(|entry| entry.version.is_none()));
     if !needs_write {
+        return;
+    }
+    // 读档被拒绝（SaveBlocked）时磁盘上的档是玩家还要的：块卸载不能写、也不能
+    // 删（delete 同样会改档）。条目保持 version == None，释放阶段照常回收内存，
+    // 只是内容不进档。warn 每次有实际待写条目的 tick 一条：被拒绝的会话不会
+    // 再加载体、也不会产生新的卸载请求，正常情况下这条日志只出现极少数次。
+    if world.contains_resource::<SaveBlocked>() {
+        warn!("stream: 卸载落盘已禁用（读档被拒绝，原档保留），本 tick 不写盘");
         return;
     }
     // 没有存档（headless / 单测）：跳过写盘，释放阶段会立即释放。

@@ -76,6 +76,9 @@ signal entity_state_changed(entity: EntityData)
 signal entity_removed(entity: EntityData, reason: int)
 signal bevy_error(code: String, message: String)
 signal bevy_stopped(exit_code: int)
+## 读档被拒绝（code 以 "save." 开头）：世界身份与存档不一致，原档保留未覆盖。
+## 与 bevy_error 同时发出，区别是它只表达「世界打不开」这一类可展示的拒绝。
+signal world_load_failed(code: String, message: String)
 ## 本地控制对象切换（来源：INPUTCAPS 载荷的 local / 实体变化）。
 signal controlled_entity_changed(entity: EntityData)
 ## 输入能力位变化（present = 能力组件并集，available = 当前可用位）。
@@ -105,6 +108,8 @@ var _container: Node = null
 var _tick: int = 0
 ## 最近一次采样的渲染插值 alpha（供 CameraRig 等需要与实体同步采样的外部节点读取）。
 var render_alpha: float = 1.0
+## 最近一次后端错误（{code, message}）；后端停掉后仍保留，供差异面板读取。
+var last_error: Dictionary = {}
 
 
 func _ready() -> void:
@@ -391,7 +396,14 @@ func _on_bevy_started() -> void:
 
 
 func _on_bevy_error(code: String, message: String) -> void:
+	last_error = {"code": code, "message": message}
 	bevy_error.emit(code, message)
+	# 读档拒绝：世界停在「已 Started 但没建世界」的半死状态，必须在这里收尾。
+	# 同时通知外部（差异面板），再走既有 stop 入口把后端线程干净停掉。
+	if code.begins_with("save."):
+		world_load_failed.emit(code, message)
+		if _mgr != null and _mgr.has_method("stop_bevy"):
+			_mgr.stop_bevy()
 
 
 func _on_input_controlled_changed(e: EntityData) -> void:

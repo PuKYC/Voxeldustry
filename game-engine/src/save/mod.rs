@@ -234,6 +234,72 @@ pub enum SaveErrorKind {
     MissingResource { what: &'static str },
 }
 
+impl SaveErrorKind {
+    /// 稳定错误码（对 Godot / 日志 / 测试的公开契约）。
+    ///
+    /// **文案可改，code 不可改**：客户端按 code 分支（比如 `save.*` 弹差异面板），
+    /// 用户能看到的说明在 [`fmt::Display`] 里。每个变体一个类别，不返回
+    /// `save.unknown` —— 否则客户端没法区分「坏字节」与「世界身份不符」。
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Truncated { .. } => "save.truncated",
+            Self::TrailingBytes { .. } => "save.trailing_bytes",
+            Self::BadMagic { .. } => "save.bad_magic",
+            Self::Unsupported { .. } => "save.unsupported",
+            Self::NonZeroReserved { .. } => "save.non_zero_reserved",
+            Self::InvalidValue { .. } => "save.invalid_value",
+            Self::TooLarge { .. } => "save.too_large",
+            Self::NotStrictlyIncreasing { .. } => "save.not_strictly_increasing",
+            Self::Duplicate { .. } => "save.duplicate",
+            Self::ChunkKeyOrder { .. } => "save.chunk_key_order",
+            Self::Missing { .. } => "save.missing",
+            Self::Inconsistent { .. } => "save.inconsistent",
+            Self::InvalidCombination { .. } => "save.invalid_combination",
+            Self::InvalidBounds { .. } => "save.invalid_bounds",
+            Self::DigestMismatch { .. } => "save.digest_mismatch",
+            Self::BodyKeyMismatch { .. } => "save.body_key_mismatch",
+            Self::Io { .. } => "save.io",
+            Self::Payload { .. } => "save.payload",
+            Self::InvalidString { .. } => "save.invalid_string",
+            Self::Param { .. } => "save.param_mismatch",
+            Self::MissingMod { .. } => "save.missing_mod",
+            Self::UnexpectedMod { .. } => "save.unexpected_mod",
+            Self::ModVersionMismatch { .. } => "save.mod_version_mismatch",
+            Self::ActionTableMismatch { .. } => "save.action_table_mismatch",
+            Self::ActionCountMismatch { .. } => "save.action_count_mismatch",
+            Self::MissingPlugin { .. } => "save.missing_plugin",
+            Self::UnexpectedPlugin { .. } => "save.unexpected_plugin",
+            Self::PluginOrderMismatch { .. } => "save.plugin_order_mismatch",
+            Self::MissingResource { .. } => "save.missing_resource",
+        }
+    }
+
+    /// 这是不是「世界身份不一致」导致的拒绝（mod / 插件 / 动作表 / 参数 / 版本）。
+    ///
+    /// 为 `true` 时**不能降级建新世界**：档本身是好的，只是与当前装配不符，
+    /// 建新世界再自动存档会直接把玩家的档覆盖掉。为 `false`（损坏 / 截断 /
+    /// 多字节 / 坏魔数 / IO / 摘要 / 版本号不认识）时保持原有降级路径 ——
+    /// 这类档玩家只能靠删档恢复，当成身份不符只会让他永远进不去。
+    #[must_use]
+    pub fn is_world_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingMod { .. }
+                | Self::UnexpectedMod { .. }
+                | Self::ModVersionMismatch { .. }
+                | Self::ActionTableMismatch { .. }
+                | Self::ActionCountMismatch { .. }
+                | Self::MissingPlugin { .. }
+                | Self::UnexpectedPlugin { .. }
+                | Self::PluginOrderMismatch { .. }
+                | Self::MissingResource { .. }
+                | Self::Param { .. }
+                | Self::Unsupported { .. }
+        )
+    }
+}
+
 impl fmt::Display for SaveErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -324,5 +390,216 @@ impl fmt::Display for SaveErrorKind {
                 None => write!(f, "io {stage} failed: {kind}"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SaveErrorKind;
+
+    /// 每个变体一个可区分类别；`save.unknown` 会让客户端没法分支。
+    #[test]
+    fn every_kind_has_a_distinct_code() {
+        let kinds = [
+            SaveErrorKind::Truncated { need: 1, have: 0 },
+            SaveErrorKind::TrailingBytes { extra: 1 },
+            SaveErrorKind::BadMagic {
+                expected: "ECS2",
+                found: *b"BADMAGIC",
+            },
+            SaveErrorKind::Unsupported {
+                what: "version",
+                value: 3,
+            },
+            SaveErrorKind::NonZeroReserved { value: 1 },
+            SaveErrorKind::InvalidValue {
+                what: "voxel_size",
+                value: 0,
+            },
+            SaveErrorKind::TooLarge {
+                what: "count",
+                value: 9,
+                max: 1,
+            },
+            SaveErrorKind::NotStrictlyIncreasing {
+                what: "body",
+                previous: 2,
+                current: 1,
+            },
+            SaveErrorKind::Duplicate {
+                what: "body",
+                id: 7,
+            },
+            SaveErrorKind::ChunkKeyOrder {
+                previous: [1, 0, 0],
+                current: [0, 0, 0],
+            },
+            SaveErrorKind::Missing {
+                what: "body",
+                id: 3,
+            },
+            SaveErrorKind::Inconsistent {
+                what: "header_len",
+                expected: 1,
+                found: 2,
+            },
+            SaveErrorKind::InvalidCombination {
+                what: "content+proposal",
+            },
+            SaveErrorKind::InvalidBounds { index: 0, axis: 1 },
+            SaveErrorKind::DigestMismatch {
+                stored: 1,
+                computed: 2,
+            },
+            SaveErrorKind::BodyKeyMismatch { map: 1, record: 2 },
+            SaveErrorKind::Io {
+                stage: "read",
+                kind: std::io::ErrorKind::NotFound,
+                raw: Some(2),
+            },
+            SaveErrorKind::Payload {
+                what: "decode",
+                detail: "bad".to_string(),
+            },
+            SaveErrorKind::InvalidString { what: "plugin id" },
+            SaveErrorKind::Param {
+                detail: "radius".to_string(),
+            },
+            SaveErrorKind::MissingMod {
+                id: "core".to_string(),
+            },
+            SaveErrorKind::UnexpectedMod {
+                id: "core".to_string(),
+            },
+            SaveErrorKind::ModVersionMismatch {
+                id: "core".to_string(),
+                saved: 1,
+                current: 2,
+            },
+            SaveErrorKind::ActionTableMismatch {
+                name: "jump".to_string(),
+            },
+            SaveErrorKind::ActionCountMismatch {
+                expected: 1,
+                found: 2,
+            },
+            SaveErrorKind::MissingPlugin {
+                id: "p".to_string(),
+            },
+            SaveErrorKind::UnexpectedPlugin {
+                id: "p".to_string(),
+            },
+            SaveErrorKind::PluginOrderMismatch {
+                saved: "a,b".to_string(),
+                current: "b,a".to_string(),
+            },
+            SaveErrorKind::MissingResource { what: "ParamTable" },
+        ];
+
+        let mut codes: Vec<&'static str> = kinds.iter().map(SaveErrorKind::code).collect();
+        codes.sort_unstable();
+        let unique = {
+            let mut deduped = codes.clone();
+            deduped.dedup();
+            deduped
+        };
+        assert_eq!(codes.len(), unique.len(), "错误码必须互不重复：{codes:?}");
+        assert!(
+            codes.iter().all(|code| code.starts_with("save.")),
+            "错误码统一用 save. 前缀：{codes:?}"
+        );
+        assert!(
+            codes.iter().all(|code| *code != "save.unknown"),
+            "不允许 save.unknown：类别必须能区分"
+        );
+    }
+
+    /// 世界身份不一致 = 拒绝；坏字节 / IO / 摘要 = 仍可降级建新世界。
+    #[test]
+    fn only_identity_mismatch_is_a_world_rejection() {
+        let rejection = [
+            SaveErrorKind::MissingMod {
+                id: "m".to_string(),
+            },
+            SaveErrorKind::UnexpectedMod {
+                id: "m".to_string(),
+            },
+            SaveErrorKind::ModVersionMismatch {
+                id: "m".to_string(),
+                saved: 1,
+                current: 2,
+            },
+            SaveErrorKind::ActionTableMismatch {
+                name: "jump".to_string(),
+            },
+            SaveErrorKind::ActionCountMismatch {
+                expected: 1,
+                found: 2,
+            },
+            SaveErrorKind::MissingPlugin {
+                id: "p".to_string(),
+            },
+            SaveErrorKind::UnexpectedPlugin {
+                id: "p".to_string(),
+            },
+            SaveErrorKind::PluginOrderMismatch {
+                saved: "a".to_string(),
+                current: "b".to_string(),
+            },
+            SaveErrorKind::MissingResource { what: "ParamTable" },
+            SaveErrorKind::Param {
+                detail: "radius".to_string(),
+            },
+            SaveErrorKind::Unsupported {
+                what: "format_version",
+                value: 3,
+            },
+        ];
+        for kind in &rejection {
+            assert!(kind.is_world_rejection(), "{kind:?} 应判定为世界拒绝");
+        }
+
+        let degradation = [
+            SaveErrorKind::Truncated { need: 8, have: 3 },
+            SaveErrorKind::TrailingBytes { extra: 1 },
+            SaveErrorKind::BadMagic {
+                expected: "ECS2",
+                found: *b"BADMAGIC",
+            },
+            SaveErrorKind::DigestMismatch {
+                stored: 1,
+                computed: 2,
+            },
+            SaveErrorKind::Io {
+                stage: "open",
+                kind: std::io::ErrorKind::PermissionDenied,
+                raw: Some(13),
+            },
+            SaveErrorKind::Payload {
+                what: "decode",
+                detail: "bad".to_string(),
+            },
+            SaveErrorKind::InvalidString { what: "plugin id" },
+        ];
+        for kind in &degradation {
+            assert!(!kind.is_world_rejection(), "{kind:?} 不应判定为世界拒绝");
+        }
+    }
+
+    /// Display 是玩家可见文案，code 是机器契约：两者必须同时可用。
+    #[test]
+    fn display_and_code_are_independent() {
+        let error = super::SaveError::semantic(
+            "load.meta.mods",
+            SaveErrorKind::MissingMod {
+                id: "core".to_string(),
+            },
+        );
+        assert_eq!(error.path(), "load.meta.mods");
+        assert_eq!(error.kind().code(), "save.missing_mod");
+        assert!(
+            error.to_string().contains("存档加载过 mod"),
+            "Display 的中文原因不能被 code 取代：{error}"
+        );
     }
 }

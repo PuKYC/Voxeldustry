@@ -30,8 +30,11 @@
 //!   新建世界由同一条 match/return 分支保证互斥，不靠标志位猜；
 //! - 没有 root、或 world.meta 不存在：spawn 一个空 VoxVolume，块交给后续
 //!   驻留 / 流式管线按请求装；
-//! - 读档失败（坏档 / 缺资源）：error! 记录后按新世界降级，空容器照建，
-//!   绝不让坏档把启动卡死。
+//! - 读档失败分两类：[SaveErrorKind::is_world_rejection] 为真的**身份不符**
+//!   （mod / 插件 / 动作表 / 参数 / 版本）走拒绝路径 —— 不建世界、不落盘
+//!   （[SaveBlocked]），写 [WorldLoadRejection] 并把 `save.*` 错误码回传
+//!   Godot，然后请求退出；损坏 / 截断 / IO 仍然 error! 后按新世界降级，
+//!   空容器照建，绝不让坏档把启动卡死。
 //!
 //! 引导与 [attach_terrain_body] 用 chain 串起来，保证「先恢复或建容器，再挂
 //! body 身份」；用 chain 而不是依赖插件添加顺序，是因为 CoreGame 里
@@ -85,15 +88,17 @@
 use std::collections::BTreeSet;
 
 use bevy::prelude::*;
+use game_engine::backend::{BackendChannels, BevyLifecycleMsg, FromBevy};
 use game_engine::identity::StableEntityId;
 use game_engine::math::{FixedPoint, Vec3F};
 use game_engine::residency::{
     BodyRef, GameTickSet, LogicPos, Observer, ResidencyPlugin, ResidencySet,
 };
-use game_engine::save::{PersistPlugin, SaveConfig, SavePaths, SavePlugin, SaveStore};
+use game_engine::save::{PersistPlugin, SaveConfig, SaveError, SavePaths, SavePlugin, SaveStore};
 
 use crate::gameplay::Velocity;
 use crate::input::control::LocalPlayer;
+use crate::spec::CoreSpec;
 use crate::static_data::voxel::DEFAULT_VOXEL_SIZE;
 use crate::voxel::body::BodyKey;
 use crate::voxel::stream::{VoxelStreamConfig, VoxelStreamPlugin};
@@ -103,7 +108,8 @@ use crate::voxel::{
 };
 use crate::voxel::{GameVoxelPlugin, VoxVolume};
 use crate::world::chunk::WorldChunkPlugin;
-use crate::world::load::load_world;
+use crate::world::load::{load_world, WorldLoadRejection, WorldLoadRejectionHandle};
+use crate::world::save::SaveBlocked;
 use crate::world::save_plugin::{OrphanPolicy, SaveRoot, WorldSaveConfig, WorldSavePlugin};
 use crate::world::seed::WorldSeed;
 use crate::world::IslandRegistry;
@@ -318,8 +324,9 @@ fn reclaim_after_load(world: &World, paths: &SavePaths) {
 ///
 /// 读档成功时**直接 return**：世界里已经有存档恢复出来的 body / 块，不能再
 /// spawn 空容器，否则会出现一个空地形体外加一个读回来的地形体。无 SaveRoot、
-/// world.meta 不存在、读档失败三种情况共用下面同一条新建路径；坏档只降级
-/// （error!）不 panic，避免玩家被一份坏档永久卡在启动。
+/// world.meta 不存在、**损坏**档三种情况共用下面同一条新建路径；损坏档只降级
+/// （error!）不 panic，避免玩家被一份坏档永久卡在启动。身份不符的档则相反：
+/// 走 [reject_world_load] 拒绝并返回，既不建新世界也不覆盖原档。
 ///
 /// 这里必须能在没有任何 SaveStore 时运行（无 SaveRoot 的 headless / 单测），
 /// 所以只按 SaveRoot 决定是否碰磁盘，不无条件取 SaveStore。
@@ -361,7 +368,15 @@ fn bootstrap_streaming_world(world: &mut World) {
             Ok(None) => {
                 info!("world: 没有存档，按新世界启动");
             }
+            Err(error) if error.kind().is_world_rejection() => {
+                // 身份不符（mod / 插件 / 动作表 / 参数 / 版本）：档本身是好的，
+                // 只是与当前装配不同。这里既不建新世界也不落盘，原档原样留给玩家。
+                reject_world_load(world, &error);
+                return;
+            }
             Err(error) => {
+                // 损坏 / 截断 / IO：玩家往往只能靠删档或让世界重建恢复，保持
+                // 原来的降级语义（error! 后落到下面的新建世界路径）。
                 error!("world: 读档失败，按新世界启动：{error}");
             }
         }
@@ -394,6 +409,48 @@ fn bootstrap_streaming_world(world: &mut World) {
     world.spawn((volume, game_engine::voxel::VoxelCollider));
     #[cfg(not(feature = "physics"))]
     world.spawn(volume);
+}
+
+/// 世界身份不符（mod / 插件 / 动作表 / 参数 / 版本）：**拒绝**读档。
+///
+/// 档本身能读，只是与当前装配不同（少装 / 多装 / 版本不同），属于配置问题而
+/// 不是损坏问题：静默新建一个空世界会在第一次自动存档时把玩家还想用的档盖掉。
+/// 所以这里只做三件事：留诊断（[WorldLoadRejection] + 跨线程句柄）→ 回传
+/// [BevyLifecycleMsg::Error] 给 Godot → 请求退出主循环。不 spawn 体素容器、
+/// 不写 [WorldLoadReport]、不覆盖 [WorldSeed]，世界保持「拒绝后的空壳」，
+/// 由 [SaveBlocked] 保证它永远不会落盘。
+///
+/// 退出用 Bevy 的 [AppExit]（error 码 1）：runner 每帧 `update()` 之后
+/// `should_exit()` 就能读到，和「窗口关闭」走同一条路径，不必给后端新增资源。
+/// headless 单测里没有 `Messages<AppExit>` 时 `write_message` 返回 None，
+/// 不会 panic。
+fn reject_world_load(world: &mut World, error: &SaveError) {
+    let rejection = WorldLoadRejection {
+        code: error.kind().code().to_string(),
+        path: error.path().to_string(),
+        message: error.to_string(),
+    };
+    error!(
+        "world: 读档被拒绝 {} @ {}：{}（保留原档，不建新世界）",
+        rejection.code, rejection.path, rejection.message
+    );
+    if let Some(handle) = world.get_resource::<WorldLoadRejectionHandle>() {
+        handle.set(rejection.clone());
+    }
+    // Godot 侧从后台线程的共享状态读它渲染差异面板；headless 没有这个资源，
+    // 拿不到就安静跳过。消息发不出去（接收端已丢）也不影响本地诊断。
+    if let Some(channels) = world.get_resource::<BackendChannels<CoreSpec>>() {
+        let _ = channels.life_tx.send(FromBevy {
+            session: channels.session,
+            payload: BevyLifecycleMsg::Error {
+                code: rejection.code.clone(),
+                message: rejection.message.clone(),
+            },
+        });
+    }
+    world.insert_resource(rejection);
+    world.insert_resource(SaveBlocked);
+    world.write_message(AppExit::error());
 }
 
 /// 固定 [GameTickSet] 的全局顺序：驻留 → 流式 → 世界区块 → 玩法 → 存档。
@@ -576,7 +633,7 @@ mod tests {
     use game_engine::residency::{
         BodyRef, ChunkAnchor, ChunkReached, LogicPos, Observer, ResidencyTable,
     };
-    use game_engine::save::{SavePaths, SaveStore};
+    use game_engine::save::{SaveErrorKind, SavePaths, SaveStore};
     use game_engine::streaming::{ChunkPersistence, GenTable, StoreLookup};
     use game_engine::voxel::{
         chunk_key, MaxDepth, VoxOpsBulkWrite, VoxTree, VoxVolume, VoxelBox, VoxelDirtySet,
@@ -1395,5 +1452,57 @@ mod tests {
             world.get::<BodyRef>(player).is_none(),
             "没有地形体时不能瞎写 BodyRef"
         );
+    }
+
+    /// 身份不符的档被拒绝：只留诊断 + 闸门 + 退出请求，不建世界。
+    ///
+    /// 这里直接调 reject_world_load（bootstrap 的 Err 分支只多一层 match）：
+    /// 断言拒绝路径不 spawn VoxVolume、不写 WorldLoadReport、不动 WorldSeed，
+    /// 且 SaveBlocked 与 AppExit 都就位。没有 BackendChannels 时必须安静跳过
+    /// （headless 单测就是这种形态），不能 panic。
+    #[test]
+    fn world_rejection_keeps_world_empty_and_blocks_saves() {
+        let mut world = World::new();
+        world.init_resource::<Messages<AppExit>>();
+        world.insert_resource(WorldSeed(0x1234));
+        let error = SaveError::semantic(
+            "load.meta.mods",
+            SaveErrorKind::MissingMod {
+                id: "core".to_string(),
+            },
+        );
+
+        reject_world_load(&mut world, &error);
+
+        let rejection = world.resource::<WorldLoadRejection>().clone();
+        assert_eq!(rejection.code, "save.missing_mod");
+        assert_eq!(rejection.path, "load.meta.mods");
+        assert!(
+            rejection.message.contains("存档加载过 mod"),
+            "message 必须是 SaveError 的 Display 原文：{}",
+            rejection.message
+        );
+        assert!(
+            world.contains_resource::<SaveBlocked>(),
+            "拒绝后必须装上存档闸门"
+        );
+        assert!(
+            !world.contains_resource::<WorldLoadReport>(),
+            "拒绝路径不能写 WorldLoadReport（它会被当成「已从档恢复」）"
+        );
+        assert_eq!(
+            world.resource::<WorldSeed>().0,
+            0x1234,
+            "拒绝路径不能覆盖 WorldSeed"
+        );
+        let mut volume_query = world.query_filtered::<Entity, With<VoxVolume>>();
+        assert_eq!(
+            volume_query.iter(&world).count(),
+            0,
+            "拒绝路径不能 spawn 空体素容器"
+        );
+
+        let exits: Vec<AppExit> = world.resource_mut::<Messages<AppExit>>().drain().collect();
+        assert_eq!(exits, vec![AppExit::error()], "拒绝后必须请求退出主循环");
     }
 }

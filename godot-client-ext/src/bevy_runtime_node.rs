@@ -32,6 +32,7 @@ use game_core::voxel::terrain::{
     nearest_block_distance_m, TerrainConfig, TerrainMode, VoxelLodRuntime,
 };
 use game_core::voxel::VoxelLodConfig;
+use game_core::world::WorldLoadRejectionHandle;
 
 use crate::presentation_bridge;
 
@@ -78,6 +79,18 @@ pub struct BevyAppManager {
 
     /// 静态数据表句柄：Godot 写重载请求 / 读当前表；后台 Bevy 在 FixedUpdate 应用。
     object_tables: ObjectTablesHandle,
+
+    /// 读档拒绝句柄：后台 Bevy 线程写，本节点（Godot 主线程）读。
+    ///
+    /// 与 voxel_lod / object_tables 同一模式；后台线程停掉之后值仍在，
+    /// 因此 `bev_stopped` 之后仍能读出来展示差异。
+    world_load_rejection: WorldLoadRejectionHandle,
+
+    /// 后台线程回传的最后一次错误 (code, message)。
+    ///
+    /// 句柄里没有拒绝信息时，`world_load_rejection()` 用它兜底：`save.*` 的
+    /// Error 一定先于 Stopped 到达（同一通道、同顺序），所以 stop 之后可读。
+    last_error: Option<(String, String)>,
 }
 
 #[godot_api]
@@ -97,6 +110,8 @@ impl INode for BevyAppManager {
             voxel_lod: Arc::new(Mutex::new(VoxelLodRuntime::default())),
             memory_soft_limit: Arc::new(Mutex::new(None)),
             object_tables: ObjectTablesHandle::default(),
+            world_load_rejection: WorldLoadRejectionHandle::default(),
+            last_error: None,
         }
     }
 
@@ -117,7 +132,12 @@ impl INode for BevyAppManager {
                 BevyLifecycleMsg::Started => self.emit_started(),
                 BevyLifecycleMsg::Paused => self.emit_paused(),
                 BevyLifecycleMsg::Resumed => self.emit_resumed(),
-                BevyLifecycleMsg::Error { code, message } => self.emit_error(code, message),
+                BevyLifecycleMsg::Error { code, message } => {
+                    // 先留档再发信号：GDScript 可能在信号回调里立刻 stop_bevy()，
+                    // 那时这条错误已经必须能被 world_load_rejection() 读到。
+                    self.last_error = Some((code.clone(), message.clone()));
+                    self.emit_error(code, message);
+                }
                 BevyLifecycleMsg::Custom(message) => self.emit_custom(message),
                 BevyLifecycleMsg::Stopped(exit_code) => {
                     self.cleanup_after_stop();
@@ -842,6 +862,40 @@ impl BevyAppManager {
         }
         out
     }
+
+    /// 最近一次读档拒绝：`{ code, path, message }`；**空字典 = 没有拒绝过**。
+    ///
+    /// 值来自后台 Bevy 线程写入的共享句柄（`WorldLoadRejectionHandle`），
+    /// 所以 `bev_stopped` / stop 之后仍能读：GDScript 可以「先收 bev_error
+    /// 弹窗，玩家点返回 → stop，再按需读详情」。句柄为空但最后一次错误码以
+    /// `save.` 开头时退化成 `{ code, path: "", message }`（headless / 旧版
+    /// game-core 没有句柄时的兜底），保证原因不丢。
+    #[func]
+    fn world_load_rejection(&self) -> VarDictionary {
+        let mut out = VarDictionary::new();
+        if let Some(rejection) = self.world_load_rejection.get() {
+            let code = Variant::from(GString::from(rejection.code.as_str()));
+            let path = Variant::from(GString::from(rejection.path.as_str()));
+            let message = Variant::from(GString::from(rejection.message.as_str()));
+            out.set("code", &code);
+            out.set("path", &path);
+            out.set("message", &message);
+            return out;
+        }
+        let Some((code, message)) = self.last_error.clone() else {
+            return out;
+        };
+        if !code.starts_with("save.") {
+            return out;
+        }
+        let code = Variant::from(GString::from(code.as_str()));
+        let path = Variant::from(GString::from(""));
+        let message = Variant::from(GString::from(message.as_str()));
+        out.set("code", &code);
+        out.set("path", &path);
+        out.set("message", &message);
+        out
+    }
 }
 
 /// Godot 传来的存档目录 -> `Option<PathBuf>`：空字符串 = 不落盘。
@@ -892,6 +946,10 @@ impl BevyAppManager {
         config.voxel_lod = Some(self.voxel_lod.clone());
         config.memory_soft_limit = Some(self.memory_soft_limit.clone());
         config.object_tables = Some(self.object_tables.clone());
+        // 新会话从零开始：上一次的拒绝不能冒充这一次的。
+        self.world_load_rejection.clear();
+        self.last_error = None;
+        config.world_load_rejection = Some(self.world_load_rejection.clone());
 
         // 跨边界句柄：Godot 主线程留一份，后台线程拿一份克隆（内部是 Arc 共享）。
         let bridge = ClientBridge::with_semantics(session, self.semantics.clone());

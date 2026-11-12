@@ -21,7 +21,9 @@ use crate::spec::{ClientBridge, CoreSpec};
 use crate::static_data::ObjectTablesHandle;
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
 use crate::world::streaming::ObserverDrivenStreamingPlayer;
-use crate::world::{default_plugin_selection, intern_plugin_selection, SaveRoot};
+use crate::world::{
+    default_plugin_selection, intern_plugin_selection, SaveRoot, WorldLoadRejectionHandle,
+};
 
 // 消息类型由引擎定义，重导出保持 godot 侧路径不变。
 pub use game_engine::backend::{BevyControlMsg, BevyLifecycleMsg, FromBevy};
@@ -87,6 +89,14 @@ pub struct BevyBackendConfig {
     /// Some 时空列表表示「一个可选插件都不装」，不是「用默认」；未知 id 在启动阶段
     /// 结构化失败（ModuleBuildFailure + bev_error），不会 panic。
     pub plugins: Option<Vec<String>>,
+    /// 读档拒绝信息的跨线程句柄（Bevy 写、Godot 读）。
+    ///
+    /// Some 时插进 World：[WorldLoadRejectionHandle] 会被
+    /// `bootstrap_streaming_world` 写入 `save.*` 拒绝详情，Godot 侧在
+    /// [`BevyLifecycleMsg::Error`] 之后、甚至 `bev_stopped` 之后都能读同一份值。
+    /// None 时拒绝只留在 World 的 [`crate::world::WorldLoadRejection`] 资源里
+    /// （headless / 单测）。
+    pub world_load_rejection: Option<WorldLoadRejectionHandle>,
 }
 
 impl Default for BevyBackendConfig {
@@ -109,6 +119,7 @@ impl Default for BevyBackendConfig {
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
             plugins: None,
+            world_load_rejection: None,
         }
     }
 }
@@ -134,6 +145,7 @@ struct CoreGameModule {
     mods: CoreMods,
     param_overrides: BTreeMap<String, i64>,
     plugins: Option<Vec<String>>,
+    world_load_rejection: Option<WorldLoadRejectionHandle>,
 }
 
 impl GameModule<CoreSpec> for CoreGameModule {
@@ -168,6 +180,11 @@ impl GameModule<CoreSpec> for CoreGameModule {
         // 静态表句柄必须早于 CoreGame.build：StaticDataPlugin 的 init_resource
         // 不会覆盖已有资源，启动表会直接发布进 Godot 持有的这份句柄。
         if let Some(handle) = &self.object_tables {
+            app.insert_resource(handle.clone());
+        }
+        // 拒绝句柄必须早于 CoreGame.build：bootstrap_streaming_world 在 Startup
+        // 里就要写它，晚于 build 插入就赶不上这一帧。
+        if let Some(handle) = &self.world_load_rejection {
             app.insert_resource(handle.clone());
         }
         // dev 观察者入口（流式 + voxel_viewer，即 start_bevy_streaming）没有输入
@@ -263,6 +280,7 @@ pub fn run_bevy_backend(
             mods: config.mods,
             param_overrides: config.param_overrides,
             plugins: config.plugins,
+            world_load_rejection: config.world_load_rejection,
         },
         bridge,
         ctrl_rx,
@@ -295,6 +313,7 @@ mod tests {
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
             plugins: None,
+            world_load_rejection: None,
         }
     }
 

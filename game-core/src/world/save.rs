@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bevy::prelude::{Entity, World};
+use bevy::prelude::{Entity, Resource, World};
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableIdAllocator};
 use game_engine::input::ResolvedActions;
@@ -47,6 +47,19 @@ use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelDirtySet, VoxelIn
 
 use crate::voxel::body::{Body, BodyKind};
 use crate::world::{IslandId, IslandRegistry, WorldSeed};
+
+/// 存档闸门：存在时**任何**写盘入口都提前返回，一个字节都不写。
+///
+/// 只在读档被拒绝时插入（见 [`crate::world::WorldLoadRejection`]）：档本身是好的，
+/// 只是与当前装配不符，玩家可能装回某个 mod 再来。此时世界是「拒绝后的空壳」，
+/// 任何落盘都会把原档覆盖成一个空世界 —— 宁可这次会话完全不存档。
+///
+/// # warn 策略
+///
+/// 每次**真正触发的**存档请求 warn 一次（不是每帧）：触发点都在 tick / 消息判定
+/// 之后，一次请求最多一条日志，既不会刷屏，也不会让「按了保存但没反应」静默。
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SaveBlocked;
 
 /// 一次**世界级**采集结果：一份 `world.meta` 的语义 + 按 (body, region) 分组的 region 文件。
 ///

@@ -295,7 +295,9 @@ fn build_app<S: GameSpec, M: GameModule<S>>(
 /// 后台 App 的主循环：处理控制指令、按目标帧率推进 `App::update`。
 ///
 /// 收到 [`BevyControlMsg::Shutdown`] 时插入 [`BackendShutdown`] 并补跑最后一帧，
-/// 然后返回 [`AppExit::Success`]；`App` 自身请求退出时同样正常返回。
+/// 然后返回 [`AppExit::Success`]；`App` 自身请求退出（系统里写 `AppExit`，
+/// 例如读档被拒绝）时返回**那个** `AppExit`，错误码一路传到 [`finish_run`]，
+/// Godot 看到的 `Stopped` 码因此不会把失败伪装成正常退出。
 fn run_app_loop<S: GameSpec>(
     mut app: App,
     config: &EngineConfig,
@@ -307,6 +309,8 @@ fn run_app_loop<S: GameSpec>(
     let mut paused = false;
     let mut exit_requested = false;
     let mut last_update = Instant::now();
+    // 默认正常退出；系统写入的 AppExit（含错误码）会覆盖它。
+    let mut exit = AppExit::Success;
     app.finish();
     app.cleanup();
 
@@ -344,7 +348,9 @@ fn run_app_loop<S: GameSpec>(
 
         app.update();
 
-        if app.should_exit().is_some() {
+        if let Some(requested) = app.should_exit() {
+            // 保留退出原因：模块（读档拒绝、致命错误）用它把失败码交给 finish_run。
+            exit = requested;
             break;
         }
 
@@ -354,7 +360,7 @@ fn run_app_loop<S: GameSpec>(
         }
     }
 
-    AppExit::Success
+    exit
 }
 
 /// 排空控制通道并更新暂停/退出状态，同时回送对应生命周期消息。
@@ -397,9 +403,22 @@ fn drain_control_messages<S: GameSpec>(
     }
 }
 
+/// [`AppExit`] 的进程退出码：Success = 0，Error(n) = n。
+///
+/// 模块用 `AppExit::error()`（码 1）表达「我主动停机但这次是失败」；不这样
+/// 翻译的话 Godot 会把读档拒绝当成正常退出，`bev_stopped(0)` 掩盖真实原因。
+fn app_exit_code(exit: &AppExit) -> u8 {
+    match exit {
+        AppExit::Success => 0,
+        AppExit::Error(code) => code.get(),
+    }
+}
+
 /// 把 `App::run` 的结果翻译为进程退出码，并回送停止/错误生命周期消息。
 ///
-/// panic 载荷优先按 `String` / `&str` 提取文本，其他类型统一回退为
+/// 正常退出（含 `AppExit::Success`）回送 `Stopped(0)`；系统请求的
+/// `AppExit::Error(n)` 回送 `Stopped(n)` 并以 n 退出进程。panic 载荷优先按
+/// `String` / `&str` 提取文本，其他类型统一回退为
 /// `"Unknown panic in Bevy backend"`。
 fn finish_run(
     result: std::thread::Result<AppExit>,
@@ -407,12 +426,17 @@ fn finish_run(
     life_tx: Sender<FromBevy>,
 ) -> ExitCode {
     match result {
-        Ok(_) => {
+        Ok(exit) => {
+            let code = app_exit_code(&exit);
             let _ = life_tx.send(FromBevy {
                 session,
-                payload: BevyLifecycleMsg::Stopped(0),
+                payload: BevyLifecycleMsg::Stopped(code as i64),
             });
-            ExitCode::SUCCESS
+            if code == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(code)
+            }
         }
         Err(payload) => {
             let err_msg = if let Some(s) = payload.downcast_ref::<String>() {
@@ -436,5 +460,51 @@ fn finish_run(
             });
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DefaultSpec, NoSemantics};
+
+    /// `AppExit::Success` → 0，`AppExit::error()` → 1。
+    #[test]
+    fn app_exit_code_maps_success_and_error() {
+        assert_eq!(app_exit_code(&AppExit::Success), 0);
+        assert_eq!(app_exit_code(&AppExit::error()), 1);
+    }
+
+    /// 系统里写 `AppExit`（读档拒绝就是这么停机的）必须被 `run_app_loop` 的
+    /// `should_exit` 捕获，并原样返回错误码。看门狗在 2s 后发 Shutdown：万一
+    /// `should_exit` 没看到 AppExit，循环会以 Success 退出，断言失败而不是挂死。
+    #[test]
+    fn system_app_exit_stops_the_loop_with_its_code() {
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
+        let (life_tx, _life_rx) = crossbeam_channel::unbounded::<FromBevy>();
+        let bridge = ClientBridge::with_semantics(7, NoSemantics);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        app.insert_resource(BackendChannels::<DefaultSpec> {
+            ctrl_rx,
+            life_tx,
+            session: 7,
+            _spec: PhantomData,
+        });
+        app.add_systems(Update, |mut exit: MessageWriter<AppExit>| {
+            exit.write(AppExit::error());
+        });
+
+        let _watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            let _ = ctrl_tx.send(BevyControlMsg::Shutdown);
+        });
+
+        let exit = run_app_loop::<DefaultSpec>(app, &EngineConfig::default(), &bridge);
+        assert!(exit.is_error(), "run_app_loop 没捕获系统写入的 AppExit");
+        assert_eq!(app_exit_code(&exit), 1);
     }
 }

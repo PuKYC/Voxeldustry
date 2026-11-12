@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use bevy::prelude::{warn, Entity, Resource, World};
 
@@ -76,6 +77,47 @@ pub struct LoadedWorld {
     pub world_tick: u64,
     /// 本次读档的统计。
     pub stats: LoadStats,
+}
+
+/// 读档被拒绝：世界身份（mod / 插件 / 动作表 / 参数 / 版本）与存档不一致。
+/// 由流式启动系统写入，Godot 侧读它渲染差异面板。
+///
+/// 只有 [`SaveErrorKind::is_world_rejection`] 为真的错误才会变成它：档本身是好的，
+/// 只是与当前装配不符。损坏 / 截断 / IO 仍然走「降级建新世界」，不会走这条路径。
+#[derive(Resource, Clone, Debug, PartialEq, Eq)]
+pub struct WorldLoadRejection {
+    /// 稳定错误码（[`SaveErrorKind::code`]），客户端按它分支。
+    pub code: String,
+    /// 出错的字段路径（[`SaveError::path`]），如 `load.meta.plugins`。
+    pub path: String,
+    /// 完整原因（[`SaveError`] 的 Display，含中文说明）。
+    pub message: String,
+}
+
+/// 拒绝信息的跨线程槽：后台 Bevy 线程写，Godot 主线程读。
+///
+/// 与 [`crate::voxel::terrain::VoxelLodHandle`] / `ObjectTablesHandle` 同一种模式
+/// （`Arc<Mutex<..>>` 句柄经 `BevyBackendConfig` 双向持有）：后台 App 停掉之后
+/// 句柄里的值仍然在，Godot 侧因此能在 `bev_stopped` 之后继续展示差异。
+#[derive(Resource, Clone, Debug, Default)]
+pub struct WorldLoadRejectionHandle(Arc<Mutex<Option<WorldLoadRejection>>>);
+
+impl WorldLoadRejectionHandle {
+    /// 写入拒绝信息（覆盖上一次；启动新会话前由调用方 [`Self::clear`]）。
+    pub fn set(&self, rejection: WorldLoadRejection) {
+        *self.0.lock().expect("world load rejection lock") = Some(rejection);
+    }
+
+    /// 读最近一次拒绝信息；没有拒绝过时为 None。
+    #[must_use]
+    pub fn get(&self) -> Option<WorldLoadRejection> {
+        self.0.lock().expect("world load rejection lock").clone()
+    }
+
+    /// 清空（每次启动新会话时调用，避免把上一次的拒绝当成这一次的）。
+    pub fn clear(&self) {
+        *self.0.lock().expect("world load rejection lock") = None;
+    }
 }
 
 /// 从 paths 读一个世界；generator_version 是当前生成器的版本号。

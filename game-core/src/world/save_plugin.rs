@@ -75,7 +75,7 @@ use game_engine::residency::GameTickSet;
 use game_engine::save::{SaveConfig, SavePaths, SaveSet, SaveStore};
 
 use crate::voxel::stream::VoxelStreamConfig;
-use crate::world::save::{capture_world, write_capture};
+use crate::world::save::{capture_world, write_capture, SaveBlocked};
 
 /// SaveNow 前落盘屏障的超时：正常 flush 是亚毫秒级，5s 已经意味着磁盘或后台
 /// 线程异常；宁可本次存档失败并报错，也不要把主线程无限卡在存档上。
@@ -274,6 +274,16 @@ fn save_now_system(world: &mut World, mut cursor: Local<MessageCursor<SaveNow>>)
 /// [capture_world] 采集 -> [write_capture] 落盘 -> 记账。失败只记
 /// [WorldSaveStatus::last_error]，不 panic、不前进 saves / last_world_tick。
 fn perform_save(world: &mut World, tick: u64) {
+    // 读档被拒绝（SaveBlocked）时世界只是空壳：此刻任何落盘都会把原档覆盖成
+    // 一个空世界，而原档本身是好的，玩家装回 mod / 插件后还想再进。所有触发
+    // 路径（手动 SaveNow、自动存档、退出补跑帧）都汇到 perform_save，一个闸门
+    // 就够。warn 每次真正触发的请求一条（触发点在 tick / 消息判定之后），既不会
+    // 每帧刷屏，也不会让「按了保存却没反应」静默。
+    if world.contains_resource::<SaveBlocked>() {
+        warn!("世界存档已禁用（读档被拒绝，原档保留）：本次存档请求不写盘");
+        return;
+    }
+
     // 生成器版本只认流式层配置：卸载落盘（voxel::stream）也读同一个资源，
     // 两条写路径才不会给同一块写出两个版本号。缺配置时**不能**用默认值兜底：
     // 写错版本号会让下次读档把旧地形当成新地形，比不写更糟。
@@ -563,6 +573,37 @@ mod tests {
         let recaptured = capture_world(&mut loaded, 1, GENERATOR_VERSION).expect("回读世界可采集");
         assert_eq!(recaptured.meta, expected.meta, "回读后 meta 必须一致");
         assert_eq!(recaptured.regions, expected.regions, "回读后块内容必须一致");
+    }
+
+    /// 读档被拒绝后世界处于 [SaveBlocked]：手动 SaveNow 不得产生任何文件。
+    ///
+    /// 这条闸门同时挡住自动存档与退出补跑帧（三者都汇到 perform_save），
+    /// 是「绝不覆盖原档」的最后一道保险。
+    #[test]
+    fn save_blocked_prevents_save_now_from_writing_files() {
+        let dir = TempDir::new("save_blocked");
+        let mut app = test_app(dir.path(), None);
+        spawn_island_with_chunk(app.world_mut());
+        app.world_mut().insert_resource(SaveBlocked);
+
+        app.world_mut().write_message(SaveNow);
+        tick(&mut app);
+
+        let paths = SavePaths::new(dir.path());
+        assert!(
+            !paths.world_meta().exists(),
+            "SaveBlocked 存在时不得写 world.meta：{:?}",
+            paths.world_meta()
+        );
+        assert!(
+            !dir.path().join("regions").exists(),
+            "SaveBlocked 存在时不得写 region：{:?}",
+            dir.path().join("regions")
+        );
+        // 闸门是「跳过」而不是「失败」：不记录 last_error，状态保持干净。
+        let status = app.world().resource::<WorldSaveStatus>();
+        assert_eq!(status.saves, 0);
+        assert_eq!(status.last_error, None);
     }
 
     #[test]
