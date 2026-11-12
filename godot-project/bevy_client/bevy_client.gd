@@ -37,6 +37,9 @@ enum Mode {
 ## streaming：true 时以只读方式打开 save_dir——可看、不可玩、不写盘。
 ## 读档身份校验放宽，但结构损坏的存档仍然拒绝；插件只装表现与地形，不装玩法。
 @export var read_only: bool = false
+## mod 包根目录（绝对路径）：每个子目录一个 `mod.json` + `data/*.jsonc`。
+## 空串 = 不装 mod。启动前自动扫描；任一包解析失败则本次启动取消（不装半套）。
+@export var mod_dir: String = ""
 ## 路径 B：AO 总强度（1.0 = 当前观感、默认开启；0.0 = 完全关闭）。启动时写入 VoxelMeshNode。
 @export_range(0.0, 1.0, 0.01) var voxel_ao_strength: float = 1.0
 ## 路径 B：AO 曲线指数（1.0 = 当前观感；>1 加深，<1 减淡）。
@@ -178,11 +181,33 @@ func _ready() -> void:
 		_start_backend()
 
 
+## 扫描 mod 包目录并留在管理节点上；返回 { ok, count, packages, errors }。
+## 扩展没有 scan_mod_packages() 时报 ok=false（宁可不启动，也不静默丢 mod）。
+func scan_mod_packages(directory: String) -> Dictionary:
+	if _mgr == null or not _mgr.has_method("scan_mod_packages"):
+		return {"ok": false, "count": 0, "packages": [], "errors": [{"path": directory, "code": "mod.package.unsupported", "message": "扩展缺少 scan_mod_packages()"}]}
+	return _mgr.scan_mod_packages(directory)
+
+
+## 启动前确保 mod 包已扫描；返回 false 表示本次不应启动。
+func _ensure_mod_packages() -> bool:
+	if mod_dir.is_empty():
+		return true
+	var result := scan_mod_packages(mod_dir)
+	if bool(result.get("ok", false)):
+		return true
+	var errors: Array = result.get("errors", [])
+	var first: Dictionary = errors[0] if not errors.is_empty() else {}
+	push_error("[BevyClient] mod 包扫描失败（%s）：%s %s" % [mod_dir, first.get("code", "?"), first.get("message", "")])
+	return false
+
 ## autostart 分派：按 mode 选择扩展入口。
 ##
 ## 路径 B 的两个入口用 `has_method` 保护：扩展还没编译进这些方法时回退到实体
 ## 演示，而不是让场景直接起不来（前向兼容）。
 func _start_backend() -> void:
+	if not _ensure_mod_packages():
+		return
 	match mode:
 		Mode.VOXEL_DEMO:
 			if _mgr.has_method("start_bevy_voxel_demo"):

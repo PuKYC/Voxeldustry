@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use game_core::bevy_backend::*;
+use game_core::package::{scan_package_root, LoadedPackage};
 use game_core::presentation::semantics::SemanticRegistry;
 use game_core::spec::ClientBridge;
 use game_core::static_data::ObjectTablesHandle;
@@ -86,6 +87,12 @@ pub struct BevyAppManager {
     /// 因此 `bev_stopped` 之后仍能读出来展示差异。
     world_load_rejection: WorldLoadRejectionHandle,
 
+    /// 已扫描通过的目录式 mod 包（见 [game_core::package]）。
+    ///
+    /// 扫描发生在 Godot 主线程，装配发生在每次 `start_backend`：包一旦扫描成功
+    /// 就随之后每一次启动带进后台配置，直到下一次扫描覆盖。
+    packages: Vec<LoadedPackage>,
+
     /// 后台线程回传的最后一次错误 (code, message)。
     ///
     /// 句柄里没有拒绝信息时，`world_load_rejection()` 用它兜底：`save.*` 的
@@ -111,6 +118,7 @@ impl INode for BevyAppManager {
             memory_soft_limit: Arc::new(Mutex::new(None)),
             object_tables: ObjectTablesHandle::default(),
             world_load_rejection: WorldLoadRejectionHandle::default(),
+            packages: Vec::new(),
             last_error: None,
         }
     }
@@ -320,6 +328,92 @@ impl BevyAppManager {
         });
     }
 
+    /// 扫描 mod 包根目录：解析 <root>/<目录>/mod.json 与 data 补丁，结果留在节点上。
+    ///
+    /// 全有或全无：任一包失败则一个都不装（错误列在返回字典里），已扫描成功的结果
+    /// 不会被半成品覆盖。返回 { ok, count, packages, errors }：
+    /// - ok=true 时 packages 是 [{ id, version, source, actions, params, presentation, data_files }]；
+    /// - ok=false 时 errors 是 [{ path, code, message }]，code 形如 mod.package.schema。
+    ///
+    /// 扫描只读文件，不装配；之后任一 start_bevy_* 都会把包带进后台配置。
+    #[func]
+    fn scan_mod_packages(&mut self, root: GString) -> VarDictionary {
+        let root = root.to_string();
+        let mut out = VarDictionary::new();
+        let mut errors: Array<VarDictionary> = Array::new();
+        if root.is_empty() {
+            self.packages.clear();
+            out.set("ok", false);
+            out.set("count", 0);
+            out.set("packages", &Array::<VarDictionary>::new());
+            let mut error = VarDictionary::new();
+            error.set("path", "");
+            error.set("code", "mod.package.io");
+            error.set("message", "mod 包根目录为空");
+            errors.push(&error);
+            out.set("errors", &errors);
+            return out;
+        }
+        match scan_package_root(std::path::Path::new(&root)) {
+            Ok(packages) => {
+                let mut list: Array<VarDictionary> = Array::new();
+                for package in &packages {
+                    let mut item = VarDictionary::new();
+                    item.set("id", package.id());
+                    item.set("version", i64::from(package.version()));
+                    item.set("source", package.source.display().to_string());
+                    let actions: Vec<&str> = package
+                        .manifest
+                        .actions
+                        .iter()
+                        .map(|action| action.as_str())
+                        .collect();
+                    item.set("actions", &strings_to_packed(&actions));
+                    let params: Vec<&str> = package
+                        .manifest
+                        .params
+                        .iter()
+                        .map(|param| param.key.as_str())
+                        .collect();
+                    item.set("params", &strings_to_packed(&params));
+                    let presentation: Vec<&str> = package
+                        .manifest
+                        .presentation
+                        .iter()
+                        .map(|payload| payload.name.as_str())
+                        .collect();
+                    item.set("presentation", &strings_to_packed(&presentation));
+                    let data: Vec<&str> = package
+                        .manifest
+                        .data
+                        .iter()
+                        .map(|path| path.as_str())
+                        .collect();
+                    item.set("data_files", &strings_to_packed(&data));
+                    list.push(&item);
+                }
+                out.set("ok", true);
+                out.set("count", i64::try_from(packages.len()).unwrap_or(i64::MAX));
+                out.set("packages", &list);
+                out.set("errors", &errors);
+                self.packages = packages;
+            }
+            Err(failures) => {
+                for failure in failures {
+                    let mut error = VarDictionary::new();
+                    error.set("path", failure.path().display().to_string());
+                    error.set("code", failure.code());
+                    error.set("message", failure.message());
+                    errors.push(&error);
+                }
+                out.set("ok", false);
+                out.set("count", 0);
+                out.set("packages", &Array::<VarDictionary>::new());
+                out.set("errors", &errors);
+            }
+        }
+        out
+    }
     /// 启动体素性能场景：给定半径 / max_lod 的地形 + 每 tick 移动的观察者。
     ///
     /// `radius_blocks` 是 x/z 上围绕世界原点的基础子块半径（1 块 = 32 体素 ≈ 14.4 m），
@@ -938,6 +1032,12 @@ impl BevyAppManager {
     }
 }
 
+/// 借用字符串切片 -> Godot 字符串数组（FFI 返回值的说明性字段用）。
+fn strings_to_packed(items: &[&str]) -> PackedStringArray {
+    let owned: Vec<GString> = items.iter().map(|item| GString::from(*item)).collect();
+    PackedStringArray::from(owned)
+}
+
 /// Godot 传来的存档目录 -> `Option<PathBuf>`：空字符串 = 不落盘。
 ///
 /// 抽成自由函数是为了能被单测直接调用（`start_backend` 一调就起后台线程，
@@ -986,6 +1086,7 @@ impl BevyAppManager {
         config.voxel_lod = Some(self.voxel_lod.clone());
         config.memory_soft_limit = Some(self.memory_soft_limit.clone());
         config.object_tables = Some(self.object_tables.clone());
+        config.packages = self.packages.clone();
         // 新会话从零开始：上一次的拒绝不能冒充这一次的。
         self.world_load_rejection.clear();
         self.last_error = None;

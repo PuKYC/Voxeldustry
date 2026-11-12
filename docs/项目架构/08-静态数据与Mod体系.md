@@ -8,7 +8,7 @@ tags:
   - 项目架构
   - 静态数据
   - Mod
-source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12"
+source: "代码阅读 @ commit 36cd288 + JSONC 数据层实现；mod 动作表 / 插件注册表 / 存档冻结 / 插件选择入口 @ 2026-11-11；读档拒绝与 SaveBlocked 语义 @ 2026-11-11；mod 表现子种类（presentation / sub_kind）@ 2026-11-12；只读打开（read_only / readonly_plugin_selection / SavePaths::read_only / LoadMode::ReadOnly）@ 2026-11-12；目录式 mod 包（package.rs / scan_package_root / scan_mod_packages）@ 2026-11-12"
 ---
 
 # 静态数据与 Mod 体系
@@ -304,6 +304,46 @@ Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`�
   `ModFieldVis` 取 `All` / `Required` / `ServerOnly`（与扩展袋可见性同义）。解析规则见「表现子种类分配」小节。
 
 参数表由 `ParamTable::resolve` 在 mod `install` 之前解析：未知覆盖 key 直接拒绝，默认值 / 范围 / 布尔 / 枚举逐项校验；`CoreGame::build_with_mods` / `build_with_profile` 负责这个装配点。
+
+### 目录式 mod 包（运行期加载）
+
+编译期 native mod 的清单全是 `&'static`，Godot 造不出来。运行期包由 `game-core/src/package.rs` 解析成**拥有所有权**的 `LoadedPackage`（可跨 FFI 持有、可单测），装配时再 `to_mod()`：`Box::leak` 成 `'static` 并实现 `Mod<S>`，`install` 把 data 补丁交给 `ModContext::add_object_layer`。泄漏只发生在启动 / 建档冷路径，进程生命周期内一份。
+
+格式是**目录**（不引入 zip 依赖）：
+
+```text
+<mods 根>/
+  bobber/
+    mod.json
+    data/blocks.jsonc
+    data/items.jsonc
+```
+
+- 扫描入口 `scan_package_root(root)`：根目录自身有 `mod.json` 时按单包处理；否则只扫**含 `mod.json` 的子目录**，没有清单的子目录直接跳过。目录名与包顺序都排序后确定。
+- 清单字段与 `ModManifest` 同名：`id`、`version`、`engine_api`、`load_after`、`load_after_optional`、`conflicts`、`exclusive_groups`、`actions`、`params`、`presentation`、`data`。`serde` 用 `deny_unknown_fields`，写错字段名直接报 schema 错误，不静默忽略。
+- `params` 的元素是 `{ key, type: { kind: "bool" | "int" | "fixed" | "enum", min, max, step, scale, values }, default, scope: "world" | "debug", group?, visible_if? }`；`presentation` 的元素是 `{ name, fields: [{ key, name, visibility: "all" | "required" | "server_only", required_bits? }] }`。
+- `data` 是相对包目录的路径数组，只接受 `Component::Normal` 段（拒绝 `..` 逃逸），不重复，≤ 64 个；文件用 JSONC 解析，顶层必须是对象，表名走 `ObjectTableKind::parse`（voxel / biome / entity / item 及其别名），补丁必须是数组。
+
+校验（任一失败整包拒绝，错误码 `mod.package.*`）：
+
+| 类别 | 规则 | code |
+| --- | --- | --- |
+| 清单 | id / 依赖名 1..=64 字节，仅 ASCII 字母数字与 `_ - .`；`version > 0`；`engine_api == CURRENT_ENGINE_API`（当前 1） | `mod.package.manifest` / `mod.package.engine_api` |
+| 关系 | `load_after` / `load_after_optional` / `conflicts` 不能引用自己，列表内不重复 | `mod.package.schema` |
+| 动作 | 名字非空、≤ `ACTION_NAME_MAX_BYTES`、无控制字符，包内不重名 | `mod.package.schema` |
+| 参数 | key 包内唯一；Bool 默认 0/1；Int/Fixed `min <= max`、`step > 0`、默认在范围内；Fixed `scale > 0`；Enum 非空且默认下标合法；`visible_if.key` 必须已声明 | `mod.package.schema` |
+| 表现 | 子种类名 / 字段名非空且 ≤ 64 字节；包内子种类不重名；字段 key 与名字在 spec 内不重名；`required` 必须有非 0 `required_bits`，其它可见性必须为 0 | `mod.package.schema` |
+| 数据 | 文件存在、≤ 1 MiB（单文件）/ 8 MiB（整包）、JSONC 可解析、表名可识别、补丁是数组 | `mod.package.data` |
+| IO | 目录 / 文件读失败 | `mod.package.io` |
+
+上限：单包清单 ≤ 256 KiB、data ≤ 64 个、扫描结果 ≤ 64 个包（`MAX_PACKAGES`）。
+
+装配链与编译期 mod 完全共用：`Mods::push(package.to_mod())` → 拓扑排序 / 冲突 / `ResolvedActions` / `ResolvedModPayloads` 全部照旧，因此包声明的动作与表现子种类自动获得通道位与 `sub_kind`。包**不加载可执行代码**，只提供清单与数据补丁；脚本层是独立里程碑（BMS），不在这条路径上。
+
+Godot 侧流程：`BevyAppManager.scan_mod_packages(root)` 读目录并解析，返回 `{ ok, count, packages, errors }`（`ok=false` 时 `errors` 为 `{ path, code, message }`）；成功结果留在节点上，之后**任一** `start_bevy_*` 都把它带进 `BevyBackendConfig.packages`。`bevy_client.gd` 的 `mod_dir` 非空时在 `_start_backend` 前自动扫描，失败则取消本次启动（不装半套）。
+
+包不参与存档身份：`world.meta` 冻结的是 mod `id/version` 与解析后的插件序列，**不含**包文件哈希。改了包内容却没升 `version`，旧档仍会放行；发布者必须靠 `version` 表达内容变更，校验 / 回滚等价是后续里程碑。
+
 
 ### 动作表解析
 

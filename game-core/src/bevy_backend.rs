@@ -18,6 +18,7 @@ use game_engine::residency::MemorySoftLimitHandle;
 use crate::app::CoreGame;
 use crate::dev::demo::DemoPlugin;
 use crate::mods::{default_core_mods, CoreMods};
+use crate::package::LoadedPackage;
 use crate::spec::{ClientBridge, CoreSpec};
 use crate::static_data::ObjectTablesHandle;
 use crate::voxel::terrain::{TerrainConfig, TerrainMode, VoxelLodHandle, VoxelLodRuntime};
@@ -90,6 +91,11 @@ pub struct BevyBackendConfig {
     /// Some 时空列表表示「一个可选插件都不装」，不是「用默认」；未知 id 在启动阶段
     /// 结构化失败（ModuleBuildFailure + bev_error），不会 panic。
     pub plugins: Option<Vec<String>>,
+    /// 目录式 mod 包（已解析，见 [crate::package]）。
+    ///
+    /// 启动时按顺序转成 native mod 追加到 [Self::mods] 之后，参与同一套
+    /// 拓扑排序 / 冲突校验 / 动作与表现表解析。默认空。
+    pub packages: Vec<LoadedPackage>,
     /// 只读打开：不推进玩法、不写盘（见 [crate::input::ReadOnlySession]）。
     ///
     /// true 时装配前插入 [ReadOnlySession]，默认插件选择换成
@@ -127,6 +133,7 @@ impl Default for BevyBackendConfig {
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
             plugins: None,
+            packages: Vec::new(),
             read_only: false,
             world_load_rejection: None,
         }
@@ -154,6 +161,7 @@ struct CoreGameModule {
     mods: CoreMods,
     param_overrides: BTreeMap<String, i64>,
     plugins: Option<Vec<String>>,
+    packages: Vec<LoadedPackage>,
     read_only: bool,
     world_load_rejection: Option<WorldLoadRejectionHandle>,
 }
@@ -231,8 +239,14 @@ impl GameModule<CoreSpec> for CoreGameModule {
         };
         // 装配失败不 panic：把稳定 code + 中文说明放进资源，由 runner 在
         // 发 Started 之前拦截并回传 Godot，然后以失败退出。
+        // 目录式包追加在编译期 mod 之后：两者共享同一套拓扑排序与冲突校验。
+        // `to_mod` 会 leak 清单与补丁文本（启动一次，进程生命周期）。
+        let mut mods = self.mods.clone();
+        for package in &self.packages {
+            mods = mods.push(package.to_mod::<CoreSpec>());
+        }
         if let Err(error) =
-            CoreGame.build_with_profile(app, self.mods.clone(), &self.param_overrides, &selection)
+            CoreGame.build_with_profile(app, mods, &self.param_overrides, &selection)
         {
             app.insert_resource(ModuleBuildFailure {
                 code: error.code().to_string(),
@@ -301,6 +315,7 @@ pub fn run_bevy_backend(
             mods: config.mods,
             param_overrides: config.param_overrides,
             plugins: config.plugins,
+            packages: config.packages,
             read_only: config.read_only,
             world_load_rejection: config.world_load_rejection,
         },
@@ -335,6 +350,7 @@ mod tests {
             mods: default_core_mods(),
             param_overrides: BTreeMap::new(),
             plugins: None,
+            packages: Vec::new(),
             read_only: false,
             world_load_rejection: None,
         }

@@ -35,6 +35,8 @@ pub mod input;
 /// 中立扩展字段袋（逻辑侧容器，见模块文档的分层说明）。
 pub mod logic_ext;
 pub mod mods;
+/// 目录式 mod 包解析（Godot 读盘 → Rust 解析 → Mods）。
+pub mod package;
 mod prediction;
 pub mod presentation;
 pub mod privacy;
