@@ -34,8 +34,15 @@ use crate::static_data::{strip_jsonc, ObjectTableKind};
 
 /// 清单文件名（相对包根目录）。
 pub const PACKAGE_MANIFEST_FILE: &str = "mod.json";
-/// 当前引擎 API 版本；包清单里的 `engine_api` 必须与它相等。
+/// 当前引擎 API 版本。
+///
+/// 包清单里的 `engine_api` 表示「按哪一版 API 写的」，落在
+/// `[MIN_SUPPORTED_ENGINE_API, CURRENT_ENGINE_API]` 内即放行。
+/// 只增不改的扩展（新字段、新载荷）只把它加一；
+/// 破坏性变更才同时提高 [`MIN_SUPPORTED_ENGINE_API`]。
 pub const CURRENT_ENGINE_API: u32 = 1;
+/// 引擎仍然兼容的最低 `engine_api`。低于它的包按「需要更新」拒绝。
+pub const MIN_SUPPORTED_ENGINE_API: u32 = 1;
 /// 单次扫描的包数量上限。
 pub const MAX_PACKAGES: usize = 64;
 /// 每个包的数据补丁文件数量上限。
@@ -64,7 +71,7 @@ pub enum PackageErrorKind {
     Schema,
     /// 数据补丁缺失或格式不对。
     Data,
-    /// `engine_api` 与当前引擎不一致。
+    /// `engine_api` 不在当前引擎支持的区间内（过旧或过新）。
     EngineApi,
 }
 
@@ -556,6 +563,23 @@ enum RawVisibility {
 
 // ─────────────────────────── 校验 ───────────────────────────
 
+/// `engine_api` 区间判定。拆成纯函数，便于用任意区间做边界测试。
+///
+/// 过旧与过新给出不同文案：前者提示作者更新 mod，后者提示玩家更新游戏。
+fn check_engine_api(declared: u32, min: u32, current: u32) -> Result<(), String> {
+    if declared < min {
+        return Err(format!(
+            "清单 engine_api {declared} 低于当前引擎支持的最低版本 {min}，需要更新此 mod"
+        ));
+    }
+    if declared > current {
+        return Err(format!(
+            "清单 engine_api {declared} 高于当前引擎版本 {current}，需要更新游戏"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_manifest(path: &Path, raw: RawManifest) -> Result<PackageManifest, PackageError> {
     let schema = |message: String| PackageError::new(path, PackageErrorKind::Schema, message);
 
@@ -563,16 +587,8 @@ fn validate_manifest(path: &Path, raw: RawManifest) -> Result<PackageManifest, P
     if raw.version == 0 {
         return Err(schema("version 必须大于 0".to_string()));
     }
-    if raw.engine_api != CURRENT_ENGINE_API {
-        return Err(PackageError::new(
-            path,
-            PackageErrorKind::EngineApi,
-            format!(
-                "清单要求 engine_api {}，当前引擎是 {CURRENT_ENGINE_API}",
-                raw.engine_api
-            ),
-        ));
-    }
+    check_engine_api(raw.engine_api, MIN_SUPPORTED_ENGINE_API, CURRENT_ENGINE_API)
+        .map_err(|message| PackageError::new(path, PackageErrorKind::EngineApi, message))?;
 
     validate_name_list(&raw.load_after, "load_after", &schema)?;
     validate_name_list(&raw.load_after_optional, "load_after_optional", &schema)?;

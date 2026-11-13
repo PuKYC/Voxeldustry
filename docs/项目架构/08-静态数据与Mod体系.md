@@ -299,7 +299,7 @@ Godot 入口是 `start_bevy_streaming_readonly(fixed_hz, runner_hz, save_dir)`�
 - `load_after_optional`：可选依赖，存在时排在自己之前，缺失不报错。
 - `conflicts`：单向声明，对方存在即报 `Conflict`。
 - `exclusive_groups`：同一组最多加载一个 mod，冲突报 `ExclusiveGroup`。
-- `engine_api` 是整数版本，只增不改。
+- `engine_api` 是整数版本，只增不改。包的值表示「按哪一版 API 写的」，引擎接受 `[MIN_SUPPORTED_ENGINE_API, CURRENT_ENGINE_API]` 内的包：只增不改的扩展只抬高 `CURRENT`，破坏性变更才抬高 `MIN`。
 - `params`：参数 schema（`ParamSpec`）。key 在 mod 内局部，全 key 为 `<mod_id>.<key>`；`ParamScope::World` 在 `PostStartup` 冻结并随存档保存，`ParamScope::Debug` 不进存档。客户端本地设置（画质、按键）不进入本表。目录式包的 `params` 与它**同表**合并（见下节）。
 - `actions`：本 mod 声明的输入动作名（`&'static [&'static str]`，不声明则 `&[]`）。解析规则见下节。
 - `presentation`：本 mod 的表现子种类声明（`&'static [ModPayloadSpec]`，不声明则 `&[]`）。
@@ -374,7 +374,7 @@ GDScript 面板 `godot-project/ui/screens/param_panel.gd`（`class_name ParamPan
 
 | 类别 | 规则 | code |
 | --- | --- | --- |
-| 清单 | id / 依赖名 1..=64 字节，仅 ASCII 字母数字与 `_ - .`；`version > 0`；`engine_api == CURRENT_ENGINE_API`（当前 1） | `mod.package.manifest` / `mod.package.engine_api` |
+| 清单 | id / 依赖名 1..=64 字节，仅 ASCII 字母数字与 `_ - .`；`version > 0`；`MIN_SUPPORTED_ENGINE_API <= engine_api <= CURRENT_ENGINE_API`（当前均为 1；过旧提示更新 mod，过新提示更新游戏） | `mod.package.manifest` / `mod.package.engine_api` |
 | 关系 | `load_after` / `load_after_optional` / `conflicts` 不能引用自己，列表内不重复 | `mod.package.schema` |
 | 动作 | 名字非空、≤ `ACTION_NAME_MAX_BYTES`、无控制字符，包内不重名 | `mod.package.schema` |
 | 参数 | key 包内唯一；Bool 默认 0/1；Int/Fixed `min <= max`、`step > 0`、默认在范围内；Fixed `scale > 0`；Enum 非空且默认下标合法；`visible_if.key` 必须已声明 | `mod.package.schema` |

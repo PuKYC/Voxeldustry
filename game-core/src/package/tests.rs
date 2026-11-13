@@ -178,6 +178,50 @@ fn rejects_engine_api_mismatch() {
 }
 
 #[test]
+fn engine_api_range_boundaries() {
+    // 区间 [2, 4]：两端含，区间外分别报过旧 / 过新。
+    assert!(check_engine_api(2, 2, 4).is_ok());
+    assert!(check_engine_api(3, 2, 4).is_ok());
+    assert!(check_engine_api(4, 2, 4).is_ok());
+
+    let old = check_engine_api(1, 2, 4).expect_err("低于最低版本应拒绝");
+    assert!(old.contains("更新此 mod"), "{old}");
+    let new = check_engine_api(5, 2, 4).expect_err("高于当前版本应拒绝");
+    assert!(new.contains("更新游戏"), "{new}");
+
+    // min == current 时退化为相等判断（旧行为）。
+    assert!(check_engine_api(1, 1, 1).is_ok());
+    assert!(check_engine_api(0, 1, 1).is_err());
+    assert!(check_engine_api(2, 1, 1).is_err());
+}
+
+#[test]
+fn accepts_engine_api_inside_supported_range() {
+    const { assert!(MIN_SUPPORTED_ENGINE_API <= CURRENT_ENGINE_API) };
+    for api in MIN_SUPPORTED_ENGINE_API..=CURRENT_ENGINE_API {
+        let dir = TempDir::new("api_ok");
+        package_with(
+            dir.path(),
+            &format!(r#"{{"id":"fishing","version":1,"engine_api":{api}}}"#),
+            &[],
+        );
+        load_package(dir.path()).expect("区间内的 engine_api 应放行");
+    }
+}
+
+#[test]
+fn rejects_engine_api_below_minimum() {
+    let dir = TempDir::new("api_zero");
+    package_with(
+        dir.path(),
+        r#"{"id":"fishing","version":1,"engine_api":0}"#,
+        &[],
+    );
+    let error = load_package(dir.path()).expect_err("engine_api 0 低于最低版本");
+    assert_eq!(error.kind(), PackageErrorKind::EngineApi);
+}
+
+#[test]
 fn rejects_missing_and_escaping_data_files() {
     let dir = TempDir::new("data");
     package_with(
