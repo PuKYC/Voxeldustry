@@ -55,6 +55,8 @@ pub const MAX_ACTION_NAME_LEN: u16 = 64;
 pub const MAX_PLUGIN_COUNT: u32 = 64;
 /// 插件 id 的 UTF-8 字节长度上限。
 pub const MAX_PLUGIN_ID_LEN: u16 = 64;
+/// 游戏版本字符串的 UTF-8 字节长度上限。
+pub const MAX_GAME_VERSION_LEN: u16 = 32;
 /// 单 region 区块数上限（§3 偏移 12）。
 pub const MAX_CHUNK_COUNT: u32 = 64;
 /// 单条记录体长度上限（§0）。
@@ -235,6 +237,22 @@ pub struct WorldMeta {
     /// 不能事后重算（重算会把「注册表变了」变成静默漂移）。v1 为空，
     /// v2 缺该段即坏档。
     pub plugins: Vec<String>,
+    /// v2：最近一次写出本文件的游戏版本与 `engine_api`。
+    ///
+    /// 每次保存都由当前构建重写（不是「创建者」）：兼容性取决于写出插件序列与
+    /// 动作表的那一版，所以记最后写入者才有判断价值。只用于展示与诊断，
+    /// **不参与放行 / 拒绝**——放行仍由 mod / 插件 / 动作表的逐项比对决定。
+    /// v1 解码结果为默认值（空字符串、0）；v2 缺该段即坏档。
+    pub saved_with: SavedWith,
+}
+
+/// 写出存档的构建身份（见 [`WorldMeta::saved_with`]）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SavedWith {
+    /// 游戏版本字符串（如 `0.1.0`），不解析、不比较大小，只做展示与相等判断。
+    pub game_version: String,
+    /// 写出时引擎的 `CURRENT_ENGINE_API`。
+    pub engine_api: u32,
 }
 
 impl WorldMeta {

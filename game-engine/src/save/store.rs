@@ -805,6 +805,7 @@ mod tests {
             params: Vec::new(),
             actions: Vec::new(),
             plugins: Vec::new(),
+            saved_with: Default::default(),
         }
     }
 
@@ -1201,6 +1202,7 @@ mod tests {
             params: Vec::new(),
             actions: Vec::new(),
             plugins: Vec::new(),
+            saved_with: Default::default(),
         };
         let target = write_world_meta(&paths, &meta).expect("写 world.meta");
 

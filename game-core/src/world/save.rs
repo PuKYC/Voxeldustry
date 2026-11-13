@@ -41,7 +41,7 @@ use game_engine::save::{
     capture as capture_snapshot, export_chunk, read_region, region_of, write_region,
     write_world_meta, ActionRecord, AttachTag, BodyKind as SaveBodyKind, BodyRecord, ChunkRecord,
     ModRecord, OpaqueComponents, PersistRegistry, RegionFile, SaveError, SaveErrorKind, SavePaths,
-    WorldMeta,
+    SavedWith, WorldMeta,
 };
 use game_engine::voxel::{Attachment, ChunkKey, VoxVolume, VoxelDirtySet, VoxelInterner};
 
@@ -71,6 +71,15 @@ pub struct WorldCapture {
     pub meta: WorldMeta,
     /// (body, region 键) -> region 文件；键升序，落盘顺序即此顺序。
     pub regions: BTreeMap<(BodyKey, ChunkKey), RegionFile>,
+}
+
+/// 当前构建写出存档时记录的身份：游戏版本 + `engine_api`。
+#[must_use]
+pub fn current_saved_with() -> SavedWith {
+    SavedWith {
+        game_version: crate::GAME_VERSION.to_string(),
+        engine_api: crate::package::CURRENT_ENGINE_API,
+    }
 }
 
 /// 采集当前世界：`world.meta` + 全部 region。
@@ -273,6 +282,7 @@ pub fn capture_world(
             params,
             actions,
             plugins,
+            saved_with: current_saved_with(),
         },
         regions,
     })
@@ -562,6 +572,7 @@ mod tests {
                 params: Vec::new(),
                 actions: Vec::new(),
                 plugins: Vec::new(),
+                saved_with: current_saved_with(),
             }
         );
         assert!(capture.regions.is_empty(), "空世界不产生 region");

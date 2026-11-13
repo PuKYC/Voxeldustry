@@ -26,6 +26,12 @@
 //! | `net`（`feature = "net"`） | replicon 可见性适配 |
 //! | `dev` | 仅开发 / 演示场景（生产可整体删除） |
 
+/// 游戏版本字符串（取自 `Cargo.toml` 的 workspace 版本）。
+///
+/// 写进 `world.meta` 的 [`SavedWith`](game_engine::save::SavedWith)，只用于展示与诊断，
+/// 不参与放行 / 拒绝存档，也不按大小比较。
+pub const GAME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod app;
 pub mod bevy_backend;
 mod dev;

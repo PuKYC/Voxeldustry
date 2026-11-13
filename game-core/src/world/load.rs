@@ -28,7 +28,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use bevy::prelude::{warn, Entity, Resource, World};
+use bevy::prelude::{info, warn, Entity, Resource, World};
 
 use game_engine::body_key::BodyKey;
 use game_engine::identity::{StableEntityId, StableEntityIndex, StableIdAllocator};
@@ -39,7 +39,7 @@ use game_engine::residency::ChunkAnchor;
 use game_engine::save::{
     install_chunk, read_region, read_world_meta, reclaim_orphans, region_of, regions_on_disk,
     AttachTag, BodyKind, BodyRecord, OpaqueComponents, PersistRegistry, ReclaimStats, RegionFile,
-    SaveError, SaveErrorKind, SavePaths, WorldMeta, REGION_SIZE,
+    SaveError, SaveErrorKind, SavePaths, SavedWith, WorldMeta, REGION_SIZE,
 };
 use game_engine::streaming::EntityRecord;
 use game_engine::voxel::{
@@ -49,6 +49,7 @@ use game_engine::voxel::{
 
 use crate::static_data::voxel::BiomeId;
 use crate::voxel::body::{AutomatonTag, Body, IslandTag, ShipTag, StructureTag};
+use crate::world::save::current_saved_with;
 use crate::world::{Island, IslandId, IslandRegistry, WorldSeed};
 
 /// 一次读档的统计数据。
@@ -282,6 +283,7 @@ pub fn load_world_with_mode(
 
     // 阶段一：只读文件 + 全部校验；这一步不碰 world。
     let plan = build_plan(world, paths, meta, generator_version, mode)?;
+    log_saved_with(&plan.meta.saved_with);
 
     // 阶段二：先确认所有必需资源都在，再开始写世界。
     require_resources(world)?;
@@ -317,6 +319,26 @@ pub fn load_world_with_mode(
             orphan_regions: plan.orphan_regions,
         },
     }))
+}
+
+/// 存档由不同构建写出时留一条日志。**只做诊断，不放行也不拒绝**：
+/// 兼容与否仍由 mod / 插件 / 动作表的逐项比对决定。
+fn log_saved_with(saved: &SavedWith) {
+    let current = current_saved_with();
+    if *saved == current {
+        return;
+    }
+    if saved.engine_api > current.engine_api {
+        warn!(
+            "world: 存档由更新的构建写出（游戏 {:?} / engine_api {}），当前是 {:?} / {}",
+            saved.game_version, saved.engine_api, current.game_version, current.engine_api
+        );
+    } else {
+        info!(
+            "world: 存档由其它构建写出（游戏 {:?} / engine_api {}），当前是 {:?} / {}",
+            saved.game_version, saved.engine_api, current.game_version, current.engine_api
+        );
+    }
 }
 
 /// 回收孤儿 region：删掉 `world.meta.bodies` 里没有的 body 目录。

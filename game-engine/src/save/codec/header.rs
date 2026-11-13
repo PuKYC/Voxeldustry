@@ -6,10 +6,11 @@ use crate::identity::StableEntityId;
 use crate::input::actions::MAX_INPUT_CHANNELS;
 use crate::modding::ParamRecord;
 use crate::save::format::{
-    digest, ActionRecord, AttachTag, BodyKind, BodyRecord, ModRecord, WorldMeta, BODY_RECORD_LEN,
-    CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_ACTION_COUNT, MAX_ACTION_NAME_LEN, MAX_BODY_COUNT,
-    MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT, MAX_PARAM_KEY_LEN, MAX_PLUGIN_COUNT,
-    MAX_PLUGIN_ID_LEN, MIN_SUPPORTED_FORMAT_VERSION, WORLD_HEADER_LEN, WORLD_MAGIC,
+    digest, ActionRecord, AttachTag, BodyKind, BodyRecord, ModRecord, SavedWith, WorldMeta,
+    BODY_RECORD_LEN, CODEC_ID, DIGEST_LEN, FORMAT_VERSION, MAX_ACTION_COUNT, MAX_ACTION_NAME_LEN,
+    MAX_BODY_COUNT, MAX_GAME_VERSION_LEN, MAX_MOD_COUNT, MAX_MOD_ID_LEN, MAX_PARAM_COUNT,
+    MAX_PARAM_KEY_LEN, MAX_PLUGIN_COUNT, MAX_PLUGIN_ID_LEN, MIN_SUPPORTED_FORMAT_VERSION,
+    WORLD_HEADER_LEN, WORLD_MAGIC,
 };
 use crate::save::{SaveError, SaveErrorKind};
 use std::collections::{BTreeMap, BTreeSet};
@@ -193,6 +194,38 @@ fn encode_extension(writer: &mut Writer, meta: &WorldMeta) -> Result<(), SaveErr
     encode_params(writer, &meta.params)?;
     encode_actions(writer, &meta.actions)?;
     encode_plugins(writer, &meta.plugins)?;
+    encode_saved_with(writer, &meta.saved_with)?;
+    Ok(())
+}
+
+/// 编码构建身份段：u16 version_len + game_version + u32 engine_api。
+///
+/// 字符串允许为空（表示「未知」，只出现在测试夹具里），但长度受限且不含控制字符。
+fn encode_saved_with(writer: &mut Writer, saved: &SavedWith) -> Result<(), SaveError> {
+    let offset = writer.len();
+    if saved.game_version.len() > usize::from(MAX_GAME_VERSION_LEN) {
+        return Err(SaveError::new(
+            "world.meta.saved_with.game_version",
+            offset,
+            SaveErrorKind::TooLarge {
+                what: "game_version length",
+                value: saved.game_version.len() as u64,
+                max: u64::from(MAX_GAME_VERSION_LEN),
+            },
+        ));
+    }
+    if saved.game_version.chars().any(char::is_control) {
+        return Err(SaveError::new(
+            "world.meta.saved_with.game_version",
+            offset,
+            SaveErrorKind::InvalidString {
+                what: "game_version",
+            },
+        ));
+    }
+    writer.u16(u16::try_from(saved.game_version.len()).expect("长度已校验"));
+    writer.bytes(saved.game_version.as_bytes());
+    writer.u32(saved.engine_api);
     Ok(())
 }
 
@@ -758,19 +791,21 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         }
     }
 
-    let (mods, params, actions, plugins, digest_offset) = if format_version >= 2 {
+    let (mods, params, actions, plugins, saved_with, digest_offset) = if format_version >= 2 {
         let payload_end = bytes.len() - DIGEST_LEN;
         let mut extension = Reader::new(&bytes[body_end..payload_end], body_end);
         let mut mods = Vec::new();
         let mut params = Vec::new();
         let mut actions = Vec::new();
         let mut plugins = Vec::new();
+        let mut saved_with = SavedWith::default();
         decode_extension(
             &mut extension,
             &mut mods,
             &mut params,
             &mut actions,
             &mut plugins,
+            &mut saved_with,
         )?;
         if extension.remaining() != 0 {
             return Err(SaveError::new(
@@ -781,7 +816,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
                 },
             ));
         }
-        (mods, params, actions, plugins, payload_end)
+        (mods, params, actions, plugins, saved_with, payload_end)
     } else {
         let expected_len = body_end + DIGEST_LEN;
         if bytes.len() != expected_len {
@@ -795,7 +830,14 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
                 },
             ));
         }
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), body_end)
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SavedWith::default(),
+            body_end,
+        )
     };
 
     let stored = read_u64_at(bytes, digest_offset);
@@ -817,6 +859,7 @@ pub fn decode_world_meta(bytes: &[u8]) -> Result<WorldMeta, SaveError> {
         params,
         actions,
         plugins,
+        saved_with,
     })
 }
 
@@ -827,6 +870,7 @@ fn decode_extension(
     params: &mut Vec<ParamRecord>,
     actions: &mut Vec<ActionRecord>,
     plugins: &mut Vec<String>,
+    saved_with: &mut SavedWith,
 ) -> Result<(), SaveError> {
     let count_offset = reader.offset();
     let mod_count = reader.u32("world.meta.mod_count")?;
@@ -1000,7 +1044,49 @@ fn decode_extension(
     // v2 起动作表段是必填的：params 之后没字节就是坏档（旧 v2 不再兼容）。
     decode_actions(reader, actions)?;
     // 插件清单段同样必填：缺段即坏档，不做「按空清单放行」。
-    decode_plugins(reader, plugins)
+    decode_plugins(reader, plugins)?;
+    // 构建身份段同样必填，位于插件段之后、digest 之前。
+    decode_saved_with(reader, saved_with)
+}
+
+/// 解码构建身份段：u16 version_len + game_version + u32 engine_api。
+fn decode_saved_with(reader: &mut Reader, saved: &mut SavedWith) -> Result<(), SaveError> {
+    let len_offset = reader.offset();
+    let len = reader.u16("world.meta.saved_with.version_len")?;
+    if len > MAX_GAME_VERSION_LEN {
+        return Err(SaveError::new(
+            "world.meta.saved_with.version_len",
+            len_offset,
+            SaveErrorKind::TooLarge {
+                what: "game_version length",
+                value: u64::from(len),
+                max: u64::from(MAX_GAME_VERSION_LEN),
+            },
+        ));
+    }
+    let text_offset = reader.offset();
+    let raw = reader.take(usize::from(len), "world.meta.saved_with.game_version")?;
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        SaveError::new(
+            "world.meta.saved_with.game_version",
+            text_offset,
+            SaveErrorKind::InvalidString {
+                what: "game_version",
+            },
+        )
+    })?;
+    if text.chars().any(char::is_control) {
+        return Err(SaveError::new(
+            "world.meta.saved_with.game_version",
+            text_offset,
+            SaveErrorKind::InvalidString {
+                what: "game_version",
+            },
+        ));
+    }
+    saved.game_version = text.to_string();
+    saved.engine_api = reader.u32("world.meta.saved_with.engine_api")?;
+    Ok(())
 }
 
 /// 解码动作表段：count + 每条 (name_len + name + action + channel_bit)。

@@ -471,10 +471,13 @@ u32 action_count
   每条：u16 name_len + name 字节 + u32 action + u32 channel_bit
 u32 plugin_count              # 插件装配顺序：不排序，按构建顺序原样写
   每条：u16 id_len + id 字节
+u16 version_len + game_version 字节 + u32 engine_api   # 构建身份：最近一次写出本文件的构建
 u64 digest                    # 覆盖头、body 表与上面全部扩展字节
 ```
 
-兼容：v1 存档没有扩展段，解码为「空清单 / 空参数 / 空动作表 / 空插件表」。**未发布前不做旧档兼容**：v2 的扩展段（mod 清单、参数、动作表、插件表）全部必填，缺段按坏档拒绝——读档阶段一还会把冻结的动作表与当前装配逐项比对，数量或内容不符直接整档失败。上限 `MAX_MOD_COUNT` = `MAX_PARAM_COUNT` = `MAX_ACTION_COUNT` = 4096、`MAX_PLUGIN_COUNT` = 64，名字长度上限 255 / 255 / 64 / 64。
+兼容：v1 存档没有扩展段，解码为「空清单 / 空参数 / 空动作表 / 空插件表」。**未发布前不做旧档兼容**：v2 的扩展段（mod 清单、参数、动作表、插件表、构建身份）全部必填，缺段按坏档拒绝——读档阶段一还会把冻结的动作表与当前装配逐项比对，数量或内容不符直接整档失败。上限 `MAX_MOD_COUNT` = `MAX_PARAM_COUNT` = `MAX_ACTION_COUNT` = 4096、`MAX_PLUGIN_COUNT` = 64，名字长度上限 255 / 255 / 64 / 64；`game_version` 最长 `MAX_GAME_VERSION_LEN` = 32 字节且不含控制字符（允许为空，表示未知）。
+
+构建身份（`WorldMeta.saved_with`）记的是**最近一次写出**本文件的 `GAME_VERSION`（取自 `Cargo.toml` workspace 版本）与 `CURRENT_ENGINE_API`，每次保存由当前构建重写，不是「创建者」：兼容性取决于写出插件序列与动作表的那一版。它**只用于展示与诊断，不参与放行或拒绝**，也不按大小比较；读档时若与当前构建不同会留一条日志（存档的 `engine_api` 更新时为 `warn`，否则为 `info`）。放行仍由上面的 mod / 插件 / 动作表逐项比对决定。
 
 读档失败按**原因分成两类**，处置完全不同（判据是 `SaveErrorKind::is_world_rejection()`）：
 

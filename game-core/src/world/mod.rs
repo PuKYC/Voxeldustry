@@ -32,7 +32,7 @@ pub use profile::{
     PLUGIN_REGISTRY,
 };
 pub use rng::WorldRng;
-pub use save::{capture_world, write_capture, SaveBlocked, WorldCapture};
+pub use save::{capture_world, current_saved_with, write_capture, SaveBlocked, WorldCapture};
 pub use save_plugin::{
     OrphanPolicy, SaveNow, SaveRoot, WorldSaveConfig, WorldSavePaths, WorldSavePlugin,
     WorldSaveStatus,
